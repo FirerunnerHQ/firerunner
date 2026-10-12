@@ -117,7 +117,9 @@ func fetchMetaCIDRs(ctx context.Context, cl *http.Client, url string, categories
 //   - anti-spoof: on guest interfaces, drop any packet whose source is not a VM
 //     address, so a guest cannot forge the host's or another network's IP.
 //   - forward: the egress allowlist (or blanket NAT when open), which also
-//     blocks guest-to-guest traffic.
+//     blocks guest-to-guest traffic. In every mode guests are also kept off
+//     non-public networks (the host's LAN, the tailnet, link-local metadata)
+//     and outbound mail ports; see guestEgressGuards.
 //   - postrouting: masquerade guest egress out the external interface.
 //
 // A companion ip6 table drops all guest-originated IPv6 (guests are IPv4-only),
@@ -138,6 +140,8 @@ func buildNFTRuleset(cfg egressRuleset) string {
 	fmt.Fprintf(&b, "add table ip %s\n", table)
 	fmt.Fprintf(&b, "delete table ip %s\n", table)
 	fmt.Fprintf(&b, "table ip %s {\n", table)
+
+	fmt.Fprintf(&b, "\tset nonpublic {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\telements = { %s }\n\t}\n", strings.Join(nonPublicNets, ", "))
 
 	if !cfg.Open {
 		fmt.Fprintf(&b, "\tset allowed {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n")
@@ -169,11 +173,14 @@ func buildNFTRuleset(cfg egressRuleset) string {
 	}
 	if !cfg.Open {
 		fmt.Fprintf(&b, "\t\tip saddr %s ct state established,related accept\n", cfg.VMCidr)
-		fmt.Fprintf(&b, "\t\tip saddr %s ip daddr @allowed accept\n", cfg.VMCidr)
 		if cfg.AllowDNS && len(cfg.DNSServers) > 0 {
 			fmt.Fprintf(&b, "\t\tip saddr %s udp dport 53 ip daddr @dns accept\n", cfg.VMCidr)
 			fmt.Fprintf(&b, "\t\tip saddr %s tcp dport 53 ip daddr @dns accept\n", cfg.VMCidr)
 		}
+		// The guards precede the allowlist accept: an allowlisted range must not
+		// open a mail port, nor a non-public address.
+		guestEgressGuards(&b, cfg.VMCidr)
+		fmt.Fprintf(&b, "\t\tip saddr %s ip daddr @allowed accept\n", cfg.VMCidr)
 		if cfg.AllowNTP {
 			fmt.Fprintf(&b, "\t\tip saddr %s udp dport 123 accept\n", cfg.VMCidr)
 		}
@@ -185,6 +192,7 @@ func buildNFTRuleset(cfg egressRuleset) string {
 		// intra-CIDR traffic while leaving all other forwarding (guest->internet)
 		// to the accept policy.
 		fmt.Fprintf(&b, "\t\tip saddr %s ip daddr %s drop\n", cfg.VMCidr, cfg.VMCidr)
+		guestEgressGuards(&b, cfg.VMCidr)
 	}
 	b.WriteString("\t}\n")
 
@@ -204,6 +212,44 @@ func buildNFTRuleset(cfg egressRuleset) string {
 		b.WriteString("}\n")
 	}
 	return b.String()
+}
+
+// nonPublicNets are the IPv4 ranges that are not globally reachable (RFC 6890):
+// the host's LAN and any other RFC1918 network, the tailnet's CGNAT range,
+// link-local (cloud metadata), loopback, multicast and reserved space. A CI
+// guest runs untrusted code; nothing it should reach lives in these ranges.
+var nonPublicNets = []string{
+	"0.0.0.0/8",
+	"10.0.0.0/8",
+	"100.64.0.0/10",
+	"127.0.0.0/8",
+	"169.254.0.0/16",
+	"172.16.0.0/12",
+	"192.0.0.0/24",
+	"192.168.0.0/16",
+	"198.18.0.0/15",
+	"224.0.0.0/4",
+	"240.0.0.0/4",
+}
+
+// mailPorts are the SMTP ports a guest must never open a connection to, so a
+// job cannot send mail (spam) from the host's address.
+const mailPorts = "25, 465, 587, 2525"
+
+// guestEgressGuards writes the forward rules that hold in every egress mode:
+// guests reach no non-public network and no mail port. The forward hook sees a
+// packet after prerouting DNAT, so a destination the HOST rewrote (the CI
+// hosts redirect guest DNS to a resolver on a private veth) is exempt from the
+// non-public drop: a guest cannot create a DNAT entry, only the host's own
+// rules can. In allowlist mode these come after the explicit resolver accept,
+// so a configured LAN resolver stays reachable on port 53 only.
+//
+// ⚠️ The exemption must test the dnat BIT: "ct status != dnat" compiles to an
+// exact compare against 0x20, which every real connection (confirmed, seen-
+// reply, ...) fails, so it would drop host-DNAT'd traffic too.
+func guestEgressGuards(b *strings.Builder, vmCidr string) {
+	fmt.Fprintf(b, "\t\tip saddr %s ip daddr @nonpublic ct status & dnat == 0 drop\n", vmCidr)
+	fmt.Fprintf(b, "\t\tip saddr %s tcp dport { %s } drop\n", vmCidr, mailPorts)
 }
 
 // egressRuleset is the fully-resolved input to buildNFTRuleset.
