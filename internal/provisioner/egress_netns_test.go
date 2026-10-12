@@ -86,9 +86,10 @@ func newLab(t *testing.T) lab {
 	sh(t, l.in(l.router, "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")...)
 	// The WAN answers for the internet and for every private network a CI host
 	// can see: a public host, the home LAN, other RFC1918 ranges, the tailnet's
-	// CGNAT range and a link-local metadata address. TEST-NET-1 stands in for a
-	// public host outside an allowlist.
-	for _, a := range []string{"203.0.113.10", "192.0.2.10", "192.168.4.10", "10.0.0.5", "172.31.0.5", "100.100.100.100", "169.254.169.254"} {
+	// CGNAT range, a link-local metadata address and a documentation (TEST-NET)
+	// address. The public stand-ins are genuinely global addresses: nothing
+	// leaves the lab, so they only ever reach the WAN namespace.
+	for _, a := range []string{"1.0.0.1", "9.9.9.9", "203.0.113.10", "192.168.4.10", "10.0.0.5", "172.31.0.5", "100.100.100.100", "169.254.169.254"} {
 		sh(t, l.in(l.wan, "ip", "addr", "add", a+"/32", "dev", "eth0")...)
 	}
 	return l
@@ -165,10 +166,11 @@ var guestBoundaries = []probe{
 	{"tailnet CGNAT", "100.100.100.100", 443, false},
 	{"link-local metadata", "169.254.169.254", 80, false},
 	{"resolver without DNAT", "10.53.0.2", 53, false},
-	{"smtp", "203.0.113.10", 25, false},
-	{"smtps", "203.0.113.10", 465, false},
-	{"submission", "203.0.113.10", 587, false},
-	{"alt submission", "203.0.113.10", 2525, false},
+	{"documentation TEST-NET-3", "203.0.113.10", 443, false},
+	{"smtp", "1.0.0.1", 25, false},
+	{"smtps", "1.0.0.1", 465, false},
+	{"submission", "1.0.0.1", 587, false},
+	{"alt submission", "1.0.0.1", 2525, false},
 	{"other guest", "172.19.1.2", 443, false},
 	{"host uplink address", "198.51.100.1", 22, false},
 	{"host gateway ssh", "172.19.0.1", 22, false},
@@ -184,8 +186,8 @@ func TestEgressNetNSOpen(t *testing.T) {
 		VMCidr: labCIDR, CachePort: labCache, Open: true,
 	}))
 	l.check(t, append([]probe{
-		{"public https", "203.0.113.10", 443, true},
-		{"other public host", "192.0.2.10", 443, true},
+		{"public https", "1.0.0.1", 443, true},
+		{"other public host", "9.9.9.9", 443, true},
 		// 8.8.8.8 is routed nowhere in the lab: only the host's DNAT to the
 		// private resolver can deliver it.
 		{"host-DNAT'd DNS", "8.8.8.8", 53, true},
@@ -198,14 +200,14 @@ func TestEgressNetNSAllowlist(t *testing.T) {
 	l.load(t, "firerunner.nft", buildNFTRuleset(egressRuleset{
 		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
 		VMCidr: labCIDR, CachePort: labCache,
-		Allowed:    []string{"203.0.113.0/24"},
+		Allowed:    []string{"1.0.0.0/24"},
 		DNSServers: []string{"192.168.4.10"},
 		AllowDNS:   true,
 		AllowNTP:   true,
 	}))
 	l.check(t, append([]probe{
-		{"allowlisted https", "203.0.113.10", 443, true},
-		{"public host outside the allowlist", "192.0.2.10", 443, false},
+		{"allowlisted https", "1.0.0.1", 443, true},
+		{"public host outside the allowlist", "9.9.9.9", 443, false},
 		// An explicitly configured resolver stays reachable on 53 even when it
 		// is on the LAN, and only on 53.
 		{"configured LAN resolver", "192.168.4.10", 53, true},

@@ -301,7 +301,7 @@ func TestBuildNFTRulesetGuestEgressGuards(t *testing.T) {
 			if !strings.Contains(out, "set nonpublic {") || !strings.Contains(out, "flags interval") {
 				t.Fatalf("missing nonpublic set:\n%s", out)
 			}
-			for _, cidr := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8", "224.0.0.0/4"} {
+			for _, cidr := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8", "224.0.0.0/4", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"} {
 				if !strings.Contains(out, cidr) {
 					t.Errorf("nonpublic set missing %s", cidr)
 				}

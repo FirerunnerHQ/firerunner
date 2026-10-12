@@ -216,8 +216,10 @@ func buildNFTRuleset(cfg egressRuleset) string {
 
 // nonPublicNets are the IPv4 ranges that are not globally reachable (RFC 6890):
 // the host's LAN and any other RFC1918 network, the tailnet's CGNAT range,
-// link-local (cloud metadata), loopback, multicast and reserved space. A CI
-// guest runs untrusted code; nothing it should reach lives in these ranges.
+// link-local (cloud metadata), loopback, documentation (TEST-NET-1/2/3),
+// benchmarking, multicast and reserved space. A CI guest runs untrusted code;
+// nothing it should reach lives in these ranges. 192.88.99.0/24 (deprecated
+// 6to4 relay anycast) is deliberately absent: RFC 6890 marks it global.
 var nonPublicNets = []string{
 	"0.0.0.0/8",
 	"10.0.0.0/8",
@@ -226,8 +228,11 @@ var nonPublicNets = []string{
 	"169.254.0.0/16",
 	"172.16.0.0/12",
 	"192.0.0.0/24",
+	"192.0.2.0/24",
 	"192.168.0.0/16",
 	"198.18.0.0/15",
+	"198.51.100.0/24",
+	"203.0.113.0/24",
 	"224.0.0.0/4",
 	"240.0.0.0/4",
 }
