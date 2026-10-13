@@ -74,6 +74,17 @@ GitHub categories are `api`, `actions`, `git`, `packages`, and `dns`/`ntp` are
 pseudo-categories. Pass `--egress open` to disable the allowlist and fall back to
 blanket NAT.
 
+In **every** mode, `--egress open` included, guests are kept off non-public
+networks and mail: the forward chain drops guest traffic to any non-globally-
+reachable IPv4 range (RFC1918 — so the host's LAN — the `100.64.0.0/10` tailnet
+range, link-local `169.254.0.0/16` metadata, loopback, documentation, multicast, reserved) and
+to TCP ports 25, 465, 587 and 2525. Two exceptions, both chosen by the host
+rather than the guest: a resolver listed in `--dns-servers` stays reachable on
+port 53 in allowlist mode even on the LAN, and a destination the host itself
+rewrote with DNAT (for example, redirecting guest DNS to a local resolver) is
+not treated as a guest-chosen private address. `make netns-test` proves this
+against the real kernel in throwaway network namespaces.
+
 The same table also protects the **host itself**: an `input` chain drops
 guest→host traffic (so a guest cannot reach host-local services), allowing only
 the optional cache-server port on its gateway; interface-keyed **anti-spoof**

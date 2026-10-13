@@ -11,3 +11,4 @@
 .DS_Store
 cover.out
 *.out
+/egress-netns.test

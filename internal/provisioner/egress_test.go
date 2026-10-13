@@ -251,3 +251,134 @@ func TestEgressConfigHelpers(t *testing.T) {
 		t.Errorf("metaCats = %v", cats)
 	}
 }
+
+// forwardChain returns the forward chain's rule lines, in order.
+func forwardChain(t *testing.T, ruleset string) []string {
+	t.Helper()
+	start := strings.Index(ruleset, "chain forward {")
+	if start < 0 {
+		t.Fatalf("no forward chain in:\n%s", ruleset)
+	}
+	body := ruleset[start:]
+	body = body[:strings.Index(body, "\t}\n")]
+	var rules []string
+	for _, l := range strings.Split(body, "\n")[1:] {
+		if l = strings.TrimSpace(l); l != "" {
+			rules = append(rules, l)
+		}
+	}
+	return rules
+}
+
+// ruleIndex returns the position of the first forward rule containing substr,
+// failing the test when there is none.
+func ruleIndex(t *testing.T, rules []string, substr string) int {
+	t.Helper()
+	for i, r := range rules {
+		if strings.Contains(r, substr) {
+			return i
+		}
+	}
+	t.Fatalf("no forward rule contains %q:\n%s", substr, strings.Join(rules, "\n"))
+	return -1
+}
+
+// TestBuildNFTRulesetGuestEgressGuards pins the rules that hold in EVERY egress
+// mode: guests reach no non-public network (LAN, tailnet, link-local
+// metadata) and no outbound mail port. Before these, open mode forwarded a
+// guest to anything the host could route to, the home LAN included.
+func TestBuildNFTRulesetGuestEgressGuards(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rs   egressRuleset
+	}{
+		{"open", egressRuleset{ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR, Open: true}},
+		{"allowlist", egressRuleset{ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR, Allowed: []string{"140.82.112.0/20"}}},
+		{"no iface prefix", egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Open: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := buildNFTRuleset(tc.rs)
+			if !strings.Contains(out, "set nonpublic {") || !strings.Contains(out, "flags interval") {
+				t.Fatalf("missing nonpublic set:\n%s", out)
+			}
+			for _, cidr := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8", "224.0.0.0/4", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"} {
+				if !strings.Contains(out, cidr) {
+					t.Errorf("nonpublic set missing %s", cidr)
+				}
+			}
+			rules := forwardChain(t, out)
+			ruleIndex(t, rules, "ip saddr "+vmCIDR+" ip daddr @nonpublic ct status & dnat == 0 drop")
+			ruleIndex(t, rules, "ip saddr "+vmCIDR+" tcp dport { 25, 465, 587, 2525 } drop")
+		})
+	}
+}
+
+// TestBuildNFTRulesetDNATExemptionTestsTheBit guards a trap verified on real
+// nft 1.1.3: "ct status != dnat" compiles to an exact compare against 0x20,
+// which every real connection fails, so it dropped host-DNAT'd guest DNS (the
+// CI hosts redirect it to a resolver on a private veth).
+func TestBuildNFTRulesetDNATExemptionTestsTheBit(t *testing.T) {
+	out := buildNFTRuleset(egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Open: true})
+	if strings.Contains(out, "!= dnat") {
+		t.Fatalf("dnat exemption must test the bit (& dnat == 0), not compare the whole status:\n%s", out)
+	}
+}
+
+// TestBuildNFTRulesetAllowlistOrder pins the allowlist forward order: an
+// explicitly configured resolver is accepted (even on the LAN) before the
+// guards, and the guards precede the allowlist accept so no allowlisted range
+// can open a mail port or a non-public address. NTP and the final drop follow.
+func TestBuildNFTRulesetAllowlistOrder(t *testing.T) {
+	rules := forwardChain(t, buildNFTRuleset(egressRuleset{
+		ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR,
+		Allowed:    []string{"140.82.112.0/20"},
+		DNSServers: []string{"192.168.4.1"},
+		AllowDNS:   true,
+		AllowNTP:   true,
+	}))
+	order := []string{
+		"ip saddr != " + vmCIDR + " drop",
+		"ct state established,related accept",
+		"udp dport 53 ip daddr @dns accept",
+		"tcp dport 53 ip daddr @dns accept",
+		"@nonpublic",
+		"dport { 25, 465, 587, 2525 } drop",
+		"ip daddr @allowed accept",
+		"udp dport 123 accept",
+		"ip saddr " + vmCIDR + " drop",
+	}
+	prev := -1
+	for _, want := range order {
+		i := ruleIndex(t, rules, want)
+		if i <= prev {
+			t.Fatalf("forward rule %q at %d, want after %d:\n%s", want, i, prev, strings.Join(rules, "\n"))
+		}
+		prev = i
+	}
+	if prev != len(rules)-1 {
+		t.Errorf("the default drop must be the last forward rule:\n%s", strings.Join(rules, "\n"))
+	}
+}
+
+// TestBuildNFTRulesetOpenOrder pins open mode: anti-spoof, the guest-to-guest
+// drop, then the guards, with the chain's accept policy for everything else.
+func TestBuildNFTRulesetOpenOrder(t *testing.T) {
+	rules := forwardChain(t, buildNFTRuleset(egressRuleset{ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR, Open: true}))
+	order := []string{
+		"ip saddr != " + vmCIDR + " drop",
+		"ip daddr " + vmCIDR + " drop",
+		"@nonpublic",
+		"dport { 25, 465, 587, 2525 } drop",
+	}
+	prev := -1
+	for _, want := range order {
+		i := ruleIndex(t, rules, want)
+		if i <= prev {
+			t.Fatalf("forward rule %q at %d, want after %d:\n%s", want, i, prev, strings.Join(rules, "\n"))
+		}
+		prev = i
+	}
+	if len(rules) != len(order)+1 { // +1: the chain's type/hook/policy line
+		t.Errorf("open mode forward chain has unexpected rules:\n%s", strings.Join(rules, "\n"))
+	}
+}

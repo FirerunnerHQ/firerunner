@@ -29,6 +29,23 @@ jobs:
       - name: Test golden docker shim
         run: images/test-docker-shim.sh
 
+  # The egress firewall against the real kernel's nftables, in throwaway
+  # network namespaces: what a guest can and cannot reach in each egress mode.
+  netns:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Install nftables
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+      - name: Egress firewall in network namespaces
+        run: make netns-test
+
   # End-to-end boot of a real Firecracker microVM. Requires a KVM-capable
   # self-hosted runner; runs only when manually dispatched so it never blocks PRs.
   e2e:

@@ -48,6 +48,15 @@ cover-check: cover
 e2e:
 	go test -tags e2e -count=1 ./test/e2e/...
 
+# The egress firewall against the real kernel: loads the generated nft ruleset
+# into throwaway network namespaces and probes what a guest can reach. Needs
+# Linux, root, ip and nft; the test binary is built as the user and run as root.
+.PHONY: netns-test
+netns-test:
+	go test -c -tags netns -o egress-netns.test ./internal/provisioner/
+	sudo ./egress-netns.test -test.run EgressNetNS -test.count 1 -test.v
+	rm -f egress-netns.test
+
 .PHONY: clean
 clean:
-	rm -f $(BINARY) $(COVERPROFILE)
+	rm -f $(BINARY) $(COVERPROFILE) egress-netns.test
