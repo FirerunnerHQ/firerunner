@@ -235,7 +235,14 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 }
 
 // ServeHTTP makes Server an http.Handler.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Also bind at handler entry for in-process callers. Do this before reading
+	// the request body, which an old VM could deliberately delay across reuse.
+	if r.Context().Value(connectionGenerationKey{}) == nil {
+		r = r.WithContext(s.bindGeneration(r.Context(), r.RemoteAddr))
+	}
+	s.mux.ServeHTTP(w, r)
+}
 
 // StartJanitor runs a background loop that reclaims abandoned (reserved but
 // never finalized) entries until the returned stop function is called.

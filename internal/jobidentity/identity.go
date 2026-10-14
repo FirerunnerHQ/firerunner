@@ -138,7 +138,7 @@ func (s Reader) Lookup(ip string) (Identity, error) {
 		return Identity{}, fmt.Errorf("identity address mismatch")
 	}
 	if err := i.Validate(time.Now()); err != nil {
-		return Identity{}, err
+		return i, err // preserve the trusted generation of a pending lease
 	}
 	return i, nil
 }

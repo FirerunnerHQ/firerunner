@@ -601,6 +601,10 @@ refused even if it claims the pinned repository in its request.
   GET and HEAD all check authority; a signed URL alone is insufficient. VM exit
   revokes the record before the slot is reused, late API responses cannot grant
   a new occupant the old rights, and a failed revocation quarantines the slot.
+  TCP connections also bind to their initial VM generation: an old keep-alive
+  or delayed request body cannot acquire the next job's scope. If embedding the
+  handler, install `Server.ConnectionContext` as `http.Server.ConnContext`
+  (the CLI does this automatically).
 - The daemon renews records every 30 seconds with a 90-second lease. Atomic
   replacement prevents partial reads; the cache server rereads each request.
   Startup clears stale records under an exclusive directory lock. A daemon

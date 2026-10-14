@@ -456,3 +456,114 @@ func TestGuestHeadersCannotSelectIdentity(t *testing.T) {
 		t.Fatal("invalid address granted fallback")
 	}
 }
+
+func TestKeepAliveCannotAcquireReusedSlotIdentity(t *testing.T) {
+	s, err := New(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	current := testIdentity("owner/repo", prRef, "old")
+	if err := s.SetScope("owner/repo", mainRef, func(string) (jobidentity.Identity, error) { mu.Lock(); defer mu.Unlock(); return current, nil }); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewUnstartedServer(s)
+	ts.Config.ConnContext = s.ConnectionContext
+	ts.Start()
+	defer ts.Close()
+	transport := &http.Transport{MaxConnsPerHost: 1}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	request := func(key string) createResp {
+		t.Helper()
+		r, err := client.Post(ts.URL+twirpBase+"CreateCacheEntry", "application/json", strings.NewReader(fmt.Sprintf(`{"key":%q,"version":"v"}`, key)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		var out createResp
+		if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		return out
+	}
+	if !request("old").OK {
+		t.Fatal("initial generation denied")
+	}
+	mu.Lock()
+	current = testIdentity("owner/repo", mainRef, "new")
+	mu.Unlock()
+	if request("poison").OK {
+		t.Fatal("old TCP connection acquired new generation")
+	}
+	transport.CloseIdleConnections()
+	if !request("fresh-connection").OK {
+		t.Fatal("new occupant cannot use a new connection")
+	}
+}
+
+func TestSlowBodyCannotAcquireReusedSlotIdentity(t *testing.T) {
+	l := newScopeLab(t)
+	guest := l.guest(t, "172.16.0.2", prRef, "old")
+	reader, writer := io.Pipe()
+	req := httptest.NewRequest("POST", guest+twirpBase+"CreateCacheEntry", reader)
+	req.RemoteAddr = "172.16.0.2:1234"
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { l.s.ServeHTTP(w, req); close(done) }()
+	// Write returns only once the handler is reading the old request body.
+	if _, err := writer.Write([]byte(`{"key":`)); err != nil {
+		t.Fatal(err)
+	}
+	l.set("172.16.0.2", testIdentity("owner/repo", mainRef, "new"))
+	_, _ = writer.Write([]byte(`"poison","version":"v"}`))
+	_ = writer.Close()
+	<-done
+	var c createResp
+	if err := json.Unmarshal(w.Body.Bytes(), &c); err != nil || c.OK {
+		t.Fatalf("old body acquired new job rights: %s", w.Body)
+	}
+}
+
+func TestPendingConnectionCanUseItsOwnJobAfterStart(t *testing.T) {
+	s, err := New(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	current := jobidentity.Identity{Generation: "same-vm"}
+	if err := s.SetScope("owner/repo", mainRef, func(string) (jobidentity.Identity, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return current, current.Validate(time.Now())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewUnstartedServer(s)
+	ts.Config.ConnContext = s.ConnectionContext
+	ts.Start()
+	defer ts.Close()
+	transport := &http.Transport{MaxConnsPerHost: 1}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	resp, err := client.Get(ts.URL + "/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	mu.Lock()
+	current = testIdentity("owner/repo", mainRef, "job")
+	current.Generation = "same-vm"
+	mu.Unlock()
+	resp, err = client.Post(ts.URL+twirpBase+"CreateCacheEntry", "application/json", strings.NewReader(`{"key":"started","version":"v"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var c createResp
+	if err := json.NewDecoder(resp.Body).Decode(&c); err != nil || !c.OK {
+		t.Fatalf("pending connection denied: %+v %v", c, err)
+	}
+}

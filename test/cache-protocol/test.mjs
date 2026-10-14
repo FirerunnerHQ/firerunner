@@ -8,7 +8,8 @@ import {createServer} from 'node:net';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
-import * as cache from '@actions/cache';
+import {fileURLToPath} from 'node:url';
+const worker = fileURLToPath(new URL('./worker.mjs', import.meta.url));
 
 const binary = process.env.FIRERUNNER_BINARY;
 assert(binary, 'Set FIRERUNNER_BINARY to the built firerunner executable');
@@ -52,16 +53,28 @@ async function identity(ref, reads = [ref, main]) {
   }), {mode: 0o600});
   await rename(`${file}.tmp`, file);
 }
+// Each operation gets a fresh process/TCP pool, as a new ephemeral VM would.
+async function toolkit(operation, key, restoreKeys = []) {
+  const proc = spawn(process.execPath, [worker, operation, key, JSON.stringify(restoreKeys)], {stdio: ['ignore', 'pipe', 'pipe']});
+  let stdout = '', stderr = '';
+  proc.stdout.on('data', chunk => { stdout += chunk; });
+  proc.stderr.on('data', chunk => { stderr += chunk; });
+  const [code] = await once(proc, 'exit');
+  assert.equal(code, 0, `${operation} ${key} failed:\n${stdout}\n${stderr}`);
+  const line = stdout.split('\n').find(line => line.startsWith('RESULT:'));
+  assert(line, stdout);
+  return JSON.parse(line.slice(7)).value;
+}
 async function save(key, contents) {
   await mkdir('payload', {recursive: true});
   await writeFile('payload/value.txt', contents);
-  assert(await cache.saveCache(['payload'], key) > 0, `save ${key} failed`);
+  assert(await toolkit('save', key) > 0, `save ${key} failed`);
 }
 async function restore(key, expected, restoreKeys = [], matched = key) {
   await rm('payload', {recursive: true, force: true});
-  const actual = await cache.restoreCache(['payload'], key, restoreKeys);
+  const actual = await toolkit('restore', key, restoreKeys);
   if (expected === undefined) {
-    assert.equal(actual, undefined, `unexpected cache hit for ${key}`);
+    assert.equal(actual, null, `unexpected cache hit for ${key}`);
   } else {
     assert.equal(actual, matched);
     assert.equal(await readFile('payload/value.txt', 'utf8'), expected);
@@ -100,7 +113,7 @@ try {
   // Before JobStarted, only the configured default scope can be read.
   await rm(join(jobs, '127.0.0.1.json'));
   await restore('shared', 'DEFAULT');
-  const saved = await cache.saveCache(['payload'], 'unknown-job');
+  const saved = await toolkit('save', 'unknown-job');
   assert.equal(saved, -1, 'unknown job acquired a cache reservation');
   console.log('PASS: actual toolkit save/extract, ref precedence, isolation, rerun, default-only fallback, denied writes');
 } catch (error) {

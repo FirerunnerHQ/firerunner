@@ -155,8 +155,9 @@ func cacheServe(args []string) error {
 	defer stopJanitor()
 
 	httpSrv := &http.Server{
-		Addr:    *addr,
-		Handler: srv,
+		Addr:        *addr,
+		Handler:     srv,
+		ConnContext: srv.ConnectionContext,
 		// Guests run untrusted code; bound timeouts
 		// keep a slow or stalled client from pinning a connection (and its
 		// goroutine/fd) indefinitely. Body reads are streamed to disk with no
