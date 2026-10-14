@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 #
 # build-smoke-rootfs.sh — build a tiny self-destructing rootfs for the firerunner
-# smoke e2e. The rootfs contains a single static Go PID1 (smoke_init.go) at
-# /sbin/init that reboots immediately, so firerunner's Launch can be validated
-# end-to-end (real Firecracker boot + self-destruct) without a full golden image
-# or a GitHub App.
+# boot/cache e2e. The rootfs contains a static Go PID1 (smoke_init.go) at
+# /sbin/init that performs the requested cache checks and reboots, validating
+# real guest HTTP and self-destruct without a full golden image or GitHub App.
 #
 # Linux + root only (needs loop mount + mknod). Output defaults to
 # /var/tmp/fr-smoke/rootfs.ext4; pair it with a guest kernel via FR_KERNEL.
 #
-#   sudo ./build-smoke-rootfs.sh
-#   sudo env FR_KERNEL=/path/vmlinux FR_GOLDEN=/var/tmp/fr-smoke/rootfs.ext4 \
-#     FR_EXT_IFACE=enp2s0 go test -tags e2e -run TestLaunchBootsAndSelfDestructs \
-#     -v ./test/e2e/
+#   sudo ./test/e2e/build-smoke-rootfs.sh
+#   FR_KERNEL=/path/vmlinux FR_GOLDEN=/var/tmp/fr-smoke/rootfs.ext4 make e2e
 #
 set -euo pipefail
 

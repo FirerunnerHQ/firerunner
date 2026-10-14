@@ -40,7 +40,7 @@ cover-check: cover
 # End-to-end tests require a real KVM host and are gated behind the `e2e` tag.
 .PHONY: e2e
 e2e:
-	go test -tags e2e -count=1 ./test/e2e/...
+	./test/e2e/run.sh
 
 # The egress firewall against the real kernel: loads the generated nft ruleset
 # into throwaway network namespaces and probes what a guest can reach. Needs

@@ -1,54 +1,60 @@
 # firerunner end-to-end tests
 
-These tests boot **real Firecracker microVMs**, so they only run on a Linux host
-with `/dev/kvm`, and are gated behind the `e2e` build tag (they are skipped
-otherwise). They also need `CAP_NET_ADMIN` (tap devices, nftables, sysctl), so
-run them as root.
+These tests boot **real Firecracker microVMs** on Linux with `/dev/kvm`.
+They require Firecracker on `PATH`, `ip`, `nft`, and root/sudo privileges.
+The rootfs builder also requires Go, `mkfs.ext4`, loop mounts and `mknod`.
 
-## Smoke test (no golden image, no GitHub App)
+## Run boot and cache isolation tests
 
-`TestLaunchBootsAndSelfDestructs` validates the entire `Launch` path — reflink
-clone, per-VM tap/IP, the nftables egress allowlist, the Firecracker API
-sequence, guest boot, and teardown — against a tiny **self-destructing rootfs**.
-That rootfs is just a static Go PID1 (`smoke_init.go`) at `/sbin/init` that
-reboots immediately; with `reboot=k` on the cmdline the VMM exits, which is
-exactly firerunner's self-destruct signal. If `Launch` returns quickly, the
-whole path works.
+From the repository root:
 
 ```bash
-# 1. Build the smoke rootfs (Linux + root):
-sudo ./build-smoke-rootfs.sh          # -> /var/tmp/fr-smoke/rootfs.ext4
-
-# 2. Compile the e2e binary as your user, run it as root:
-go test -c -tags e2e -o /tmp/fr-e2e.test ./test/e2e/
-sudo env \
-  FR_KERNEL=/path/to/vmlinux \
-  FR_GOLDEN=/var/tmp/fr-smoke/rootfs.ext4 \
-  FR_EXT_IFACE=enp2s0 \
-  /tmp/fr-e2e.test -test.run TestLaunchBootsAndSelfDestructs -test.v
+# Rebuild after changing smoke_init.go. This is a dedicated disposable image.
+sudo ./test/e2e/build-smoke-rootfs.sh /var/tmp/fr-smoke/rootfs.ext4
+FR_KERNEL=/absolute/path/to/vmlinux \
+FR_GOLDEN=/var/tmp/fr-smoke/rootfs.ext4 make e2e
 ```
 
-Expected: `--- PASS ... (~1s)`. A hang until the context timeout means the guest
-never reset (check the kernel `reboot=k` arg and that `/sbin/init` is the static
-init).
+`run.sh` compiles the test binary as the caller, then uses root/sudo to create a
+throwaway network namespace with a dummy external interface. All taps, routes
+and nftables rules stay in that namespace, which is deleted on exit. No external
+network access, GitHub credentials or existing runner services are needed.
+Missing prerequisites fail this command rather than silently skipping tests.
+The guest kernel needs virtio networking, static kernel IP configuration and ext4.
 
-Compiling the test as your user and running the binary as root keeps root out of
-your Go module/build caches.
+The smoke rootfs contains a static Go PID1 at `/sbin/init`. Each guest must print
+an explicit success marker, reboot and exit before the deadline. Cancellation
+alone is not success. Tests assert that the tap and network slot are reclaimed.
 
-## Required environment
+`TestCacheScopesAcrossMicroVMs` keeps one real cache server and job registry
+across seven sequential VMs, reusing the same guest IP:
 
-| Var           | Meaning                                             |
-| ------------- | --------------------------------------------------- |
-| `FR_KERNEL`   | uncompressed guest kernel (vmlinux)                 |
-| `FR_GOLDEN`   | rootfs image to boot (smoke rootfs, or a real one)  |
-| `FR_EXT_IFACE`| host egress interface (e.g. `enp2s0`)               |
+| Guest | Checks |
+| --- | --- |
+| main | Upload/finalize shared and default-only entries |
+| base branch | Restore default, then save its own shared entry |
+| PR | Base/default fallback, own-ref writes and precedence, forged metadata ignored |
+| sibling PR | Cannot read the first PR's entries, including empty-prefix search |
+| same PR rerun | Can restore its own prior entry |
+| main after PR | Cannot read PR-only entries; shared entry remains MAIN |
+| unknown identity | Cannot write or read PR entries; default-only restore works |
 
-The tests skip (not fail) when `/dev/kvm` or these variables are missing.
+Every cache operation originates in the guest and traverses the real tap,
+source-IP firewall binding, HTTP server, identity reader and cache storage.
+Every VM exit must revoke its job record before the IP is reused.
+Only the GitHub resolver is a host fixture. The separate `test/cache-protocol`
+suite exercises real `@actions/cache` archive upload/extraction; unit and netns
+tests cover stale connections, delayed requests, spoofing and failure paths.
 
-## Full job test
+To invoke the compiled test binary directly, set `FR_KERNEL`, `FR_GOLDEN`, and
+`FR_EXT_IFACE` inside a disposable network namespace. Set `FR_REQUIRE_E2E=1`
+to fail on missing prerequisites; without it, direct Go test invocations skip.
+The `e2e` build tag is required.
 
-Running an actual GitHub Actions job end-to-end additionally needs a
-firerunner-compatible golden image (`actions/runner` + the MMDS-JIT boot service;
-see [`../../images/`](../../images/README.md)) and a GitHub App or PAT pointed at
-a test repository. That is exercised by running the `firerunner` binary itself,
-not by this package.
+## Full GitHub job test
+
+A real GitHub Actions assignment additionally needs a firerunner-compatible
+golden image (`actions/runner` plus MMDS-JIT boot service; see
+[`../../images/`](../../images/README.md)) and a GitHub App or PAT pointed at a
+test repository. Exercise that through the `firerunner` binary itself.
+The smoke/cache suite does not validate live GitHub assignment or API resolution.
