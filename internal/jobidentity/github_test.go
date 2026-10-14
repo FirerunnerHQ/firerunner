@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ type apiFixture struct {
 	requestURI                                func(string)
 	event, head, headRepo, sha, defaultBranch string
 	candidates                                []int
+	runBases                                  map[int]string
 	prs                                       map[int]map[string]any
 	branchSHA, branchRef                      string
 	tags                                      []map[string]any
@@ -35,7 +37,7 @@ type apiFixture struct {
 }
 
 func fixture() *apiFixture {
-	return &apiFixture{event: "pull_request", head: "feature", headRepo: "fork/repo", sha: "abc123", defaultBranch: "main", candidates: []int{7}, prs: map[int]map[string]any{7: prJSON(7, "release")}, branchSHA: "abc123", branchRef: "refs/heads/feature"}
+	return &apiFixture{event: "pull_request", head: "feature", headRepo: "fork/repo", sha: "abc123", defaultBranch: "main", candidates: []int{7}, runBases: map[int]string{7: "release"}, prs: map[int]map[string]any{7: prJSON(7, "release")}, branchSHA: "abc123", branchRef: "refs/heads/feature"}
 }
 func prJSON(n int, base string) map[string]any {
 	return map[string]any{"number": n, "head": map[string]any{"ref": "feature", "sha": "abc123", "repo": map[string]any{"full_name": "fork/repo"}}, "base": map[string]any{"ref": base, "repo": map[string]any{"full_name": "owner/repo"}}}
@@ -63,17 +65,17 @@ func (f *apiFixture) server(t *testing.T) *httptest.Server {
 		var out any
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/actions/runs/42"):
-			candidates := []map[string]int{}
+			candidates := []map[string]any{}
 			for _, n := range f.candidates {
-				candidates = append(candidates, map[string]int{"number": n})
+				candidates = append(candidates, map[string]any{"number": n, "base": map[string]any{"ref": f.runBases[n]}})
 			}
 			out = map[string]any{"id": 42, "event": f.event, "head_branch": f.head, "head_sha": f.sha, "repository": map[string]any{"full_name": "owner/repo"}, "head_repository": map[string]any{"full_name": f.headRepo}, "pull_requests": candidates}
 		case r.URL.Path == "/repos/owner/repo":
 			out = map[string]any{"full_name": "owner/repo", "default_branch": f.defaultBranch}
 		case strings.Contains(r.URL.Path, "/commits/"):
-			candidates := []map[string]int{}
-			for n := range f.prs {
-				candidates = append(candidates, map[string]int{"number": n})
+			candidates := []map[string]any{}
+			for _, p := range f.prs {
+				candidates = append(candidates, p)
 			}
 			out = candidates
 		case strings.Contains(r.URL.Path, "/pulls/"):
@@ -102,8 +104,13 @@ func TestResolveGitHubPolicy(t *testing.T) {
 		wantErr   bool
 	}{
 		{"fork PR", func(*apiFixture) {}, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/release", "refs/heads/main"}, false},
-		{"empty PR list fallback", func(f *apiFixture) { f.candidates = nil }, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/release", "refs/heads/main"}, false},
-		{"duplicate base/default", func(f *apiFixture) { f.prs[7] = prJSON(7, "main") }, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/main"}, false},
+		{"empty PR list fallback ignores live base", func(f *apiFixture) { f.candidates = nil }, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/main"}, false},
+		{"duplicate base/default", func(f *apiFixture) { f.prs[7] = prJSON(7, "main"); f.runBases[7] = "main" }, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/main"}, false},
+		{"retargeted from default", func(f *apiFixture) { f.runBases[7] = "main" }, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/main"}, false},
+		{"retargeted from another base", func(f *apiFixture) { f.runBases[7] = "old-release" }, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/main"}, false},
+		{"missing run base", func(f *apiFixture) { f.runBases = nil }, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/main"}, false},
+		{"invalid run base", func(f *apiFixture) { f.runBases[7] = "../release" }, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/main"}, false},
+		{"base on another PR association", func(f *apiFixture) { f.runBases = map[int]string{8: "release"} }, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/main"}, false},
 		{"missing PR", func(f *apiFixture) { f.candidates = nil; f.prs = nil }, "", nil, true},
 		{"ambiguous PR", func(f *apiFixture) { f.candidates = []int{7, 8}; f.prs[8] = prJSON(8, "other") }, "", nil, true},
 		{"wrong head repo", func(f *apiFixture) { f.headRepo = "attacker/repo" }, "", nil, true},
@@ -256,14 +263,83 @@ func TestInstallationTokenRefresh(t *testing.T) {
 }
 
 func TestGitHubURL(t *testing.T) {
-	for _, tt := range []struct{ raw, want string }{{"https://github.com/owner/repo", "https://api.github.com"}, {"https://ghe.example/org", "https://ghe.example/api/v3"}} {
-		g, err := NewGitHub(tt.raw, "pat", scaleset.GitHubAppAuth{})
-		if err != nil || g.base != tt.want {
-			t.Fatalf("%v %v", g, err)
+	// Avoid inheriting an override from the developer's environment.
+	t.Setenv("GITHUB_ACTIONS_FORCE_GHES", "")
+	if err := os.Unsetenv("GITHUB_ACTIONS_FORCE_GHES"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct{ raw, want string }{
+		{"https://github.com/owner/repo", "https://api.github.com"},
+		{"https://GitHub.COM/org", "https://api.github.com"},
+		{"https://WWW.GitHub.com/org", "https://api.github.com"},
+		{"https://tenant.ghe.com/org", "https://api.tenant.ghe.com"},
+		{"https://Tenant.GHE.COM/org", "https://api.tenant.ghe.com"},
+		{"https://github.localhost/org", "https://api.github.localhost"},
+		{"https://ghe.example/org", "https://ghe.example/api/v3"},
+		{"https://ghe.example:8443/org", "https://ghe.example:8443/api/v3"},
+		{"https://ghe.com.evil.example/org", "https://ghe.com.evil.example/api/v3"},
+	} {
+		t.Run(tt.raw, func(t *testing.T) {
+			g, err := NewGitHub(tt.raw, "pat", scaleset.GitHubAppAuth{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if g.base != tt.want {
+				t.Fatalf("base = %q, want %q", g.base, tt.want)
+			}
+		})
+	}
+	for _, value := range []string{"", "1", "false"} {
+		t.Run("force GHES="+value, func(t *testing.T) {
+			t.Setenv("GITHUB_ACTIONS_FORCE_GHES", value)
+			for _, host := range []string{"github.com", "tenant.ghe.com"} {
+				g, err := NewGitHub("https://"+host+"/org", "pat", scaleset.GitHubAppAuth{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if g.base != "https://"+host+"/api/v3" {
+					t.Fatalf("override ignored: %s", g.base)
+				}
+			}
+		})
+	}
+	for _, raw := range []string{"http://github.com/owner", "https:///owner", "://invalid"} {
+		if _, err := NewGitHub(raw, "pat", scaleset.GitHubAppAuth{}); err == nil {
+			t.Fatalf("invalid URL accepted: %s", raw)
 		}
 	}
-	if _, err := NewGitHub("http://github.com/owner", "pat", scaleset.GitHubAppAuth{}); err == nil {
-		t.Fatal("insecure URL accepted")
+}
+
+func TestRetargetedPRMemoization(t *testing.T) {
+	f := fixture()
+	f.runBases[7] = "main"
+	srv := f.server(t)
+	defer srv.Close()
+	g := &GitHub{base: srv.URL, pat: "pat", client: srv.Client()}
+	for n := range 3 {
+		if n == 2 {
+			g.resolveMu.Lock()
+			for key, result := range g.runs {
+				result.expiry = time.Now().Add(-time.Second)
+				g.runs[key] = result
+			}
+			g.resolveMu.Unlock()
+		}
+		id := fmt.Sprint(n)
+		i, err := g.Resolve(context.Background(), Job{Repository: "owner/repo", RunID: 42, JobID: id, Event: f.event})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i.JobID != id || i.WriteRef != "refs/pull/7/merge" || !reflect.DeepEqual(i.ReadRefs, []string{"refs/pull/7/merge", "refs/heads/main"}) {
+			t.Fatalf("retargeted PR gained base rights on lookup %d: %+v", n, i)
+		}
+		wantCalls := int32(3)
+		if n == 2 {
+			wantCalls = 6
+		}
+		if f.calls.Load() != wantCalls {
+			t.Fatalf("requests = %d, want %d", f.calls.Load(), wantCalls)
+		}
 	}
 }
 

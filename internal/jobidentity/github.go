@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -45,9 +46,16 @@ func NewGitHub(rawURL, pat string, app scaleset.GitHubAppAuth) (*GitHub, error) 
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return nil, errors.New("GitHub URL must use https")
 	}
-	base := u.Scheme + "://" + u.Host + "/api/v3"
-	if u.Host == "github.com" || u.Host == "www.github.com" {
-		base = "https://api.github.com"
+	host := strings.ToLower(u.Host)
+	base := u.Scheme + "://" + host + "/api/v3"
+	// Keep API routing consistent with the scaleset client, including hosted
+	// Enterprise Cloud tenants and the explicit GHES override.
+	_, forceGHES := os.LookupEnv("GITHUB_ACTIONS_FORCE_GHES")
+	if !forceGHES && (host == "github.com" || host == "www.github.com" || host == "github.localhost" || strings.HasSuffix(host, ".ghe.com")) {
+		if host == "www.github.com" {
+			host = "github.com"
+		}
+		base = "https://api." + host
 	}
 	return &GitHub{base: base, pat: pat, app: app, client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
@@ -286,9 +294,22 @@ func (g *GitHub) resolve(ctx context.Context, j Job) (Identity, error) {
 			return Identity{}, errors.New("PR association missing or ambiguous")
 		}
 		p := matched[0]
-		base := "refs/heads/" + p.Base.Ref
-		if !ValidRef(base) {
+		if !ValidRef("refs/heads/" + p.Base.Ref) {
 			return Identity{}, errors.New("invalid PR base")
+		}
+		// A live PR may have been retargeted after this run was queued. Only
+		// grant its optional base layer when the run association agrees. The
+		// commit fallback proves PR ownership, but cannot prove the run's base.
+		base := ""
+		for _, associated := range run.PullRequests {
+			if associated.Number != p.Number {
+				continue
+			}
+			if associated.Base.Ref != p.Base.Ref {
+				base = ""
+				break
+			}
+			base = "refs/heads/" + associated.Base.Ref
 		}
 		i.WriteRef = fmt.Sprintf("refs/pull/%d/merge", p.Number)
 		i.ReadRefs = refs(i.WriteRef, base, def)

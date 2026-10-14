@@ -623,6 +623,11 @@ There is no global repository/default-ref override or anonymous fallback.
 - REST `pull_requests` can be empty: the resolver checks commit-associated PRs
   and requires a unique match of head/base repository and head branch. A later
   push to a branch or PR does not invalidate earlier queued runs or reruns.
+  PR base reads require the run association and current PR to agree on the base.
+  Retargeted PRs, missing run base metadata and commit-association fallback get
+  only PR-own and default reads; the current PR cannot grant a new base scope.
+  API routing supports GitHub.com, Enterprise Cloud (`*.ghe.com`) and GHES,
+  including the scaleset client's `GITHUB_ACTIONS_FORCE_GHES` override.
   Branch writes require an existing branch and no same-named tag. Tag runs,
   ambiguous PR associations and API errors get no write access. `pull_request_target`,
   `workflow_run`, `issue_comment` and other unrecognized events get resolved
