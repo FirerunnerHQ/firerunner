@@ -3,6 +3,7 @@ package provisioner
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -856,5 +857,43 @@ func TestClassifyLaunchExit(t *testing.T) {
 	// A non-ExitError (I/O error, lost process) is always a failure.
 	if err := classifyLaunchExit(io.ErrUnexpectedEOF, nil, time.Hour, minRuntime); err == nil {
 		t.Error("non-ExitError should always be a failure")
+	}
+}
+
+type fakeVMJobs struct {
+	registered, released bool
+	ip                   string
+	failRelease          bool
+}
+
+func (j *fakeVMJobs) Register(name, ip string) error { j.registered = true; j.ip = ip; return nil }
+func (j *fakeVMJobs) Release(name string) error {
+	j.released = true
+	if j.failRelease {
+		return fmt.Errorf("disk error")
+	}
+	return nil
+}
+
+func TestLaunchRevokesIdentityBeforeSlotReuse(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			jobs := &fakeVMJobs{failRelease: fail}
+			f := NewFirecracker(FirecrackerConfig{MaxVMs: 1, Jobs: jobs}, testLogger())
+			// SetupNetwork fails before any host mutation (ExtIface is unset).
+			if err := f.Launch(context.Background(), "runner", "jit", core.RunnerSpec{}, nil); err == nil {
+				t.Fatal("expected failed launch")
+			}
+			if !jobs.registered || !jobs.released || jobs.ip != "172.16.0.2" {
+				t.Fatalf("lifecycle %+v", jobs)
+			}
+			want := 1
+			if fail {
+				want = 0
+			}
+			if f.FreeSlots() != want {
+				t.Fatalf("available slots %d want %d", f.FreeSlots(), want)
+			}
+		})
 	}
 }

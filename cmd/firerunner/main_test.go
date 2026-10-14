@@ -39,3 +39,16 @@ func TestParseSize(t *testing.T) {
 		}
 	}
 }
+
+func TestCacheServerRejectsUnsafeScopeConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"--jobs-dir", "relative"},
+		{"--repository", ""},
+		{"--repository", "owner/repo", "--default-ref", "main"},
+	} {
+		args = append([]string{"--dir", t.TempDir()}, args...)
+		if err := cacheServe(args); err == nil {
+			t.Fatalf("accepted %v", args)
+		}
+	}
+}

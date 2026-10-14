@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/solcreek/firerunner/internal/cacheserver"
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/diag"
+	"github.com/solcreek/firerunner/internal/jobidentity"
 	"github.com/solcreek/firerunner/internal/listener"
 	"github.com/solcreek/firerunner/internal/provisioner"
 	"github.com/solcreek/firerunner/internal/scheduler"
@@ -109,14 +111,19 @@ func diagnose(cmd string, args []string) error {
 // which publishes the address into the guest via MMDS.
 func cacheServe(args []string) error {
 	fs := flag.NewFlagSet("cache-server", flag.ContinueOnError)
-	addr := fs.String("addr", "127.0.0.1:8099", "listen address (bind to a guest-facing gateway IP for microVM access; the server is unauthenticated so never expose it on a public interface)")
+	addr := fs.String("addr", "127.0.0.1:8099", "listen address (bind to a guest-facing gateway IP for microVM access; source addresses identify guests; never expose it on a public interface)")
 	dir := fs.String("dir", "/var/lib/firerunner/cache", "cache storage directory")
 	maxSize := fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)")
 	maxEntry := fs.String("max-entry-size", "10GB", "refuse any single cache entry larger than this (e.g. 10GB, 0 for unlimited)")
-	repo := fs.String("repository", "", "pin every entry to this tenant, ignoring the unauthenticated client repository_id; set it (e.g. owner/name) so one server safely serves a single repository")
+	repo := fs.String("repository", "", "required repository (owner/name); must match the host-authenticated job identity")
+	jobsDir := fs.String("jobs-dir", jobidentity.DefaultDir, "private identity directory written by the local daemon")
+	defaultRef := fs.String("default-ref", "", "trusted default ref for read-only access without a job record (e.g. refs/heads/main); empty means miss")
 	artifactUpstream := fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if !filepath.IsAbs(*jobsDir) {
+		return fmt.Errorf("--jobs-dir must be an absolute path")
 	}
 	maxBytes, err := parseSize(*maxSize)
 	if err != nil {
@@ -135,9 +142,8 @@ func cacheServe(args []string) error {
 	}
 	srv.SetMaxSize(maxBytes)
 	srv.SetMaxEntrySize(maxEntryBytes)
-	srv.SetRepository(*repo)
-	if *repo == "" {
-		log.Warn("cache server not pinned to a repository; the unauthenticated client repository_id is trusted and caches are not isolated across repositories — pass --repository to serve a single repo safely")
+	if err := srv.SetScope(*repo, *defaultRef, (jobidentity.Reader{Dir: *jobsDir}).Lookup); err != nil {
+		return err
 	}
 	if err := srv.SetArtifactUpstream(*artifactUpstream); err != nil {
 		return fmt.Errorf("--artifact-upstream: %w", err)
@@ -151,7 +157,7 @@ func cacheServe(args []string) error {
 	httpSrv := &http.Server{
 		Addr:    *addr,
 		Handler: srv,
-		// The server is unauthenticated and internet-adjacent; bound timeouts
+		// Guests run untrusted code; bound timeouts
 		// keep a slow or stalled client from pinning a connection (and its
 		// goroutine/fd) indefinitely. Body reads are streamed to disk with no
 		// overall deadline because a large cache archive can legitimately take a
@@ -230,13 +236,14 @@ Pass --json to either for machine-readable output.
 cache-server flags:
   --addr string      listen address (default "127.0.0.1:8099"; bind to a
                      guest-facing gateway IP for microVM access — never expose
-                     this unauthenticated server on a public interface)
+                     this server on a public interface)
   --dir string       cache storage directory (default "/var/lib/firerunner/cache")
   --max-size string  evict LRU entries above this total size (default "50GB"; 0 = unlimited)
   --max-entry-size string  refuse any single entry larger than this (default "10GB"; 0 = unlimited)
-  --repository string  pin every entry to this tenant, ignoring the
-                     unauthenticated client repository_id; set it (e.g.
-                     owner/name) so one server safely serves a single repository
+  --repository string  required owner/name; must match the trusted job record
+  --jobs-dir string  daemon's private job identity directory (default "/run/firerunner/jobs")
+  --default-ref string  optional refs/heads/<branch> for default-only restores
+                     before JobStarted; empty means cache miss without identity
   --artifact-upstream string  forward ArtifactService RPCs (upload/download-
                      artifact v4+, which share ACTIONS_RESULTS_URL with the
                      cache) to this Results endpoint so artifacts stay on GitHub
@@ -265,6 +272,21 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// network and the MaxRunners slot budget. Each tier is its own GitHub scale
 	// set with its own microVM shape and golden image; developers pick one with
 	// runs-on: <tier name>.
+
+	var onJobStarted func(context.Context, jobidentity.Job)
+	if cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != "" {
+		jobs, err := jobidentity.NewRegistry(cfg.CacheJobsDir, log)
+		if err != nil {
+			return fmt.Errorf("cache job registry: %w", err)
+		}
+		defer jobs.Close()
+		resolver, err := jobidentity.NewGitHub(cfg.URL, cfg.Token, app)
+		if err != nil {
+			return err
+		}
+		cfg.Firecracker.Jobs = jobs
+		onJobStarted = func(ctx context.Context, j jobidentity.Job) { jobs.Start(ctx, j, resolver) }
+	}
 	prov := provisioner.NewFirecracker(cfg.Firecracker, log)
 	tiers := cfg.EffectiveTiers()
 
@@ -283,16 +305,17 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	for _, t := range tiers {
 		tlog := log.With("tier", t.Name)
 		lis, err := listener.New(ctx, listener.Config{
-			URL:         cfg.URL,
-			Name:        t.Name,
-			RunnerGroup: cfg.RunnerGroup,
-			Labels:      t.Labels,
-			MaxRunners:  t.Max,
-			MinRunners:  t.Min,
-			Token:       cfg.Token,
-			App:         app,
-			Version:     version,
-			Logger:      tlog,
+			URL:          cfg.URL,
+			OnJobStarted: onJobStarted,
+			Name:         t.Name,
+			RunnerGroup:  cfg.RunnerGroup,
+			Labels:       t.Labels,
+			MaxRunners:   t.Max,
+			MinRunners:   t.Min,
+			Token:        cfg.Token,
+			App:          app,
+			Version:      version,
+			Logger:       tlog,
 		}, owner)
 		if err != nil {
 			closeAll()

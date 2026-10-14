@@ -26,6 +26,9 @@ import (
 // deliberately depends on nothing beyond the firecracker binary and the Linux
 // host tools (cp with reflink, ip, nft, sysctl) — no containerd, CNI or LVM.
 type FirecrackerConfig struct {
+	// Jobs binds VM addresses to host-observed jobs. Nil when local caching is off.
+	Jobs VMJobs
+
 	// Binary is the path to the firecracker executable.
 	Binary string
 	// KernelImage is the uncompressed guest kernel (vmlinux) path.
@@ -154,6 +157,11 @@ type commandRunner func(ctx context.Context, name string, args ...string) error
 // `nft list chain` can be faked in tests.
 type commandOutputRunner func(ctx context.Context, name string, args ...string) (string, error)
 
+type VMJobs interface {
+	Register(runner, ip string) error
+	Release(runner string) error
+}
+
 // Firecracker is a Provisioner that talks to the Firecracker REST API directly
 // over its unix socket using only the standard library.
 type Firecracker struct {
@@ -225,13 +233,28 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	if !ok {
 		return fmt.Errorf("no free network slot (max %d microVMs)", f.cfg.MaxVMs)
 	}
-	defer f.ipam.release(slot)
+
+	vnet := slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase)
+	registered := false
+	defer func() {
+		if registered {
+			if err := f.cfg.Jobs.Release(name); err != nil {
+				f.log.Error("cache identity revocation failed; quarantining slot", "slot", slot, "err", err)
+				return
+			}
+		}
+		f.ipam.release(slot)
+	}()
+	if f.cfg.Jobs != nil {
+		if err := f.cfg.Jobs.Register(name, vnet.guestIP); err != nil {
+			return fmt.Errorf("register VM identity: %w", err)
+		}
+		registered = true
+	}
 
 	if err := f.SetupNetwork(ctx); err != nil {
 		return fmt.Errorf("setup network: %w", err)
 	}
-	vnet := slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase)
-
 	if err := f.setupNet(ctx, vnet); err != nil {
 		return fmt.Errorf("setup network for %s: %w", vnet.tap, err)
 	}
@@ -396,6 +419,8 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 	}
 
 	rs := egressRuleset{
+		MaxVMs:      f.cfg.MaxVMs,
+		NetNS:       f.cfg.NetNS,
 		Table:       f.cfg.NFTTable,
 		IfacePrefix: f.cfg.TapPrefix,
 		ExtIface:    f.cfg.ExtIface,

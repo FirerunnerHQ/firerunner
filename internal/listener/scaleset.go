@@ -14,6 +14,7 @@ import (
 	sslistener "github.com/actions/scaleset/listener"
 
 	"github.com/solcreek/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/jobidentity"
 )
 
 // Config configures the scale-set listener.
@@ -33,7 +34,8 @@ type Config struct {
 	Version   string
 	CommitSHA string
 
-	Logger *slog.Logger
+	OnJobStarted func(context.Context, jobidentity.Job)
+	Logger       *slog.Logger
 }
 
 // ScaleSet is the production Listener. Constructing it registers an ephemeral
@@ -181,11 +183,12 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 		return fmt.Errorf("create scaleset listener: %w", err)
 	}
 	a := &scaler{
-		onDesired:  onDesired,
-		onBusy:     onBusy,
-		minRunners: s.cfg.MinRunners,
-		maxRunners: s.cfg.MaxRunners,
-		log:        s.log,
+		onDesired:    onDesired,
+		onJobStarted: s.cfg.OnJobStarted,
+		onBusy:       onBusy,
+		minRunners:   s.cfg.MinRunners,
+		maxRunners:   s.cfg.MaxRunners,
+		log:          s.log,
 	}
 	if capacity != nil {
 		a.capacity = capacity
@@ -214,7 +217,7 @@ func (s *ScaleSet) Close(ctx context.Context) error {
 
 // scaler adapts GitHub's scale-set callbacks onto firerunner's DesiredFunc.
 // Because every microVM is ephemeral and self-terminating, job start/completion
-// need no action beyond logging and marking the VM busy for the shutdown drain.
+// mark the VM busy for shutdown drain and dispatch trusted identity resolution.
 // JobStarted is a second, independent busy signal alongside the guest console
 // marker the provisioner watches: the console marker fires the instant the guest
 // dequeues a job (the primary, earliest source), while the scale-set protocol's
@@ -228,14 +231,15 @@ func (s *ScaleSet) Close(ctx context.Context) error {
 // the live capacity instead lets a host at the shared slot cap decline work
 // that a sibling scale set (same name, another runner group) could start now.
 type scaler struct {
-	onDesired   DesiredFunc
-	onBusy      BusyFunc
-	capacity    CapacityFunc
-	setCapacity func(int)
-	minRunners  int
-	maxRunners  int
-	log         *slog.Logger
-	lastAdvert  int
+	onJobStarted func(context.Context, jobidentity.Job)
+	onDesired    DesiredFunc
+	onBusy       BusyFunc
+	capacity     CapacityFunc
+	setCapacity  func(int)
+	minRunners   int
+	maxRunners   int
+	log          *slog.Logger
+	lastAdvert   int
 }
 
 var _ sslistener.Scaler = (*scaler)(nil)
@@ -269,10 +273,13 @@ func (a *scaler) advertiseCapacity() {
 	a.setCapacity(c)
 }
 
-func (a *scaler) HandleJobStarted(_ context.Context, j *scaleset.JobStarted) error {
+func (a *scaler) HandleJobStarted(ctx context.Context, j *scaleset.JobStarted) error {
 	a.log.Info("job started", "runner", j.RunnerName, "runnerRequestId", j.RunnerRequestID)
 	if a.onBusy != nil && j.RunnerName != "" {
 		a.onBusy(j.RunnerName)
+	}
+	if a.onJobStarted != nil {
+		a.onJobStarted(ctx, jobidentity.Job{Runner: j.RunnerName, Repository: j.OwnerName + "/" + j.RepositoryName, Event: j.EventName, RunID: j.WorkflowRunID, JobID: j.JobID})
 	}
 	return nil
 }

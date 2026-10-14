@@ -11,6 +11,7 @@ import (
 	"github.com/actions/scaleset"
 
 	"github.com/solcreek/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/jobidentity"
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -301,5 +302,24 @@ func TestJITSourceRemoveRunnerMapsErrors(t *testing.T) {
 				t.Fatalf("removed=%v wantRemove=%v", f.removed, tc.wantRemove)
 			}
 		})
+	}
+}
+
+func TestJobIdentityComesFromControlPlane(t *testing.T) {
+	var got jobidentity.Job
+	busy := false
+	a := &scaler{log: testLogger(), onBusy: func(string) { busy = true }, onJobStarted: func(_ context.Context, j jobidentity.Job) {
+		if !busy {
+			t.Error("busy signal delayed behind identity")
+		}
+		got = j
+	}}
+	err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: "runner", JobMessageBase: scaleset.JobMessageBase{OwnerName: "owner", RepositoryName: "repo", EventName: "pull_request", WorkflowRunID: 42, JobID: "job", JobWorkflowRef: "owner/repo/.github/workflows/ci.yml@refs/heads/main"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := jobidentity.Job{Runner: "runner", Repository: "owner/repo", Event: "pull_request", RunID: 42, JobID: "job"}
+	if got != want {
+		t.Fatalf("got %+v want %+v", got, want)
 	}
 }

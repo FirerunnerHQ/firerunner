@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -366,6 +367,7 @@ func TestBuildNFTRulesetOpenOrder(t *testing.T) {
 	rules := forwardChain(t, buildNFTRuleset(egressRuleset{ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR, Open: true}))
 	order := []string{
 		"ip saddr != " + vmCIDR + " drop",
+		"iifname . ip saddr != @guest_sources",
 		"ip daddr " + vmCIDR + " drop",
 		"@nonpublic",
 		"dport { 25, 465, 587, 2525 } drop",
@@ -380,5 +382,34 @@ func TestBuildNFTRulesetOpenOrder(t *testing.T) {
 	}
 	if len(rules) != len(order)+1 { // +1: the chain's type/hook/policy line
 		t.Errorf("open mode forward chain has unexpected rules:\n%s", strings.Join(rules, "\n"))
+	}
+}
+
+func TestGuestSourceBindings(t *testing.T) {
+	for _, netns := range []bool{false, true} {
+		for _, open := range []bool{false, true} {
+			t.Run(fmt.Sprintf("netns=%t/open=%t", netns, open), func(t *testing.T) {
+				cfg := egressRuleset{IfacePrefix: "custom", VMCidr: "172.19.0.0/16", ExtIface: "eth0", MaxVMs: 2, NetNS: netns, Open: open, CachePort: 8099}
+				rules := buildNFTRuleset(cfg)
+				for slot := 0; slot < 2; slot++ {
+					name := fmt.Sprintf("custom%d", slot)
+					if netns {
+						name = fmt.Sprintf("customv%dh", slot)
+					}
+					if !strings.Contains(rules, fmt.Sprintf("\"%s\" . 172.19.%d.2", name, slot)) {
+						t.Fatal("missing exact source binding")
+					}
+				}
+				if strings.Count(rules, "iifname . ip saddr != @guest_sources") != 2 {
+					t.Fatal("both input and forward need bindings")
+				}
+				if i := strings.Index(rules, "iifname . ip saddr != @guest_sources"); i < 0 || i > strings.Index(rules, "ct state established,related accept") {
+					t.Fatal("source check must precede established accept")
+				}
+				if buildNFTRuleset(cfg) != rules {
+					t.Fatal("refresh lost source bindings")
+				}
+			})
+		}
 	}
 }

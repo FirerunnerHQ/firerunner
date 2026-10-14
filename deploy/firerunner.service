@@ -30,6 +30,8 @@ TimeoutStopSec=1h
 # non-login user with only the capabilities it requires.
 User=firerunner
 Group=firerunner
+RuntimeDirectory=firerunner
+RuntimeDirectoryMode=0700
 SupplementaryGroups=kvm
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN

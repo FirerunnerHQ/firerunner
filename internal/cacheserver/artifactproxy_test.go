@@ -76,7 +76,7 @@ func (u *upstreamRecorder) last(t *testing.T) recordedReq {
 // (empty = forwarding disabled) plus an httptest front for it.
 func newArtifactServer(t *testing.T, upstream string) (*Server, *httptest.Server) {
 	t.Helper()
-	s, err := New(t.TempDir(), nil)
+	s, err := newAuthorizedStore(t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -507,7 +507,7 @@ func TestArtifactStatsAndMetrics(t *testing.T) {
 // TestSetArtifactUpstreamValidation checks the upstream must be an absolute
 // http(s) URL without query/fragment, and that empty cleanly disables.
 func TestSetArtifactUpstreamValidation(t *testing.T) {
-	s, err := New(t.TempDir(), nil)
+	s, err := newAuthorizedStore(t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

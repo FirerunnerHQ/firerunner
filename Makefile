@@ -1,15 +1,9 @@
 BINARY := firerunner
 PKG := ./...
-# Coverage is gated on every package that can be meaningfully unit-tested: the
-# functional core (pure logic + seam-injected I/O), the diag health checks, and
-# the cache server's HTTP handlers. Only cmd/ (flag wiring + signal handling)
-# and internal/listener (the actions/scaleset GitHub control-plane client) sit
-# outside the gate — they are the imperative shell, needing a live GitHub + KVM
-# host, and are exercised by `make test` and the e2e suite instead. The
-# multi-tier orchestration logic they invoke (tier catalog parsing, warm-pool
-# vs. slot-budget validation) lives in internal/config, which IS gated.
-COVERPKG := ./internal/config/...,./internal/core/...,./internal/provisioner/...,./internal/scheduler/...,./internal/diag/...,./internal/cacheserver/...
-COVERPKGDIRS := ./internal/config/... ./internal/core/... ./internal/provisioner/... ./internal/scheduler/... ./internal/diag/... ./internal/cacheserver/...
+# Run ALL packages, including listener/CLI wiring tests. The aggregate coverage
+# gate covers the functional core and host identity resolver; the imperative
+# listener/CLI shell is tested but excluded from the aggregate denominator.
+COVERPKG := ./internal/config/...,./internal/core/...,./internal/provisioner/...,./internal/scheduler/...,./internal/diag/...,./internal/cacheserver/...,./internal/jobidentity/...
 COVERPROFILE := cover.out
 COVER_MIN ?= 70
 
@@ -28,7 +22,7 @@ test:
 # Unit coverage across all packages (cross-package attribution via -coverpkg).
 .PHONY: cover
 cover:
-	go test -race -covermode=atomic -coverpkg=$(COVERPKG) -coverprofile=$(COVERPROFILE) $(COVERPKGDIRS)
+	go test -race -covermode=atomic -coverpkg=$(COVERPKG) -coverprofile=$(COVERPROFILE) $(PKG)
 	go tool cover -func=$(COVERPROFILE) | tail -n 1
 
 .PHONY: cover-html
@@ -54,7 +48,7 @@ e2e:
 .PHONY: netns-test
 netns-test:
 	go test -c -tags netns -o egress-netns.test ./internal/provisioner/
-	sudo ./egress-netns.test -test.run EgressNetNS -test.count 1 -test.v
+	sudo env FR_REQUIRE_NETNS="$(FR_REQUIRE_NETNS)" ./egress-netns.test -test.run EgressNetNS -test.count 1 -test.v
 	rm -f egress-netns.test
 
 .PHONY: clean
