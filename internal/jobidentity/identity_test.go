@@ -282,3 +282,54 @@ func TestResolverFailureCannotGrantRights(t *testing.T) {
 		t.Fatal("failed resolution authorized")
 	}
 }
+
+func TestReaderGroupPermissionsAndOwner(t *testing.T) {
+	dir := privateDir(t)
+	if err := os.Chmod(dir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewRegistry(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.Register("runner", "172.16.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	blocked := make(chan struct{})
+	defer close(blocked)
+	job := Job{Runner: "runner", Repository: "other/repo", JobID: "queued", RunID: 7, Event: "pull_request"}
+	r.Start(context.Background(), job, resolveFunc(func(context.Context, Job) (Identity, error) { <-blocked; return Identity{}, errors.New("offline") }))
+	reader := Reader{Dir: dir}
+	if err := reader.Check(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := reader.Lookup("172.16.0.2")
+	if err == nil || got.Repository != job.Repository || got.JobID != job.JobID || got.WriteRef != "" {
+		t.Fatalf("pending provenance: %+v %v", got, err)
+	}
+	path := filepath.Join(dir, "172.16.0.2.json")
+	st, _ := os.Stat(path)
+	if st.Mode().Perm() != 0640 {
+		t.Fatal(st.Mode())
+	}
+	wrong := os.Getuid() + 1
+	if err := (Reader{Dir: dir, OwnerUID: &wrong}).Check(); err == nil {
+		t.Fatal("wrong owner trusted")
+	}
+	for _, mode := range []os.FileMode{0660, 0642, 0644} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		got, err := reader.Lookup("172.16.0.2")
+		if err == nil || got.Generation != "" {
+			t.Fatalf("unsafe file trusted: %o", mode)
+		}
+	}
+	if err := os.Chmod(dir, 0770); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Check(); err == nil {
+		t.Fatal("group-writable directory accepted")
+	}
+}

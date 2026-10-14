@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+)
 
 func TestParseSize(t *testing.T) {
 	cases := []struct {
@@ -49,6 +54,22 @@ func TestCacheServerRejectsUnsafeScopeConfig(t *testing.T) {
 		args = append([]string{"--dir", t.TempDir()}, args...)
 		if err := cacheServe(args); err == nil {
 			t.Fatalf("accepted %v", args)
+		}
+	}
+}
+
+func TestCacheServerChecksIdentityDirectoryAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"--jobs-dir", dir, "--jobs-owner-uid", strconv.Itoa(os.Getuid() + 1)},
+		{"--jobs-dir", dir + "/missing"},
+	} {
+		args = append([]string{"--dir", t.TempDir()}, args...)
+		if err := cacheServe(args); err == nil || !strings.Contains(err.Error(), "job identity directory") {
+			t.Fatalf("startup check: %v", err)
 		}
 	}
 }

@@ -38,7 +38,7 @@ func newScopeLab(t *testing.T) *scopeLab {
 		t.Fatal(err)
 	}
 	l := &scopeLab{s: s, identities: map[string]jobidentity.Identity{}}
-	if err := s.SetScope("owner/repo", mainRef, l.lookup); err != nil {
+	if err := s.SetScope(l.lookup); err != nil {
 		t.Fatal(err)
 	}
 	return l
@@ -230,8 +230,8 @@ func TestIdentityRevocationAndUnknownJob(t *testing.T) {
 	if c["ok"] != false {
 		t.Fatal("unknown job may create")
 	}
-	if b, _ := restore(t, unknown, "default"); b != "TRUSTED" {
-		t.Fatal("default-only fallback failed")
+	if b, _ := restore(t, unknown, "default"); b != "" {
+		t.Fatal("unknown job read default cache")
 	}
 	if b, _ := restore(t, unknown, "private"); b != "" {
 		t.Fatal("unknown job reads PR")
@@ -345,7 +345,7 @@ func TestLegacyEntriesNeverAuthorized(t *testing.T) {
 	if err := os.WriteFile(s.blobPath(90), []byte("old"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetScope("owner/repo", mainRef, func(string) (jobidentity.Identity, error) { return testIdentity("owner/repo", mainRef, "job"), nil }); err != nil {
+	if err := s.SetScope(func(string) (jobidentity.Identity, error) { return testIdentity("owner/repo", mainRef, "job"), nil }); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(s)
@@ -371,12 +371,7 @@ func TestUnconfiguredScopeFailsClosed(t *testing.T) {
 	if c := twirp(t, ts.URL, "CreateCacheEntry", createReq{Key: "k", Version: "v"}); c["ok"] != false {
 		t.Fatal(c)
 	}
-	for _, tt := range []struct{ repo, ref string }{{"", ""}, {"../repo", ""}, {"owner/repo", "main"}, {"owner/repo", "refs/tags/main"}} {
-		if err := s.SetScope(tt.repo, tt.ref, func(string) (jobidentity.Identity, error) { return jobidentity.Identity{}, nil }); err == nil {
-			t.Fatal("invalid scope accepted")
-		}
-	}
-	if err := s.SetScope("owner/repo", "", nil); err == nil {
+	if err := s.SetScope(nil); err == nil {
 		t.Fatal("nil reader accepted")
 	}
 }
@@ -464,7 +459,7 @@ func TestKeepAliveCannotAcquireReusedSlotIdentity(t *testing.T) {
 	}
 	var mu sync.Mutex
 	current := testIdentity("owner/repo", prRef, "old")
-	if err := s.SetScope("owner/repo", mainRef, func(string) (jobidentity.Identity, error) { mu.Lock(); defer mu.Unlock(); return current, nil }); err != nil {
+	if err := s.SetScope(func(string) (jobidentity.Identity, error) { mu.Lock(); defer mu.Unlock(); return current, nil }); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewUnstartedServer(s)
@@ -533,7 +528,7 @@ func TestPendingConnectionCanUseItsOwnJobAfterStart(t *testing.T) {
 	}
 	var mu sync.Mutex
 	current := jobidentity.Identity{Generation: "same-vm"}
-	if err := s.SetScope("owner/repo", mainRef, func(string) (jobidentity.Identity, error) {
+	if err := s.SetScope(func(string) (jobidentity.Identity, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		return current, current.Validate(time.Now())
@@ -565,5 +560,61 @@ func TestPendingConnectionCanUseItsOwnJobAfterStart(t *testing.T) {
 	var c createResp
 	if err := json.NewDecoder(resp.Body).Decode(&c); err != nil || !c.OK {
 		t.Fatalf("pending connection denied: %+v %v", c, err)
+	}
+}
+
+func TestMultiRepositoryAndUnresolvedIsolation(t *testing.T) {
+	l := newScopeLab(t)
+	a := l.guest(t, "172.16.0.2", mainRef, "a")
+	b := l.guest(t, "172.16.1.2", "", "b")
+	aBlob := l.save(t, a, "same-key", "REPO A")
+	for _, state := range []string{"missing", "pending", "expired", "unresolved"} {
+		t.Run(state, func(t *testing.T) {
+			i := testIdentity("owner/b", mainRef, "b")
+			switch state {
+			case "missing":
+				i = jobidentity.Identity{}
+			case "pending":
+				i.ReadRefs = nil
+				i.WriteRef = ""
+			case "expired":
+				i.ExpiresAt = 1
+			case "unresolved":
+				i.ReadRefs = nil
+			}
+			l.set("172.16.1.2", i)
+			if got, _ := restore(t, b, "same-key", ""); got != "" {
+				t.Fatal("unresolved repo read another repo")
+			}
+			if c := twirp(t, b, "CreateCacheEntry", createReq{Key: "same-key", Version: "v"}); c["ok"] != false {
+				t.Fatal("unresolved identity wrote cache")
+			}
+		})
+	}
+	l.set("172.16.1.2", testIdentity("owner/b", mainRef, "b"))
+	if got, _ := restore(t, b, "same-key", ""); got != "" {
+		t.Fatal("resolved repo B read A")
+	}
+	l.save(t, b, "same-key", "REPO B")
+	for _, tt := range []struct{ url, want string }{{a, "REPO A"}, {b, "REPO B"}} {
+		if got, _ := restore(t, tt.url, "same-key"); got != tt.want {
+			t.Fatalf("tenant cache: %q", got)
+		}
+	}
+	// A valid blob URL is still scoped to its repository on GET and HEAD.
+	u, _ := url.Parse(aBlob)
+	for _, method := range []string{"GET", "HEAD"} {
+		req, _ := http.NewRequest(method, b+strings.Replace(u.RequestURI(), "/upload/", "/download/", 1), nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("foreign blob: %d", resp.StatusCode)
+		}
+	}
+	if l.s.snapshot().IdentityDenied == 0 {
+		t.Fatal("identity failures not observable")
 	}
 }

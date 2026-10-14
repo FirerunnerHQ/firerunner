@@ -172,6 +172,25 @@ func exercise(base, mode string) error {
 			return err
 		}
 		return restore(base, "shared", "MAIN")
+	case "repo-b":
+		if err := restore(base, "shared", ""); err != nil {
+			return err
+		}
+		if err := save(base, "shared", "REPO B"); err != nil {
+			return err
+		}
+		return restore(base, "shared", "REPO B")
+	case "repo-a-again":
+		return restore(base, "shared", "MAIN")
+	case "read-only":
+		c, err := create(base, "read-only-write")
+		if err != nil {
+			return err
+		}
+		if c["ok"] == true {
+			return fmt.Errorf("read-only identity wrote cache")
+		}
+		return restore(base, "shared", "MAIN")
 	case "unknown":
 		c, err := create(base, "unknown-write")
 		if err != nil {
@@ -183,7 +202,7 @@ func exercise(base, mode string) error {
 		if err := restore(base, "pr-private", ""); err != nil {
 			return err
 		}
-		return restore(base, "shared", "MAIN")
+		return restore(base, "shared", "")
 	default:
 		return fmt.Errorf("unknown mode %q", mode)
 	}

@@ -42,15 +42,15 @@ func NewRegistry(dir string, log *slog.Logger) (*Registry, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, err
 	}
 	st, err := os.Lstat(dir)
 	if err != nil {
 		return nil, err
 	}
-	if !st.IsDir() || st.Mode().Perm()&0077 != 0 {
-		return nil, errors.New("jobs directory must be a private directory (0700)")
+	if !st.IsDir() || !(Reader{Dir: dir}).trusted(st) {
+		return nil, errors.New("jobs directory must be a daemon-owned directory (0750 or 0700)")
 	}
 	f, err := os.OpenFile(filepath.Join(dir, ".lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -100,6 +100,20 @@ func (r *Registry) write(i Identity) error {
 		return err
 	}
 	defer os.Remove(f.Name())
+	// Match the directory's dedicated reader group, even without setgid inheritance.
+	st, err := os.Stat(r.dir)
+	if err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chown(-1, int(st.Sys().(*syscall.Stat_t).Gid)); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chmod(0640); err != nil {
+		f.Close()
+		return err
+	}
 	if _, err := f.Write(b); err != nil {
 		f.Close()
 		return err
@@ -169,6 +183,12 @@ func (r *Registry) Start(ctx context.Context, j Job, resolver Resolver) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	l.cancel = cancel
+	// Persist authenticated JobStarted provenance before making any REST call.
+	l.identity.Repository, l.identity.Event = j.Repository, j.Event
+	l.identity.RunID, l.identity.JobID = j.RunID, j.JobID
+	if err := r.write(l.identity); err != nil {
+		r.log.Warn("publish pending cache identity", "runner", j.Runner, "err", err)
+	}
 	r.mu.Unlock()
 	go func() {
 		defer cancel()
@@ -188,11 +208,14 @@ func (r *Registry) Start(ctx context.Context, j Job, resolver Resolver) {
 		}
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		if r.leases[j.Runner] != l || ctx.Err() != nil {
+		if r.leases[j.Runner] != l {
 			return
 		}
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		if err != nil {
-			r.log.Warn("cache identity unavailable; writes disabled", "runner", j.Runner, "err", err)
+			r.log.Warn("cache identity unavailable; reads and writes disabled", "runner", j.Runner, "err", err)
 			return
 		}
 		i.IP, i.Runner, i.Generation = l.identity.IP, j.Runner, l.identity.Generation

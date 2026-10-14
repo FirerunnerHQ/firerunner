@@ -27,7 +27,7 @@ an explicit success marker, reboot and exit before the deadline. Cancellation
 alone is not success. Tests assert that the tap and network slot are reclaimed.
 
 `TestCacheScopesAcrossMicroVMs` keeps one real cache server and job registry
-across seven sequential VMs, reusing the same guest IP:
+across ten sequential VMs, reusing the same guest IP:
 
 | Guest | Checks |
 | --- | --- |
@@ -37,7 +37,10 @@ across seven sequential VMs, reusing the same guest IP:
 | sibling PR | Cannot read the first PR's entries, including empty-prefix search |
 | same PR rerun | Can restore its own prior entry |
 | main after PR | Cannot read PR-only entries; shared entry remains MAIN |
-| unknown identity | Cannot write or read PR entries; default-only restore works |
+| unknown identity | Cannot read or write any repository |
+| repository B | Cannot read A; saves/restores its own identical key |
+| repository A again | Still reads its original entry after B writes |
+| resolved read-only identity | Default restore works; writes denied |
 
 Every cache operation originates in the guest and traverses the real tap,
 source-IP firewall binding, HTTP server, identity reader and cache storage.

@@ -115,9 +115,8 @@ func cacheServe(args []string) error {
 	dir := fs.String("dir", "/var/lib/firerunner/cache", "cache storage directory")
 	maxSize := fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)")
 	maxEntry := fs.String("max-entry-size", "10GB", "refuse any single cache entry larger than this (e.g. 10GB, 0 for unlimited)")
-	repo := fs.String("repository", "", "required repository (owner/name); must match the host-authenticated job identity")
 	jobsDir := fs.String("jobs-dir", jobidentity.DefaultDir, "private identity directory written by the local daemon")
-	defaultRef := fs.String("default-ref", "", "trusted default ref for read-only access without a job record (e.g. refs/heads/main); empty means miss")
+	jobsOwner := fs.Int("jobs-owner-uid", os.Getuid(), "UID of the daemon that owns job records (default current UID)")
 	artifactUpstream := fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -142,7 +141,11 @@ func cacheServe(args []string) error {
 	}
 	srv.SetMaxSize(maxBytes)
 	srv.SetMaxEntrySize(maxEntryBytes)
-	if err := srv.SetScope(*repo, *defaultRef, (jobidentity.Reader{Dir: *jobsDir}).Lookup); err != nil {
+	reader := jobidentity.Reader{Dir: *jobsDir, OwnerUID: jobsOwner}
+	if err := reader.Check(); err != nil {
+		return fmt.Errorf("job identity directory: %w", err)
+	}
+	if err := srv.SetScope(reader.Lookup); err != nil {
 		return err
 	}
 	if err := srv.SetArtifactUpstream(*artifactUpstream); err != nil {
@@ -241,10 +244,8 @@ cache-server flags:
   --dir string       cache storage directory (default "/var/lib/firerunner/cache")
   --max-size string  evict LRU entries above this total size (default "50GB"; 0 = unlimited)
   --max-entry-size string  refuse any single entry larger than this (default "10GB"; 0 = unlimited)
-  --repository string  required owner/name; must match the trusted job record
+  --jobs-owner-uid int  daemon UID that owns the records (default current UID)
   --jobs-dir string  daemon's private job identity directory (default "/run/firerunner/jobs")
-  --default-ref string  optional refs/heads/<branch> for default-only restores
-                     before JobStarted; empty means cache miss without identity
   --artifact-upstream string  forward ArtifactService RPCs (upload/download-
                      artifact v4+, which share ACTIONS_RESULTS_URL with the
                      cache) to this Results endpoint so artifacts stay on GitHub

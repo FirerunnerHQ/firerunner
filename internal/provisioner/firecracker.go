@@ -439,6 +439,10 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 		rs.Allowed = cidrs
 	}
 
+	rules, err := buildNFTRuleset(rs)
+	if err != nil {
+		return err
+	}
 	if err := f.run(ctx, "sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
 		return err
 	}
@@ -447,7 +451,7 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 		return fmt.Errorf("mkdir work dir: %w", err)
 	}
 	path := filepath.Join(f.cfg.WorkDir, "firerunner.nft")
-	if err := os.WriteFile(path, []byte(buildNFTRuleset(rs)), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(rules), 0o600); err != nil {
 		return fmt.Errorf("write nft ruleset: %w", err)
 	}
 	if err := f.run(ctx, "nft", "-f", path); err != nil {

@@ -109,7 +109,7 @@ func (f fixtureJobs) Register(name, ip string) error {
 	if f.identity == nil {
 		return nil
 	}
-	f.registry.Start(context.Background(), jobidentity.Job{Runner: name}, fixtureResolver{*f.identity})
+	f.registry.Start(context.Background(), jobidentity.Job{Runner: name, Repository: f.identity.Repository, Event: f.identity.Event, RunID: f.identity.RunID, JobID: f.identity.JobID}, fixtureResolver{*f.identity})
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := f.reader.Lookup(ip); err == nil {
@@ -135,7 +135,7 @@ func TestCacheScopesAcrossMicroVMs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cache.SetScope("owner/repo", "refs/heads/main", reader.Lookup); err != nil {
+	if err := cache.SetScope(reader.Lookup); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := net.Listen("tcp4", "0.0.0.0:0")
@@ -157,13 +157,19 @@ func TestCacheScopesAcrossMicroVMs(t *testing.T) {
 		{"rerun", "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/release", "refs/heads/main"}},
 		{"main-after", "refs/heads/main", []string{"refs/heads/main"}},
 		{"unknown", "", nil},
+		{"repo-b", "refs/heads/main", []string{"refs/heads/main"}},
+		{"repo-a-again", "refs/heads/main", []string{"refs/heads/main"}},
+		{"read-only", "", []string{"refs/heads/main"}},
 	}
 	for n, tt := range tests {
 		t.Run(tt.mode, func(t *testing.T) {
 			cfg := config(t, kernel, golden)
 			jobs := fixtureJobs{registry: registry, reader: reader}
-			if tt.write != "" {
+			if len(tt.reads) > 0 {
 				jobs.identity = &jobidentity.Identity{Repository: "owner/repo", Event: "fixture", WriteRef: tt.write, ReadRefs: tt.reads, RunID: int64(n + 1), JobID: tt.mode}
+			}
+			if tt.mode == "repo-b" {
+				jobs.identity.Repository = "owner/other"
 			}
 			cfg.Jobs = jobs
 			cfg.CachePort = port

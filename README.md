@@ -469,15 +469,15 @@ exact key, key prefix, then ordered `restore-keys`.
 implementation of exactly that protocol, backed by a directory on disk:
 
 ```bash
-firerunner cache-server --repository owner/name --dir /var/lib/firerunner/cache
+firerunner cache-server --dir /var/lib/firerunner/cache
 ```
 
 It implements the three Twirp methods plus the Azure block-blob upload
 (single-shot and staged `comp=block`/`comp=blocklist`) and ranged downloads,
 tags each blob URL with a per-entry token, and persists an index so caches
 survive restarts. Host-owned job records authorize each connection by its guest
-source address, repository and ref. Run one per repository with the required
-`--repository`; see the security model below before deploying it.
+source address, repository and ref. One server supports all repositories served
+by its daemon, with the namespace derived exclusively from the job record.
 
 It binds `127.0.0.1:8099` by default. Because each microVM slot reaches the host
 on its own per-slot gateway IP (`172.16.<slot>.1`), serving guests means binding
@@ -492,7 +492,7 @@ total over the cap, the least-recently-used entries are evicted until it fits
 100GB`, or `--max-size 0` for unlimited):
 
 ```bash
-firerunner cache-server --repository owner/name --dir /var/lib/firerunner/cache --max-size 50GB
+firerunner cache-server --dir /var/lib/firerunner/cache --max-size 50GB
 ```
 
 The server also exposes `GET /stats` (JSON: entry count, bytes, hits, misses,
@@ -527,13 +527,13 @@ nothing, so `actions/cache` has no endpoint. Jobs still run, just with no cache.
 # 1. build a cache-redirect golden (pair it with a --toolcache drive as usual):
 sudo images/build-ubuntu-rootfs.sh --toolset minimal --cache-redirect \
   --out /var/lib/firerunner/ubuntu-rootfs-minimal.ext4
-# 2. run the cache-server bound to the guest-facing address, then point
-#    firerunner at it (0.0.0.0 serves every per-slot gateway; keep it firewalled
-#    off any LAN/WAN interface):
-firerunner cache-server --addr 0.0.0.0:8099 --repository owner/name \
-  --dir /var/lib/firerunner/cache --jobs-dir /run/firerunner/jobs \
-  --default-ref refs/heads/main &
+# 2. configure/start the daemon first, then the separate cache service described
+#    below. Its guest-facing listener must be firewalled off LAN/WAN interfaces.
 firerunner ... --golden /var/lib/firerunner/ubuntu-rootfs-minimal.ext4 --cache-port 8099
+# In another shell, after the jobs directory exists (use the daemon UID):
+sudo -u firerunner-cache firerunner cache-server --addr 0.0.0.0:8099 \
+  --dir /var/lib/firerunner-cache --jobs-dir /run/firerunner/jobs \
+  --jobs-owner-uid "$(id -u firerunner)"
 ```
 
 `status` shows the resolved cache configuration and `doctor` probes the
@@ -589,8 +589,8 @@ commands pass through untouched, and on a non-redirect golden it is inert.
 control plane and resolves the run and repository through the authenticated
 REST API. The guest's `ACTIONS_RUNTIME_TOKEN`, metadata, `Authorization`, and
 `X-Forwarded-For` headers do not grant local cache authority. One cache-server
-serves one required `--repository owner/name`; a known job from another repo is
-refused even if it claims the pinned repository in its request.
+serves multiple repositories, using only the repository from a resolved record.
+There is no global repository/default-ref override or anonymous fallback.
 
 - A branch job writes only to its branch ref. A PR (including a fork PR) writes
   only to `refs/pull/<number>/merge`. Restore exhausts that ref's exact/prefix
@@ -610,26 +610,35 @@ refused even if it claims the pinned repository in its request.
   Startup clears stale records under an exclusive directory lock. A daemon
   crash can leave the old VM authorized until lease expiry; systemd's cgroup
   cleanup is still required to reap orphaned VMs. Expired records never write.
-- Missing, pending, invalid or expired identities cannot write. Optional
-  `--default-ref refs/heads/main` explicitly permits **read-only** access to that
-  repository/ref before `JobStarted`; without it these requests miss. Set it
-  to the repository's actual default branch and update it on branch renames.
-  A failed identity lookup is a cache miss/denied save, never a job failure.
+- Missing, pending, invalid or expired identities cannot read or write. The
+  authenticated repository/run/job is published at `JobStarted` before REST
+  resolution, but grants no rights until resolution succeeds. Default-only
+  reads require a resolved identity for that repository. A failed lookup is a
+  cache miss/denied save, never a job failure. The first lookup failure per
+  address is logged (bounded to 4096 outstanding addresses); successful lookup
+  resets it. `/stats` exposes `identity_denied` and `/metrics` exposes
+  `firerunner_cache_identity_denied_total`. Resolution failures and timeouts are
+  logged by the daemon; after three attempts/30 seconds they stay denied for
+  that job. Guest HTTP never triggers privileged REST retries.
 - REST `pull_requests` can be empty: the resolver checks commit-associated PRs
-  and requires a unique match of repository, branch and SHA. Branch writes need
-  a live branch at the run SHA and no same-named tag. Old runs whose branch or
-  PR has advanced may lose caching. Tag runs, ambiguous associations, and API
-  errors do not receive write access. `pull_request_target`, `workflow_run`,
-  `issue_comment` and other unrecognized events get default-only reads. This
-  implementation does not claim full GitHub `cache-mode` compatibility and
-  does not accept guest environment variables as permission overrides.
-- Pass the same private directory to the daemon (`--cache-jobs-dir`,
-  `FR_CACHE_JOBS_DIR`, default `/run/firerunner/jobs`) and cache-server
-  (`--jobs-dir`). Use **0700 directories and 0600 records**, owned by the daemon;
-  run the cache server as that user or root. Never mount this path into guests.
-  The bundled systemd units create private runtime directories; the jailer
-  template uses `/run/firerunner-<instance>/jobs`. Each daemon needs a distinct
-  directory. All tiers within a daemon share it.
+  and requires a unique match of head/base repository and head branch. A later
+  push to a branch or PR does not invalidate earlier queued runs or reruns.
+  Branch writes require an existing branch and no same-named tag. Tag runs,
+  ambiguous PR associations and API errors get no write access. `pull_request_target`,
+  `workflow_run`, `issue_comment` and other unrecognized events get resolved
+  default-only reads. `JobWorkflowRef` is deliberately not a trigger ref: even
+  same-repository reusable workflows can point to another branch. This does not
+  implement GitHub `cache-mode` overrides from guest environment variables.
+- Pass the same directory to the daemon (`--cache-jobs-dir`, `FR_CACHE_JOBS_DIR`,
+  default `/run/firerunner/jobs`) and cache-server (`--jobs-dir`). Use daemon-owned
+  **0750 directories and 0640 records**, with a dedicated read-only group. The
+  writer preserves the directory's group on atomic replacement. No group/other
+  writes or other-user access is accepted; 0700/0600 also works for same-UID
+  tests. Run the cache server as its own user and set `--jobs-owner-uid` to the
+  daemon UID (default: current UID). Wrong ownership or unreadable directories
+  fail startup; records are checked again on each request. Never mount the
+  directory into guests. Each daemon needs its own directory; all its tiers
+  share it. The jailer template uses `/run/firerunner-<instance>/jobs`.
 - Cache traffic must reach the server directly with its guest source IP intact.
   The firewall binds each tap (or host-veth in netns mode) to its exact guest
   address **before** established-connection and cache-port accepts, in open and
@@ -644,14 +653,41 @@ restored, finalized, or accessed through old blob URLs. They are not relabeled
 as default-branch entries. The loader retains their IDs and size accounting to
 avoid ID reuse; normal eviction can reclaim them. Prefer a new empty `--dir`
 on upgrade, and remove the old directory separately once no old server uses it.
-Deploy the new daemon/firewall and cache server together. The server has no
-legacy unauthenticated-write mode.
+Stop the old cache server first to close its unauthenticated access, upgrade and
+restart the daemon/firewall, then verify records appear for active VMs before
+starting the new cache server on a fresh `--dir`. Plan for the daemon's graceful
+drain to take up to the longest job. Caches may miss during this interval. Remove
+old `--repository` and `--default-ref` flags; they are no longer accepted.
+The server has no legacy unauthenticated-write mode.
+
+For separate service users, create the `firerunner-cache` system group and user,
+then add a daemon unit drop-in with `Group=firerunner-cache` and
+`RuntimeDirectoryMode=0750`, and `UMask=0027` (also for a jailer instance). Keep App keys and any
+secret environment files **0600**, owned by the daemon or root. Set the cache
+service's `/etc/firerunner/cache.env` to non-secret values:
+
+```ini
+FR_CACHE_JOBS_DIR=/run/firerunner/jobs
+FR_CACHE_OWNER_UID=<numeric UID from id -u firerunner; 0 for the root jailer daemon>
+```
+
+Install [`deploy/firerunner-cache.service`](deploy/firerunner-cache.service),
+which has its own user/storage, no capabilities, and read-only `/run`. Only the
+daemon owns `RuntimeDirectory=firerunner`; do not repeat it in the cache unit,
+or stopping either unit could remove live records. The cache unit starts after
+`firerunner.service`; adjust `After=` for a jailer instance. Configure the guest
+firewall before exposing its listener.
 
 The cache-enabled daemon's GitHub App additionally needs repository **Actions:
 read**, **Contents: read** (ref verification), and **Pull requests: read**
 (PR association), plus its existing runner-registration permissions. Install
 it on every repository served. The resolver uses a separate REST client and
-short-lived installation tokens; it never writes credentials into job records.
+short-lived installation tokens restricted to the requested repository and
+Actions/Pull requests/Metadata/Contents read permissions. Contents read remains
+necessary for branch/tag probes. Concurrent matrix jobs share one resolution;
+successful run policies are cached for two minutes (bounded to 1024 runs), while
+job IDs, generations and record leases remain per job. Credentials never enter
+job records.
 
 **Artifact forwarding.** The artifact forwarder is not a general proxy: it relays exactly the five
   `ArtifactService` methods the toolkit calls (anything else, including an

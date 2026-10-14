@@ -189,7 +189,7 @@ func TestEgressNetNSOpen(t *testing.T) {
 	requireNetNS(t)
 	l := newLab(t)
 	l.load(t, "guest-dns.nft", guestDNAT)
-	l.load(t, "firerunner.nft", buildNFTRuleset(egressRuleset{
+	l.load(t, "firerunner.nft", mustNFTRuleset(t, egressRuleset{
 		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
 		VMCidr: labCIDR, CachePort: labCache, Open: true,
 	}))
@@ -205,7 +205,7 @@ func TestEgressNetNSOpen(t *testing.T) {
 func TestEgressNetNSAllowlist(t *testing.T) {
 	requireNetNS(t)
 	l := newLab(t)
-	l.load(t, "firerunner.nft", buildNFTRuleset(egressRuleset{
+	l.load(t, "firerunner.nft", mustNFTRuleset(t, egressRuleset{
 		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
 		VMCidr: labCIDR, CachePort: labCache,
 		Allowed:    []string{"1.0.0.0/24"},
@@ -286,7 +286,7 @@ func TestEgressNetNSSourceSpoofing(t *testing.T) {
 				sh(t, l.in(l.router, "sysctl", "-q", "-w", "net.ipv4.conf.all.rp_filter=0", "net.ipv4.conf."+iface+".rp_filter=0")...)
 				cfg := egressRuleset{Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0", VMCidr: labCIDR, CachePort: labCache, MaxVMs: 2, NetNS: veth, Open: open, Allowed: []string{"1.0.0.0/24"}}
 				for refresh := 0; refresh < 2; refresh++ {
-					l.load(t, "firerunner.nft", buildNFTRuleset(cfg))
+					l.load(t, "firerunner.nft", mustNFTRuleset(t, cfg))
 					if !l.reachable(t, l.guest0, "172.19.0.1", labCache) {
 						t.Fatal("legitimate cache connection blocked")
 					}

@@ -43,7 +43,7 @@
 // Cache authority comes from host-owned job records indexed by the connection's
 // source address. The daemon pins each guest interface to that address. Guests
 // cannot select their repository, write ref, or readable refs. Missing identities
-// cannot write and may read only the explicitly configured default branch.
+// cannot read or write any repository.
 // Every blob request also checks its scope; reservations belong to one VM/job.
 // Legacy entries without a ref are never served. See the README for deployment
 // requirements, including local routing without source NAT and directory access.
@@ -109,15 +109,16 @@ type Server struct {
 	log *slog.Logger
 	mux *http.ServeMux
 
-	mu         sync.Mutex
-	entries    map[uint64]*Entry
-	nextID     uint64
-	maxSize    int64            // 0 = unlimited; total completed-blob bytes to keep
-	maxEntry   int64            // 0 = unlimited; hard cap on a single entry's blob
-	staged     map[uint64]int64 // bytes written so far for a not-yet-finalized entry
-	repo       string
-	defaultRef string
-	lookup     func(string) (jobidentity.Identity, error)
+	mu               sync.Mutex
+	entries          map[uint64]*Entry
+	nextID           uint64
+	maxSize          int64            // 0 = unlimited; total completed-blob bytes to keep
+	maxEntry         int64            // 0 = unlimited; hard cap on a single entry's blob
+	staged           map[uint64]int64 // bytes written so far for a not-yet-finalized entry
+	identityDenied   atomic.Uint64
+	identityMu       sync.Mutex
+	identityFailures map[string]bool
+	lookup           func(string) (jobidentity.Identity, error)
 
 	// counters (under mu) for observability via /stats and /metrics.
 	hits      uint64
@@ -137,6 +138,7 @@ type Server struct {
 // Stats is a point-in-time snapshot of the cache store, served by /stats and
 // /metrics and consumed by `firerunner status`.
 type Stats struct {
+	IdentityDenied uint64 `json:"identity_denied"`
 	Entries        int    `json:"entries"`         // completed entries currently stored
 	Bytes          int64  `json:"bytes"`           // total size of completed blobs
 	MaxBytes       int64  `json:"max_bytes"`       // configured cap (0 = unlimited)
@@ -154,7 +156,7 @@ func (s *Server) snapshot() Stats {
 	defer s.mu.Unlock()
 	st := Stats{
 		MaxBytes: s.maxSize, Hits: s.hits, Misses: s.misses, Saves: s.saves, Evictions: s.evictions,
-		ArtifactRPCs: s.artifactRPCs.Load(), ArtifactErrors: s.artifactErrors.Load(),
+		IdentityDenied: s.identityDenied.Load(), ArtifactRPCs: s.artifactRPCs.Load(), ArtifactErrors: s.artifactErrors.Load(),
 	}
 	for _, e := range s.entries {
 		if e.Complete {
@@ -674,6 +676,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	st := s.snapshot()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintf(w, "# HELP firerunner_cache_identity_denied_total Cache operations denied for unavailable identity.\n# TYPE firerunner_cache_identity_denied_total counter\nfirerunner_cache_identity_denied_total %d\n", st.IdentityDenied)
 	fmt.Fprintf(w, "# HELP firerunner_cache_entries Completed cache entries stored.\n")
 	fmt.Fprintf(w, "# TYPE firerunner_cache_entries gauge\nfirerunner_cache_entries %d\n", st.Entries)
 	fmt.Fprintf(w, "# HELP firerunner_cache_bytes Total size of completed cache blobs.\n")

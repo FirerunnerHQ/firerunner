@@ -24,7 +24,7 @@ func newAuthorizedStore(dir string, log *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = s.SetScope("owner/pinned", "", func(string) (jobidentity.Identity, error) {
+	err = s.SetScope(func(string) (jobidentity.Identity, error) {
 		return testIdentity("owner/pinned", "refs/heads/main", "test"), nil
 	})
 	return s, err

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +22,8 @@ import (
 )
 
 type apiFixture struct {
+	calls                                     atomic.Int32
+	requestURI                                func(string)
 	event, head, headRepo, sha, defaultBranch string
 	candidates                                []int
 	prs                                       map[int]map[string]any
@@ -40,6 +43,10 @@ func prJSON(n int, base string) map[string]any {
 func (f *apiFixture) server(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.calls.Add(1)
+		if f.requestURI != nil {
+			f.requestURI(r.RequestURI)
+		}
 		if r.Header.Get("Authorization") != "Bearer pat" {
 			t.Errorf("wrong auth")
 		}
@@ -100,7 +107,7 @@ func TestResolveGitHubPolicy(t *testing.T) {
 		{"missing PR", func(f *apiFixture) { f.candidates = nil; f.prs = nil }, "", nil, true},
 		{"ambiguous PR", func(f *apiFixture) { f.candidates = []int{7, 8}; f.prs[8] = prJSON(8, "other") }, "", nil, true},
 		{"wrong head repo", func(f *apiFixture) { f.headRepo = "attacker/repo" }, "", nil, true},
-		{"head advanced", func(f *apiFixture) { f.sha = "old" }, "", nil, true},
+		{"head advanced", func(f *apiFixture) { f.sha = "old" }, "refs/pull/7/merge", []string{"refs/pull/7/merge", "refs/heads/release", "refs/heads/main"}, false},
 		{"wrong base repo", func(f *apiFixture) {
 			f.prs[7]["base"] = map[string]any{"ref": "main", "repo": map[string]any{"full_name": "attacker/repo"}}
 		}, "", nil, true},
@@ -125,7 +132,7 @@ func TestResolveGitHubPolicy(t *testing.T) {
 			f.headRepo = "owner/repo"
 			f.tags = []map[string]any{{"ref": "refs/tags/feature-extra"}}
 		}, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
-		{"branch advanced", func(f *apiFixture) { f.event = "push"; f.headRepo = "owner/repo"; f.branchSHA = "newer" }, "", nil, true},
+		{"branch advanced", func(f *apiFixture) { f.event = "push"; f.headRepo = "owner/repo"; f.branchSHA = "newer" }, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
 		{"foreign push", func(f *apiFixture) { f.event = "push" }, "", nil, true},
 		{"pull request target read only", func(f *apiFixture) { f.event = "pull_request_target" }, "", []string{"refs/heads/main"}, false},
 		{"workflow run read only", func(f *apiFixture) { f.event = "workflow_run" }, "", []string{"refs/heads/main"}, false},
@@ -208,6 +215,16 @@ func TestInstallationTokenRefresh(t *testing.T) {
 		if err != nil || !token.Valid {
 			t.Errorf("invalid app JWT: %v", err)
 		}
+		var body struct {
+			Repositories []string          `json:"repositories"`
+			Permissions  map[string]string `json:"permissions"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if (len(body.Repositories) != 1 || (body.Repositories[0] != "repo" && body.Repositories[0] != "other")) || !reflect.DeepEqual(body.Permissions, map[string]string{"actions": "read", "pull_requests": "read", "metadata": "read", "contents": "read"}) {
+			t.Errorf("overbroad token: %+v", body)
+		}
 		n := calls.Add(1)
 		w.WriteHeader(201)
 		_ = json.NewEncoder(w).Encode(map[string]any{"token": fmt.Sprint(n), "expires_at": time.Now().Add(time.Hour)})
@@ -215,19 +232,25 @@ func TestInstallationTokenRefresh(t *testing.T) {
 	defer srv.Close()
 	g := &GitHub{base: srv.URL, client: srv.Client(), app: scaleset.GitHubAppAuth{ClientID: "client", InstallationID: 7, PrivateKey: string(raw)}}
 	for range 2 {
-		v, err := g.auth(context.Background())
+		v, err := g.auth(context.Background(), "owner/repo")
 		if err != nil || v != "1" {
 			t.Fatalf("token cache: %s %v", v, err)
 		}
 	}
-	g.expiry = time.Now()
-	v, err := g.auth(context.Background())
+	g.tokens["owner/repo"] = installationToken{value: "old", expiry: time.Now()}
+	v, err := g.auth(context.Background(), "owner/repo")
 	if err != nil || v != "2" || calls.Load() != 2 {
 		t.Fatalf("refresh: %s %v", v, err)
 	}
-	g.expiry = time.Now()
+	if v, err := g.auth(context.Background(), "owner/other"); err != nil || v != "3" {
+		t.Fatalf("different repository reused token: %s %v", v, err)
+	}
+	if v, err := g.auth(context.Background(), "owner/repo"); err != nil || v != "2" || calls.Load() != 3 {
+		t.Fatalf("repository token cache: %s %v", v, err)
+	}
+	g.tokens["owner/repo"] = installationToken{value: "old", expiry: time.Now()}
 	g.app.PrivateKey = "invalid"
-	if _, err := g.auth(context.Background()); err == nil {
+	if _, err := g.auth(context.Background(), "owner/repo"); err == nil {
 		t.Fatal("invalid private key accepted")
 	}
 }
@@ -241,5 +264,79 @@ func TestGitHubURL(t *testing.T) {
 	}
 	if _, err := NewGitHub("http://github.com/owner", "pat", scaleset.GitHubAppAuth{}); err == nil {
 		t.Fatal("insecure URL accepted")
+	}
+}
+
+func TestRunMemoizationMatrixAndExpiry(t *testing.T) {
+	f := fixture()
+	srv := f.server(t)
+	defer srv.Close()
+	g := &GitHub{base: srv.URL, pat: "pat", client: srv.Client()}
+	var wg sync.WaitGroup
+	for n := range 30 {
+		wg.Go(func() {
+			id := fmt.Sprint(n)
+			i, err := g.Resolve(context.Background(), Job{Repository: "owner/repo", RunID: 42, JobID: id, Event: f.event})
+			if err != nil || i.JobID != id || i.WriteRef != "refs/pull/7/merge" {
+				t.Errorf("matrix identity %+v %v", i, err)
+			}
+			i.ReadRefs[0] = "mutated"
+		})
+	}
+	wg.Wait()
+	if f.calls.Load() != 3 {
+		t.Fatalf("matrix made %d requests, want 3", f.calls.Load())
+	}
+	g.resolveMu.Lock()
+	for k, v := range g.runs {
+		v.expiry = time.Now().Add(-time.Second)
+		g.runs[k] = v
+	}
+	g.resolveMu.Unlock()
+	if _, err := g.Resolve(context.Background(), Job{Repository: "owner/repo", RunID: 42, JobID: "rerun", Event: f.event}); err != nil {
+		t.Fatal(err)
+	}
+	if f.calls.Load() != 6 {
+		t.Fatal("expired policy reused")
+	}
+}
+func TestSlashedBranchAndReusableWorkflowDoNotChangeScope(t *testing.T) {
+	f := fixture()
+	f.event = "push"
+	f.headRepo = "owner/repo"
+	f.head = "feature/queued"
+	f.branchRef = "refs/heads/feature/queued"
+	f.branchSHA = "advanced"
+	f.requestURI = func(uri string) {
+		if strings.Contains(uri, "%2F") {
+			t.Errorf("escaped branch slash: %s", uri)
+		}
+	}
+	srv := f.server(t)
+	defer srv.Close()
+	g := &GitHub{base: srv.URL, pat: "pat", client: srv.Client()}
+	i, err := g.Resolve(context.Background(), Job{Repository: "owner/repo", RunID: 42, JobID: "job", Event: "push", WorkflowRef: "owner/repo/.github/workflows/reusable.yml@refs/heads/main"})
+	if err != nil || i.WriteRef != f.branchRef {
+		t.Fatalf("workflow ref elevated queued branch: %+v %v", i, err)
+	}
+}
+
+func TestRunMemoDoesNotCrossRepositoryOrEvent(t *testing.T) {
+	f := fixture()
+	srv := f.server(t)
+	defer srv.Close()
+	g := &GitHub{base: srv.URL, pat: "pat", client: srv.Client()}
+	j := Job{Repository: "owner/repo", RunID: 42, JobID: "job", Event: f.event}
+	if _, err := g.Resolve(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	j.Repository = "owner/other"
+	if _, err := g.Resolve(context.Background(), j); err == nil {
+		t.Fatal("memo crossed repository")
+	}
+	j.Repository = "owner/repo"
+	j.Event = "push"
+	if _, err := g.Resolve(context.Background(), j); err == nil {
+		t.Fatal("memo crossed event")
 	}
 }

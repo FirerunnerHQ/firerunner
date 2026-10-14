@@ -11,21 +11,13 @@ import (
 	"github.com/solcreek/firerunner/internal/jobidentity"
 )
 
-// SetScope enables host-authenticated, ref-scoped caching. Call before serving.
-// The default ref is an explicit operator policy for requests without a job
-// record, never a claim from the guest. Empty disables that read-only fallback.
-// A server without SetScope has no cache read/write authority.
-func (s *Server) SetScope(repo, defaultRef string, lookup func(string) (jobidentity.Identity, error)) error {
-	if !jobidentity.ValidRepository(repo) {
-		return fmt.Errorf("--repository must be owner/name")
-	}
-	if defaultRef != "" && (!strings.HasPrefix(defaultRef, "refs/heads/") || !jobidentity.ValidRef(defaultRef)) {
-		return fmt.Errorf("--default-ref must be refs/heads/<branch> or empty")
-	}
+// SetScope enables multi-repository caching using only host-authenticated records.
+// Missing, pending, expired and invalid records have no read or write authority.
+func (s *Server) SetScope(lookup func(string) (jobidentity.Identity, error)) error {
 	if lookup == nil {
 		return fmt.Errorf("job identity reader is required")
 	}
-	s.repo, s.defaultRef, s.lookup = strings.ToLower(repo), defaultRef, lookup
+	s.lookup = lookup
 	return nil
 }
 
@@ -49,29 +41,37 @@ func (s *Server) bindGeneration(ctx context.Context, remote string) context.Cont
 }
 
 func (s *Server) identity(r *http.Request) jobidentity.Identity {
-	var fallback jobidentity.Identity
-	if s.repo == "" || s.lookup == nil {
-		return fallback
-	}
-	fallback.Repository = s.repo
-	if s.defaultRef != "" {
-		fallback.ReadRefs = []string{s.defaultRef}
+	if s.lookup == nil {
+		return jobidentity.Identity{}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return jobidentity.Identity{}
 	}
 	i, err := s.lookup(host)
-	if err != nil || i.Validate(time.Now()) != nil {
-		return fallback
+	if err == nil {
+		err = i.Validate(time.Now())
 	}
+	if err != nil {
+		s.identityDenied.Add(1)
+		s.identityMu.Lock()
+		if s.identityFailures == nil {
+			s.identityFailures = make(map[string]bool)
+		}
+		if !s.identityFailures[host] && len(s.identityFailures) < 4096 {
+			s.identityFailures[host] = true
+			s.log.Warn("cache identity unavailable; reads and writes denied", "guest", host, "err", err)
+		}
+		s.identityMu.Unlock()
+		return jobidentity.Identity{}
+	}
+	s.identityMu.Lock()
+	delete(s.identityFailures, host)
+	s.identityMu.Unlock()
 	if generation, bound := r.Context().Value(connectionGenerationKey{}).(string); bound && generation != i.Generation {
 		return jobidentity.Identity{}
 	}
-	if !strings.EqualFold(i.Repository, s.repo) {
-		return jobidentity.Identity{}
-	}
-	i.Repository = s.repo
+	i.Repository = strings.ToLower(i.Repository)
 	return i
 }
 

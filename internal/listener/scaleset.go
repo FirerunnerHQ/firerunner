@@ -279,7 +279,7 @@ func (a *scaler) HandleJobStarted(ctx context.Context, j *scaleset.JobStarted) e
 		a.onBusy(j.RunnerName)
 	}
 	if a.onJobStarted != nil {
-		a.onJobStarted(ctx, jobidentity.Job{Runner: j.RunnerName, Repository: j.OwnerName + "/" + j.RepositoryName, Event: j.EventName, RunID: j.WorkflowRunID, JobID: j.JobID})
+		a.onJobStarted(ctx, jobidentity.Job{WorkflowRef: j.JobWorkflowRef, Runner: j.RunnerName, Repository: j.OwnerName + "/" + j.RepositoryName, Event: j.EventName, RunID: j.WorkflowRunID, JobID: j.JobID})
 	}
 	return nil
 }

@@ -2,7 +2,8 @@
 
 This runs the pinned real `@actions/cache` toolkit against the built executable.
 It creates and extracts actual archives and checks default/base/PR precedence,
-sibling isolation, PR reruns, and read-only behavior before a job record exists.
+sibling/repository isolation, PR reruns, resolved read-only identities, and
+denied reads/writes before a job record exists.
 All cache files and host identity fixtures live in a disposable directory.
 Each operation runs in a fresh worker process/TCP pool to model a new VM;
 Go integration tests separately exercise connections opened before JobStarted

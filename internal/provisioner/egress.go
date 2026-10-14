@@ -127,7 +127,13 @@ func fetchMetaCIDRs(ctx context.Context, cl *http.Client, url string, categories
 // as defense-in-depth. Both interface-keyed features are emitted only when
 // IfacePrefix is set; an empty prefix would glob every host interface.
 // It is pure so the generated policy can be asserted in tests.
-func buildNFTRuleset(cfg egressRuleset) string {
+func buildNFTRuleset(cfg egressRuleset) (string, error) {
+	if cfg.IfacePrefix != "" {
+		prefix, err := netip.ParsePrefix(cfg.VMCidr)
+		if err != nil || !prefix.Addr().Is4() || prefix.Bits() != 16 || prefix != prefix.Masked() || prefix.Addr().As4()[0] != 172 || cfg.MaxVMs < 0 || cfg.MaxVMs > 256 {
+			return "", fmt.Errorf("invalid guest source binding configuration: CIDR %q, pool %d (need 172.x.0.0/16 and 0..256 slots)", cfg.VMCidr, cfg.MaxVMs)
+		}
+	}
 	table := cfg.Table
 	if table == "" {
 		table = natTable
@@ -238,7 +244,7 @@ func buildNFTRuleset(cfg egressRuleset) string {
 		fmt.Fprintf(&b, "\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n\t\tiifname \"%s\" drop\n\t}\n", iface)
 		b.WriteString("}\n")
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // nonPublicNets are the IPv4 ranges that are not globally reachable (RFC 6890):

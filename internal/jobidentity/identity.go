@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -18,11 +19,12 @@ const DefaultDir = "/run/firerunner/jobs"
 
 // Job comes from the authenticated scale-set control plane, not a runner token.
 type Job struct {
-	Runner     string
-	Repository string
-	Event      string
-	RunID      int64
-	JobID      string
+	WorkflowRef string // Workflow definition, deliberately not used as triggering authority.
+	Runner      string
+	Repository  string
+	Event       string
+	RunID       int64
+	JobID       string
 }
 
 // Identity is published by the daemon. Generation changes on EVERY slot reuse.
@@ -102,7 +104,44 @@ func (i Identity) CanRead(ref string) bool {
 
 // Reader always rereads the atomic file: revocation must not wait for a cache TTL.
 // The directory is host-private and must never be mounted into a guest.
-type Reader struct{ Dir string }
+type Reader struct {
+	Dir string
+	// Nil expects the current UID. Separate cache users must pin the daemon UID.
+	OwnerUID *int
+}
+
+func (s Reader) trusted(st os.FileInfo) bool {
+	uid := os.Getuid()
+	if s.OwnerUID != nil {
+		uid = *s.OwnerUID
+	}
+	stat, ok := st.Sys().(*syscall.Stat_t)
+	return ok && int(stat.Uid) == uid && st.Mode().Perm()&0027 == 0
+}
+
+// Check fails startup on an unreadable, writable-by-readers or wrongly owned directory.
+func (s Reader) Check() error {
+	st, err := os.Lstat(s.Dir)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() || !s.trusted(st) {
+		return errors.New("jobs directory must be daemon-owned and at most 0750")
+	}
+	if err := syscall.Access(s.Dir, 4|1); err != nil {
+		return fmt.Errorf("jobs directory requires read/search access: %w", err)
+	}
+	f, err := os.Open(s.Dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Readdirnames(1)
+	if err == io.EOF {
+		return nil
+	}
+	return err
+}
 
 func (s Reader) Lookup(ip string) (Identity, error) {
 	var i Identity
@@ -115,7 +154,7 @@ func (s Reader) Lookup(ip string) (Identity, error) {
 	if err != nil {
 		return i, err
 	}
-	if !dir.IsDir() || dir.Mode().Perm()&0077 != 0 {
+	if !dir.IsDir() || !s.trusted(dir) {
 		return i, errors.New("jobs directory is not private")
 	}
 	path := filepath.Join(s.Dir, ip+".json")
@@ -123,7 +162,7 @@ func (s Reader) Lookup(ip string) (Identity, error) {
 	if err != nil {
 		return i, err
 	}
-	if !file.Mode().IsRegular() || file.Mode().Perm()&0077 != 0 {
+	if !file.Mode().IsRegular() || !s.trusted(file) {
 		return i, errors.New("job record is not a private regular file")
 	}
 	f, err := os.Open(path)
@@ -131,6 +170,13 @@ func (s Reader) Lookup(ip string) (Identity, error) {
 		return i, err
 	}
 	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return i, err
+	}
+	if !os.SameFile(file, opened) || !s.trusted(opened) {
+		return i, errors.New("job record changed while opening")
+	}
 	if err := json.NewDecoder(io.LimitReader(f, 65537)).Decode(&i); err != nil {
 		return Identity{}, err
 	}

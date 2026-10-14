@@ -26,8 +26,8 @@ const port = probe.address().port;
 await new Promise(resolve => probe.close(resolve));
 const base = `http://127.0.0.1:${port}`;
 const child = spawn(resolve(binary), ['cache-server', '--addr', `127.0.0.1:${port}`,
-  '--dir', data, '--repository', 'owner/repo', '--jobs-dir', jobs,
-  '--default-ref', 'refs/heads/main', '--artifact-upstream', ''], {stdio: ['ignore', 'ignore', 'pipe']});
+  '--dir', data, '--jobs-dir', jobs,
+  '--artifact-upstream', ''], {stdio: ['ignore', 'ignore', 'pipe']});
 let logs = '';
 child.stderr.on('data', chunk => { logs += chunk; });
 const exited = once(child, 'exit');
@@ -42,11 +42,11 @@ const main = 'refs/heads/main';
 const branch = 'refs/heads/release';
 const pr = 'refs/pull/7/merge';
 let generation = 0;
-async function identity(ref, reads = [ref, main]) {
+async function identity(ref, reads = [ref, main], repository = 'owner/repo') {
   const job = `job-${++generation}`;
   const file = join(jobs, '127.0.0.1.json');
   await writeFile(`${file}.tmp`, JSON.stringify({
-    ip: '127.0.0.1', runner: job, generation: job, repository: 'owner/repo',
+    ip: '127.0.0.1', runner: job, generation: job, repository,
     event: ref.startsWith('refs/pull/') ? 'pull_request' : 'push',
     write_ref: ref, read_refs: [...new Set(reads)], run_id: generation, job_id: job,
     expires_at: Math.floor(Date.now() / 1000) + 3600
@@ -110,12 +110,23 @@ try {
   await identity(main);
   await restore('shared', 'DEFAULT');
   await restore('pr-only', undefined);
-  // Before JobStarted, only the configured default scope can be read.
-  await rm(join(jobs, '127.0.0.1.json'));
+  await identity(main, [main], 'owner/other');
+  await restore('shared', undefined, ['']);
+  await save('shared', 'OTHER REPO');
+  await restore('shared', 'OTHER REPO');
+  await identity(main);
   await restore('shared', 'DEFAULT');
+  await identity('', [main]);
+  await restore('shared', 'DEFAULT');
+  assert.equal(await toolkit('save', 'read-only-job'), -1);
+  // Before JobStarted, no repository or ref authority exists.
+  await rm(join(jobs, '127.0.0.1.json'));
+  await restore('shared', undefined);
+  await mkdir('payload', {recursive: true});
+  await writeFile('payload/value.txt', 'UNKNOWN');
   const saved = await toolkit('save', 'unknown-job');
   assert.equal(saved, -1, 'unknown job acquired a cache reservation');
-  console.log('PASS: actual toolkit save/extract, ref precedence, isolation, rerun, default-only fallback, denied writes');
+  console.log('PASS: actual toolkit save/extract, ref precedence, isolation, rerun, unknown identity denied');
 } catch (error) {
   console.error(logs);
   throw error;

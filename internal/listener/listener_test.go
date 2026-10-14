@@ -318,7 +318,7 @@ func TestJobIdentityComesFromControlPlane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := jobidentity.Job{Runner: "runner", Repository: "owner/repo", Event: "pull_request", RunID: 42, JobID: "job"}
+	want := jobidentity.Job{WorkflowRef: "owner/repo/.github/workflows/ci.yml@refs/heads/main", Runner: "runner", Repository: "owner/repo", Event: "pull_request", RunID: 42, JobID: "job"}
 	if got != want {
 		t.Fatalf("got %+v want %+v", got, want)
 	}

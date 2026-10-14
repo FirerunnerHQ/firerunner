@@ -43,6 +43,10 @@ jobs:
           check-latest: true
       - name: Install nftables
         run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+      - name: Identity records readable but not writable by a separate UID
+        run: |
+          go test -c -o /tmp/fr-identity.test ./internal/jobidentity
+          sudo /tmp/fr-identity.test -test.run '^TestReaderSeparateUID$' -test.v
       - name: Egress firewall in network namespaces
         run: FR_REQUIRE_NETNS=1 make netns-test
 
