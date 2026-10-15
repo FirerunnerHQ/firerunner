@@ -568,7 +568,7 @@ func cacheInputScript(tapPrefix string, port int) string {
 // open.
 func (f *Firecracker) ensureHostCacheInput(ctx context.Context) error {
 	if f.cfg.CachePort == 0 {
-		return nil // no --cache-port; a --cache-url address opens its own INPUT path
+		return nil // no --cache-port; with --cache-url the operator must accept that address/port on INPUT
 	}
 	out, err := f.runOut(ctx, "nft", "-a", "list", "chain", "ip", "filter", "INPUT")
 	if err != nil {
