@@ -628,7 +628,14 @@ There is no global repository/default-ref override or anonymous fallback.
   only PR-own and default reads; the current PR cannot grant a new base scope.
   API routing supports GitHub.com, Enterprise Cloud (`*.ghe.com`) and GHES,
   including the scaleset client's `GITHUB_ACTIONS_FORCE_GHES` override.
-  Branch writes require an existing branch and no same-named tag. Tag runs,
+  Branch writes require an existing branch, no same-named tag, and proof that
+  the run's commit belongs to that branch: run `head_branch` is a bare name, so
+  a tag deleted after its run would otherwise pass as the branch. A `push` run
+  needs a repository-activity record (push, force push, PR or merge-queue merge,
+  branch creation) updating `refs/heads/<branch>` to the run's SHA within the
+  last month, searched up to 1,000 records. Dispatch and schedule runs, and GHES
+  without the activity endpoint, need the commit in the branch's current
+  history (`compare`). Tag runs,
   ambiguous PR associations and API errors get no write access. `pull_request_target`,
   `workflow_run`, `issue_comment` and other unrecognized events get resolved
   default-only reads. `JobWorkflowRef` is deliberately not a trigger ref: even
@@ -684,12 +691,12 @@ or stopping either unit could remove live records. The cache unit starts after
 firewall before exposing its listener.
 
 The cache-enabled daemon's GitHub App additionally needs repository **Actions:
-read**, **Contents: read** (ref verification), and **Pull requests: read**
+read**, **Contents: read** (ref, activity and compare checks), and **Pull requests: read**
 (PR association), plus its existing runner-registration permissions. Install
 it on every repository served. The resolver uses a separate REST client and
 short-lived installation tokens restricted to the requested repository and
 Actions/Pull requests/Metadata/Contents read permissions. Contents read remains
-necessary for branch/tag probes. Concurrent matrix jobs share one resolution;
+necessary for branch/tag probes and for the activity and compare endpoints. Concurrent matrix jobs share one resolution;
 successful run policies are cached for two minutes (bounded to 1024 runs), while
 job IDs, generations and record leases remain per job. Credentials never enter
 job records.

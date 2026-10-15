@@ -103,10 +103,26 @@ func (g *GitHub) auth(ctx context.Context, repo string) (string, error) {
 	return result.Token, nil
 }
 
+// statusError keeps the HTTP status so callers can tell a missing endpoint apart.
+type statusError struct {
+	method, path string
+	code         int
+}
+
+func (e statusError) Error() string {
+	return fmt.Sprintf("GitHub %s %s: HTTP %d", e.method, e.path, e.code)
+}
+
 func (g *GitHub) request(ctx context.Context, method, path, token string, body io.Reader, out any) error {
+	_, err := g.requestPage(ctx, method, path, token, body, out)
+	return err
+}
+
+// requestPage also returns the raw Link header for cursor-paginated endpoints.
+func (g *GitHub) requestPage(ctx context.Context, method, path, token string, body io.Reader, out any) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, method, g.base+path, body)
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
@@ -114,24 +130,28 @@ func (g *GitHub) request(ctx context.Context, method, path, token string, body i
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	resp, err := g.client.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && !(method == http.MethodPost && resp.StatusCode == http.StatusCreated) {
-		return fmt.Errorf("GitHub %s %s: HTTP %d", method, path, resp.StatusCode)
+		return "", statusError{method, path, resp.StatusCode}
 	}
-	return json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(out)
+	return resp.Header.Get("Link"), json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(out)
 }
 func (g *GitHub) get(ctx context.Context, path string, out any) error {
+	_, err := g.getPage(ctx, path, out)
+	return err
+}
+func (g *GitHub) getPage(ctx context.Context, path string, out any) (string, error) {
 	parts := strings.SplitN(strings.TrimPrefix(path, "/repos/"), "/", 3)
 	if len(parts) < 2 {
-		return errors.New("invalid repository API path")
+		return "", errors.New("invalid repository API path")
 	}
 	token, err := g.auth(ctx, strings.ToLower(parts[0]+"/"+parts[1]))
 	if err != nil {
-		return err
+		return "", err
 	}
-	return g.request(ctx, http.MethodGet, path, token, nil, out)
+	return g.requestPage(ctx, http.MethodGet, path, token, nil, out)
 }
 
 type repository struct {
@@ -345,6 +365,15 @@ func (g *GitHub) resolve(ctx context.Context, j Job) (Identity, error) {
 		if branch.Ref != own {
 			return Identity{}, errors.New("branch ref unavailable; cache writes disabled")
 		}
+		// head_branch is a bare name: a deleted same-named tag leaves no trace
+		// above. Require authenticated evidence that this commit was on the branch.
+		onBranch, err := g.commitOnBranch(ctx, root, run, own)
+		if err != nil {
+			return Identity{}, err
+		}
+		if !onBranch {
+			return Identity{}, errors.New("run commit not proven on branch; cache writes disabled")
+		}
 		i.WriteRef = own
 		i.ReadRefs = refs(own, "", def)
 	default:
@@ -352,6 +381,79 @@ func (g *GitHub) resolve(ctx context.Context, j Job) (Identity, error) {
 		// default only. Never assume the workflow-file ref is the triggering ref.
 	}
 	return i, nil
+}
+
+// activityPages bounds the push-history search. Re-runs are allowed for 30
+// days, so the search covers a month; a busier branch fails closed.
+const activityPages = 10
+
+// commitOnBranch proves the run's commit belongs to the branch ref. A push run
+// needs a recorded update of that exact ref to its SHA; repository activity
+// lists only branch refs, never tags. Other events have no push record, and
+// GHES releases without the activity endpoint fall back to: the commit is in
+// the branch history now.
+func (g *GitHub) commitOnBranch(ctx context.Context, root string, run workflowRun, own string) (bool, error) {
+	if run.Event == "push" {
+		found, err := g.pushedTo(ctx, root, own, run.HeadSHA)
+		var status statusError
+		if !errors.As(err, &status) || status.code != http.StatusNotFound {
+			return found, err
+		}
+	}
+	var compare struct {
+		Status string `json:"status"`
+	}
+	branch := strings.TrimPrefix(own, "refs/heads/")
+	if err := g.get(ctx, root+"/compare/"+url.PathEscape(run.HeadSHA)+"..."+escapeRefPath(branch), &compare); err != nil {
+		return false, err
+	}
+	return compare.Status == "identical" || compare.Status == "ahead", nil
+}
+
+func (g *GitHub) pushedTo(ctx context.Context, root, ref, sha string) (bool, error) {
+	query := "ref=" + strings.ReplaceAll(url.QueryEscape(ref), "%2F", "/") + "&time_period=month&per_page=100"
+	for page := 0; page < activityPages; page++ {
+		var list []struct {
+			Ref   string `json:"ref"`
+			After string `json:"after"`
+			Type  string `json:"activity_type"`
+		}
+		link, err := g.getPage(ctx, root+"/activity?"+query, &list)
+		if err != nil {
+			return false, err
+		}
+		for _, a := range list {
+			switch a.Type {
+			case "push", "force_push", "pr_merge", "merge_queue_merge", "branch_creation":
+				if a.Ref == ref && a.After == sha {
+					return true, nil
+				}
+			}
+		}
+		cursor := nextCursor(link)
+		if cursor == "" {
+			return false, nil
+		}
+		query = "ref=" + strings.ReplaceAll(url.QueryEscape(ref), "%2F", "/") + "&time_period=month&per_page=100&after=" + url.QueryEscape(cursor)
+	}
+	return false, nil
+}
+
+// nextCursor extracts the "after" cursor of the rel="next" link. The link
+// itself points at /repositories/<id>, which the token router cannot scope.
+func nextCursor(link string) string {
+	for _, part := range strings.Split(link, ",") {
+		target, rel, ok := strings.Cut(part, ";")
+		if !ok || !strings.Contains(rel, `rel="next"`) {
+			continue
+		}
+		u, err := url.Parse(strings.Trim(strings.TrimSpace(target), "<>"))
+		if err != nil {
+			return ""
+		}
+		return u.Query().Get("after")
+	}
+	return ""
 }
 
 // Preserve slashes in branch names; escape each path segment separately.

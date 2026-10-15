@@ -31,13 +31,15 @@ type apiFixture struct {
 	prs                                       map[int]map[string]any
 	branchSHA, branchRef                      string
 	tags                                      []map[string]any
+	activity                                  [][]map[string]any // pages; nil = the run's own push
+	compare                                   string
 	failPath                                  string
 	status                                    int
 	corrupt                                   bool
 }
 
 func fixture() *apiFixture {
-	return &apiFixture{event: "pull_request", head: "feature", headRepo: "fork/repo", sha: "abc123", defaultBranch: "main", candidates: []int{7}, runBases: map[int]string{7: "release"}, prs: map[int]map[string]any{7: prJSON(7, "release")}, branchSHA: "abc123", branchRef: "refs/heads/feature"}
+	return &apiFixture{event: "pull_request", head: "feature", headRepo: "fork/repo", sha: "abc123", defaultBranch: "main", candidates: []int{7}, runBases: map[int]string{7: "release"}, prs: map[int]map[string]any{7: prJSON(7, "release")}, branchSHA: "abc123", branchRef: "refs/heads/feature", compare: "identical"}
 }
 func prJSON(n int, base string) map[string]any {
 	return map[string]any{"number": n, "head": map[string]any{"ref": "feature", "sha": "abc123", "repo": map[string]any{"full_name": "fork/repo"}}, "base": map[string]any{"ref": base, "repo": map[string]any{"full_name": "owner/repo"}}}
@@ -86,6 +88,31 @@ func (f *apiFixture) server(t *testing.T) *httptest.Server {
 			out = f.tags
 		case strings.Contains(r.URL.Path, "/git/ref/heads/"):
 			out = map[string]any{"ref": f.branchRef, "object": map[string]any{"sha": f.branchSHA}}
+		case strings.HasSuffix(r.URL.Path, "/activity"):
+			q := r.URL.Query()
+			if q.Get("ref") != "refs/heads/"+f.head || q.Get("time_period") != "month" {
+				t.Errorf("activity query %s", r.URL.RawQuery)
+			}
+			pages := f.activity
+			if pages == nil {
+				pages = [][]map[string]any{{{"ref": "refs/heads/" + f.head, "after": f.sha, "activity_type": "push"}}}
+			}
+			page := 0
+			if after := q.Get("after"); after != "" {
+				_, _ = fmt.Sscanf(after, "c%d", &page)
+			}
+			if page+1 < len(pages) {
+				w.Header().Set("Link", fmt.Sprintf(`<https://api.github.com/repositories/1/activity?per_page=100&after=c%d>; rel="next"`, page+1))
+			}
+			out = []map[string]any{}
+			if page < len(pages) {
+				out = pages[page]
+			}
+		case strings.Contains(r.URL.Path, "/compare/"):
+			if !strings.HasSuffix(r.URL.Path, "/compare/"+f.sha+"..."+f.head) {
+				t.Errorf("compare path %s", r.URL.Path)
+			}
+			out = map[string]any{"status": f.compare}
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -141,6 +168,73 @@ func TestResolveGitHubPolicy(t *testing.T) {
 		}, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
 		{"branch advanced", func(f *apiFixture) { f.event = "push"; f.headRepo = "owner/repo"; f.branchSHA = "newer" }, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
 		{"foreign push", func(f *apiFixture) { f.event = "push" }, "", nil, true},
+		{"deleted same-named tag push", func(f *apiFixture) {
+			f.event = "push"
+			f.headRepo = "owner/repo"
+			f.activity = [][]map[string]any{}
+			f.compare = "diverged"
+		}, "", nil, true},
+		{"push record required even on branch history", func(f *apiFixture) {
+			f.event = "push"
+			f.headRepo = "owner/repo"
+			f.activity = [][]map[string]any{}
+			f.compare = "ahead"
+		}, "", nil, true},
+		{"rerun after force push", func(f *apiFixture) {
+			f.event = "push"
+			f.headRepo = "owner/repo"
+			f.branchSHA = "rewritten"
+			f.compare = "diverged"
+		}, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
+		{"merged PR record", func(f *apiFixture) {
+			f.event = "push"
+			f.headRepo = "owner/repo"
+			f.activity = [][]map[string]any{{{"ref": "refs/heads/feature", "after": "abc123", "activity_type": "pr_merge"}}}
+		}, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
+		{"tag activity is not a branch push", func(f *apiFixture) {
+			f.event = "push"
+			f.headRepo = "owner/repo"
+			f.activity = [][]map[string]any{{{"ref": "refs/tags/feature", "after": "abc123", "activity_type": "push"}}}
+		}, "", nil, true},
+		{"deletion record is not a push", func(f *apiFixture) {
+			f.event = "push"
+			f.headRepo = "owner/repo"
+			f.activity = [][]map[string]any{{{"ref": "refs/heads/feature", "after": "abc123", "activity_type": "branch_deletion"}}}
+		}, "", nil, true},
+		{"other commit pushed", func(f *apiFixture) {
+			f.event = "push"
+			f.headRepo = "owner/repo"
+			f.activity = [][]map[string]any{{{"ref": "refs/heads/feature", "after": "other", "activity_type": "push"}}}
+		}, "", nil, true},
+		{"GHES without activity uses ancestry", func(f *apiFixture) {
+			f.event = "push"
+			f.headRepo = "owner/repo"
+			f.failPath = "/activity"
+			f.status = 404
+			f.compare = "ahead"
+		}, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
+		{"GHES without activity, foreign commit", func(f *apiFixture) {
+			f.event = "push"
+			f.headRepo = "owner/repo"
+			f.failPath = "/activity"
+			f.status = 404
+			f.compare = "diverged"
+		}, "", nil, true},
+		{"activity error fails closed", func(f *apiFixture) {
+			f.event = "push"
+			f.headRepo = "owner/repo"
+			f.failPath = "/activity"
+			f.status = 500
+		}, "", nil, true},
+		{"dispatch on advanced branch", func(f *apiFixture) { f.event = "workflow_dispatch"; f.headRepo = "owner/repo"; f.compare = "ahead" }, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
+		{"dispatch on deleted same-named tag", func(f *apiFixture) { f.event = "workflow_dispatch"; f.headRepo = "owner/repo"; f.compare = "diverged" }, "", nil, true},
+		{"dispatch commit ahead of branch", func(f *apiFixture) { f.event = "workflow_dispatch"; f.headRepo = "owner/repo"; f.compare = "behind" }, "", nil, true},
+		{"compare error fails closed", func(f *apiFixture) {
+			f.event = "workflow_dispatch"
+			f.headRepo = "owner/repo"
+			f.failPath = "/compare/"
+			f.status = 500
+		}, "", nil, true},
 		{"pull request target read only", func(f *apiFixture) { f.event = "pull_request_target" }, "", []string{"refs/heads/main"}, false},
 		{"workflow run read only", func(f *apiFixture) { f.event = "workflow_run" }, "", []string{"refs/heads/main"}, false},
 		{"unknown event read only", func(f *apiFixture) { f.event = "new_event" }, "", []string{"refs/heads/main"}, false},
@@ -414,5 +508,64 @@ func TestRunMemoDoesNotCrossRepositoryOrEvent(t *testing.T) {
 	j.Event = "push"
 	if _, err := g.Resolve(context.Background(), j); err == nil {
 		t.Fatal("memo crossed event")
+	}
+}
+
+func TestPushRecordPagination(t *testing.T) {
+	filler := func(n int) []map[string]any {
+		var page []map[string]any
+		for k := 0; k < n; k++ {
+			page = append(page, map[string]any{"ref": "refs/heads/feature", "after": fmt.Sprintf("old%d", k), "activity_type": "push"})
+		}
+		return page
+	}
+	for _, tt := range []struct {
+		name      string
+		pages     int
+		foundOn   int // -1: never
+		wantErr   bool
+		wantPages int
+	}{
+		{"found on third page", 5, 2, false, 3},
+		{"absent after the last page", 3, -1, true, 3},
+		{"search is bounded", activityPages + 5, -1, true, activityPages},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := fixture()
+			f.event, f.headRepo = "push", "owner/repo"
+			for p := 0; p < tt.pages; p++ {
+				page := filler(100)
+				if p == tt.foundOn {
+					page[57] = map[string]any{"ref": "refs/heads/feature", "after": f.sha, "activity_type": "push"}
+				}
+				f.activity = append(f.activity, page)
+			}
+			var activityCalls atomic.Int32
+			f.requestURI = func(uri string) {
+				if strings.Contains(uri, "/activity?") {
+					activityCalls.Add(1)
+				}
+			}
+			srv := f.server(t)
+			defer srv.Close()
+			g := &GitHub{base: srv.URL, pat: "pat", client: srv.Client()}
+			i, err := g.Resolve(context.Background(), Job{Repository: "owner/repo", RunID: 42, JobID: "job", Event: "push"})
+			if (err != nil) != tt.wantErr || (!tt.wantErr && i.WriteRef != "refs/heads/feature") {
+				t.Fatalf("identity %+v, err %v", i, err)
+			}
+			if int(activityCalls.Load()) != tt.wantPages {
+				t.Fatalf("activity pages = %d, want %d", activityCalls.Load(), tt.wantPages)
+			}
+		})
+	}
+}
+
+func TestNextCursor(t *testing.T) {
+	link := `<https://api.github.com/repositories/1/activity?after=prev>; rel="prev", <https://api.github.com/repositories/1/activity?per_page=100&after=Y3Vy%3D>; rel="next"`
+	if got := nextCursor(link); got != "Y3Vy=" {
+		t.Fatalf("cursor %q", got)
+	}
+	if nextCursor(`<https://x/y?after=a>; rel="prev"`) != "" || nextCursor("") != "" {
+		t.Fatal("cursor without next")
 	}
 }
