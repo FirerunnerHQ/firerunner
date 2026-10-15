@@ -136,7 +136,11 @@ func (g *GitHub) requestPage(ctx context.Context, method, path, token string, bo
 	if resp.StatusCode != http.StatusOK && !(method == http.MethodPost && resp.StatusCode == http.StatusCreated) {
 		return "", statusError{method, path, resp.StatusCode}
 	}
-	return resp.Header.Get("Link"), json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(out)
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 2<<20))
+	if stream, ok := out.(interface{ decodeStream(*json.Decoder) error }); ok {
+		return resp.Header.Get("Link"), stream.decodeStream(dec)
+	}
+	return resp.Header.Get("Link"), dec.Decode(out)
 }
 func (g *GitHub) get(ctx context.Context, path string, out any) error {
 	_, err := g.getPage(ctx, path, out)
@@ -367,12 +371,14 @@ func (g *GitHub) resolve(ctx context.Context, j Job) (Identity, error) {
 		}
 		// head_branch is a bare name: a deleted same-named tag leaves no trace
 		// above. Require authenticated evidence that this commit was on the branch.
-		onBranch, err := g.commitOnBranch(ctx, root, run, own)
+		onBranch, err := g.commitOnBranch(ctx, root, run, own, branch.Object.SHA)
 		if err != nil {
 			return Identity{}, err
 		}
 		if !onBranch {
-			return Identity{}, errors.New("run commit not proven on branch; cache writes disabled")
+			// Unproven (deleted same-named tag, or a record older than the
+			// search window): no write, but keep the default-only reads.
+			return i, nil
 		}
 		i.WriteRef = own
 		i.ReadRefs = refs(own, "", def)
@@ -392,7 +398,7 @@ const activityPages = 10
 // lists only branch refs, never tags. Other events have no push record, and
 // GHES releases without the activity endpoint fall back to: the commit is in
 // the branch history now.
-func (g *GitHub) commitOnBranch(ctx context.Context, root string, run workflowRun, own string) (bool, error) {
+func (g *GitHub) commitOnBranch(ctx context.Context, root string, run workflowRun, own, tip string) (bool, error) {
 	if run.Event == "push" {
 		found, err := g.pushedTo(ctx, root, own, run.HeadSHA)
 		var status statusError
@@ -400,14 +406,40 @@ func (g *GitHub) commitOnBranch(ctx context.Context, root string, run workflowRu
 			return found, err
 		}
 	}
-	var compare struct {
-		Status string `json:"status"`
+	if tip == run.HeadSHA {
+		return true, nil
 	}
+	var compare compareStatus
 	branch := strings.TrimPrefix(own, "refs/heads/")
 	if err := g.get(ctx, root+"/compare/"+url.PathEscape(run.HeadSHA)+"..."+escapeRefPath(branch), &compare); err != nil {
 		return false, err
 	}
 	return compare.Status == "identical" || compare.Status == "ahead", nil
+}
+
+// compareStatus reads only the top-level "status" of a compare response, which
+// precedes its commits and patches; a far-advanced branch can exceed the
+// response limit.
+type compareStatus struct{ Status string }
+
+func (c *compareStatus) decodeStream(dec *json.Decoder) error {
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return errors.New("invalid compare response")
+	}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if key == "status" {
+			return dec.Decode(&c.Status)
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return err
+		}
+	}
+	return errors.New("compare response has no status")
 }
 
 func (g *GitHub) pushedTo(ctx context.Context, root, ref, sha string) (bool, error) {

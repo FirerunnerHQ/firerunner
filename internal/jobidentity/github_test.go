@@ -112,7 +112,9 @@ func (f *apiFixture) server(t *testing.T) *httptest.Server {
 			if !strings.HasSuffix(r.URL.Path, "/compare/"+f.sha+"..."+f.head) {
 				t.Errorf("compare path %s", r.URL.Path)
 			}
-			out = map[string]any{"status": f.compare}
+			// status precedes commits and patches, which can exceed the 2 MiB limit.
+			fmt.Fprintf(w, `{"url":"x","base_commit":{"sha":"b"},"status":%q,"files":[{"patch":"%s"}]}`, f.compare, strings.Repeat("x", 3<<20))
+			return
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -173,13 +175,13 @@ func TestResolveGitHubPolicy(t *testing.T) {
 			f.headRepo = "owner/repo"
 			f.activity = [][]map[string]any{}
 			f.compare = "diverged"
-		}, "", nil, true},
+		}, "", []string{"refs/heads/main"}, false},
 		{"push record required even on branch history", func(f *apiFixture) {
 			f.event = "push"
 			f.headRepo = "owner/repo"
 			f.activity = [][]map[string]any{}
 			f.compare = "ahead"
-		}, "", nil, true},
+		}, "", []string{"refs/heads/main"}, false},
 		{"rerun after force push", func(f *apiFixture) {
 			f.event = "push"
 			f.headRepo = "owner/repo"
@@ -195,18 +197,19 @@ func TestResolveGitHubPolicy(t *testing.T) {
 			f.event = "push"
 			f.headRepo = "owner/repo"
 			f.activity = [][]map[string]any{{{"ref": "refs/tags/feature", "after": "abc123", "activity_type": "push"}}}
-		}, "", nil, true},
+		}, "", []string{"refs/heads/main"}, false},
 		{"deletion record is not a push", func(f *apiFixture) {
 			f.event = "push"
 			f.headRepo = "owner/repo"
 			f.activity = [][]map[string]any{{{"ref": "refs/heads/feature", "after": "abc123", "activity_type": "branch_deletion"}}}
-		}, "", nil, true},
+		}, "", []string{"refs/heads/main"}, false},
 		{"other commit pushed", func(f *apiFixture) {
 			f.event = "push"
 			f.headRepo = "owner/repo"
 			f.activity = [][]map[string]any{{{"ref": "refs/heads/feature", "after": "other", "activity_type": "push"}}}
-		}, "", nil, true},
+		}, "", []string{"refs/heads/main"}, false},
 		{"GHES without activity uses ancestry", func(f *apiFixture) {
+			f.branchSHA = "tip"
 			f.event = "push"
 			f.headRepo = "owner/repo"
 			f.failPath = "/activity"
@@ -214,22 +217,39 @@ func TestResolveGitHubPolicy(t *testing.T) {
 			f.compare = "ahead"
 		}, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
 		{"GHES without activity, foreign commit", func(f *apiFixture) {
+			f.branchSHA = "tip"
 			f.event = "push"
 			f.headRepo = "owner/repo"
 			f.failPath = "/activity"
 			f.status = 404
 			f.compare = "diverged"
-		}, "", nil, true},
+		}, "", []string{"refs/heads/main"}, false},
 		{"activity error fails closed", func(f *apiFixture) {
 			f.event = "push"
 			f.headRepo = "owner/repo"
 			f.failPath = "/activity"
 			f.status = 500
 		}, "", nil, true},
-		{"dispatch on advanced branch", func(f *apiFixture) { f.event = "workflow_dispatch"; f.headRepo = "owner/repo"; f.compare = "ahead" }, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
-		{"dispatch on deleted same-named tag", func(f *apiFixture) { f.event = "workflow_dispatch"; f.headRepo = "owner/repo"; f.compare = "diverged" }, "", nil, true},
-		{"dispatch commit ahead of branch", func(f *apiFixture) { f.event = "workflow_dispatch"; f.headRepo = "owner/repo"; f.compare = "behind" }, "", nil, true},
+		{"dispatch on advanced branch", func(f *apiFixture) {
+			f.branchSHA = "tip"
+			f.event = "workflow_dispatch"
+			f.headRepo = "owner/repo"
+			f.compare = "ahead"
+		}, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
+		{"dispatch on deleted same-named tag", func(f *apiFixture) {
+			f.branchSHA = "tip"
+			f.event = "workflow_dispatch"
+			f.headRepo = "owner/repo"
+			f.compare = "diverged"
+		}, "", []string{"refs/heads/main"}, false},
+		{"dispatch commit ahead of branch", func(f *apiFixture) {
+			f.branchSHA = "tip"
+			f.event = "workflow_dispatch"
+			f.headRepo = "owner/repo"
+			f.compare = "behind"
+		}, "", []string{"refs/heads/main"}, false},
 		{"compare error fails closed", func(f *apiFixture) {
+			f.branchSHA = "tip"
 			f.event = "workflow_dispatch"
 			f.headRepo = "owner/repo"
 			f.failPath = "/compare/"
@@ -522,8 +542,8 @@ func TestPushRecordPagination(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
 		pages     int
-		foundOn   int // -1: never
-		wantErr   bool
+		foundOn   int  // -1: never
+		wantErr   bool // true: unproven, read-only identity
 		wantPages int
 	}{
 		{"found on third page", 5, 2, false, 3},
@@ -550,7 +570,11 @@ func TestPushRecordPagination(t *testing.T) {
 			defer srv.Close()
 			g := &GitHub{base: srv.URL, pat: "pat", client: srv.Client()}
 			i, err := g.Resolve(context.Background(), Job{Repository: "owner/repo", RunID: 42, JobID: "job", Event: "push"})
-			if (err != nil) != tt.wantErr || (!tt.wantErr && i.WriteRef != "refs/heads/feature") {
+			wantWrite, wantReads := "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}
+			if tt.wantErr { // unproven: no write, default-only reads
+				wantWrite, wantReads = "", []string{"refs/heads/main"}
+			}
+			if err != nil || i.WriteRef != wantWrite || !reflect.DeepEqual(i.ReadRefs, wantReads) {
 				t.Fatalf("identity %+v, err %v", i, err)
 			}
 			if int(activityCalls.Load()) != tt.wantPages {

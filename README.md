@@ -635,7 +635,8 @@ There is no global repository/default-ref override or anonymous fallback.
   branch creation) updating `refs/heads/<branch>` to the run's SHA within the
   last month, searched up to 1,000 records. Dispatch and schedule runs, and GHES
   without the activity endpoint, need the commit in the branch's current
-  history (`compare`). Tag runs,
+  history (`compare`, skipped when the branch still points at it). An unproven
+  run keeps default-only reads and gets no write. Tag runs,
   ambiguous PR associations and API errors get no write access. `pull_request_target`,
   `workflow_run`, `issue_comment` and other unrecognized events get resolved
   default-only reads. `JobWorkflowRef` is deliberately not a trigger ref: even
