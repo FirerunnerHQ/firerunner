@@ -438,9 +438,9 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, finalizeResp{OK: true, EntryID: strconv.FormatUint(e.ID, 10)})
 }
 
-// handleGetDownloadURL resolves the best matching entry (exact key first, then
-// restore-key prefixes in order, newest wins) and returns a download URL, or
-// ok:false on a miss.
+// handleGetDownloadURL resolves the best matching entry across the caller's
+// read refs in order (own, PR base, default; see match) and returns a download
+// URL, or ok:false on a miss.
 func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	var req getReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
