@@ -117,10 +117,10 @@ type FirecrackerConfig struct {
 	// Opt-in and off by default; jobs still pass without it (cache simply falls
 	// back to a miss / GitHub's cache when the golden is not cache-redirected).
 	CachePort int
-	// CacheURL, when set, is an explicit base URL of a cache-server (e.g.
-	// http://cache.internal:8099) used verbatim by the guest. It overrides
-	// CachePort for deployments where the cache-server is not on the microVM's
-	// host gateway. Opt-in and off by default.
+	// CacheURL, when set, is an explicit base URL of a cache-server on this
+	// host, used verbatim by the guest. It overrides CachePort. The server
+	// authorizes by guest source IP against this daemon's jobs directory, so it
+	// must not sit behind SNAT or a proxy. Opt-in and off by default.
 	CacheURL string
 
 	// MaxVMLifetime, when non-zero, is a host-side backstop on how long a single
