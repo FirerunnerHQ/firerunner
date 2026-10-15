@@ -560,14 +560,15 @@ func cacheInputScript(tapPrefix string, port int) string {
 // ensureHostCacheInput lets microVMs reach the self-hosted cache-server on their
 // host gateway when the host's ip/filter INPUT policy defaults to drop (ufw,
 // hardened hosts). It is best-effort and idempotent, and a no-op unless a local
-// cache port is configured (a remote --cache-url is reached via egress, not the
-// host INPUT chain) and the INPUT chain actually drops by default. It first
+// cache port is configured and the INPUT chain actually drops by default. A
+// --cache-url-only deployment (same host, see CacheURL) is not opened here: the
+// operator must accept that address and port on INPUT. It first
 // sweeps any of this instance's cache rules left over from a previous, different
 // --cache-port so a port change never strands the guest or leaves the old port
 // open.
 func (f *Firecracker) ensureHostCacheInput(ctx context.Context) error {
 	if f.cfg.CachePort == 0 {
-		return nil // no local cache-server to reach, or a remote --cache-url is in use
+		return nil // no --cache-port; a --cache-url address opens its own INPUT path
 	}
 	out, err := f.runOut(ctx, "nft", "-a", "list", "chain", "ip", "filter", "INPUT")
 	if err != nil {
