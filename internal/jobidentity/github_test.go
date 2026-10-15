@@ -230,6 +230,12 @@ func TestResolveGitHubPolicy(t *testing.T) {
 			f.failPath = "/activity"
 			f.status = 500
 		}, "", nil, true},
+		{"dispatch at branch tip skips compare", func(f *apiFixture) {
+			f.event = "workflow_dispatch"
+			f.headRepo = "owner/repo"
+			f.failPath = "/compare/"
+			f.status = 500
+		}, "refs/heads/feature", []string{"refs/heads/feature", "refs/heads/main"}, false},
 		{"dispatch on advanced branch", func(f *apiFixture) {
 			f.branchSHA = "tip"
 			f.event = "workflow_dispatch"
