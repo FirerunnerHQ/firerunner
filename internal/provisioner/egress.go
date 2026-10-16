@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -126,7 +127,13 @@ func fetchMetaCIDRs(ctx context.Context, cl *http.Client, url string, categories
 // as defense-in-depth. Both interface-keyed features are emitted only when
 // IfacePrefix is set; an empty prefix would glob every host interface.
 // It is pure so the generated policy can be asserted in tests.
-func buildNFTRuleset(cfg egressRuleset) string {
+func buildNFTRuleset(cfg egressRuleset) (string, error) {
+	if cfg.IfacePrefix != "" {
+		prefix, err := netip.ParsePrefix(cfg.VMCidr)
+		if err != nil || !prefix.Addr().Is4() || prefix.Bits() != 16 || prefix != prefix.Masked() || prefix.Addr().As4()[0] != 172 || cfg.MaxVMs < 0 || cfg.MaxVMs > 256 {
+			return "", fmt.Errorf("invalid guest source binding configuration: CIDR %q, pool %d (need 172.x.0.0/16 and 0..256 slots)", cfg.VMCidr, cfg.MaxVMs)
+		}
+	}
 	table := cfg.Table
 	if table == "" {
 		table = natTable
@@ -141,6 +148,30 @@ func buildNFTRuleset(cfg egressRuleset) string {
 	fmt.Fprintf(&b, "delete table ip %s\n", table)
 	fmt.Fprintf(&b, "table ip %s {\n", table)
 
+	if iface != "" {
+		// Enumerate the pool, not just active VMs: refreshes cannot erase a live
+		// binding and a new VM is protected before its interface comes up.
+		b.WriteString("\tcounter guest_spoof_drop { }\n\tset guest_sources {\n\t\ttype ifname . ipv4_addr\n")
+		pool := cfg.MaxVMs
+		if pool <= 0 {
+			pool = 256
+		}
+		prefix, err := netip.ParsePrefix(cfg.VMCidr)
+		if err == nil && prefix.Addr().Is4() && prefix.Bits() == 16 && pool <= 256 {
+			octets := prefix.Addr().As4()
+			var pairs []string
+			for slot := 0; slot < pool; slot++ {
+				n := slotNet(slot, cfg.IfacePrefix, int(octets[1]))
+				name := n.tap
+				if cfg.NetNS {
+					name = slotNetNS(n, int(octets[1]), cfg.IfacePrefix).hostVeth
+				}
+				pairs = append(pairs, fmt.Sprintf("\"%s\" . %s", name, n.guestIP))
+			}
+			fmt.Fprintf(&b, "\t\telements = { %s }\n", strings.Join(pairs, ", "))
+		}
+		b.WriteString("\t}\n")
+	}
 	fmt.Fprintf(&b, "\tset nonpublic {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\telements = { %s }\n\t}\n", strings.Join(nonPublicNets, ", "))
 
 	if !cfg.Open {
@@ -159,6 +190,7 @@ func buildNFTRuleset(cfg egressRuleset) string {
 	if iface != "" {
 		b.WriteString("\tchain input {\n\t\ttype filter hook input priority 0; policy accept;\n")
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" ip saddr != %s drop\n", iface, cfg.VMCidr)
+		fmt.Fprintf(&b, "\t\tiifname \"%s\" iifname . ip saddr != @guest_sources counter name guest_spoof_drop drop\n", iface)
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" ct state established,related accept\n", iface)
 		if cfg.CachePort > 0 {
 			fmt.Fprintf(&b, "\t\tiifname \"%s\" ip daddr %s tcp dport %d accept\n", iface, cfg.VMCidr, cfg.CachePort)
@@ -170,6 +202,7 @@ func buildNFTRuleset(cfg egressRuleset) string {
 	b.WriteString("\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n")
 	if iface != "" {
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" ip saddr != %s drop\n", iface, cfg.VMCidr)
+		fmt.Fprintf(&b, "\t\tiifname \"%s\" iifname . ip saddr != @guest_sources counter name guest_spoof_drop drop\n", iface)
 	}
 	if !cfg.Open {
 		fmt.Fprintf(&b, "\t\tip saddr %s ct state established,related accept\n", cfg.VMCidr)
@@ -211,7 +244,7 @@ func buildNFTRuleset(cfg egressRuleset) string {
 		fmt.Fprintf(&b, "\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n\t\tiifname \"%s\" drop\n\t}\n", iface)
 		b.WriteString("}\n")
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // nonPublicNets are the IPv4 ranges that are not globally reachable (RFC 6890):
@@ -259,6 +292,8 @@ func guestEgressGuards(b *strings.Builder, vmCidr string) {
 
 // egressRuleset is the fully-resolved input to buildNFTRuleset.
 type egressRuleset struct {
+	MaxVMs int
+	NetNS  bool
 	// Table is the nftables table name to manage. Empty falls back to natTable
 	// so a second firerunner instance can own an isolated table.
 	Table string

@@ -5,19 +5,36 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/solcreek/firerunner/internal/jobidentity"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
+
+func testIdentity(repo, ref, job string) jobidentity.Identity {
+	return jobidentity.Identity{Repository: repo, WriteRef: ref, ReadRefs: []string{ref}, Runner: "test-runner", Generation: job, JobID: job, RunID: 1, ExpiresAt: time.Now().Add(time.Hour).Unix()}
+}
+func newAuthorizedStore(dir string, log *slog.Logger) (*Server, error) {
+	s, err := New(dir, log)
+	if err != nil {
+		return nil, err
+	}
+	err = s.SetScope(func(string) (jobidentity.Identity, error) {
+		return testIdentity("owner/pinned", "refs/heads/main", "test"), nil
+	})
+	return s, err
+}
 
 // newTestServer returns a Server backed by a temp dir and an httptest server in
 // front of it so signed URLs (built from r.Host) resolve back to the same server.
 func newTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
-	s, err := New(t.TempDir(), nil)
+	s, err := newAuthorizedStore(t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -84,7 +101,7 @@ func saveEntry(t *testing.T, base, repo, key, version string, n int) {
 // the least-recently-used completed entries (lowest ID on a UsedAt tie) and never
 // the entry just stored.
 func TestEvictLRUOnSizeCap(t *testing.T) {
-	s, err := New(t.TempDir(), nil)
+	s, err := newAuthorizedStore(t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -129,7 +146,7 @@ func TestEvictLRUOnSizeCap(t *testing.T) {
 // TestEvictKeepsOversizeEntry checks a single blob larger than the cap is still
 // kept and served (we never evict the just-finalized entry down to nothing).
 func TestEvictKeepsOversizeEntry(t *testing.T) {
-	s, err := New(t.TempDir(), nil)
+	s, err := newAuthorizedStore(t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -275,18 +292,22 @@ func TestRestoreKeyPrefix(t *testing.T) {
 	}
 }
 
-// TestRepoIsolation checks entries never cross repository_id boundaries.
+// TestRepoIsolation uses host identity, never the client metadata.
 func TestRepoIsolation(t *testing.T) {
-	_, base := newTestServer(t)
-	const version, key = "vr", "shared-key"
-	create := twirp(t, base, "CreateCacheEntry", createReq{Metadata: meta("1"), Key: key, Version: version})
-	putBlob(t, create["signed_upload_url"].(string), []byte("repo1"))
-	twirp(t, base, "FinalizeCacheEntryUpload", finalizeReq{Metadata: meta("1"), Key: key, Version: version, SizeBytes: "5"})
-
-	// Same key+version but a different repo must miss.
-	get := twirp(t, base, "GetCacheEntryDownloadURL", getReq{Metadata: meta("2"), Key: key, Version: version})
-	if get["ok"] != false {
-		t.Fatalf("cross-repo leak: %v", get)
+	s, err := newAuthorizedStore(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	saveEntry(t, ts.URL, "ignored", "shared-key", "v", 5)
+	// Replace identity only between requests; configuration is immutable in production.
+	s.lookup = func(string) (jobidentity.Identity, error) {
+		return testIdentity("owner/other", "refs/heads/main", "other"), nil
+	}
+	got := twirp(t, ts.URL, "GetCacheEntryDownloadURL", getReq{Metadata: meta("owner/pinned"), Key: "shared-key", RestoreKeys: []string{""}, Version: "v"})
+	if got["ok"] != false {
+		t.Fatalf("cross-repo leak: %v", got)
 	}
 }
 
@@ -332,7 +353,7 @@ func TestSigRequired(t *testing.T) {
 // TestPersistenceReload confirms the on-disk index survives a restart.
 func TestPersistenceReload(t *testing.T) {
 	dir := t.TempDir()
-	s1, err := New(dir, nil)
+	s1, err := newAuthorizedStore(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +364,7 @@ func TestPersistenceReload(t *testing.T) {
 	ts1.Close()
 
 	// Reopen the same dir: the finalized entry should still resolve.
-	s2, err := New(dir, nil)
+	s2, err := newAuthorizedStore(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +379,7 @@ func TestPersistenceReload(t *testing.T) {
 // TestStatsAndMetrics checks the /stats JSON and /metrics text reflect saves,
 // hits and misses.
 func TestStatsAndMetrics(t *testing.T) {
-	s, err := New(t.TempDir(), nil)
+	s, err := newAuthorizedStore(t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -418,7 +439,7 @@ func TestBlockIDEncoding(t *testing.T) {
 // loose mode would let any local account read and poison the cache.
 func TestStorePermsAreTight(t *testing.T) {
 	dir := t.TempDir()
-	s, err := New(dir, nil)
+	s, err := newAuthorizedStore(dir, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -453,7 +474,7 @@ func TestStorePermsAreTight(t *testing.T) {
 // so one job cannot fill the host disk with an unbounded upload.
 func TestMaxEntrySizeRejectsSingleShot(t *testing.T) {
 	dir := t.TempDir()
-	s, err := New(dir, nil)
+	s, err := newAuthorizedStore(dir, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -483,7 +504,7 @@ func TestMaxEntrySizeRejectsSingleShot(t *testing.T) {
 // exceeds the cap are refused and the live blob path is never created.
 func TestMaxEntrySizeRejectsBlockList(t *testing.T) {
 	dir := t.TempDir()
-	s, err := New(dir, nil)
+	s, err := newAuthorizedStore(dir, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -589,11 +610,10 @@ func TestConcurrentReservationIsRejected(t *testing.T) {
 // blank restore key cannot see or match the victim's entry, because the server
 // forces every request into the single pinned tenant.
 func TestRepositoryPinIgnoresClientMetadata(t *testing.T) {
-	s, err := New(t.TempDir(), nil)
+	s, err := newAuthorizedStore(t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	s.SetRepository("owner/pinned")
 	ts := httptest.NewServer(s)
 	t.Cleanup(ts.Close)
 	base := ts.URL

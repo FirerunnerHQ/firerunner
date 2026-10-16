@@ -1,0 +1,32 @@
+[Unit]
+Description=firerunner host-authenticated cache
+After=network-online.target firerunner.service
+
+[Service]
+Type=simple
+User=firerunner-cache
+Group=firerunner-cache
+# Non-secret values: FR_CACHE_JOBS_DIR and FR_CACHE_OWNER_UID (daemon UID).
+# The daemon must create this directory before starting this service.
+EnvironmentFile=/etc/firerunner/cache.env
+ExecStart=/usr/local/bin/firerunner cache-server --addr 0.0.0.0:8099 --dir /var/lib/firerunner-cache --jobs-dir ${FR_CACHE_JOBS_DIR} --jobs-owner-uid ${FR_CACHE_OWNER_UID}
+Restart=on-failure
+RestartSec=5
+StateDirectory=firerunner-cache
+StateDirectoryMode=0700
+# Never share the daemon's RuntimeDirectory ownership/lifecycle.
+ReadOnlyPaths=/run
+InaccessiblePaths=/etc/firerunner
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

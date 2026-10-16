@@ -462,8 +462,8 @@ Twirp/JSON RPC to the service at `ACTIONS_RESULTS_URL`
 (`CreateCacheEntry` → `FinalizeCacheEntryUpload` → `GetCacheEntryDownloadURL`),
 then streams the `tar+zstd` archive to/from a signed blob URL the RPC returns
 (never through the RPC itself). Entries are keyed by `key`+`version`, namespaced
-per repository, immutable, and restored by exact key first then `restore-keys`
-as prefixes.
+per repository and ref, immutable, and restored within each allowed ref by
+exact key, key prefix, then ordered `restore-keys`.
 
 **Our server.** `firerunner cache-server` is a small, dependency-free
 implementation of exactly that protocol, backed by a directory on disk:
@@ -475,9 +475,9 @@ firerunner cache-server --dir /var/lib/firerunner/cache
 It implements the three Twirp methods plus the Azure block-blob upload
 (single-shot and staged `comp=block`/`comp=blocklist`) and ranged downloads,
 tags each blob URL with a per-entry token, and persists an index so caches
-survive restarts. It performs **no authentication** and cannot cryptographically
-isolate repositories — run one per repository and pin it with `--repository`;
-see the security model below before deploying it.
+survive restarts. Host-owned job records authorize each connection by its guest
+source address, repository and ref. One server supports all repositories served
+by its daemon, with the namespace derived exclusively from the job record.
 
 It binds `127.0.0.1:8099` by default. Because each microVM slot reaches the host
 on its own per-slot gateway IP (`172.16.<slot>.1`), serving guests means binding
@@ -507,9 +507,10 @@ runner overwrites `ACTIONS_RESULTS_URL` with the value from its per-job message:
    firerunner publishes the port to each microVM via MMDS; the guest boot script
    builds `ACTIONS_RESULTS_URL` from its own default gateway (the host's per-slot
    tap IP) and this port, so the URL always points back at the host. For a
-   cache-server that is *not* on the host gateway, use `--cache-url
-   http://host:8099` (env `FR_CACHE_URL`) instead, and add its host to the
-   egress allowlist.
+   different address on the same host, use `--cache-url http://host:8099`
+   (env `FR_CACHE_URL`). Ref authorization requires the original guest source
+   address and the same host-owned job directory; a remote cache behind SNAT
+   or a reverse proxy is **not supported** by this identity scheme.
 2. **A cache-redirect golden** — build the rootfs with
    `build-ubuntu-rootfs.sh --cache-redirect`. This renames the
    `ACTIONS_RESULTS_URL` string inside the runner agent so GitHub's URL lands in
@@ -526,12 +527,13 @@ nothing, so `actions/cache` has no endpoint. Jobs still run, just with no cache.
 # 1. build a cache-redirect golden (pair it with a --toolcache drive as usual):
 sudo images/build-ubuntu-rootfs.sh --toolset minimal --cache-redirect \
   --out /var/lib/firerunner/ubuntu-rootfs-minimal.ext4
-# 2. run the cache-server bound to the guest-facing address, then point
-#    firerunner at it (0.0.0.0 serves every per-slot gateway; keep it firewalled
-#    off any LAN/WAN interface):
-firerunner cache-server --addr 0.0.0.0:8099 --repository owner/name \
-  --dir /var/lib/firerunner/cache &
+# 2. configure/start the daemon first, then the separate cache service described
+#    below. Its guest-facing listener must be firewalled off LAN/WAN interfaces.
 firerunner ... --golden /var/lib/firerunner/ubuntu-rootfs-minimal.ext4 --cache-port 8099
+# In another shell, after the jobs directory exists (use the daemon UID):
+sudo -u firerunner-cache firerunner cache-server --addr 0.0.0.0:8099 \
+  --dir /var/lib/firerunner-cache --jobs-dir /run/firerunner/jobs \
+  --jobs-owner-uid "$(id -u firerunner)"
 ```
 
 `status` shows the resolved cache configuration and `doctor` probes the
@@ -583,31 +585,124 @@ exec`. The shim acts only when the variable is set, only for
 `create`, and only when the caller is `Runner.Worker`; a job's own `docker`
 commands pass through untouched, and on a non-redirect golden it is inert.
 
-**Security model.** This server performs **no authentication** and cannot
-cryptographically isolate repositories: the `ACTIONS_RUNTIME_TOKEN` a runner
-presents is signed by an internal GitHub key with no public JWKS, so a
-self-hosted server can neither verify it nor trust the `repository_id` a guest
-supplies (the `@actions/cache` toolkit does not even send it). Without
-`--repository`, all entries share **one global namespace**: any caller can read
-another entry with a blank restore key (`restore-keys: ['']` prefix-matches
-everything), and the per-entry blob token is the **same for download and
-upload**, so anyone who can read an entry can also overwrite it.
+**Security model.** The daemon receives `JobStarted` through GitHub's scale-set
+control plane and resolves the run and repository through the authenticated
+REST API. The guest's `ACTIONS_RUNTIME_TOKEN`, metadata, `Authorization`, and
+`X-Forwarded-For` headers do not grant local cache authority. One cache-server
+serves multiple repositories, using only the repository from a resolved record.
+There is no global repository/default-ref override or anonymous fallback.
 
-Because per-repository isolation cannot be authenticated, enforce it
-structurally by running **one cache-server per repository** and pinning it:
+- A branch job writes only to its branch ref. A PR (including a fork PR) writes
+  only to `refs/pull/<number>/merge`. Restore exhausts that ref's exact/prefix
+  matches before its PR base and then the default branch. An own-ref prefix
+  beats a default-ref exact hit. Sibling PRs and branches cannot read each
+  other's entries, including with a blank restore key.
+- Reservations belong to the creating job and VM generation. Uploads, finalize,
+  GET and HEAD all check authority; a signed URL alone is insufficient. VM exit
+  revokes the record before the slot is reused, late API responses cannot grant
+  a new occupant the old rights, and a failed revocation quarantines the slot.
+  TCP connections also bind to their initial VM generation: an old keep-alive
+  or delayed request body cannot acquire the next job's scope. If embedding the
+  handler, install `Server.ConnectionContext` as `http.Server.ConnContext`
+  (the CLI does this automatically).
+- The daemon renews records every 30 seconds with a 90-second lease. Atomic
+  replacement prevents partial reads; the cache server rereads each request.
+  Startup clears stale records under an exclusive directory lock. A daemon
+  crash can leave the old VM authorized until lease expiry; systemd's cgroup
+  cleanup is still required to reap orphaned VMs. Expired records never write.
+- Missing, pending, invalid or expired identities cannot read or write. The
+  authenticated repository/run/job is published at `JobStarted` before REST
+  resolution, but grants no rights until resolution succeeds. Default-only
+  reads require a resolved identity for that repository. A failed lookup is a
+  cache miss/denied save, never a job failure. The first lookup failure per
+  address is logged (bounded to 4096 outstanding addresses); successful lookup
+  resets it. `/stats` exposes `identity_denied` and `/metrics` exposes
+  `firerunner_cache_identity_denied_total`. Resolution failures and timeouts are
+  logged by the daemon; after three attempts/30 seconds they stay denied for
+  that job. Guest HTTP never triggers privileged REST retries.
+- REST `pull_requests` can be empty: the resolver checks commit-associated PRs
+  and requires a unique match of head/base repository and head branch. A later
+  push to a branch or PR does not invalidate earlier queued runs or reruns.
+  PR base reads require the run association and current PR to agree on the base.
+  Retargeted PRs, missing run base metadata and commit-association fallback get
+  only PR-own and default reads; the current PR cannot grant a new base scope.
+  API routing supports GitHub.com, Enterprise Cloud (`*.ghe.com`) and GHES,
+  including the scaleset client's `GITHUB_ACTIONS_FORCE_GHES` override.
+  Branch writes require an existing branch, no same-named tag, and proof that
+  the run's commit belongs to that branch: run `head_branch` is a bare name, so
+  a tag deleted after its run would otherwise pass as the branch. A `push` run
+  needs a repository-activity record (push, force push, PR or merge-queue merge,
+  branch creation) updating `refs/heads/<branch>` to the run's SHA within the
+  last month, searched up to 1,000 records. Dispatch and schedule runs, and GHES
+  without the activity endpoint, need the commit in the branch's current
+  history (`compare`, skipped when the branch still points at it). An unproven
+  run keeps default-only reads and gets no write. Tag runs,
+  ambiguous PR associations and API errors get no write access. `pull_request_target`,
+  `workflow_run`, `issue_comment` and other unrecognized events get resolved
+  default-only reads. `JobWorkflowRef` is deliberately not a trigger ref: even
+  same-repository reusable workflows can point to another branch. This does not
+  implement GitHub `cache-mode` overrides from guest environment variables.
+- Pass the same directory to the daemon (`--cache-jobs-dir`, `FR_CACHE_JOBS_DIR`,
+  default `/run/firerunner/jobs`) and cache-server (`--jobs-dir`). Use daemon-owned
+  **0750 directories and 0640 records**, with a dedicated read-only group. The
+  writer preserves the directory's group on atomic replacement. No group/other
+  writes or other-user access is accepted; 0700/0600 also works for same-UID
+  tests. Run the cache server as its own user and set `--jobs-owner-uid` to the
+  daemon UID (default: current UID). Wrong ownership or unreadable directories
+  fail startup; records are checked again on each request. Never mount the
+  directory into guests. Each daemon needs its own directory; all its tiers
+  share it. The jailer template uses `/run/firerunner-<instance>/jobs`.
+- Cache traffic must reach the server directly with its guest source IP intact.
+  The firewall binds each tap (or host-veth in netns mode) to its exact guest
+  address **before** established-connection and cache-port accepts, in open and
+  allowlist modes. Keep the listening port off LAN/WAN interfaces; local host
+  processes and the host administrator remain trusted.
+- Default/base caches are intentionally readable by fork PRs: **do not store
+  secrets in them**. Code authorized to write a trusted branch can still poison
+  that branch's cache. This is ref isolation, not content authentication.
 
-- Pass **`--repository owner/name`**. The server then ignores the
-  unauthenticated client `repository_id` and forces every entry into that single
-  tenant, so a blank or forged `repository_id` cannot create or match another
-  repo's entries. This is the enforceable form of "one server per repo"; without
-  it the server logs a warning at startup.
-- Keep the listen address reachable **only from its own microVMs**. The default
-  `--addr 127.0.0.1:8099` is loopback-only; to serve guests bind the host's
-  guest-facing gateway IP (or `--addr 0.0.0.0:8099`) and firewall it so no
-  LAN/WAN client can reach it.
-- Assume any job that can reach it can read and overwrite every entry within its
-  tenant (a fork-PR job can poison a cache a later trusted job restores).
-- The artifact forwarder is not a general proxy: it relays exactly the five
+**Upgrade/migration.** Entries lacking `ref` cannot be attributed and are never
+restored, finalized, or accessed through old blob URLs. They are not relabeled
+as default-branch entries. The loader retains their IDs and size accounting to
+avoid ID reuse; normal eviction can reclaim them. Prefer a new empty `--dir`
+on upgrade, and remove the old directory separately once no old server uses it.
+Stop the old cache server first to close its unauthenticated access, upgrade and
+restart the daemon/firewall, then verify records appear for active VMs before
+starting the new cache server on a fresh `--dir`. Plan for the daemon's graceful
+drain to take up to the longest job. Caches may miss during this interval. Remove
+old `--repository` and `--default-ref` flags; they are no longer accepted.
+The server has no legacy unauthenticated-write mode.
+
+For separate service users, create the `firerunner-cache` system group and user,
+then add a daemon unit drop-in with `Group=firerunner-cache` and
+`RuntimeDirectoryMode=0750`, and `UMask=0027` (also for a jailer instance). Keep App keys and any
+secret environment files **0600**, owned by the daemon or root. Set the cache
+service's `/etc/firerunner/cache.env` to non-secret values:
+
+```ini
+FR_CACHE_JOBS_DIR=/run/firerunner/jobs
+FR_CACHE_OWNER_UID=<numeric UID from id -u firerunner; 0 for the root jailer daemon>
+```
+
+Install [`deploy/firerunner-cache.service`](deploy/firerunner-cache.service),
+which has its own user/storage, no capabilities, and read-only `/run`. Only the
+daemon owns `RuntimeDirectory=firerunner`; do not repeat it in the cache unit,
+or stopping either unit could remove live records. The cache unit starts after
+`firerunner.service`; adjust `After=` for a jailer instance. Configure the guest
+firewall before exposing its listener.
+
+The cache-enabled daemon's GitHub App additionally needs repository **Actions:
+read**, **Contents: read** (ref, activity and compare checks), and **Pull requests: read**
+(PR association), plus its existing runner-registration permissions. Install
+it on every repository served. The resolver uses a separate REST client and
+short-lived installation tokens restricted to the requested repository and
+Actions/Pull requests/Metadata/Contents read permissions. Contents read remains
+necessary for branch/tag probes and for the activity and compare endpoints. Concurrent matrix jobs share one resolution;
+successful run policies are cached for two minutes (bounded to 1024 runs), while
+job IDs, generations and record leases remain per job. Credentials never enter
+job records.
+
+**Artifact forwarding.** The artifact forwarder is not a general proxy: it relays exactly the five
   `ArtifactService` methods the toolkit calls (anything else, including an
   encoded dot-segment aimed at another service, is refused before forwarding),
   only via `POST`, only to the single operator-configured

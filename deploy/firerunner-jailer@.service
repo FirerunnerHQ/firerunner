@@ -24,6 +24,9 @@ EnvironmentFile=/etc/firerunner/%i.env
 # FR_WORKDIR/FR_LOG_DIR must match these paths.
 Environment=FR_WORKDIR=/var/tmp/firerunner-%i
 Environment=FR_LOG_DIR=/var/log/firerunner-%i
+Environment=FR_CACHE_JOBS_DIR=/run/firerunner-%i/jobs
+RuntimeDirectory=firerunner-%i
+RuntimeDirectoryMode=0700
 # This unit is the jailer unit: force it on so a misconfigured env file cannot
 # silently fall back to the non-jailer (in-process, non-root) launch path.
 Environment=FR_JAILER=true

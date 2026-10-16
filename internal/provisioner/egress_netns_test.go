@@ -11,6 +11,7 @@
 package provisioner
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -35,13 +36,20 @@ type lab struct {
 
 func requireNetNS(t *testing.T) {
 	t.Helper()
+	missing := ""
 	if os.Geteuid() != 0 {
-		t.Skip("skipping: needs root to create network namespaces")
+		missing = "needs root to create network namespaces"
 	}
 	for _, bin := range []string{"ip", "nft", "bash", "timeout"} {
 		if _, err := exec.LookPath(bin); err != nil {
-			t.Skipf("skipping: %s not on PATH", bin)
+			missing = bin + " not on PATH"
 		}
+	}
+	if missing != "" {
+		if os.Getenv("FR_REQUIRE_NETNS") == "1" {
+			t.Fatal(missing)
+		}
+		t.Skip(missing)
 	}
 }
 
@@ -181,7 +189,7 @@ func TestEgressNetNSOpen(t *testing.T) {
 	requireNetNS(t)
 	l := newLab(t)
 	l.load(t, "guest-dns.nft", guestDNAT)
-	l.load(t, "firerunner.nft", buildNFTRuleset(egressRuleset{
+	l.load(t, "firerunner.nft", mustNFTRuleset(t, egressRuleset{
 		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
 		VMCidr: labCIDR, CachePort: labCache, Open: true,
 	}))
@@ -197,7 +205,7 @@ func TestEgressNetNSOpen(t *testing.T) {
 func TestEgressNetNSAllowlist(t *testing.T) {
 	requireNetNS(t)
 	l := newLab(t)
-	l.load(t, "firerunner.nft", buildNFTRuleset(egressRuleset{
+	l.load(t, "firerunner.nft", mustNFTRuleset(t, egressRuleset{
 		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
 		VMCidr: labCIDR, CachePort: labCache,
 		Allowed:    []string{"1.0.0.0/24"},
@@ -212,4 +220,88 @@ func TestEgressNetNSAllowlist(t *testing.T) {
 		// is on the LAN, and only on 53.
 		{"configured LAN resolver", "192.168.4.10", 53, true},
 	}, guestBoundaries...))
+}
+
+// sourceProbe sends a TCP SYN with an explicit source. We assert the nft counter
+// rather than a connection timeout: a spoofed return route or rp_filter could
+// otherwise make a broken firewall look correct. No packet leaves the lab.
+func (l lab) sourceProbe(t *testing.T, source, destination string) {
+	t.Helper()
+	const script = `import socket,struct,sys
+src,dst=sys.argv[1:]
+def checksum(b):
+ s=sum(struct.unpack('!%dH'%(len(b)//2),b));s=(s>>16)+(s&65535);s+=(s>>16);return (~s)&65535
+tcp=struct.pack('!HHLLBBHHH',42345,8099,1,0,80,2,65535,0,0)
+pseudo=socket.inet_aton(src)+socket.inet_aton(dst)+struct.pack('!BBH',0,6,len(tcp))
+tcp=tcp[:16]+struct.pack('!H',checksum(pseudo+tcp))+tcp[18:]
+ip=struct.pack('!BBHHHBBH4s4s',69,0,40,1,0,64,6,0,socket.inet_aton(src),socket.inet_aton(dst))
+s=socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_RAW)
+s.sendto(ip+tcp,(dst,0))
+`
+	sh(t, l.in(l.guest0, "python3", "-c", script, source, destination)...)
+}
+func (l lab) spoofCount(t *testing.T) uint64 {
+	t.Helper()
+	out, err := exec.Command("ip", "netns", "exec", l.router, "nft", "-j", "list", "counter", "ip", "fr_test", "guest_spoof_drop").CombinedOutput()
+	if err != nil {
+		t.Fatalf("counter: %v %s", err, out)
+	}
+	var doc struct {
+		NFTables []struct {
+			Counter *struct {
+				Packets uint64 `json:"packets"`
+			} `json:"counter"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range doc.NFTables {
+		if entry.Counter != nil {
+			return entry.Counter.Packets
+		}
+	}
+	t.Fatalf("missing spoof counter: %s", out)
+	return 0
+}
+
+func TestEgressNetNSSourceSpoofing(t *testing.T) {
+	requireNetNS(t)
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Fatal("python3 required for packet injection")
+	}
+	for _, veth := range []bool{false, true} {
+		for _, open := range []bool{false, true} {
+			t.Run(fmt.Sprintf("veth=%t/open=%t", veth, open), func(t *testing.T) {
+				l := newLab(t)
+				iface := "fk0"
+				if veth {
+					// The host's policy observes the netns host-veth, carrying the original
+					// guest source. Rename the lab ingress to exercise that exact binding.
+					sh(t, l.in(l.router, "ip", "link", "set", "fk0", "down")...)
+					sh(t, l.in(l.router, "ip", "link", "set", "fk0", "name", "fkv0h")...)
+					sh(t, l.in(l.router, "ip", "link", "set", "fkv0h", "up")...)
+					iface = "fkv0h"
+				}
+				sh(t, l.in(l.router, "sysctl", "-q", "-w", "net.ipv4.conf.all.rp_filter=0", "net.ipv4.conf."+iface+".rp_filter=0")...)
+				cfg := egressRuleset{Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0", VMCidr: labCIDR, CachePort: labCache, MaxVMs: 2, NetNS: veth, Open: open, Allowed: []string{"1.0.0.0/24"}}
+				for refresh := 0; refresh < 2; refresh++ {
+					l.load(t, "firerunner.nft", mustNFTRuleset(t, cfg))
+					if !l.reachable(t, l.guest0, "172.19.0.1", labCache) {
+						t.Fatal("legitimate cache connection blocked")
+					}
+					if got := l.spoofCount(t); got != 0 {
+						t.Fatalf("legitimate source counted: %d", got)
+					}
+					for _, destination := range []string{"172.19.0.1", "1.0.0.1"} {
+						before := l.spoofCount(t)
+						l.sourceProbe(t, "172.19.1.2", destination)
+						if after := l.spoofCount(t); after <= before {
+							t.Fatalf("spoof on %s to %s escaped source check (%d -> %d)", iface, destination, before, after)
+						}
+					}
+				}
+			})
+		}
+	}
 }

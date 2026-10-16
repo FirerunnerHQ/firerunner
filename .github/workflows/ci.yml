@@ -43,8 +43,31 @@ jobs:
           check-latest: true
       - name: Install nftables
         run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+      - name: Identity records readable but not writable by a separate UID
+        run: |
+          go test -c -o /tmp/fr-identity.test ./internal/jobidentity
+          sudo /tmp/fr-identity.test -test.run '^TestReaderSeparateUID$' -test.v
       - name: Egress firewall in network namespaces
-        run: make netns-test
+        run: FR_REQUIRE_NETNS=1 make netns-test
+
+  cache-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: Build cache server
+        run: go build -o /tmp/firerunner-cache-test ./cmd/firerunner
+      - name: Install pinned cache toolkit
+        run: npm ci --prefix test/cache-protocol --ignore-scripts
+      - name: Real toolkit archive save and restore across ref scopes
+        env:
+          FIRERUNNER_BINARY: /tmp/firerunner-cache-test
+        run: npm test --prefix test/cache-protocol
 
   # End-to-end boot of a real Firecracker microVM. Requires a KVM-capable
   # self-hosted runner; runs only when manually dispatched so it never blocks PRs.

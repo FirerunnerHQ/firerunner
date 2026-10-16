@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -66,7 +67,7 @@ func TestFetchMetaCIDRsHTTPError(t *testing.T) {
 // TestBuildNFTRulesetCustomTable asserts a second instance can own an isolated
 // nft table so the two rulesets never clobber each other.
 func TestBuildNFTRulesetCustomTable(t *testing.T) {
-	out := buildNFTRuleset(egressRuleset{
+	out := mustNFTRuleset(t, egressRuleset{
 		Table:    "firerunner_node",
 		ExtIface: "enp2s0",
 		VMCidr:   "172.17.0.0/16",
@@ -96,7 +97,7 @@ func TestBuildNFTRulesetAllowlist(t *testing.T) {
 		AllowDNS:   true,
 		AllowNTP:   true,
 	}
-	out := buildNFTRuleset(rs)
+	out := mustNFTRuleset(t, rs)
 
 	// Atomic table-replace idiom.
 	for _, want := range []string{
@@ -140,7 +141,7 @@ func TestBuildNFTRulesetAllowlist(t *testing.T) {
 }
 
 func TestBuildNFTRulesetOpen(t *testing.T) {
-	out := buildNFTRuleset(egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Open: true})
+	out := mustNFTRuleset(t, egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Open: true})
 	// Open mode has no allowlist, but must still block guest-to-guest traffic.
 	if strings.Contains(out, "@allowed") {
 		t.Errorf("open mode must not have an allowlist:\n%s", out)
@@ -158,7 +159,7 @@ func TestBuildNFTRulesetOpen(t *testing.T) {
 }
 
 func TestBuildNFTRulesetNoDNSNoNTP(t *testing.T) {
-	out := buildNFTRuleset(egressRuleset{
+	out := mustNFTRuleset(t, egressRuleset{
 		ExtIface: "eth0",
 		VMCidr:   vmCIDR,
 		Allowed:  []string{"140.82.112.0/20"},
@@ -179,7 +180,7 @@ func TestBuildNFTRulesetNoDNSNoNTP(t *testing.T) {
 // keyed anti-spoof on both input and forward, and an ip6 drop table. All are
 // keyed on the guest interface prefix so the host's own traffic is untouched.
 func TestBuildNFTRulesetHostHardening(t *testing.T) {
-	out := buildNFTRuleset(egressRuleset{
+	out := mustNFTRuleset(t, egressRuleset{
 		ExtIface:    "eth0",
 		IfacePrefix: "fr",
 		VMCidr:      vmCIDR,
@@ -214,7 +215,7 @@ func TestBuildNFTRulesetHostHardening(t *testing.T) {
 // known guest interface the interface-keyed rules must be omitted entirely
 // rather than globbing every host interface with "*".
 func TestBuildNFTRulesetNoIfacePrefix(t *testing.T) {
-	out := buildNFTRuleset(egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Allowed: []string{"140.82.112.0/20"}})
+	out := mustNFTRuleset(t, egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Allowed: []string{"140.82.112.0/20"}})
 	for _, absent := range []string{"chain input {", "table ip6", `iifname "*"`, "saddr != "} {
 		if strings.Contains(out, absent) {
 			t.Errorf("empty IfacePrefix must not emit %q:\n%s", absent, out)
@@ -225,7 +226,7 @@ func TestBuildNFTRulesetNoIfacePrefix(t *testing.T) {
 // TestBuildNFTRulesetOpenHardened confirms host protection applies even in open
 // egress mode: guests still must not reach host services except the cache.
 func TestBuildNFTRulesetOpenHardened(t *testing.T) {
-	out := buildNFTRuleset(egressRuleset{ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR, Open: true})
+	out := mustNFTRuleset(t, egressRuleset{ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR, Open: true})
 	if !strings.Contains(out, "chain input {") || !strings.Contains(out, `iifname "fr*" drop`) {
 		t.Errorf("open mode must still protect the host with an input drop:\n%s", out)
 	}
@@ -297,7 +298,7 @@ func TestBuildNFTRulesetGuestEgressGuards(t *testing.T) {
 		{"no iface prefix", egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Open: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out := buildNFTRuleset(tc.rs)
+			out := mustNFTRuleset(t, tc.rs)
 			if !strings.Contains(out, "set nonpublic {") || !strings.Contains(out, "flags interval") {
 				t.Fatalf("missing nonpublic set:\n%s", out)
 			}
@@ -318,7 +319,7 @@ func TestBuildNFTRulesetGuestEgressGuards(t *testing.T) {
 // which every real connection fails, so it dropped host-DNAT'd guest DNS (the
 // CI hosts redirect it to a resolver on a private veth).
 func TestBuildNFTRulesetDNATExemptionTestsTheBit(t *testing.T) {
-	out := buildNFTRuleset(egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Open: true})
+	out := mustNFTRuleset(t, egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Open: true})
 	if strings.Contains(out, "!= dnat") {
 		t.Fatalf("dnat exemption must test the bit (& dnat == 0), not compare the whole status:\n%s", out)
 	}
@@ -329,7 +330,7 @@ func TestBuildNFTRulesetDNATExemptionTestsTheBit(t *testing.T) {
 // guards, and the guards precede the allowlist accept so no allowlisted range
 // can open a mail port or a non-public address. NTP and the final drop follow.
 func TestBuildNFTRulesetAllowlistOrder(t *testing.T) {
-	rules := forwardChain(t, buildNFTRuleset(egressRuleset{
+	rules := forwardChain(t, mustNFTRuleset(t, egressRuleset{
 		ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR,
 		Allowed:    []string{"140.82.112.0/20"},
 		DNSServers: []string{"192.168.4.1"},
@@ -363,9 +364,10 @@ func TestBuildNFTRulesetAllowlistOrder(t *testing.T) {
 // TestBuildNFTRulesetOpenOrder pins open mode: anti-spoof, the guest-to-guest
 // drop, then the guards, with the chain's accept policy for everything else.
 func TestBuildNFTRulesetOpenOrder(t *testing.T) {
-	rules := forwardChain(t, buildNFTRuleset(egressRuleset{ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR, Open: true}))
+	rules := forwardChain(t, mustNFTRuleset(t, egressRuleset{ExtIface: "eth0", IfacePrefix: "fr", VMCidr: vmCIDR, Open: true}))
 	order := []string{
 		"ip saddr != " + vmCIDR + " drop",
+		"iifname . ip saddr != @guest_sources",
 		"ip daddr " + vmCIDR + " drop",
 		"@nonpublic",
 		"dport { 25, 465, 587, 2525 } drop",
@@ -380,5 +382,58 @@ func TestBuildNFTRulesetOpenOrder(t *testing.T) {
 	}
 	if len(rules) != len(order)+1 { // +1: the chain's type/hook/policy line
 		t.Errorf("open mode forward chain has unexpected rules:\n%s", strings.Join(rules, "\n"))
+	}
+}
+
+func TestGuestSourceBindings(t *testing.T) {
+	for _, netns := range []bool{false, true} {
+		for _, open := range []bool{false, true} {
+			t.Run(fmt.Sprintf("netns=%t/open=%t", netns, open), func(t *testing.T) {
+				cfg := egressRuleset{IfacePrefix: "custom", VMCidr: "172.19.0.0/16", ExtIface: "eth0", MaxVMs: 2, NetNS: netns, Open: open, CachePort: 8099}
+				rules := mustNFTRuleset(t, cfg)
+				for slot := 0; slot < 2; slot++ {
+					name := fmt.Sprintf("custom%d", slot)
+					if netns {
+						name = fmt.Sprintf("customv%dh", slot)
+					}
+					if !strings.Contains(rules, fmt.Sprintf("\"%s\" . 172.19.%d.2", name, slot)) {
+						t.Fatal("missing exact source binding")
+					}
+				}
+				if strings.Count(rules, "iifname . ip saddr != @guest_sources") != 2 {
+					t.Fatal("both input and forward need bindings")
+				}
+				if i := strings.Index(rules, "iifname . ip saddr != @guest_sources"); i < 0 || i > strings.Index(rules, "ct state established,related accept") {
+					t.Fatal("source check must precede established accept")
+				}
+				if mustNFTRuleset(t, cfg) != rules {
+					t.Fatal("refresh lost source bindings")
+				}
+			})
+		}
+	}
+}
+
+func mustNFTRuleset(t *testing.T, cfg egressRuleset) string {
+	t.Helper()
+	rules, err := buildNFTRuleset(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rules
+}
+func TestInvalidSourceBindingsFailBeforeRules(t *testing.T) {
+	for _, cfg := range []egressRuleset{
+		{IfacePrefix: "fr", VMCidr: "invalid"},
+		{IfacePrefix: "fr", VMCidr: "172.16.0.0/24"},
+		{IfacePrefix: "fr", VMCidr: "172.16.1.0/16"},
+		{IfacePrefix: "fr", VMCidr: "10.16.0.0/16"},
+		{IfacePrefix: "fr", VMCidr: "::/16"},
+		{IfacePrefix: "fr", VMCidr: vmCIDR, MaxVMs: 257},
+		{IfacePrefix: "fr", VMCidr: vmCIDR, MaxVMs: -1},
+	} {
+		if rules, err := buildNFTRuleset(cfg); err == nil || rules != "" {
+			t.Fatalf("invalid bindings emitted rules: %+v %v", cfg, err)
+		}
 	}
 }

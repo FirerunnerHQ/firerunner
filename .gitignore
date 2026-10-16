@@ -12,3 +12,6 @@
 cover.out
 *.out
 /egress-netns.test
+
+# Protocol test dependencies
+/test/cache-protocol/node_modules/

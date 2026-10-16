@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -48,7 +49,8 @@ type Config struct {
 	Tiers     []Tier
 	TiersPath string
 
-	Firecracker provisioner.FirecrackerConfig
+	CacheJobsDir string
+	Firecracker  provisioner.FirecrackerConfig
 
 	LogLevel  string
 	LogFormat string
@@ -167,8 +169,9 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&jailerCgroup, "jailer-cgroup", env("FR_JAILER_CGROUP", ""), "semicolon-separated cgroup v2 limits applied to each microVM via the jailer, each <file>=<value> (e.g. \"memory.max=2147483648;cpu.max=200000;pids.max=512\"); requires --jailer")
 	fs.BoolVar(&c.Firecracker.NetNS, "netns", er.boolean("FR_NETNS", false), "run each microVM in its own network namespace (tap lives in the netns, veth uplink to the host); strongest network isolation, requires --jailer")
 	fs.StringVar(&c.Firecracker.ToolCacheImage, "toolcache", env("FR_TOOLCACHE", ""), "path to a read-only ext4 image (labelled \"hostedtoolcache\", mirroring GitHub's tool-cache layout) attached to every microVM so setup-* actions hit a pre-seeded cache instead of downloading; opt-in accelerator, jobs fall back to downloading when unset")
+	fs.StringVar(&c.CacheJobsDir, "cache-jobs-dir", env("FR_CACHE_JOBS_DIR", "/run/firerunner/jobs"), "private job identity directory shared with the local cache server; unique per daemon")
 	fs.IntVar(&c.Firecracker.CachePort, "cache-port", er.int("FR_CACHE_PORT", 0), "TCP port of a firerunner cache-server reachable on each microVM's host gateway; when set, microVMs use it for actions/cache (dependency caching) instead of GitHub's hosted cache. Opt-in and off by default; the guest builds the URL from its default gateway and this port")
-	fs.StringVar(&c.Firecracker.CacheURL, "cache-url", env("FR_CACHE_URL", ""), "explicit base URL of a firerunner cache-server (e.g. http://cache.internal:8099); overrides --cache-port for deployments where the cache-server is not on the microVM's host gateway. Opt-in and off by default")
+	fs.StringVar(&c.Firecracker.CacheURL, "cache-url", env("FR_CACHE_URL", ""), "explicit base URL of a firerunner cache-server on this host (e.g. http://host:8099); overrides --cache-port. The server must share --cache-jobs-dir and see guest source IPs unchanged, so a remote server behind SNAT or a proxy is not supported. Opt-in and off by default")
 	fs.DurationVar(&c.Firecracker.MaxVMLifetime, "max-vm-lifetime", er.duration("FR_MAX_VM_LIFETIME", 6*time.Hour), "host-side backstop: kill a microVM still running after this long to reclaim its slot (a healthy VM self-destructs when its job ends, so this only fires on a stuck VM). Keep it larger than any real job; 0 disables it")
 	fs.DurationVar(&c.Firecracker.ConnectTimeout, "vm-connect-timeout", er.duration("FR_VM_CONNECT_TIMEOUT", 5*time.Minute), "kill a booted microVM whose runner has not registered with GitHub (console shows neither \"Listening for Jobs\" nor \"Running job:\") within this long, freeing its slot and backing off replenishment; catches VMs wedged by lost DNS/egress or a rejected JIT config that would otherwise hold a slot until --max-vm-lifetime. 0 disables it")
 
@@ -280,7 +283,7 @@ func (c *Config) validate() error {
 	case c.Firecracker.NetNS && !c.Firecracker.Jailer:
 		return fmt.Errorf("--netns requires --jailer")
 	case c.Firecracker.NetNS && c.Firecracker.CachePort != 0 && c.Firecracker.CacheURL == "":
-		return fmt.Errorf("--cache-port cannot be reached from inside --netns (the guest gateway lives in the namespace, not the host); use --cache-url with a routable address instead")
+		return fmt.Errorf("--cache-port cannot be reached from inside --netns (the guest gateway lives in the namespace, not the host); use --cache-url with a host address the guest reaches without SNAT instead")
 	}
 	if len(c.Tiers) > 0 {
 		if err := c.validateTiers(); err != nil {
@@ -317,6 +320,9 @@ func (c *Config) validate() error {
 	}
 	if c.Firecracker.ConnectTimeout != 0 && c.Firecracker.MaxVMLifetime != 0 && c.Firecracker.ConnectTimeout >= c.Firecracker.MaxVMLifetime {
 		return fmt.Errorf("--vm-connect-timeout %s must be shorter than --max-vm-lifetime %s", c.Firecracker.ConnectTimeout, c.Firecracker.MaxVMLifetime)
+	}
+	if (c.Firecracker.CachePort != 0 || c.Firecracker.CacheURL != "") && !filepath.IsAbs(c.CacheJobsDir) {
+		return fmt.Errorf("--cache-jobs-dir must be an absolute path")
 	}
 	if c.Firecracker.CacheURL != "" {
 		u, err := url.Parse(c.Firecracker.CacheURL)

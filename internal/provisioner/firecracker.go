@@ -26,6 +26,9 @@ import (
 // deliberately depends on nothing beyond the firecracker binary and the Linux
 // host tools (cp with reflink, ip, nft, sysctl) — no containerd, CNI or LVM.
 type FirecrackerConfig struct {
+	// Jobs binds VM addresses to host-observed jobs. Nil when local caching is off.
+	Jobs VMJobs
+
 	// Binary is the path to the firecracker executable.
 	Binary string
 	// KernelImage is the uncompressed guest kernel (vmlinux) path.
@@ -114,10 +117,10 @@ type FirecrackerConfig struct {
 	// Opt-in and off by default; jobs still pass without it (cache simply falls
 	// back to a miss / GitHub's cache when the golden is not cache-redirected).
 	CachePort int
-	// CacheURL, when set, is an explicit base URL of a cache-server (e.g.
-	// http://cache.internal:8099) used verbatim by the guest. It overrides
-	// CachePort for deployments where the cache-server is not on the microVM's
-	// host gateway. Opt-in and off by default.
+	// CacheURL, when set, is an explicit base URL of a cache-server on this
+	// host, used verbatim by the guest. It overrides CachePort. The server
+	// authorizes by guest source IP against this daemon's jobs directory, so it
+	// must not sit behind SNAT or a proxy. Opt-in and off by default.
 	CacheURL string
 
 	// MaxVMLifetime, when non-zero, is a host-side backstop on how long a single
@@ -153,6 +156,11 @@ type commandRunner func(ctx context.Context, name string, args ...string) error
 // output. It is a seam (like commandRunner) so host-state probes such as
 // `nft list chain` can be faked in tests.
 type commandOutputRunner func(ctx context.Context, name string, args ...string) (string, error)
+
+type VMJobs interface {
+	Register(runner, ip string) error
+	Release(runner string) error
+}
 
 // Firecracker is a Provisioner that talks to the Firecracker REST API directly
 // over its unix socket using only the standard library.
@@ -225,13 +233,28 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	if !ok {
 		return fmt.Errorf("no free network slot (max %d microVMs)", f.cfg.MaxVMs)
 	}
-	defer f.ipam.release(slot)
+
+	vnet := slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase)
+	registered := false
+	defer func() {
+		if registered {
+			if err := f.cfg.Jobs.Release(name); err != nil {
+				f.log.Error("cache identity revocation failed; quarantining slot", "slot", slot, "err", err)
+				return
+			}
+		}
+		f.ipam.release(slot)
+	}()
+	if f.cfg.Jobs != nil {
+		if err := f.cfg.Jobs.Register(name, vnet.guestIP); err != nil {
+			return fmt.Errorf("register VM identity: %w", err)
+		}
+		registered = true
+	}
 
 	if err := f.SetupNetwork(ctx); err != nil {
 		return fmt.Errorf("setup network: %w", err)
 	}
-	vnet := slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase)
-
 	if err := f.setupNet(ctx, vnet); err != nil {
 		return fmt.Errorf("setup network for %s: %w", vnet.tap, err)
 	}
@@ -396,6 +419,8 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 	}
 
 	rs := egressRuleset{
+		MaxVMs:      f.cfg.MaxVMs,
+		NetNS:       f.cfg.NetNS,
 		Table:       f.cfg.NFTTable,
 		IfacePrefix: f.cfg.TapPrefix,
 		ExtIface:    f.cfg.ExtIface,
@@ -414,6 +439,10 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 		rs.Allowed = cidrs
 	}
 
+	rules, err := buildNFTRuleset(rs)
+	if err != nil {
+		return err
+	}
 	if err := f.run(ctx, "sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
 		return err
 	}
@@ -422,7 +451,7 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 		return fmt.Errorf("mkdir work dir: %w", err)
 	}
 	path := filepath.Join(f.cfg.WorkDir, "firerunner.nft")
-	if err := os.WriteFile(path, []byte(buildNFTRuleset(rs)), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(rules), 0o600); err != nil {
 		return fmt.Errorf("write nft ruleset: %w", err)
 	}
 	if err := f.run(ctx, "nft", "-f", path); err != nil {
@@ -531,14 +560,15 @@ func cacheInputScript(tapPrefix string, port int) string {
 // ensureHostCacheInput lets microVMs reach the self-hosted cache-server on their
 // host gateway when the host's ip/filter INPUT policy defaults to drop (ufw,
 // hardened hosts). It is best-effort and idempotent, and a no-op unless a local
-// cache port is configured (a remote --cache-url is reached via egress, not the
-// host INPUT chain) and the INPUT chain actually drops by default. It first
+// cache port is configured and the INPUT chain actually drops by default. A
+// --cache-url-only deployment (same host, see CacheURL) is not opened here: the
+// operator must accept that address and port on INPUT. It first
 // sweeps any of this instance's cache rules left over from a previous, different
 // --cache-port so a port change never strands the guest or leaves the old port
 // open.
 func (f *Firecracker) ensureHostCacheInput(ctx context.Context) error {
 	if f.cfg.CachePort == 0 {
-		return nil // no local cache-server to reach, or a remote --cache-url is in use
+		return nil // no --cache-port; with --cache-url the operator must accept that address/port on INPUT
 	}
 	out, err := f.runOut(ctx, "nft", "-a", "list", "chain", "ip", "filter", "INPUT")
 	if err != nil {

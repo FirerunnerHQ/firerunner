@@ -40,25 +40,13 @@
 //
 // # Isolation and trust model
 //
-// This server performs NO authentication and cannot cryptographically isolate
-// repositories: a runner's ACTIONS_RUNTIME_TOKEN is signed by an internal GitHub
-// key with no public JWKS, so a self-hosted server can neither verify it nor
-// trust the repository_id a guest supplies (the real @actions/cache toolkit does
-// not even send it). Without SetRepository every entry shares one global
-// namespace: a caller can read another entry via a blank restore key
-// (restore_keys:[""] prefix-matches everything), and the per-entry blob token is
-// the SAME for upload and download, so anyone who can read an entry can also
-// overwrite it.
-//
-// Because per-repository isolation cannot be authenticated, enforce it
-// structurally: run ONE server per repository and pin it with SetRepository, so
-// the server ignores the unauthenticated client repository_id and forces every
-// entry into one tenant (a blank or forged repository_id can then neither create
-// nor match another repo's entries). Keep the listen address reachable only from
-// its own microVMs (do not expose it on any LAN/WAN NIC). Finalized entries are
-// immutable and uploads are size-bounded, but within a tenant any reachable job
-// can still read and overwrite entries. It remains a pure accelerator: every job
-// still passes with caching disabled. See the README security notes.
+// Cache authority comes from host-owned job records indexed by the connection's
+// source address. The daemon pins each guest interface to that address. Guests
+// cannot select their repository, write ref, or readable refs. Missing identities
+// cannot read or write any repository.
+// Every blob request also checks its scope; reservations belong to one VM/job.
+// Legacy entries without a ref are never served. See the README for deployment
+// requirements, including local routing without source NAT and directory access.
 package cacheserver
 
 import (
@@ -81,6 +69,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/solcreek/firerunner/internal/jobidentity"
 )
 
 const (
@@ -96,15 +86,20 @@ const (
 // to /upload/<ID>, and it becomes restorable once FinalizeCacheEntryUpload marks
 // it Complete.
 type Entry struct {
-	ID        uint64 `json:"id"`
-	Sig       string `json:"sig"`
-	RepoID    string `json:"repo_id"`
-	Key       string `json:"key"`
-	Version   string `json:"version"`
-	Size      int64  `json:"size"`
-	Complete  bool   `json:"complete"`
-	CreatedAt int64  `json:"created_at"`
-	UsedAt    int64  `json:"used_at"`
+	ioMu       sync.Mutex // serializes upload and finalize; never copied or persisted
+	Ref        string     `json:"ref"`
+	Generation string     `json:"generation"`
+	JobID      string     `json:"job_id"`
+	RunID      int64      `json:"run_id"`
+	ID         uint64     `json:"id"`
+	Sig        string     `json:"sig"`
+	RepoID     string     `json:"repo_id"`
+	Key        string     `json:"key"`
+	Version    string     `json:"version"`
+	Size       int64      `json:"size"`
+	Complete   bool       `json:"complete"`
+	CreatedAt  int64      `json:"created_at"`
+	UsedAt     int64      `json:"used_at"`
 }
 
 // Server is a disk-backed GitHub Actions cache (v2) server. It is safe for
@@ -114,13 +109,16 @@ type Server struct {
 	log *slog.Logger
 	mux *http.ServeMux
 
-	mu       sync.Mutex
-	entries  map[uint64]*Entry
-	nextID   uint64
-	maxSize  int64            // 0 = unlimited; total completed-blob bytes to keep
-	maxEntry int64            // 0 = unlimited; hard cap on a single entry's blob
-	staged   map[uint64]int64 // bytes written so far for a not-yet-finalized entry
-	repo     string           // "" = trust client repository_id; else pin every entry here
+	mu               sync.Mutex
+	entries          map[uint64]*Entry
+	nextID           uint64
+	maxSize          int64            // 0 = unlimited; total completed-blob bytes to keep
+	maxEntry         int64            // 0 = unlimited; hard cap on a single entry's blob
+	staged           map[uint64]int64 // bytes written so far for a not-yet-finalized entry
+	identityDenied   atomic.Uint64
+	identityMu       sync.Mutex
+	identityFailures map[string]bool
+	lookup           func(string) (jobidentity.Identity, error)
 
 	// counters (under mu) for observability via /stats and /metrics.
 	hits      uint64
@@ -140,6 +138,7 @@ type Server struct {
 // Stats is a point-in-time snapshot of the cache store, served by /stats and
 // /metrics and consumed by `firerunner status`.
 type Stats struct {
+	IdentityDenied uint64 `json:"identity_denied"`
 	Entries        int    `json:"entries"`         // completed entries currently stored
 	Bytes          int64  `json:"bytes"`           // total size of completed blobs
 	MaxBytes       int64  `json:"max_bytes"`       // configured cap (0 = unlimited)
@@ -157,7 +156,7 @@ func (s *Server) snapshot() Stats {
 	defer s.mu.Unlock()
 	st := Stats{
 		MaxBytes: s.maxSize, Hits: s.hits, Misses: s.misses, Saves: s.saves, Evictions: s.evictions,
-		ArtifactRPCs: s.artifactRPCs.Load(), ArtifactErrors: s.artifactErrors.Load(),
+		IdentityDenied: s.identityDenied.Load(), ArtifactRPCs: s.artifactRPCs.Load(), ArtifactErrors: s.artifactErrors.Load(),
 	}
 	for _, e := range s.entries {
 		if e.Complete {
@@ -193,21 +192,6 @@ func (s *Server) entryCap() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.maxEntry
-}
-
-// SetRepository pins every entry to a single tenant, ignoring the client-supplied
-// repository_id in the RPC metadata. The v2 cache toolkit never sends metadata
-// (so client repository_id is almost always blank) and never authenticates the
-// value even when it does, which collapses every cache into one global namespace
-// where a blank restore key leaks across repositories. Pinning is the enforceable
-// form of the "run one cache server per repository" model: with a fixed tenant a
-// forged or blank repository_id cannot create or match another repo's entries.
-// An empty value keeps the (documented, insecure) client-supplied behaviour. Call
-// before serving.
-func (s *Server) SetRepository(repo string) {
-	s.mu.Lock()
-	s.repo = repo
-	s.mu.Unlock()
 }
 
 // New opens (creating if needed) a cache store rooted at dir and returns a
@@ -253,7 +237,14 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 }
 
 // ServeHTTP makes Server an http.Handler.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Also bind at handler entry for in-process callers. Do this before reading
+	// the request body, which an old VM could deliberately delay across reuse.
+	if r.Context().Value(connectionGenerationKey{}) == nil {
+		r = r.WithContext(s.bindGeneration(r.Context(), r.RemoteAddr))
+	}
+	s.mux.ServeHTTP(w, r)
+}
 
 // StartJanitor runs a background loop that reclaims abandoned (reserved but
 // never finalized) entries until the returned stop function is called.
@@ -317,27 +308,10 @@ type getResp struct {
 	Message           string `json:"message,omitempty"`
 }
 
-// repoOf returns the tenant key for a request. When the server is pinned to a
-// single repository (SetRepository) that value always wins, so an unauthenticated
-// or forged client repository_id cannot cross tenants; otherwise the (insecure)
-// client-supplied value is used.
-func (s *Server) repoOf(m *cacheMetadata) string {
-	s.mu.Lock()
-	pinned := s.repo
-	s.mu.Unlock()
-	if pinned != "" {
-		return pinned
-	}
-	if m == nil {
-		return ""
-	}
-	return m.RepositoryID
-}
-
 // handleCreate reserves a new entry and returns an upload URL, or ok:false when
-// an entry with the same key+version already exists — completed (immutable) or a
+// an entry with the same repo+ref+key+version already exists — completed (immutable) or a
 // still-live reservation (another job is creating it). Keeping reservations
-// unique per key+version is what makes the finalize step unambiguous, matching
+// unique per repo+ref+key+version is what makes the finalize step unambiguous, matching
 // GitHub's "another job may be creating this cache".
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var req createReq
@@ -349,11 +323,16 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		twirpError(w, http.StatusBadRequest, "invalid_argument", "key and version are required")
 		return
 	}
-	repo := s.repoOf(req.Metadata)
+	identity := s.identity(r)
+	repo := identity.Repository
 	key := strings.ToLower(req.Key)
+	if identity.WriteRef == "" {
+		writeJSON(w, http.StatusOK, createResp{OK: false, Message: "job has no cache write scope"})
+		return
+	}
 
 	s.mu.Lock()
-	if e := s.findExact(repo, key, req.Version); e != nil {
+	if e := s.findExact(repo, identity.WriteRef, key, req.Version); e != nil {
 		if e.Complete {
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, createResp{OK: false, Message: "cache entry already exists"})
@@ -379,14 +358,18 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		delete(s.staged, e.ID)
 	}
 	e := &Entry{
-		ID:        s.nextID,
-		Sig:       newToken(),
-		RepoID:    repo,
-		Key:       key,
-		Version:   req.Version,
-		Size:      -1,
-		CreatedAt: time.Now().Unix(),
-		UsedAt:    time.Now().Unix(),
+		ID:         s.nextID,
+		Sig:        newToken(),
+		RepoID:     repo,
+		Ref:        identity.WriteRef,
+		Generation: identity.Generation,
+		JobID:      identity.JobID,
+		RunID:      identity.RunID,
+		Key:        key,
+		Version:    req.Version,
+		Size:       -1,
+		CreatedAt:  time.Now().Unix(),
+		UsedAt:     time.Now().Unix(),
 	}
 	s.nextID++
 	s.entries[e.ID] = e
@@ -411,14 +394,25 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 		twirpError(w, http.StatusBadRequest, "malformed", err.Error())
 		return
 	}
-	repo := s.repoOf(req.Metadata)
+	identity := s.identity(r)
+	repo := identity.Repository
 	key := strings.ToLower(req.Key)
 
 	s.mu.Lock()
+	e := s.findReserved(repo, identity.WriteRef, key, req.Version)
+	s.mu.Unlock()
+	if e == nil || !owns(identity, e) {
+		writeJSON(w, http.StatusOK, finalizeResp{OK: false, Message: "no owned cache reservation"})
+		return
+	}
+	e.ioMu.Lock()
+	defer e.ioMu.Unlock()
+	// The upload may have held the lock while the job exited. Recheck authority.
+	identity = s.identity(r)
+	s.mu.Lock()
 	defer s.mu.Unlock()
-	e := s.findReserved(repo, key, req.Version)
-	if e == nil {
-		writeJSON(w, http.StatusOK, finalizeResp{OK: false, Message: "no reserved cache entry to finalize"})
+	if s.entries[e.ID] != e || e.Complete || !owns(identity, e) {
+		writeJSON(w, http.StatusOK, finalizeResp{OK: false, Message: "cache reservation expired"})
 		return
 	}
 	fi, err := os.Stat(s.blobPath(e.ID))
@@ -444,19 +438,20 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, finalizeResp{OK: true, EntryID: strconv.FormatUint(e.ID, 10)})
 }
 
-// handleGetDownloadURL resolves the best matching entry (exact key first, then
-// restore-key prefixes in order, newest wins) and returns a download URL, or
-// ok:false on a miss.
+// handleGetDownloadURL resolves the best matching entry across the caller's
+// read refs in order (own, PR base, default; see match) and returns a download
+// URL, or ok:false on a miss.
 func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	var req getReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		twirpError(w, http.StatusBadRequest, "malformed", err.Error())
 		return
 	}
-	repo := s.repoOf(req.Metadata)
+	identity := s.identity(r)
+	repo := identity.Repository
 
 	s.mu.Lock()
-	e := s.match(repo, strings.ToLower(req.Key), req.RestoreKeys, req.Version)
+	e := s.match(repo, identity.ReadRefs, strings.ToLower(req.Key), req.RestoreKeys, req.Version)
 	if e != nil {
 		e.UsedAt = time.Now().Unix()
 		s.hits++
@@ -484,6 +479,12 @@ func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	e, ok := s.authEntry(w, r)
 	if !ok {
+		return
+	}
+	e.ioMu.Lock()
+	defer e.ioMu.Unlock()
+	if !owns(s.identity(r), e) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	// Entries are immutable once finalized: the blob token is handed out for both
@@ -675,6 +676,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	st := s.snapshot()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintf(w, "# HELP firerunner_cache_identity_denied_total Cache operations denied for unavailable identity.\n# TYPE firerunner_cache_identity_denied_total counter\nfirerunner_cache_identity_denied_total %d\n", st.IdentityDenied)
 	fmt.Fprintf(w, "# HELP firerunner_cache_entries Completed cache entries stored.\n")
 	fmt.Fprintf(w, "# TYPE firerunner_cache_entries gauge\nfirerunner_cache_entries %d\n", st.Entries)
 	fmt.Fprintf(w, "# HELP firerunner_cache_bytes Total size of completed cache blobs.\n")
@@ -713,15 +715,28 @@ func (s *Server) authEntry(w http.ResponseWriter, r *http.Request) (*Entry, bool
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return nil, false
 	}
+	identity := s.identity(r)
+	s.mu.Lock()
+	complete := e.Complete
+	s.mu.Unlock()
+	if r.Method == http.MethodPut {
+		if !owns(identity, e) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return nil, false
+		}
+	} else if !complete || e.RepoID != identity.Repository || !identity.CanRead(e.Ref) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return nil, false
+	}
 	return e, true
 }
 
 // --- matching (caller holds s.mu) ---
 
-func (s *Server) findExact(repo, key, version string) *Entry {
+func (s *Server) findExact(repo, ref, key, version string) *Entry {
 	var best *Entry
 	for _, e := range s.entries {
-		if e.RepoID == repo && e.Key == key && e.Version == version {
+		if e.RepoID == repo && ref != "" && e.Ref == ref && e.Key == key && e.Version == version {
 			if newer(best, e) {
 				best = e
 			}
@@ -730,10 +745,10 @@ func (s *Server) findExact(repo, key, version string) *Entry {
 	return best
 }
 
-func (s *Server) findReserved(repo, key, version string) *Entry {
+func (s *Server) findReserved(repo, ref, key, version string) *Entry {
 	var best *Entry
 	for _, e := range s.entries {
-		if !e.Complete && e.RepoID == repo && e.Key == key && e.Version == version {
+		if !e.Complete && e.RepoID == repo && ref != "" && e.Ref == ref && e.Key == key && e.Version == version {
 			if newer(best, e) {
 				best = e
 			}
@@ -742,24 +757,35 @@ func (s *Server) findReserved(repo, key, version string) *Entry {
 	return best
 }
 
-// match implements the toolkit's restore semantics: an exact key hit wins;
-// otherwise each restore key is tried as a prefix in order, newest first.
-func (s *Server) match(repo, key string, restoreKeys []string, version string) *Entry {
-	if e := s.completeExact(repo, key, version); e != nil {
-		return e
-	}
-	for _, rk := range restoreKeys {
-		if e := s.completePrefix(repo, strings.ToLower(rk), version); e != nil {
+// match exhausts each scope before trying the next. Within a scope an exact
+// key beats its prefix; restore keys are tried in order, exact then prefix.
+func (s *Server) match(repo string, readRefs []string, key string, restoreKeys []string, version string) *Entry {
+	for _, ref := range readRefs {
+		if e := s.completeExact(repo, ref, key, version); e != nil {
 			return e
+		}
+		if key != "" {
+			if e := s.completePrefix(repo, ref, key, version); e != nil {
+				return e
+			}
+		}
+		for _, rk := range restoreKeys {
+			rk = strings.ToLower(rk)
+			if e := s.completeExact(repo, ref, rk, version); e != nil {
+				return e
+			}
+			if e := s.completePrefix(repo, ref, rk, version); e != nil {
+				return e
+			}
 		}
 	}
 	return nil
 }
 
-func (s *Server) completeExact(repo, key, version string) *Entry {
+func (s *Server) completeExact(repo, ref, key, version string) *Entry {
 	var best *Entry
 	for _, e := range s.entries {
-		if e.Complete && e.RepoID == repo && e.Version == version && e.Key == key {
+		if e.Complete && ref != "" && e.Ref == ref && e.RepoID == repo && e.Version == version && e.Key == key {
 			if newer(best, e) {
 				best = e
 			}
@@ -768,10 +794,10 @@ func (s *Server) completeExact(repo, key, version string) *Entry {
 	return best
 }
 
-func (s *Server) completePrefix(repo, prefix, version string) *Entry {
+func (s *Server) completePrefix(repo, ref, prefix, version string) *Entry {
 	var best *Entry
 	for _, e := range s.entries {
-		if e.Complete && e.RepoID == repo && e.Version == version && strings.HasPrefix(e.Key, prefix) {
+		if e.Complete && ref != "" && e.Ref == ref && e.RepoID == repo && e.Version == version && strings.HasPrefix(e.Key, prefix) {
 			if newer(best, e) {
 				best = e
 			}
