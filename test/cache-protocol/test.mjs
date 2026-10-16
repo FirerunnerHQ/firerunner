@@ -42,16 +42,28 @@ const main = 'refs/heads/main';
 const branch = 'refs/heads/release';
 const pr = 'refs/pull/7/merge';
 let generation = 0;
-async function identity(ref, reads = [ref, main], repository = 'owner/repo') {
-  const job = `job-${++generation}`;
+async function record(fields) {
   const file = join(jobs, '127.0.0.1.json');
   await writeFile(`${file}.tmp`, JSON.stringify({
-    ip: '127.0.0.1', runner: job, generation: job, repository,
-    event: ref.startsWith('refs/pull/') ? 'pull_request' : 'push',
-    write_ref: ref, read_refs: [...new Set(reads)], run_id: generation, job_id: job,
-    expires_at: Math.floor(Date.now() / 1000) + 3600
+    ip: '127.0.0.1', expires_at: Math.floor(Date.now() / 1000) + 3600, ...fields
   }), {mode: 0o600});
   await rename(`${file}.tmp`, file);
+}
+// A registered VM before JobStarted: a lease with no repository or refs yet.
+async function lease() {
+  const job = `job-${++generation}`;
+  await record({runner: job, generation: job});
+  return job;
+}
+async function identity(ref, reads = [ref, main], repository = 'owner/repo', job = `job-${++generation}`) {
+  await record({
+    runner: job, generation: job, repository,
+    event: ref.startsWith('refs/pull/') ? 'pull_request' : 'push',
+    write_ref: ref, read_refs: [...new Set(reads)], run_id: generation, job_id: job
+  });
+}
+async function stats() {
+  return (await fetch(`${base}/stats`)).json();
 }
 // Each operation gets a fresh process/TCP pool, as a new ephemeral VM would.
 async function toolkit(operation, key, restoreKeys = []) {
@@ -119,6 +131,20 @@ try {
   await identity('', [main]);
   await restore('shared', 'DEFAULT');
   assert.equal(await toolkit('save', 'read-only-job'), -1);
+  // JobStarted lags the guest: a restore issued first waits for the job's rights.
+  const late = await lease();
+  const waitsBefore = (await stats()).identity_waits;
+  const early = restore('shared', 'DEFAULT');
+  await delay(3000);
+  await identity(main, [main], 'owner/repo', late);
+  await early;
+  assert((await stats()).identity_waits > waitsBefore, 'restore did not wait for the pending lease');
+  // A lease whose resolution gave up is denied at once, not after the wait.
+  const failed = await lease();
+  await record({runner: failed, generation: failed, unresolved: true});
+  const started = Date.now();
+  await restore('shared', undefined);
+  assert(Date.now() - started < 20000, 'unresolved lease made the toolkit wait');
   // Before JobStarted, no repository or ref authority exists.
   await rm(join(jobs, '127.0.0.1.json'));
   await restore('shared', undefined);
@@ -126,7 +152,7 @@ try {
   await writeFile('payload/value.txt', 'UNKNOWN');
   const saved = await toolkit('save', 'unknown-job');
   assert.equal(saved, -1, 'unknown job acquired a cache reservation');
-  console.log('PASS: actual toolkit save/extract, ref precedence, isolation, rerun, unknown identity denied');
+  console.log('PASS: actual toolkit save/extract, ref precedence, isolation, rerun, pending lease waits, unknown identity denied');
 } catch (error) {
   console.error(logs);
   throw error;
