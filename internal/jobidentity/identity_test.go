@@ -278,8 +278,44 @@ func TestResolverFailureCannotGrantRights(t *testing.T) {
 		return Identity{}, errors.New("offline")
 	}))
 	<-called
-	if _, err := (Reader{Dir: r.dir}).Lookup("172.16.0.2"); err == nil {
+	var got Identity
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if got, err = (Reader{Dir: r.dir}).Lookup("172.16.0.2"); got.Unresolved {
+			break
+		}
+	}
+	if err == nil {
 		t.Fatal("failed resolution authorized")
+	}
+	if !got.Unresolved || got.Pending(time.Now()) {
+		t.Fatalf("failed resolution left a pending lease readers would wait on: %+v", got)
+	}
+}
+
+func TestPendingLease(t *testing.T) {
+	now := time.Now()
+	live := Identity{Generation: "g", ExpiresAt: now.Add(time.Minute).Unix()}
+	if !live.Pending(now) {
+		t.Fatal("registered lease not pending")
+	}
+	for name, i := range map[string]Identity{
+		"no lease":   {ExpiresAt: live.ExpiresAt},
+		"unresolved": {Generation: "g", ExpiresAt: live.ExpiresAt, Unresolved: true},
+		"expired":    {Generation: "g", ExpiresAt: now.Add(-time.Second).Unix()},
+		"resolved":   {Generation: "g", ExpiresAt: live.ExpiresAt, ReadRefs: []string{"refs/heads/main"}},
+		"write only": {Generation: "g", ExpiresAt: live.ExpiresAt, WriteRef: "refs/heads/main"},
+	} {
+		if i.Pending(now) {
+			t.Errorf("%s: pending", name)
+		}
+	}
+	resolved := Identity{Repository: "o/r", Runner: "r", Generation: "g", JobID: "j", RunID: 1, ExpiresAt: live.ExpiresAt, WriteRef: "refs/heads/main", ReadRefs: []string{"refs/heads/main"}}
+	if err := resolved.Validate(now); err != nil {
+		t.Fatal(err)
+	}
+	resolved.Unresolved = true
+	if resolved.Validate(now) == nil {
+		t.Fatal("an unresolved record validated")
 	}
 }
 

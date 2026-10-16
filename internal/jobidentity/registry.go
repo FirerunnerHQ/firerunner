@@ -214,20 +214,22 @@ func (r *Registry) Start(ctx context.Context, j Job, resolver Resolver) {
 		if ctx.Err() != nil {
 			err = ctx.Err()
 		}
-		if err != nil {
-			r.log.Warn("cache identity unavailable; reads and writes disabled", "runner", j.Runner, "err", err)
-			return
+		if err == nil {
+			i.IP, i.Runner, i.Generation = l.identity.IP, j.Runner, l.identity.Generation
+			i.ExpiresAt = time.Now().Add(leaseTTL).Unix()
+			if err = i.Validate(time.Now()); err == nil {
+				if err = r.write(i); err == nil {
+					l.identity = i
+					return
+				}
+			}
 		}
-		i.IP, i.Runner, i.Generation = l.identity.IP, j.Runner, l.identity.Generation
-		i.ExpiresAt = time.Now().Add(leaseTTL).Unix()
-		if err = i.Validate(time.Now()); err == nil {
-			err = r.write(i)
+		r.log.Warn("cache identity unavailable; reads and writes disabled", "runner", j.Runner, "err", err)
+		// Cache servers wait on a pending lease; mark it terminal so they stop.
+		l.identity.Unresolved = true
+		if err := r.write(l.identity); err != nil {
+			r.log.Warn("publish unresolved cache identity", "runner", j.Runner, "err", err)
 		}
-		if err != nil {
-			r.log.Warn("publish cache identity", "runner", j.Runner, "err", err)
-			return
-		}
-		l.identity = i
 	}()
 }
 

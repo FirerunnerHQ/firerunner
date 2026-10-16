@@ -2,6 +2,7 @@ package cacheserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -577,6 +578,8 @@ func TestMultiRepositoryAndUnresolvedIsolation(t *testing.T) {
 			case "pending":
 				i.ReadRefs = nil
 				i.WriteRef = ""
+				l.s.SetIdentityWait(50 * time.Millisecond)
+				t.Cleanup(func() { l.s.SetIdentityWait(DefaultIdentityWait) })
 			case "expired":
 				i.ExpiresAt = 1
 			case "unresolved":
@@ -616,5 +619,140 @@ func TestMultiRepositoryAndUnresolvedIsolation(t *testing.T) {
 	}
 	if l.s.snapshot().IdentityDenied == 0 {
 		t.Fatal("identity failures not observable")
+	}
+}
+
+func pendingIdentity(repo, generation string) jobidentity.Identity {
+	return jobidentity.Identity{Repository: repo, Runner: "test-runner", Generation: generation, ExpiresAt: time.Now().Add(time.Hour).Unix()}
+}
+
+func TestPendingIdentityWaitsForResolution(t *testing.T) {
+	l := newScopeLab(t)
+	l.save(t, l.guest(t, "172.16.0.2", mainRef, "seed"), "deps", "DEFAULT")
+	b := l.guest(t, "172.16.1.2", "", "")
+	l.set("172.16.1.2", pendingIdentity("owner/repo", "late"))
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		i := testIdentity("owner/repo", prRef, "late")
+		i.ReadRefs = []string{prRef, mainRef}
+		l.set("172.16.1.2", i)
+	}()
+	start := time.Now()
+	if got, _ := restore(t, b, "deps"); got != "DEFAULT" {
+		t.Fatalf("restore issued before JobStarted missed: %q", got)
+	}
+	if time.Since(start) < 250*time.Millisecond {
+		t.Fatal("restore did not wait for the pending identity")
+	}
+	st := l.s.snapshot()
+	if st.IdentityWaits != 1 || st.IdentityDenied != 0 || st.IdentityWaitSeconds < 0.25 {
+		t.Fatalf("wait not observable: %+v", st)
+	}
+}
+
+func TestPendingIdentityWaitEnds(t *testing.T) {
+	const ip = "172.16.1.2"
+	for _, tt := range []struct {
+		name   string
+		wait   time.Duration
+		bound  string
+		after  func(*scopeLab, context.CancelFunc)
+		reason string
+		bounds [2]time.Duration
+	}{
+		{name: "deadline", wait: 150 * time.Millisecond, reason: denyPending, bounds: [2]time.Duration{150 * time.Millisecond, 5 * time.Second}},
+		{name: "unresolved", wait: 10 * time.Second, reason: denyUnresolved, bounds: [2]time.Duration{100 * time.Millisecond, 5 * time.Second},
+			after: func(l *scopeLab, _ context.CancelFunc) {
+				i := pendingIdentity("owner/repo", "g")
+				i.Unresolved = true
+				l.set(ip, i)
+			}},
+		{name: "slot reused", wait: 10 * time.Second, bound: "g", reason: denyGeneration, bounds: [2]time.Duration{100 * time.Millisecond, 5 * time.Second},
+			after: func(l *scopeLab, _ context.CancelFunc) {
+				i := testIdentity("owner/repo", mainRef, "next")
+				l.set(ip, i)
+			}},
+		{name: "client gone", wait: 10 * time.Second, reason: denyPending, bounds: [2]time.Duration{100 * time.Millisecond, 5 * time.Second},
+			after: func(_ *scopeLab, cancel context.CancelFunc) { cancel() }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := newScopeLab(t)
+			l.s.SetIdentityWait(tt.wait)
+			l.set(ip, pendingIdentity("owner/repo", "g"))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tt.bound != "" {
+				ctx = context.WithValue(ctx, connectionGenerationKey{}, tt.bound)
+			}
+			if tt.after != nil {
+				go func() { time.Sleep(100 * time.Millisecond); tt.after(l, cancel) }()
+			}
+			start := time.Now()
+			i, reason, waited := l.s.awaitIdentity(ctx, ip, start.Add(tt.wait))
+			elapsed := time.Since(start)
+			if reason != tt.reason || i.Generation != "" || !waited {
+				t.Fatalf("got reason %q identity %+v waited %v, want %q", reason, i, waited, tt.reason)
+			}
+			if elapsed < tt.bounds[0] || elapsed > tt.bounds[1] {
+				t.Fatalf("waited %v, want within %v", elapsed, tt.bounds)
+			}
+		})
+	}
+}
+
+func TestIdentityDenialsDoNotWait(t *testing.T) {
+	const ip = "172.16.1.2"
+	for _, tt := range []struct {
+		name     string
+		identity *jobidentity.Identity
+		reason   string
+	}{
+		{name: "no record", reason: denyMissing},
+		{name: "unresolved", identity: func() *jobidentity.Identity { i := pendingIdentity("owner/repo", "g"); i.Unresolved = true; return &i }(), reason: denyUnresolved},
+		{name: "expired", identity: func() *jobidentity.Identity { i := pendingIdentity("owner/repo", "g"); i.ExpiresAt = 1; return &i }(), reason: denyExpired},
+		{name: "invalid", identity: func() *jobidentity.Identity {
+			i := testIdentity("owner/repo", mainRef, "g")
+			i.ReadRefs = nil
+			return &i
+		}(), reason: denyInvalid},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := newScopeLab(t)
+			if tt.identity != nil {
+				l.set(ip, *tt.identity)
+			}
+			start := time.Now()
+			_, reason, waited := l.s.awaitIdentity(context.Background(), ip, start.Add(10*time.Second))
+			if reason != tt.reason || waited || time.Since(start) > time.Second {
+				t.Fatalf("got %q waited=%v after %v, want %q at once", reason, waited, time.Since(start), tt.reason)
+			}
+		})
+	}
+}
+
+func TestIdentityDenialMetricsByReason(t *testing.T) {
+	l := newScopeLab(t)
+	l.s.SetIdentityWait(50 * time.Millisecond)
+	b := l.guest(t, "172.16.1.2", "", "")
+	l.set("172.16.1.2", pendingIdentity("owner/repo", "g"))
+	restore(t, b, "deps")
+	unresolved := pendingIdentity("owner/repo", "g")
+	unresolved.Unresolved = true
+	l.set("172.16.1.2", unresolved)
+	restore(t, b, "deps")
+	rec := httptest.NewRecorder()
+	l.s.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	for _, want := range []string{
+		`firerunner_cache_identity_denied_total{reason="pending"} 1`,
+		`firerunner_cache_identity_denied_total{reason="unresolved"} 1`,
+		`firerunner_cache_identity_denied_total{reason="missing"} 0`,
+		"firerunner_cache_identity_waits_total 1",
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("metrics missing %q:\n%s", want, rec.Body.String())
+		}
+	}
+	if st := l.s.snapshot(); st.IdentityDenied != 2 || st.IdentityDeniedByReason[denyPending] != 1 {
+		t.Fatalf("stats: %+v", st)
 	}
 }

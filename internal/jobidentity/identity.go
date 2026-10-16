@@ -41,6 +41,8 @@ type Identity struct {
 	RunID      int64    `json:"run_id"`
 	JobID      string   `json:"job_id"`
 	ExpiresAt  int64    `json:"expires_at"`
+	// Unresolved is terminal: resolution gave up, so readers must stop waiting.
+	Unresolved bool `json:"unresolved,omitempty"`
 }
 
 func ValidRef(ref string) bool {
@@ -70,6 +72,9 @@ func ValidRepository(repo string) bool {
 
 // Validate checks a resolved record. Pending records deliberately fail this.
 func (i Identity) Validate(now time.Time) error {
+	if i.Unresolved {
+		return errors.New("job identity unresolved")
+	}
 	if !ValidRepository(i.Repository) || i.Runner == "" || i.Generation == "" || i.JobID == "" || i.RunID <= 0 || i.ExpiresAt <= now.Unix() {
 		return errors.New("missing or expired job identity")
 	}
@@ -88,6 +93,12 @@ func (i Identity) Validate(now time.Time) error {
 		return errors.New("write scope is not own scope")
 	}
 	return nil
+}
+
+// Pending reports a live lease whose job rights may still be granted: the VM
+// awaits JobStarted, or its REST resolution is in flight.
+func (i Identity) Pending(now time.Time) bool {
+	return i.Generation != "" && !i.Unresolved && i.ExpiresAt > now.Unix() && i.WriteRef == "" && len(i.ReadRefs) == 0
 }
 
 func (i Identity) CanRead(ref string) bool {

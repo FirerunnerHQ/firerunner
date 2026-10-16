@@ -614,12 +614,29 @@ There is no global repository/default-ref override or anonymous fallback.
   authenticated repository/run/job is published at `JobStarted` before REST
   resolution, but grants no rights until resolution succeeds. Default-only
   reads require a resolved identity for that repository. A failed lookup is a
-  cache miss/denied save, never a job failure. The first lookup failure per
-  address is logged (bounded to 4096 outstanding addresses); successful lookup
-  resets it. `/stats` exposes `identity_denied` and `/metrics` exposes
-  `firerunner_cache_identity_denied_total`. Resolution failures and timeouts are
-  logged by the daemon; after three attempts/30 seconds they stay denied for
-  that job. Guest HTTP never triggers privileged REST retries.
+  cache miss/denied save, never a job failure. Resolution failures and timeouts
+  are logged by the daemon; after three attempts/30 seconds the record is marked
+  `unresolved` and stays denied for that job. Guest HTTP never triggers
+  privileged REST retries.
+- `JobStarted` reaches the daemon well after the guest has dequeued the job
+  (tens of seconds is common), and a workflow's first `actions/cache` restore
+  usually runs before that. A request from a **pending** lease therefore waits,
+  polling the record, until it resolves, becomes `unresolved`, changes
+  generation, or `--identity-wait` (default 60s, `0` denies at once) runs out;
+  only then is it denied. The toolkit's HTTP client allows 3 minutes per request.
+  Waiting grants nothing a resolved record would not: the same validation and
+  connection-generation check apply afterwards.
+- The first denial per address is logged with its reason (bounded to 4096
+  outstanding addresses); a successful lookup resets it. `/stats` exposes
+  `identity_denied` (total), `identity_denied_by_reason`, `identity_waits` and
+  `identity_wait_seconds`; `/metrics` exposes
+  `firerunner_cache_identity_denied_total{reason}`,
+  `firerunner_cache_identity_waits_total` and
+  `firerunner_cache_identity_wait_seconds_total`. Reasons: `missing` (no
+  record), `pending` (the wait ran out or the client left), `unresolved`,
+  `expired`, `invalid`, and `generation` (a connection outlived its VM). A
+  rising `pending` count means `--identity-wait` is shorter than the
+  `JobStarted` lag; `unresolved` points at App permissions or the REST API.
 - REST `pull_requests` can be empty: the resolver checks commit-associated PRs
   and requires a unique match of head/base repository and head branch. A later
   push to a branch or PR does not invalidate earlier queued runs or reruns.

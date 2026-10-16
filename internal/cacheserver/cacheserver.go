@@ -109,16 +109,19 @@ type Server struct {
 	log *slog.Logger
 	mux *http.ServeMux
 
-	mu               sync.Mutex
-	entries          map[uint64]*Entry
-	nextID           uint64
-	maxSize          int64            // 0 = unlimited; total completed-blob bytes to keep
-	maxEntry         int64            // 0 = unlimited; hard cap on a single entry's blob
-	staged           map[uint64]int64 // bytes written so far for a not-yet-finalized entry
-	identityDenied   atomic.Uint64
-	identityMu       sync.Mutex
-	identityFailures map[string]bool
-	lookup           func(string) (jobidentity.Identity, error)
+	mu                sync.Mutex
+	entries           map[uint64]*Entry
+	nextID            uint64
+	maxSize           int64            // 0 = unlimited; total completed-blob bytes to keep
+	maxEntry          int64            // 0 = unlimited; hard cap on a single entry's blob
+	staged            map[uint64]int64 // bytes written so far for a not-yet-finalized entry
+	identityMu        sync.Mutex
+	identityDenied    map[string]uint64 // by reason, under identityMu
+	identityFailures  map[string]bool
+	identityWait      time.Duration
+	identityWaits     atomic.Uint64
+	identityWaitNanos atomic.Uint64
+	lookup            func(string) (jobidentity.Identity, error)
 
 	// counters (under mu) for observability via /stats and /metrics.
 	hits      uint64
@@ -138,26 +141,38 @@ type Server struct {
 // Stats is a point-in-time snapshot of the cache store, served by /stats and
 // /metrics and consumed by `firerunner status`.
 type Stats struct {
-	IdentityDenied uint64 `json:"identity_denied"`
-	Entries        int    `json:"entries"`         // completed entries currently stored
-	Bytes          int64  `json:"bytes"`           // total size of completed blobs
-	MaxBytes       int64  `json:"max_bytes"`       // configured cap (0 = unlimited)
-	Hits           uint64 `json:"hits"`            // download-URL lookups that matched
-	Misses         uint64 `json:"misses"`          // download-URL lookups that did not
-	Saves          uint64 `json:"saves"`           // entries finalized
-	Evictions      uint64 `json:"evictions"`       // entries removed by the size cap
-	ArtifactRPCs   uint64 `json:"artifact_rpcs"`   // ArtifactService RPCs forwarded upstream
-	ArtifactErrors uint64 `json:"artifact_errors"` // artifact RPCs refused, failed, or answered 5xx
+	IdentityDenied         uint64            `json:"identity_denied"`
+	IdentityDeniedByReason map[string]uint64 `json:"identity_denied_by_reason"`
+	IdentityWaits          uint64            `json:"identity_waits"`        // requests that waited on a pending lease
+	IdentityWaitSeconds    float64           `json:"identity_wait_seconds"` // total time those requests waited
+	Entries                int               `json:"entries"`               // completed entries currently stored
+	Bytes                  int64             `json:"bytes"`                 // total size of completed blobs
+	MaxBytes               int64             `json:"max_bytes"`             // configured cap (0 = unlimited)
+	Hits                   uint64            `json:"hits"`                  // download-URL lookups that matched
+	Misses                 uint64            `json:"misses"`                // download-URL lookups that did not
+	Saves                  uint64            `json:"saves"`                 // entries finalized
+	Evictions              uint64            `json:"evictions"`             // entries removed by the size cap
+	ArtifactRPCs           uint64            `json:"artifact_rpcs"`         // ArtifactService RPCs forwarded upstream
+	ArtifactErrors         uint64            `json:"artifact_errors"`       // artifact RPCs refused, failed, or answered 5xx
 }
 
 // snapshot collects current stats. The caller must NOT hold s.mu.
 func (s *Server) snapshot() Stats {
+	st := Stats{
+		IdentityDeniedByReason: make(map[string]uint64, len(denyReasons)),
+		IdentityWaits:          s.identityWaits.Load(),
+		IdentityWaitSeconds:    time.Duration(s.identityWaitNanos.Load()).Seconds(),
+		ArtifactRPCs:           s.artifactRPCs.Load(), ArtifactErrors: s.artifactErrors.Load(),
+	}
+	s.identityMu.Lock()
+	for _, reason := range denyReasons {
+		st.IdentityDeniedByReason[reason] = s.identityDenied[reason]
+		st.IdentityDenied += s.identityDenied[reason]
+	}
+	s.identityMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := Stats{
-		MaxBytes: s.maxSize, Hits: s.hits, Misses: s.misses, Saves: s.saves, Evictions: s.evictions,
-		IdentityDenied: s.identityDenied.Load(), ArtifactRPCs: s.artifactRPCs.Load(), ArtifactErrors: s.artifactErrors.Load(),
-	}
+	st.MaxBytes, st.Hits, st.Misses, st.Saves, st.Evictions = s.maxSize, s.hits, s.misses, s.saves, s.evictions
 	for _, e := range s.entries {
 		if e.Complete {
 			st.Entries++
@@ -218,6 +233,8 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 		staged:          make(map[uint64]int64),
 		nextID:          1,
 		artifactTimeout: defaultArtifactRPCTimeout,
+		identityDenied:  make(map[string]uint64),
+		identityWait:    DefaultIdentityWait,
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -676,7 +693,14 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	st := s.snapshot()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	fmt.Fprintf(w, "# HELP firerunner_cache_identity_denied_total Cache operations denied for unavailable identity.\n# TYPE firerunner_cache_identity_denied_total counter\nfirerunner_cache_identity_denied_total %d\n", st.IdentityDenied)
+	fmt.Fprintf(w, "# HELP firerunner_cache_identity_denied_total Cache operations denied for unavailable identity, by reason.\n# TYPE firerunner_cache_identity_denied_total counter\n")
+	for _, reason := range denyReasons {
+		fmt.Fprintf(w, "firerunner_cache_identity_denied_total{reason=%q} %d\n", reason, st.IdentityDeniedByReason[reason])
+	}
+	fmt.Fprintf(w, "# HELP firerunner_cache_identity_waits_total Cache operations that waited for a pending job identity.\n")
+	fmt.Fprintf(w, "# TYPE firerunner_cache_identity_waits_total counter\nfirerunner_cache_identity_waits_total %d\n", st.IdentityWaits)
+	fmt.Fprintf(w, "# HELP firerunner_cache_identity_wait_seconds_total Time cache operations spent waiting for a pending job identity.\n")
+	fmt.Fprintf(w, "# TYPE firerunner_cache_identity_wait_seconds_total counter\nfirerunner_cache_identity_wait_seconds_total %g\n", st.IdentityWaitSeconds)
 	fmt.Fprintf(w, "# HELP firerunner_cache_entries Completed cache entries stored.\n")
 	fmt.Fprintf(w, "# TYPE firerunner_cache_entries gauge\nfirerunner_cache_entries %d\n", st.Entries)
 	fmt.Fprintf(w, "# HELP firerunner_cache_bytes Total size of completed cache blobs.\n")

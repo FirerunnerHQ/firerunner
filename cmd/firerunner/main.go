@@ -117,6 +117,7 @@ func cacheServe(args []string) error {
 	maxEntry := fs.String("max-entry-size", "10GB", "refuse any single cache entry larger than this (e.g. 10GB, 0 for unlimited)")
 	jobsDir := fs.String("jobs-dir", jobidentity.DefaultDir, "private identity directory written by the local daemon")
 	jobsOwner := fs.Int("jobs-owner-uid", os.Getuid(), "UID of the daemon that owns job records (default current UID)")
+	identityWait := fs.Duration("identity-wait", cacheserver.DefaultIdentityWait, "how long a request from a VM whose job identity is still pending waits for it before being denied (0 denies at once)")
 	artifactUpstream := fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -148,6 +149,7 @@ func cacheServe(args []string) error {
 	if err := srv.SetScope(reader.Lookup); err != nil {
 		return err
 	}
+	srv.SetIdentityWait(*identityWait)
 	if err := srv.SetArtifactUpstream(*artifactUpstream); err != nil {
 		return fmt.Errorf("--artifact-upstream: %w", err)
 	}
