@@ -48,6 +48,12 @@ Ubuntu toolsets on the same glibc-2.39 parity base:
 - `--toolset full` — `base` + the actions/runner-images tool cache and curated
   docker-safe installer subset (Azure/GUI/snap/services excluded); maximum parity.
 
+Every toolset (and every Debian tier) ships `zstd`, as `ubuntu-latest` does.
+Without it `actions/cache` falls back to single-threaded gzip, which on a
+2-vCPU guest dominates the restore time of a large entry. The compression
+method is part of the cache entry version, so the first job on a golden that
+gains zstd misses every entry an older gzip guest saved, once per key.
+
 The base tier deliberately ships no language toolchain — a workflow's `setup-go`
 / `setup-node` fetches one per run. Baking a toolchain (the `firerunner-node`
 tier) removes that download, mirroring GitHub's hosted **tool cache**

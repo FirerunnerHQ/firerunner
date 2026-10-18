@@ -196,7 +196,7 @@ ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
 
 # init + base runtime the microVM and the runner need.
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-      systemd systemd-sysv ca-certificates curl wget git tar xz-utils gzip unzip zip \\
+      systemd systemd-sysv ca-certificates curl wget git tar xz-utils gzip zstd unzip zip \\
       jq sudo iproute2 iputils-ping openssh-client rsync gnupg lsb-release \\
       software-properties-common locales tzdata \\
     && rm -rf /var/lib/apt/lists/*
