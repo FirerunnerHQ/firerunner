@@ -86,7 +86,7 @@ mount -o loop "$OUT" "$MNT"
 
 # 2. Bootstrap a minimal Debian base with an init and the tools the runner and
 #    the boot service need.
-BASE_PKGS="systemd-sysv,ca-certificates,curl,tar,git,iproute2,sudo,jq"
+BASE_PKGS="systemd-sysv,ca-certificates,curl,tar,zstd,git,iproute2,sudo,jq"
 debootstrap --variant=minbase --include="$BASE_PKGS" "$SUITE" "$MNT" "$MIRROR"
 
 # Bind mounts for chroot package operations.
