@@ -53,6 +53,8 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "config":
+			os.Exit(configCmd(args[1:], os.Stdout, os.Stderr))
 		case "cache-server":
 			if err := cacheServe(args[1:]); err != nil {
 				slog.Error("cache-server failed", "err", err)
@@ -239,6 +241,8 @@ Usage:
   firerunner [flags]      run the daemon (default; see --help output of flags)
   firerunner status       show config, images, network and live microVMs
   firerunner doctor       run preflight health checks (exits non-zero on failure)
+  firerunner config check validate the configuration or a tier catalog offline
+                          (--catalog FILE; --json); see "firerunner config"
   firerunner cache-server run the self-hosted Actions dependency cache server
   firerunner version      print the version
   firerunner help         show this help

@@ -459,6 +459,18 @@ read-only credential check), and API reachability (against the derived API base,
 so GitHub Enterprise Server works too) — and prints one `PASS`/`WARN`/`FAIL`
 line each. It exits non-zero when any check fails, so it can gate a deploy.
 
+**Checking a configuration offline.** `firerunner config check` validates the
+flags and `FR_*` environment exactly as startup does, without contacting GitHub
+or AWS. Add `--catalog FILE` to validate one tier catalog on its own. That needs
+no credentials and skips image-path checks, so an edit can be checked anywhere.
+Pass `--json` for machine-readable output, which never includes credentials. Exit
+status is 0 for valid, 1 for invalid and 2 for a usage error:
+
+```bash
+firerunner config check --catalog examples/tiers-ec2.json --max-runners 8
+firerunner config check --json | jq -r 'if .ok then "ok" else .error end'
+```
+
 **Listener health.** Each tier's listener reconnects on its own. When its
 message session fails, for example when GitHub is unreachable for longer than
 the client library retries, it reopens the session with backoff (2 s doubling
