@@ -291,13 +291,16 @@ func tierProvisioner(t config.Tier, fc provisioner.Provisioner, newEC2 func(conf
 // serving. A tier whose listener stops on its own error is logged and left
 // stopped (its health tracker says why) while the others keep serving; when
 // every tier has stopped there is nothing left to serve, so it cancels ctx and
-// returns the first error.
+// returns the first error. A tier that needs a fresh process
+// (listener.ErrRestart: its scale set was deleted) stops every tier at once,
+// so the daemon exits for its supervisor to restart and re-register it.
 func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, runs []func(context.Context) error, log *slog.Logger) error {
 	var (
 		wg      sync.WaitGroup
 		mu      sync.Mutex
 		stopped int
 		first   error
+		restart bool
 	)
 	for i, run := range runs {
 		wg.Add(1)
@@ -317,10 +320,15 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 			mu.Lock()
 			defer mu.Unlock()
 			stopped++
-			if first == nil {
+			if first == nil || errors.Is(err, listener.ErrRestart) {
 				first = fmt.Errorf("tier %q: %w", names[i], err)
 			}
-			if stopped == len(runs) {
+			switch {
+			case errors.Is(err, listener.ErrRestart):
+				log.Error("restarting to register the scale set again; stopping every tier", "tier", names[i])
+				restart = true
+				cancel()
+			case stopped == len(runs):
 				log.Error("every tier has stopped; shutting down")
 				cancel()
 			}
@@ -329,7 +337,7 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 	wg.Wait()
 	mu.Lock()
 	defer mu.Unlock()
-	if stopped == len(runs) {
+	if restart || stopped == len(runs) {
 		return first
 	}
 	return nil

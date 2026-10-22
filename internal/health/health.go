@@ -20,8 +20,8 @@ const (
 	Connected State = "connected"
 	// Reconnecting: the session ended and a new one is being opened.
 	Reconnecting State = "reconnecting"
-	// Failed: the tier stopped on an error that retrying cannot fix (GitHub
-	// rejected the credentials). Other tiers keep running.
+	// Failed: the tier stopped on an error that retrying cannot fix. Rejected
+	// credentials stop only this tier; a deleted scale set restarts the daemon.
 	Failed State = "failed"
 )
 

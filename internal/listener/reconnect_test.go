@@ -113,15 +113,13 @@ func fastReconnect(t *testing.T) {
 }
 
 func testScaleSet(name string, first *fakeSession, o *opener, tr *health.Tracker) *ScaleSet {
-	id := new(atomic.Int64)
-	id.Store(1)
 	return &ScaleSet{
 		cfg:        Config{Name: name, MaxRunners: 4},
 		log:        testLogger(),
 		session:    first,
 		open:       o.open,
 		health:     tr,
-		scaleSetID: id,
+		scaleSetID: 1,
 	}
 }
 
@@ -368,7 +366,7 @@ func TestIsFatal(t *testing.T) {
 	cases := map[string]bool{
 		`failed(status="401 Unauthorized"): bad credentials`:                     true,
 		`failed(status="403 Forbidden"): resource not accessible by integration`: true,
-		`failed(status="404 Not Found"): runner scale set not found`:             false, // re-registered, not fatal
+		`failed(status="404 Not Found"): runner scale set not found`:             false, // restarts the daemon (ErrRestart), not fatal
 		`failed(status="403 Forbidden"): API rate limit exceeded`:                false,
 		`failed(status="503 Service Unavailable")`:                               false,
 		`dial tcp: i/o timeout`:                                                  false,
@@ -384,59 +382,30 @@ func TestIsFatal(t *testing.T) {
 	}
 }
 
-func TestReconnect_ReRegistersADeletedScaleSet(t *testing.T) {
-	// Another instance that created the scale set deleted it on shutdown:
-	// reopening gets 404, the tier registers the set again (a new ID), and
-	// its JIT source and new session use that ID. The tier keeps running.
+func TestReconnect_DeletedScaleSetRestarts(t *testing.T) {
+	// The scale set is gone (another instance that created it deleted it on
+	// shutdown). Reopening gets 404 and Run returns ErrRestart at once, for
+	// the daemon to restart and register it again; it is not retried.
 	fastReconnect(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	tr := health.NewTracker("a")
-	healed := newFakeSession(1, false)
 	o := &opener{results: []openResult{
 		{err: errors.New(`request POST .../sessions failed(status="404 Not Found"): runner scale set not found`)},
-		{sess: healed},
 	}}
 	ss := testScaleSet("a", newFakeSession(0, true), o, tr)
-	var registered atomic.Int32
-	ss.register = func(context.Context) error {
-		registered.Add(1)
-		ss.scaleSetID.Store(99)
-		return nil
-	}
-	jit := ss.JIT()
-	tier := startTier(ctx, ss, 4)
-
-	eventually(t, "the tier to reconnect", func() bool { return tr.Snapshot().Reconnects == 1 })
-	if n := registered.Load(); n != 1 {
-		t.Fatalf("registered %d times, want once", n)
-	}
-	if id := jit.scaleSetID.Load(); id != 99 {
-		t.Fatalf("JIT source scale set ID = %d, want the re-registered 99", id)
-	}
-	eventually(t, "a launch from the healed session", func() bool { l, _ := tier.prov.counts(); return l == 1 })
-	select {
-	case err := <-tier.done:
-		t.Fatalf("Run returned %v; a deleted scale set must not stop the tier", err)
-	default:
-	}
-}
-
-func TestReconnect_ReRegistrationRejectedIsFatal(t *testing.T) {
-	// Re-registering with credentials GitHub now rejects is fatal.
-	fastReconnect(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	tr := health.NewTracker("a")
-	o := &opener{results: []openResult{{err: errors.New(`status="404 Not Found"`)}}}
-	ss := testScaleSet("a", newFakeSession(0, true), o, tr)
-	ss.register = func(context.Context) error {
-		return errors.New(`create runner scale set: failed(status="403 Forbidden"): resource not accessible by integration`)
-	}
 	err := ss.Run(ctx, func(context.Context, int) int { return 0 }, nil, nil)
-	if !errors.Is(err, ErrFatal) || tr.Snapshot().State != health.Failed {
-		t.Fatalf("Run = %v, health %s; want ErrFatal and failed", err, tr.Snapshot().State)
+	if !errors.Is(err, ErrRestart) || errors.Is(err, ErrFatal) {
+		t.Fatalf("Run = %v, want ErrRestart (not ErrFatal)", err)
+	}
+	o.mu.Lock()
+	calls := o.calls
+	o.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("opened %d times, want no retry after a 404", calls)
+	}
+	if s := tr.Snapshot(); s.State != health.Failed || s.LastError == "" {
+		t.Fatalf("health = %+v, want failed with the 404", s)
 	}
 }
 
@@ -463,32 +432,5 @@ func TestTrackedSessionRecordsMessages(t *testing.T) {
 	_, _ = ts.GetMessage(context.Background(), 0, 1)
 	if !tr.Snapshot().LastMessage.Equal(before) {
 		t.Fatal("a failed GetMessage counted as a message")
-	}
-}
-
-func TestAdoptTracksOwnershipOfTheCurrentScaleSet(t *testing.T) {
-	cases := []struct {
-		name        string
-		created     bool
-		newID       int
-		reused      bool
-		wantCreated bool
-	}{
-		// This process created set 1; it was deleted and another instance
-		// created set 2 first. Reusing 2 must not inherit ownership of 1.
-		{"replacement made by another instance", true, 2, true, false},
-		{"replacement made by us", false, 2, false, true},
-		{"same set, still ours", true, 1, true, true},
-		{"same set, never ours", false, 1, true, false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			ss := testScaleSet("a", newFakeSession(0, false), &opener{}, nil)
-			ss.created = c.created
-			ss.adopt(c.newID, c.reused)
-			if ss.created != c.wantCreated || ss.scaleSetID.Load() != int64(c.newID) {
-				t.Fatalf("created=%v id=%d, want created=%v id=%d", ss.created, ss.scaleSetID.Load(), c.wantCreated, c.newID)
-			}
-		})
 	}
 }
