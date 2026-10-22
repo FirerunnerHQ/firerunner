@@ -113,13 +113,15 @@ func fastReconnect(t *testing.T) {
 }
 
 func testScaleSet(name string, first *fakeSession, o *opener, tr *health.Tracker) *ScaleSet {
+	id := new(atomic.Int64)
+	id.Store(1)
 	return &ScaleSet{
 		cfg:        Config{Name: name, MaxRunners: 4},
 		log:        testLogger(),
 		session:    first,
 		open:       o.open,
 		health:     tr,
-		scaleSetID: 1,
+		scaleSetID: id,
 	}
 }
 
@@ -366,7 +368,7 @@ func TestIsFatal(t *testing.T) {
 	cases := map[string]bool{
 		`failed(status="401 Unauthorized"): bad credentials`:                     true,
 		`failed(status="403 Forbidden"): resource not accessible by integration`: true,
-		`failed(status="404 Not Found"): runner scale set not found`:             true,
+		`failed(status="404 Not Found"): runner scale set not found`:             false, // re-registered, not fatal
 		`failed(status="403 Forbidden"): API rate limit exceeded`:                false,
 		`failed(status="503 Service Unavailable")`:                               false,
 		`dial tcp: i/o timeout`:                                                  false,
@@ -379,6 +381,62 @@ func TestIsFatal(t *testing.T) {
 	}
 	if isFatal(nil) {
 		t.Error("isFatal(nil) = true")
+	}
+}
+
+func TestReconnect_ReRegistersADeletedScaleSet(t *testing.T) {
+	// Another instance that created the scale set deleted it on shutdown:
+	// reopening gets 404, the tier registers the set again (a new ID), and
+	// its JIT source and new session use that ID. The tier keeps running.
+	fastReconnect(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tr := health.NewTracker("a")
+	healed := newFakeSession(1, false)
+	o := &opener{results: []openResult{
+		{err: errors.New(`request POST .../sessions failed(status="404 Not Found"): runner scale set not found`)},
+		{sess: healed},
+	}}
+	ss := testScaleSet("a", newFakeSession(0, true), o, tr)
+	var registered atomic.Int32
+	ss.register = func(context.Context) error {
+		registered.Add(1)
+		ss.scaleSetID.Store(99)
+		return nil
+	}
+	jit := ss.JIT()
+	tier := startTier(ctx, ss, 4)
+
+	eventually(t, "the tier to reconnect", func() bool { return tr.Snapshot().Reconnects == 1 })
+	if n := registered.Load(); n != 1 {
+		t.Fatalf("registered %d times, want once", n)
+	}
+	if id := jit.scaleSetID.Load(); id != 99 {
+		t.Fatalf("JIT source scale set ID = %d, want the re-registered 99", id)
+	}
+	eventually(t, "a launch from the healed session", func() bool { l, _ := tier.prov.counts(); return l == 1 })
+	select {
+	case err := <-tier.done:
+		t.Fatalf("Run returned %v; a deleted scale set must not stop the tier", err)
+	default:
+	}
+}
+
+func TestReconnect_ReRegistrationRejectedIsFatal(t *testing.T) {
+	// Re-registering with credentials GitHub now rejects is fatal.
+	fastReconnect(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr := health.NewTracker("a")
+	o := &opener{results: []openResult{{err: errors.New(`status="404 Not Found"`)}}}
+	ss := testScaleSet("a", newFakeSession(0, true), o, tr)
+	ss.register = func(context.Context) error {
+		return errors.New(`create runner scale set: failed(status="403 Forbidden"): resource not accessible by integration`)
+	}
+	err := ss.Run(ctx, func(context.Context, int) int { return 0 }, nil, nil)
+	if !errors.Is(err, ErrFatal) || tr.Snapshot().State != health.Failed {
+		t.Fatalf("Run = %v, health %s; want ErrFatal and failed", err, tr.Snapshot().State)
 	}
 }
 
