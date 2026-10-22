@@ -1,0 +1,24 @@
+[
+  {
+    "name": "firerunner",
+    "vcpu": 2,
+    "mem_mib": 4096,
+    "golden": "/var/lib/firerunner/golden.ext4",
+    "min": 1,
+    "max": 8
+  },
+  {
+    "name": "firerunner-cloud-4c",
+    "provisioner": "ec2",
+    "min": 0,
+    "max": 40,
+    "ec2": {
+      "instance_types": ["c8a.xlarge", "c7a.xlarge", "m8a.xlarge"],
+      "ami": "/firerunner/ami/runner",
+      "subnets": ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"],
+      "security_groups": ["sg-0cccccccccccccccc"],
+      "market": "spot-then-on-demand",
+      "root_volume_gib": 40
+    }
+  }
+]
