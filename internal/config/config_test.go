@@ -1,6 +1,7 @@
 package config
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -785,5 +786,47 @@ func TestCheckCatalog(t *testing.T) {
 	}
 	if _, err := CheckCatalog(filepath.Join(t.TempDir(), "none.json"), 4); err == nil {
 		t.Fatal("missing file accepted")
+	}
+}
+
+// captureStderr runs f and returns what it wrote to os.Stderr, where the flag
+// package prints usage.
+func captureStderr(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	f()
+	os.Stderr = old
+	w.Close()
+	b, _ := io.ReadAll(r)
+	return string(b)
+}
+
+func TestParse_NeverEchoesCredentials(t *testing.T) {
+	// The flag package prints every flag's default on -h and on any parse
+	// error; credentials from the env must not be among them.
+	t.Setenv("FR_TOKEN", "ghp_SECRET")
+	t.Setenv("FR_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----SECRET")
+	for _, args := range [][]string{{"-h"}, {"--bogus"}, {"--vcpu", "x"}} {
+		out := captureStderr(t, func() { _, _ = Parse(args) })
+		if strings.Contains(out, "SECRET") {
+			t.Fatalf("%v printed a credential:\n%s", args, out)
+		}
+		if !strings.Contains(out, "FR_TOKEN") {
+			t.Fatalf("%v: usage should still name the env var:\n%s", args, out)
+		}
+	}
+	// The env still supplies them, and a flag still wins.
+	c, err := Parse(nil)
+	if err != nil || c.Token != "ghp_SECRET" || !strings.Contains(c.AppPrivateKey, "BEGIN") {
+		t.Fatalf("env fallback: %+v %v", c, err)
+	}
+	c, err = Parse([]string{"--token", "flag-token"})
+	if err != nil || c.Token != "flag-token" {
+		t.Fatalf("flag override: %q %v", c.Token, err)
 	}
 }

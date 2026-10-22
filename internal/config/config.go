@@ -222,10 +222,13 @@ func Parse(args []string) (*Config, error) {
 	fs.IntVar(&c.MaxRunners, "max-runners", er.int("FR_MAX_RUNNERS", 4), "max concurrent microVMs")
 	fs.IntVar(&c.MinRunners, "min-runners", er.int("FR_MIN_RUNNERS", 0), "warm pool size: microVMs kept pre-booted and registered so jobs start without a cold boot (0 = on-demand; higher = faster pickup, more idle RAM)")
 
-	fs.StringVar(&c.Token, "token", env("FR_TOKEN", ""), "GitHub PAT (use a GitHub App in production)")
+	// Credentials are not flag defaults: the flag package prints defaults in
+	// -h output and on every parse error, which would echo FR_TOKEN and
+	// FR_APP_PRIVATE_KEY to stderr. They fall back to the env after parsing.
+	fs.StringVar(&c.Token, "token", "", "GitHub PAT (use a GitHub App in production); default FR_TOKEN")
 	fs.StringVar(&c.AppClientID, "app-client-id", env("FR_APP_CLIENT_ID", ""), "GitHub App client id")
 	fs.Int64Var(&c.AppInstallID, "app-installation-id", int64(er.int("FR_APP_INSTALLATION_ID", 0)), "GitHub App installation id")
-	fs.StringVar(&c.AppPrivateKey, "app-private-key", env("FR_APP_PRIVATE_KEY", ""), "GitHub App private key (PEM path or contents)")
+	fs.StringVar(&c.AppPrivateKey, "app-private-key", "", "GitHub App private key (PEM path or contents); default FR_APP_PRIVATE_KEY")
 
 	fs.IntVar(&c.VCPU, "vcpu", er.int("FR_VCPU", 4), "vCPUs per microVM")
 	fs.IntVar(&c.MemMiB, "mem-mib", er.int("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
@@ -273,6 +276,12 @@ func Parse(args []string) (*Config, error) {
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
+	}
+	if c.Token == "" {
+		c.Token = env("FR_TOKEN", "")
+	}
+	if c.AppPrivateKey == "" {
+		c.AppPrivateKey = env("FR_APP_PRIVATE_KEY", "")
 	}
 	// Surface any malformed FR_* env values now, so a typo fails closed instead
 	// of silently running with a default.
