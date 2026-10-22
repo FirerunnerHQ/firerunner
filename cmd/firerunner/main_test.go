@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/solcreek/firerunner/internal/config"
+	"github.com/solcreek/firerunner/internal/core"
 )
 
 func TestParseSize(t *testing.T) {
@@ -71,5 +75,38 @@ func TestCacheServerChecksIdentityDirectoryAtStartup(t *testing.T) {
 		if err := cacheServe(args); err == nil || !strings.Contains(err.Error(), "job identity directory") {
 			t.Fatalf("startup check: %v", err)
 		}
+	}
+}
+
+// stubProvisioner stands in for the host's Firecracker provisioner.
+type stubProvisioner struct{ name string }
+
+func (s stubProvisioner) Launch(context.Context, string, string, core.RunnerSpec, func()) error {
+	return nil
+}
+func (s stubProvisioner) Name() string { return s.name }
+
+func TestTierProvisioner(t *testing.T) {
+	fc := stubProvisioner{name: "firecracker"}
+	ec2 := config.Tier{Name: "cloud", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{}}
+
+	// Every Firecracker tier, implicit or explicit, shares the one host
+	// provisioner and its slot budget.
+	for _, tier := range []config.Tier{{Name: "a"}, {Name: "b", Provisioner: config.ProvisionerFirecracker}} {
+		p, err := tierProvisioner(tier, fc)
+		if err != nil || p != fc {
+			t.Fatalf("tier %q: got (%v, %v), want the shared firecracker provisioner", tier.Name, p, err)
+		}
+	}
+	// A Firecracker tier on a host without the Firecracker provisioner is a
+	// wiring bug and must fail before any scale set is registered.
+	if _, err := tierProvisioner(config.Tier{Name: "a"}, nil); err == nil {
+		t.Fatal("expected an error for a firecracker tier without a firecracker provisioner")
+	}
+	if _, err := tierProvisioner(ec2, fc); err == nil || !strings.Contains(err.Error(), "ec2") {
+		t.Fatalf("ec2 tier: err = %v, want a not-available error until the ec2 provisioner lands", err)
+	}
+	if _, err := tierProvisioner(config.Tier{Name: "x", Provisioner: "lambda"}, fc); err == nil {
+		t.Fatal("expected an error for an unknown provisioner")
 	}
 }
