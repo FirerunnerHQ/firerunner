@@ -233,3 +233,76 @@ func (f *flakyIndexStore) SaveIndex(ctx context.Context, data []byte) error {
 	}
 	return f.memStore.SaveIndex(ctx, data)
 }
+
+func getBody(t *testing.T, url string) (int, []byte) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, body
+}
+
+func TestLocalCopyServesWhileStoreDown(t *testing.T) {
+	store := newMemStore()
+	s, ts := newStoreServer(t, store)
+	s.SetLocalCacheSize(1 << 20)
+	saveEntry(t, ts.URL, "owner/pinned", "k", "v1", 64)
+
+	store.failGet = true
+	if code, body := getBody(t, downloadURL(t, ts.URL, "k")); code != http.StatusOK || len(body) != 64 {
+		t.Fatalf("GET with store down = %d len %d, want the local copy", code, len(body))
+	}
+}
+
+func TestFreshServerFillsLocalCopyFromStore(t *testing.T) {
+	store := newMemStore()
+	first, ts := newStoreServer(t, store)
+	saveEntry(t, ts.URL, "owner/pinned", "k", "v1", 64)
+	first.StartIndexSync()()
+
+	fresh, ts2 := newStoreServer(t, store)
+	fresh.SetLocalCacheSize(1 << 20)
+	url := downloadURL(t, ts2.URL, "k")
+	if code, body := getBody(t, url); code != http.StatusOK || len(body) != 64 {
+		t.Fatalf("first GET = %d len %d", code, len(body))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fresh.mu.Lock()
+		_, ok := fresh.local[1]
+		fresh.mu.Unlock()
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no local copy filled after a store read")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	store.failGet = true
+	if code, body := getBody(t, url); code != http.StatusOK || len(body) != 64 {
+		t.Fatalf("GET after fill with store down = %d len %d", code, len(body))
+	}
+}
+
+func TestLocalCopiesTrimmedButStillServedFromStore(t *testing.T) {
+	store := newMemStore()
+	s, ts := newStoreServer(t, store)
+	s.SetLocalCacheSize(40)
+	for _, k := range []string{"a", "b", "c"} {
+		saveEntry(t, ts.URL, "owner/pinned", k, "v1", 16)
+	}
+	s.mu.Lock()
+	kept := len(s.local)
+	_, newest := s.local[3]
+	s.mu.Unlock()
+	if kept != 2 || !newest {
+		t.Fatalf("local copies = %d (newest kept %v), want 2 including the newest", kept, newest)
+	}
+	if code, body := getBody(t, downloadURL(t, ts.URL, "a")); code != http.StatusOK || len(body) != 16 {
+		t.Fatalf("trimmed entry GET = %d len %d, want it from the store", code, len(body))
+	}
+}

@@ -145,6 +145,7 @@ func cacheServe(args []string) error {
 	addr, dir, maxSize, maxEntry := o.addr, o.dir, o.maxSize, o.maxEntry
 	jobsDir, jobsOwner, identityWait, artifactUpstream := o.jobsDir, o.jobsOwner, o.identityWait, o.artifactUpstream
 	s3Bucket, s3Prefix, s3Region := o.s3Bucket, o.s3Prefix, o.s3Region
+	s3LocalCache := o.s3LocalCache
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -173,6 +174,11 @@ func cacheServe(args []string) error {
 		if err != nil {
 			return err
 		}
+		localBytes, err := parseSize(*s3LocalCache)
+		if err != nil {
+			return fmt.Errorf("--s3-local-cache-size: %w", err)
+		}
+		srv.SetLocalCacheSize(localBytes)
 		if err := srv.SetBlobStore(store); err != nil {
 			return err
 		}
@@ -230,7 +236,7 @@ func cacheServe(args []string) error {
 // cacheFlags are the cache-server subcommand's flag values.
 type cacheFlags struct {
 	addr, dir, maxSize, maxEntry, jobsDir, artifactUpstream *string
-	s3Bucket, s3Prefix, s3Region                            *string
+	s3Bucket, s3Prefix, s3Region, s3LocalCache              *string
 	jobsOwner                                               *int
 	identityWait                                            *time.Duration
 }
@@ -250,6 +256,7 @@ func newCacheFlagSet() (*flag.FlagSet, cacheFlags) {
 		s3Bucket:         fs.String("s3-bucket", "", "keep completed blobs and the index in this S3 bucket instead of --dir, which then only stages uploads; credentials come from the default AWS chain"),
 		s3Prefix:         fs.String("s3-prefix", "firerunner-cache/", "key prefix inside --s3-bucket; one live cache-server per prefix"),
 		s3Region:         fs.String("s3-region", "", "region of --s3-bucket (default: from the AWS config or instance metadata)"),
+		s3LocalCache:     fs.String("s3-local-cache-size", "20GB", "with --s3-bucket, keep up to this much of the most recently used blobs on local disk so restores skip S3 (0 keeps none)"),
 	}
 }
 
@@ -322,6 +329,8 @@ cache-server flags:
   --s3-prefix string  key prefix in --s3-bucket (default "firerunner-cache/");
                      one live cache-server per prefix
   --s3-region string  region of --s3-bucket (default from AWS config / IMDS)
+  --s3-local-cache-size string  keep this much of the most recently used blobs
+                     on local disk in front of S3 (default "20GB"; 0 = none)
 `)
 }
 
