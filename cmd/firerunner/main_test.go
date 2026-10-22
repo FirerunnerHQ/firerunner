@@ -17,6 +17,7 @@ import (
 	"github.com/solcreek/firerunner/internal/health"
 	"github.com/solcreek/firerunner/internal/listener"
 	"github.com/solcreek/firerunner/internal/provisioner"
+	"github.com/solcreek/firerunner/internal/scheduler"
 )
 
 func TestParseSize(t *testing.T) {
@@ -243,5 +244,15 @@ func TestServeTiers_RestartStopsEveryTier(t *testing.T) {
 	}
 	if ctx.Err() == nil {
 		t.Fatal("the other tiers were left running")
+	}
+}
+
+func TestTierPending(t *testing.T) {
+	var shared scheduler.PendingLaunches
+	if got := tierPending(config.Tier{Name: "fc"}, &shared); got != &shared {
+		t.Fatal("a firecracker tier must share the host's pending counter")
+	}
+	if got := tierPending(config.Tier{Name: "cloud", Provisioner: config.ProvisionerEC2}, &shared); got != nil {
+		t.Fatal("an ec2 tier must not share the firecracker tiers' pending counter")
 	}
 }

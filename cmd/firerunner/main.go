@@ -345,6 +345,18 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 	return nil
 }
 
+// tierPending returns the pending-launch counter a tier's scheduler shares.
+// Firecracker tiers share one, because their launches draw on the same host
+// slots. An EC2 tier draws on no host slots, so it gets nil (a private
+// counter): its launches must not shrink the capacity Firecracker tiers
+// advertise.
+func tierPending(t config.Tier, shared *scheduler.PendingLaunches) *scheduler.PendingLaunches {
+	if t.IsEC2() {
+		return nil
+	}
+	return shared
+}
+
 func tierNames(tiers []config.Tier) []string {
 	names := make([]string, len(tiers))
 	for i, t := range tiers {
@@ -557,7 +569,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			JIT:         jit,
 			Remover:     jit,
 			Logger:      tlog,
-			Pending:     &pending,
+			Pending:     tierPending(t, &pending),
 		}))
 	}
 	defer closeAll()
