@@ -1,5 +1,6 @@
-// Package cacheserver is a stdlib-only, disk-backed implementation of the
-// GitHub Actions cache service (v2) protocol. It lets firerunner microVMs keep
+// Package cacheserver is a stdlib-only implementation of the GitHub Actions
+// cache service (v2) protocol, disk-backed unless SetBlobStore moves completed
+// blobs and the index to an external store. It lets firerunner microVMs keep
 // their `actions/cache` (and setup-*/pnpm/go-build caches built on it) on the
 // host's local disk instead of GitHub's hosted cache, so dependency restore
 // runs at LAN speed and without GitHub's per-repo quota.
@@ -122,6 +123,10 @@ type Server struct {
 	identityWaits     atomic.Uint64
 	identityWaitNanos atomic.Uint64
 	lookup            func(string) (jobidentity.Identity, error)
+
+	store  BlobStore        // nil keeps blobs on local disk
+	stored map[uint64]int64 // with a store: entries whose whole blob reached it, by size
+	index  indexSync
 
 	// counters (under mu) for observability via /stats and /metrics.
 	hits      uint64
@@ -369,7 +374,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		// The existing reservation is stale (its upload never completed); reclaim
 		// it so a fresh reservation can take the key over.
-		_ = os.Remove(s.blobPath(e.ID))
+		s.removeBlob(e.ID)
 		_ = os.RemoveAll(s.tmpDir(e.ID))
 		delete(s.entries, e.ID)
 		delete(s.staged, e.ID)
@@ -432,19 +437,25 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, finalizeResp{OK: false, Message: "cache reservation expired"})
 		return
 	}
-	fi, err := os.Stat(s.blobPath(e.ID))
-	if err != nil {
+	size, uploaded := s.stored[e.ID]
+	if s.store == nil {
+		if fi, err := os.Stat(s.blobPath(e.ID)); err == nil {
+			size, uploaded = fi.Size(), true
+		}
+	}
+	if !uploaded {
 		writeJSON(w, http.StatusOK, finalizeResp{OK: false, Message: "cache blob was not uploaded"})
 		return
 	}
-	if want, err := strconv.ParseInt(req.SizeBytes, 10, 64); err == nil && want >= 0 && want != fi.Size() {
-		writeJSON(w, http.StatusOK, finalizeResp{OK: false, Message: fmt.Sprintf("size mismatch: got %d, want %d", fi.Size(), want)})
+	if want, err := strconv.ParseInt(req.SizeBytes, 10, 64); err == nil && want >= 0 && want != size {
+		writeJSON(w, http.StatusOK, finalizeResp{OK: false, Message: fmt.Sprintf("size mismatch: got %d, want %d", size, want)})
 		return
 	}
-	e.Size = fi.Size()
+	e.Size = size
 	e.Complete = true
 	e.UsedAt = time.Now().Unix()
 	delete(s.staged, e.ID) // it now counts as a completed blob, not in-flight
+	delete(s.stored, e.ID)
 	s.saves++
 	s.evictLRU(e.ID)
 	if err := s.save(); err != nil {
@@ -538,6 +549,11 @@ func (s *Server) uploadSingle(w http.ResponseWriter, r *http.Request, e *Entry) 
 		s.clearStaged(e.ID)
 		code, msg := uploadStatus(err)
 		http.Error(w, msg, code)
+		return
+	}
+	if err := s.putBlob(r, e.ID); err != nil {
+		s.clearStaged(e.ID)
+		http.Error(w, err.Error(), http.StatusInsufficientStorage)
 		return
 	}
 	s.setStaged(e.ID, n)
@@ -651,6 +667,11 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 		return
 	}
 	_ = os.RemoveAll(dir)
+	if err := s.putBlob(r, e.ID); err != nil {
+		s.clearStaged(e.ID)
+		http.Error(w, err.Error(), http.StatusInsufficientStorage)
+		return
+	}
 	s.setStaged(e.ID, total)
 	w.WriteHeader(http.StatusCreated)
 }
@@ -661,6 +682,13 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	e, ok := s.authEntry(w, r)
 	if !ok {
+		return
+	}
+	if s.store != nil {
+		if r.Method == http.MethodHead || r.Header.Get("Range") == "" {
+			s.log.Info("cache entry served", "id", e.ID, "key", e.Key, "size", e.Size, "method", r.Method, "from", "store")
+		}
+		s.serveFromStore(w, r, e)
 		return
 	}
 	f, err := os.Open(s.blobPath(e.ID))
@@ -895,7 +923,7 @@ func (s *Server) evictLRU(keepID uint64) {
 			break // only the kept entry (and in-flight uploads) are left
 		}
 		total -= victim.Size
-		_ = os.Remove(s.blobPath(victim.ID))
+		s.removeBlob(victim.ID)
 		_ = os.RemoveAll(s.tmpDir(victim.ID))
 		delete(s.entries, victim.ID)
 		delete(s.staged, victim.ID)
@@ -921,7 +949,7 @@ func (s *Server) gc() {
 	var removed int
 	for id, e := range s.entries {
 		if !e.Complete && e.UsedAt < cutoff {
-			_ = os.Remove(s.blobPath(id))
+			s.removeBlob(id)
 			_ = os.RemoveAll(s.tmpDir(id))
 			delete(s.entries, id)
 			delete(s.staged, id)
@@ -946,6 +974,10 @@ func (s *Server) load() error {
 		}
 		return fmt.Errorf("read cache index: %w", err)
 	}
+	return s.loadIndex(data)
+}
+
+func (s *Server) loadIndex(data []byte) error {
 	var entries []*Entry
 	if err := json.Unmarshal(data, &entries); err != nil {
 		return fmt.Errorf("decode cache index: %w", err)
@@ -968,6 +1000,11 @@ func (s *Server) save() error {
 	data, err := json.Marshal(entries)
 	if err != nil {
 		return err
+	}
+	if s.store != nil {
+		s.index.mu.Lock()
+		s.index.data, s.index.dirty = data, true
+		s.index.mu.Unlock()
 	}
 	tmp := s.indexPath() + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {

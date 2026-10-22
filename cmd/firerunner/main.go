@@ -25,6 +25,7 @@ import (
 	"github.com/actions/scaleset"
 
 	"github.com/solcreek/firerunner/internal/cacheserver"
+	"github.com/solcreek/firerunner/internal/cacheserver/s3store"
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/diag"
 	"github.com/solcreek/firerunner/internal/jobidentity"
@@ -119,6 +120,9 @@ func cacheServe(args []string) error {
 	jobsOwner := fs.Int("jobs-owner-uid", os.Getuid(), "UID of the daemon that owns job records (default current UID)")
 	identityWait := fs.Duration("identity-wait", cacheserver.DefaultIdentityWait, "how long a request from a VM whose job identity is still pending waits for it before being denied (0 denies at once)")
 	artifactUpstream := fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs")
+	s3Bucket := fs.String("s3-bucket", "", "keep completed blobs and the index in this S3 bucket instead of --dir, which then only stages uploads; credentials come from the default AWS chain")
+	s3Prefix := fs.String("s3-prefix", "firerunner-cache/", "key prefix inside --s3-bucket; one live cache-server per prefix")
+	s3Region := fs.String("s3-region", "", "region of --s3-bucket (default: from the AWS config or instance metadata)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -142,6 +146,17 @@ func cacheServe(args []string) error {
 	}
 	srv.SetMaxSize(maxBytes)
 	srv.SetMaxEntrySize(maxEntryBytes)
+	if *s3Bucket != "" {
+		store, err := s3store.New(context.Background(), *s3Bucket, *s3Prefix, *s3Region)
+		if err != nil {
+			return err
+		}
+		if err := srv.SetBlobStore(store); err != nil {
+			return err
+		}
+		stopSync := srv.StartIndexSync()
+		defer stopSync()
+	}
 	reader := jobidentity.Reader{Dir: *jobsDir, OwnerUID: jobsOwner}
 	if err := reader.Check(); err != nil {
 		return fmt.Errorf("job identity directory: %w", err)
@@ -182,7 +197,7 @@ func cacheServe(args []string) error {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Info("cache-server listening", "addr", *addr, "dir", *dir, "max_size", *maxSize, "artifact_upstream", *artifactUpstream)
+	log.Info("cache-server listening", "addr", *addr, "dir", *dir, "max_size", *maxSize, "artifact_upstream", *artifactUpstream, "s3_bucket", *s3Bucket, "s3_prefix", *s3Prefix)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
@@ -252,6 +267,11 @@ cache-server flags:
                      artifact v4+, which share ACTIONS_RESULTS_URL with the
                      cache) to this Results endpoint so artifacts stay on GitHub
                      (default github.com's results-receiver; "" refuses them)
+  --s3-bucket string  keep completed blobs and the index in this S3 bucket;
+                     --dir then only stages uploads (credentials: default AWS chain)
+  --s3-prefix string  key prefix in --s3-bucket (default "firerunner-cache/");
+                     one live cache-server per prefix
+  --s3-region string  region of --s3-bucket (default from AWS config / IMDS)
 `)
 }
 
