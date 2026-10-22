@@ -164,9 +164,30 @@ func TestWatcher_SplitsLargeBatches(t *testing.T) {
 		_, stop := w.watch(id)
 		defer stop()
 	}
-	time.Sleep(30 * time.Millisecond)
+	// Wait for a full poll: the calls together cover every watched ID.
+	covered := func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		seen := map[string]bool{}
+		for _, call := range f.describeIDs {
+			for _, id := range call {
+				seen[id] = true
+			}
+		}
+		return len(seen) == len(ids)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for !covered() {
+		if time.Now().After(deadline) {
+			t.Fatal("no poll covered every watched instance")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if len(f.describeIDs) < 2 {
+		t.Fatalf("%d DescribeInstances calls for %d IDs, want them split", len(f.describeIDs), len(ids))
+	}
 	for _, call := range f.describeIDs {
 		if len(call) > describeBatch {
 			t.Fatalf("one call described %d IDs, cap is %d", len(call), describeBatch)
