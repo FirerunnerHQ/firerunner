@@ -543,6 +543,9 @@ func TestFromFlags_VMConnectTimeout(t *testing.T) {
 
 // ec2TierJSON is a valid EC2 tier; tests splice it into catalogs. The IDs are
 // placeholders in AWS's format, not real resources.
+// jitAddr is the --jit-addr every catalog with an ec2 tier needs.
+var jitAddr = []string{"--jit-addr", "10.0.0.5:8098"}
+
 const ec2TierJSON = `{"name":"cloud-4c","provisioner":"ec2","labels":["cloud"],"min":1,"max":20,
   "ec2":{"instance_types":["c8a.xlarge","c7a.xlarge"],"ami":"/firerunner/ami/runner",
          "subnets":["subnet-aaaa","subnet-bbbb"],"security_groups":["sg-cccc"],
@@ -554,7 +557,7 @@ func TestFromFlags_MixedProvisionerCatalog(t *testing.T) {
 	  {"name":"local","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":1,"max":4},
 	  `+ec2TierJSON+`
 	]`)
-	c, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "4"))
+	c, err := FromFlags(append(append(baseArgs(), jitAddr...), "--tiers", p, "--max-runners", "4"))
 	if err != nil {
 		t.Fatalf("FromFlags: %v", err)
 	}
@@ -607,7 +610,7 @@ func TestFromFlags_EC2OnlyCatalogNeedsNoFirecrackerHost(t *testing.T) {
 	// A control VM serving only EC2 tiers has no KVM, kernel or microVM
 	// egress interface, so those flags are not required.
 	p := writeTiers(t, `[`+ec2TierJSON+`]`)
-	c, err := FromFlags([]string{"--url", "https://github.com/org", "--token", "t", "--tiers", p})
+	c, err := FromFlags(append([]string{"--url", "https://github.com/org", "--token", "t", "--tiers", p}, jitAddr...))
 	if err != nil {
 		t.Fatalf("EC2-only catalog without --kernel/--ext-iface: %v", err)
 	}
@@ -616,7 +619,7 @@ func TestFromFlags_EC2OnlyCatalogNeedsNoFirecrackerHost(t *testing.T) {
 	}
 	// The same flags are still required as soon as a Firecracker tier joins.
 	mixed := writeTiers(t, `[{"name":"local","vcpu":2,"mem_mib":4096,"golden":"/g","max":2},`+ec2TierJSON+`]`)
-	if _, err := FromFlags([]string{"--url", "u", "--token", "t", "--tiers", mixed}); err == nil {
+	if _, err := FromFlags(append([]string{"--url", "u", "--token", "t", "--tiers", mixed}, jitAddr...)); err == nil {
 		t.Fatal("expected --kernel to be required once a firecracker tier is present")
 	}
 	// The single tier derived from scalar flags is a Firecracker tier.
@@ -631,7 +634,7 @@ func TestFromFlags_EC2WarmPoolOutsideSlotBudget(t *testing.T) {
 	  {"name":"local","vcpu":2,"mem_mib":4096,"golden":"/g","min":2,"max":2},
 	  `+strings.Replace(ec2TierJSON, `"min":1`, `"min":10`, 1)+`
 	]`)
-	if _, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "2")); err != nil {
+	if _, err := FromFlags(append(append(baseArgs(), jitAddr...), "--tiers", p, "--max-runners", "2")); err != nil {
 		t.Fatalf("EC2 min should not count against --max-runners: %v", err)
 	}
 }
@@ -667,8 +670,12 @@ func TestFromFlags_EC2TierErrors(t *testing.T) {
 				t.Fatalf("fragment %q not found; the case tests nothing", r[0])
 			}
 			p := writeTiers(t, `[`+body+`]`)
-			if _, err := FromFlags(append(baseArgs(), "--tiers", p)); err == nil {
+			_, err := FromFlags(append(append(baseArgs(), jitAddr...), "--tiers", p))
+			if err == nil {
 				t.Fatalf("expected error for %q", name)
+			}
+			if strings.Contains(err.Error(), "--jit-addr") {
+				t.Fatalf("%q failed on the JIT flag, not the tier: %v", name, err)
 			}
 		})
 	}
@@ -683,7 +690,7 @@ func TestFromFlags_EC2BlockOnFirecrackerTier(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := writeTiers(t, body)
-			_, err := FromFlags(append(baseArgs(), "--tiers", p))
+			_, err := FromFlags(append(append(baseArgs(), jitAddr...), "--tiers", p))
 			if err == nil || !strings.Contains(err.Error(), "ec2 block") {
 				t.Fatalf("err = %v, want an ec2-block error", err)
 			}
@@ -700,5 +707,48 @@ func TestFromFlags_ExplicitFirecrackerProvisioner(t *testing.T) {
 	}
 	if c.Tiers[0].IsEC2() {
 		t.Fatal("explicit firecracker tier reported as ec2")
+	}
+}
+
+func TestFromFlags_JITAddr(t *testing.T) {
+	ec2Only := writeTiers(t, `[`+ec2TierJSON+`]`)
+	args := func(extra ...string) []string {
+		return append([]string{"--url", "u", "--token", "t", "--tiers", ec2Only}, extra...)
+	}
+	c, err := FromFlags(args("--jit-addr", "10.0.0.5:8098"))
+	if err != nil {
+		t.Fatalf("valid --jit-addr: %v", err)
+	}
+	if c.JITAddr != "10.0.0.5:8098" || c.JITTTL != 5*time.Minute {
+		t.Fatalf("JITAddr=%q JITTTL=%s, want the address and the 5m default", c.JITAddr, c.JITTTL)
+	}
+	if _, err := FromFlags(args()); err == nil || !strings.Contains(err.Error(), "--jit-addr is required") {
+		t.Fatalf("ec2 tier without --jit-addr: err = %v", err)
+	}
+	for name, addr := range map[string]string{
+		"hostname":   "control.internal:8098",
+		"no port":    "10.0.0.5",
+		"zero port":  "10.0.0.5:0",
+		"wildcard":   "0.0.0.0:8098",
+		"loopback":   "127.0.0.1:8098",
+		"link-local": "169.254.169.254:80",
+		"v6 any":     "[::]:8098",
+	} {
+		if _, err := FromFlags(args("--jit-addr", addr)); err == nil {
+			t.Errorf("%s: --jit-addr %q accepted", name, addr)
+		}
+	}
+	if _, err := FromFlags(args("--jit-addr", "10.0.0.5:8098", "--jit-ttl", "5s")); err == nil {
+		t.Error("--jit-ttl below 30s accepted")
+	}
+	// Without an ec2 tier the flag is optional and its absence is fine.
+	if _, err := FromFlags(baseArgs()); err != nil {
+		t.Fatalf("firecracker-only config without --jit-addr: %v", err)
+	}
+	t.Setenv("FR_JIT_ADDR", "10.0.0.6:9000")
+	t.Setenv("FR_JIT_TTL", "2m")
+	c, err = FromFlags(args())
+	if err != nil || c.JITAddr != "10.0.0.6:9000" || c.JITTTL != 2*time.Minute {
+		t.Fatalf("env fallback: c=%+v err=%v", c, err)
 	}
 }
