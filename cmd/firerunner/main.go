@@ -586,7 +586,6 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// Publish each tier's listener health for status and doctor.
 	healthPath := filepath.Join(cfg.Firecracker.WorkDir, health.FileName)
 	stopHealth := publishHealth(healthPath, trackers, log)
-	defer stopHealth()
 
 	// Drive every tier's listener concurrently. A listener reconnects its own
 	// session; one that stops on a fatal error leaves the other tiers running.
@@ -613,6 +612,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 	}
 	runErr := serveTiers(runCtx, cancel, tierNames(tiers), runs, log)
+	// No tier is listening any more. Stop refreshing the health file before
+	// the drain, which can wait out long jobs: a file that keeps its last
+	// write time ages into "stale" instead of claiming live listeners.
+	stopHealth()
 
 	log.Info("shutdown signalled, draining in-flight microVMs")
 	for _, sched := range scheds {
