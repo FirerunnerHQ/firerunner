@@ -573,10 +573,11 @@ func validateEC2Tier(t Tier) error {
 	case e.RootVolumeGiB < 0:
 		return fmt.Errorf("tier %q: ec2.root_volume_gib must be >= 0", t.Name)
 	}
+	// io1/io2 need a provisioned IOPS value, which the tier does not carry.
 	switch e.VolumeType() {
-	case "gp2", "gp3", "io1", "io2":
+	case "gp2", "gp3":
 	default:
-		return fmt.Errorf("tier %q: ec2.root_volume_type %q must be gp2, gp3, io1 or io2", t.Name, e.RootVolumeType)
+		return fmt.Errorf("tier %q: ec2.root_volume_type %q must be gp2 or gp3", t.Name, e.RootVolumeType)
 	}
 	return nil
 }
