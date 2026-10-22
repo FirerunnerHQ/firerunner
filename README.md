@@ -833,4 +833,12 @@ Notes:
 
 ## License
 
-[MIT](./LICENSE)
+[MIT](./LICENSE), copyright Kaik, Inc. The `LICENSE` file lists the directories
+that carry a different license.
+
+## Contributing
+
+Contributions are accepted under the
+[Developer Certificate of Origin](https://developercertificate.org/): sign off
+every commit with `git commit -s`. The `dco` workflow checks this on each pull
+request.
