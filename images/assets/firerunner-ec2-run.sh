@@ -13,8 +13,8 @@
 # the fetch starts as soon as the NIC has an address instead of waiting for
 # network-online.target or docker.
 #
-# Powering off ends the instance: an on-demand instance is launched with
-# shutdown behaviour "terminate"; a spot instance stops, and firerunner
+# Powering off ends the instance: it is launched with shutdown behaviour
+# "terminate". A pooled persistent-spot instance can only stop, and firerunner
 # terminates it.
 set -eu
 

@@ -192,18 +192,20 @@ func TestLaunch_RunInstancesInput(t *testing.T) {
 				!aws.ToBool(in.BlockDeviceMappings[0].Ebs.DeleteOnTermination) {
 				t.Errorf("root volume = %+v", in.BlockDeviceMappings)
 			}
+			// Both markets terminate on the guest's poweroff: one-time spot
+			// accepts it.
+			if in.InstanceInitiatedShutdownBehavior != types.ShutdownBehaviorTerminate {
+				t.Errorf("shutdown behaviour = %q, want terminate", in.InstanceInitiatedShutdownBehavior)
+			}
 			switch mkt {
 			case config.MarketOnDemand:
-				if in.InstanceInitiatedShutdownBehavior != types.ShutdownBehaviorTerminate || in.InstanceMarketOptions != nil {
-					t.Errorf("on-demand: shutdown=%q market=%+v", in.InstanceInitiatedShutdownBehavior, in.InstanceMarketOptions)
+				if in.InstanceMarketOptions != nil {
+					t.Errorf("on-demand market options = %+v, want none", in.InstanceMarketOptions)
 				}
 			case config.MarketSpot:
 				mo := in.InstanceMarketOptions
 				if mo == nil || mo.MarketType != types.MarketTypeSpot || mo.SpotOptions.SpotInstanceType != types.SpotInstanceTypeOneTime {
 					t.Errorf("spot market options = %+v", mo)
-				}
-				if in.InstanceInitiatedShutdownBehavior != "" {
-					t.Errorf("spot shutdown behaviour = %q, want unset (spot cannot terminate on shutdown)", in.InstanceInitiatedShutdownBehavior)
 				}
 			}
 		})
@@ -330,13 +332,13 @@ func TestLaunch_CancelDuringCapacityWalk(t *testing.T) {
 	}
 }
 
-func TestLaunch_SpotPoweroffStopsThenTerminated(t *testing.T) {
+func TestLaunch_StoppedInstanceIsTerminated(t *testing.T) {
 	h := newHarness(t, func(o *Options) { o.EC2.Market = config.MarketSpot })
 	errc := h.launch(context.Background())
 	inst := h.instance(t)
 	h.fetch(inst.ip)
-	// A spot instance cannot terminate on shutdown: the guest's poweroff
-	// leaves it stopped, and Launch must terminate it.
+	// Belt and braces: should a poweroff ever leave the instance stopped
+	// rather than terminated, Launch terminates it.
 	h.f.setState(inst.id, types.InstanceStateNameStopped)
 	if err := waitErr(t, errc); err != nil {
 		t.Fatalf("Launch = %v, want nil after the job", err)

@@ -179,8 +179,9 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 				w.log.Info("instance gone", "state", s)
 				return result
 			case types.InstanceStateNameStopping, types.InstanceStateNameStopped:
-				// The runner powered off. On-demand instances terminate on
-				// shutdown; spot instances cannot, so finish the job here.
+				// The runner powered off but the instance only stopped, which
+				// a terminate-on-shutdown launch should never do (a pooled
+				// persistent-spot instance would). Finish the job here.
 				if !w.terminating {
 					w.terminate(context.WithoutCancel(ctx), "instance stopped")
 				}
@@ -305,9 +306,11 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 		},
 		// Idempotent across SDK retries of this exact attempt.
 		ClientToken: aws.String(clientToken(name, market, itype, subnet)),
+		// The guest's poweroff ends the instance. One-time spot accepts this
+		// too; only a persistent spot request (the stopped pool) rejects it.
+		InstanceInitiatedShutdownBehavior: types.ShutdownBehaviorTerminate,
 	}
 	if market == config.MarketSpot {
-		// One-time spot; a guest poweroff stops it, and Launch terminates it.
 		in.InstanceMarketOptions = &types.InstanceMarketOptionsRequest{
 			MarketType: types.MarketTypeSpot,
 			SpotOptions: &types.SpotMarketOptions{
@@ -315,8 +318,6 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 				InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorTerminate,
 			},
 		}
-	} else {
-		in.InstanceInitiatedShutdownBehavior = types.ShutdownBehaviorTerminate
 	}
 	if p.o.EC2.RootVolumeGiB > 0 || p.o.EC2.RootVolumeType != "" {
 		ebs := &types.EbsBlockDevice{
