@@ -1,0 +1,15 @@
+[Unit]
+Description=firerunner EC2 JIT runner (one job, then power off)
+# No network-online.target or docker ordering: the script retries until the
+# VPC endpoint answers, which is earlier than either.
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/firerunner-ec2-run.sh
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
