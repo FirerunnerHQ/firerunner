@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -255,6 +256,23 @@ cache-server flags:
 `)
 }
 
+// tierProvisioner returns the provisioner that launches t's runners. fc is the
+// host's Firecracker provisioner, shared by every Firecracker tier because they
+// draw on one slot budget; it is nil when no tier uses Firecracker.
+func tierProvisioner(t config.Tier, fc provisioner.Provisioner) (provisioner.Provisioner, error) {
+	switch t.ProvisionerName() {
+	case config.ProvisionerFirecracker:
+		if fc == nil {
+			return nil, errors.New("no firecracker provisioner configured")
+		}
+		return fc, nil
+	case config.ProvisionerEC2:
+		return nil, fmt.Errorf("provisioner %q is not available in this build yet", config.ProvisionerEC2)
+	default:
+		return nil, fmt.Errorf("unknown provisioner %q", t.Provisioner)
+	}
+}
+
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	privateKey, err := cfg.ResolvePrivateKey()
 	if err != nil {
@@ -272,10 +290,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		PrivateKey:     privateKey,
 	}
 
-	// One provisioner backs every tier: they share the host kernel, tool cache,
-	// network and the MaxRunners slot budget. Each tier is its own GitHub scale
-	// set with its own microVM shape and golden image; developers pick one with
-	// runs-on: <tier name>.
+	// Each tier is its own GitHub scale set; developers pick one with
+	// runs-on: <tier name>. One Firecracker provisioner backs every Firecracker
+	// tier: they share the host kernel, tool cache, network and the MaxRunners
+	// slot budget, while each keeps its own microVM shape and golden image.
 
 	var onJobStarted func(context.Context, jobidentity.Job)
 	if cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != "" {
@@ -291,8 +309,23 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		cfg.Firecracker.Jobs = jobs
 		onJobStarted = func(ctx context.Context, j jobidentity.Job) { jobs.Start(ctx, j, resolver) }
 	}
-	prov := provisioner.NewFirecracker(cfg.Firecracker, log)
+	var fc *provisioner.Firecracker
+	if cfg.UsesFirecracker() {
+		fc = provisioner.NewFirecracker(cfg.Firecracker, log)
+	}
 	tiers := cfg.EffectiveTiers()
+	provs := make([]provisioner.Provisioner, len(tiers))
+	for i, t := range tiers {
+		var shared provisioner.Provisioner
+		if fc != nil {
+			shared = fc
+		}
+		p, err := tierProvisioner(t, shared)
+		if err != nil {
+			return fmt.Errorf("tier %q: %w", t.Name, err)
+		}
+		provs[i] = p
+	}
 
 	// Register every tier's scale set up front so a failure aborts cleanly
 	// before we start booting microVMs.
@@ -306,7 +339,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			_ = l.Close(context.WithoutCancel(ctx))
 		}
 	}
-	for _, t := range tiers {
+	for i, t := range tiers {
 		tlog := log.With("tier", t.Name)
 		lis, err := listener.New(ctx, listener.Config{
 			URL:          cfg.URL,
@@ -331,7 +364,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			Max:         t.Max,
 			Min:         t.Min,
 			Spec:        t.Spec(),
-			Provisioner: prov,
+			Provisioner: provs[i],
 			JIT:         jit,
 			Remover:     jit,
 			Logger:      tlog,
@@ -341,25 +374,35 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	defer closeAll()
 
 	log.Info("firerunner starting",
-		"provisioner", prov.Name(),
 		"url", cfg.URL,
 		"tiers", len(tiers),
 		"maxRunners", cfg.MaxRunners,
 	)
-	for _, t := range tiers {
+	for i, t := range tiers {
+		if t.IsEC2() {
+			log.Info("serving tier",
+				"name", t.Name, "provisioner", provs[i].Name(),
+				"instanceTypes", t.EC2.InstanceTypes, "market", t.EC2.Market,
+				"min", t.Min, "max", t.Max)
+			continue
+		}
 		log.Info("serving tier",
-			"name", t.Name, "vcpu", t.VCPU, "memMiB", t.MemMiB,
+			"name", t.Name, "provisioner", provs[i].Name(),
+			"vcpu", t.VCPU, "memMiB", t.MemMiB,
 			"golden", t.Golden, "min", t.Min, "max", t.Max)
 	}
 
-	// Reclaim taps and job dirs orphaned by a previous unclean exit before we
-	// start allocating new slots, so a crash-restart cycle can't exhaust them.
-	prov.CleanupStale(ctx)
+	if fc != nil {
+		// Reclaim taps and job dirs orphaned by a previous unclean exit before
+		// we start allocating new slots, so a crash-restart cycle can't exhaust
+		// them.
+		fc.CleanupStale(ctx)
 
-	if err := prov.SetupNetwork(ctx); err != nil {
-		return fmt.Errorf("setup network: %w", err)
+		if err := fc.SetupNetwork(ctx); err != nil {
+			return fmt.Errorf("setup network: %w", err)
+		}
+		go fc.RefreshNetwork(ctx)
 	}
-	go prov.RefreshNetwork(ctx)
 
 	// Drive every tier's listener concurrently. runCtx lets the first fatal
 	// listener error tear down the rest; on SIGTERM the parent ctx cancels it.
