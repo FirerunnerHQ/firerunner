@@ -316,7 +316,6 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 			if err == nil {
 				err = errors.New("listener returned without an error")
 			}
-			log.Error("tier stopped taking jobs; other tiers keep running", "tier", names[i], "err", err)
 			mu.Lock()
 			defer mu.Unlock()
 			stopped++
@@ -325,12 +324,15 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 			}
 			switch {
 			case errors.Is(err, listener.ErrRestart):
-				log.Error("restarting to register the scale set again; stopping every tier", "tier", names[i])
+				log.Error("restarting to register the scale set again; stopping every tier", "tier", names[i], "err", err)
 				restart = true
 				cancel()
 			case stopped == len(runs):
+				log.Error("tier stopped taking jobs", "tier", names[i], "err", err)
 				log.Error("every tier has stopped; shutting down")
 				cancel()
+			default:
+				log.Error("tier stopped taking jobs; other tiers keep running", "tier", names[i], "err", err)
 			}
 		}()
 	}
