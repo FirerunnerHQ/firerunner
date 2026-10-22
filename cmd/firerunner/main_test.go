@@ -160,11 +160,12 @@ func TestServeTiers_AllTiersStoppedShutsDown(t *testing.T) {
 	defer cancel()
 	runs := []func(context.Context) error{
 		func(context.Context) error { return errors.New("a: 401") },
-		func(context.Context) error { time.Sleep(10 * time.Millisecond); return errors.New("b: 404") },
+		func(context.Context) error { return errors.New("b: 403") },
 	}
 	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler))
-	if err == nil || !strings.Contains(err.Error(), `tier "a"`) {
-		t.Fatalf("err = %v, want the first tier's error", err)
+	// Which tier stopped first is up to the scheduler; either error names it.
+	if err == nil || !(strings.Contains(err.Error(), `tier "a": a: 401`) || strings.Contains(err.Error(), `tier "b": b: 403`)) {
+		t.Fatalf("err = %v, want one tier's error", err)
 	}
 	if ctx.Err() == nil {
 		t.Fatal("ctx not cancelled once every tier stopped")
