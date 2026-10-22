@@ -467,3 +467,61 @@ func countFails(checks []Check) int {
 	}
 	return n
 }
+
+// TestStatus_EC2Tier shows an ec2 tier by its instance types and market, with
+// no microVM shape or golden image.
+func TestStatus_EC2Tier(t *testing.T) {
+	cfg := &config.Config{
+		ScaleSetName: "firerunner",
+		MaxRunners:   4,
+		Firecracker:  provisioner.FirecrackerConfig{WorkDir: t.TempDir(), TapPrefix: "fr", NetBase: 16},
+		Tiers: []config.Tier{
+			{Name: "local", VCPU: 2, MemMiB: 4096, Golden: "/g/base.ext4", Max: 4},
+			{Name: "cloud", Provisioner: config.ProvisionerEC2, Max: 20, EC2: &config.EC2Tier{
+				InstanceTypes: []string{"c8a.xlarge", "c7a.xlarge"}, Market: config.MarketSpot,
+			}},
+		},
+	}
+	var text bytes.Buffer
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatalf("Status text: %v", err)
+	}
+	for _, want := range []string{"PROVISIONER", "firecracker", "c8a.xlarge,c7a.xlarge (spot)"} {
+		if !strings.Contains(text.String(), want) {
+			t.Errorf("text status missing %q\n%s", want, text.String())
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := Status(cfg, "test", &buf, true); err != nil {
+		t.Fatalf("Status --json: %v", err)
+	}
+	var r StatusReport
+	if err := json.Unmarshal(buf.Bytes(), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	local, cloud := r.Tiers[0], r.Tiers[1]
+	if local.Provisioner != "firecracker" || local.Golden == nil || local.VCPU != 2 {
+		t.Errorf("local tier = %+v", local)
+	}
+	if cloud.Provisioner != "ec2" || cloud.Golden != nil || cloud.VCPU != 0 ||
+		len(cloud.InstanceTypes) != 2 || cloud.Market != "spot" || cloud.Max != 20 {
+		t.Errorf("cloud tier = %+v", cloud)
+	}
+}
+
+// TestDoctor_SkipsEC2TierGolden: an ec2 tier has no golden on this host, so
+// Doctor must not fail it on a missing image.
+func TestDoctor_SkipsEC2TierGolden(t *testing.T) {
+	cfg := &config.Config{
+		Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir()},
+		Tiers: []config.Tier{
+			{Name: "cloud", Provisioner: config.ProvisionerEC2, Max: 4, EC2: &config.EC2Tier{}},
+		},
+	}
+	for _, c := range runDoctor(cfg, "test").Checks {
+		if strings.HasPrefix(c.Name, "golden") || strings.HasPrefix(c.Name, "toolcache") {
+			t.Errorf("doctor checked an image for an ec2 tier: %v", c)
+		}
+	}
+}
