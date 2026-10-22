@@ -144,9 +144,15 @@ gzip because the image has no zstd.
 | save: tar + gzip | — | 5.6 s |
 | save: upload, including the node's put to S3 | — | 1.3 s |
 
-Downloads served from S3 run at about a fifth of the local-disk rate. That
-argues for keeping a bounded local read-through copy on the node, with S3 as
-the durable tier. This is not built yet.
+Downloads served from S3 ran at about a fifth of the local-disk rate. The
+node now keeps local copies in front of S3 (`--s3-local-cache-size`, from
+`feat/cacheserver-s3` 004bdec). Measured on the same 300 MB entry:
+
+| restore | run | source | download | extract |
+|---|---|---|---:|---:|
+| on the node that saved it | 39781466158 | local copy | 0.39 s (767 MB/s) | 1.02 s |
+| first, on a freshly replaced node | 39781977225 | S3, then filled into a local copy in the background (~4 s) | 3.76 s (80 MB/s) | 1.07 s |
+| second, on that node | 39782192509 | local copy | 0.53 s (561 MB/s) | 1.15 s |
 
 ### Measured: what fail-fast saves (cache node gone, one save plus one restore)
 
