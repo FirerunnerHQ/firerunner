@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,10 +25,16 @@ import (
 	"time"
 
 	"github.com/actions/scaleset"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
+	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 
 	"github.com/solcreek/firerunner/internal/cacheserver"
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/diag"
+	"github.com/solcreek/firerunner/internal/ec2"
+	"github.com/solcreek/firerunner/internal/health"
+	"github.com/solcreek/firerunner/internal/jitserver"
 	"github.com/solcreek/firerunner/internal/jobidentity"
 	"github.com/solcreek/firerunner/internal/listener"
 	"github.com/solcreek/firerunner/internal/provisioner"
@@ -258,8 +265,9 @@ cache-server flags:
 
 // tierProvisioner returns the provisioner that launches t's runners. fc is the
 // host's Firecracker provisioner, shared by every Firecracker tier because they
-// draw on one slot budget; it is nil when no tier uses Firecracker.
-func tierProvisioner(t config.Tier, fc provisioner.Provisioner) (provisioner.Provisioner, error) {
+// draw on one slot budget; it is nil when no tier uses Firecracker. newEC2
+// builds an ec2 tier's own provisioner; it is nil when no tier uses EC2.
+func tierProvisioner(t config.Tier, fc provisioner.Provisioner, newEC2 func(config.Tier) provisioner.Provisioner) (provisioner.Provisioner, error) {
 	switch t.ProvisionerName() {
 	case config.ProvisionerFirecracker:
 		if fc == nil {
@@ -267,10 +275,174 @@ func tierProvisioner(t config.Tier, fc provisioner.Provisioner) (provisioner.Pro
 		}
 		return fc, nil
 	case config.ProvisionerEC2:
-		return nil, fmt.Errorf("provisioner %q is not available in this build yet", config.ProvisionerEC2)
+		if newEC2 == nil || t.EC2 == nil {
+			return nil, errors.New("no ec2 provisioner configured")
+		}
+		return newEC2(t), nil
 	default:
 		return nil, fmt.Errorf("unknown provisioner %q", t.Provisioner)
 	}
+}
+
+// serveTiers runs every tier's listener until ctx ends. Each run gets its own
+// child context, cancelled once that run returns, so a tier that stops also
+// stops scheduling: its idle runners are cancelled and its warm pool no
+// longer refills, freeing shared slots and instances for the tiers still
+// serving. A tier whose listener stops on its own error is logged and left
+// stopped (its health tracker says why) while the others keep serving; when
+// every tier has stopped there is nothing left to serve, so it cancels ctx and
+// returns the first error. A tier that needs a fresh process
+// (listener.ErrRestart: its scale set was deleted) stops every tier at once,
+// so the daemon exits for its supervisor to restart and re-register it.
+func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, runs []func(context.Context) error, log *slog.Logger) error {
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		stopped int
+		first   error
+		restart bool
+	)
+	for i, run := range runs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tierCtx, tierCancel := context.WithCancel(ctx)
+			defer tierCancel()
+			err := run(tierCtx)
+			tierCancel()
+			if ctx.Err() != nil {
+				return
+			}
+			if err == nil {
+				err = errors.New("listener returned without an error")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			stopped++
+			if first == nil || errors.Is(err, listener.ErrRestart) {
+				first = fmt.Errorf("tier %q: %w", names[i], err)
+			}
+			switch {
+			case errors.Is(err, listener.ErrRestart):
+				log.Error("restarting to register the scale set again; stopping every tier", "tier", names[i], "err", err)
+				restart = true
+				cancel()
+			case stopped == len(runs):
+				log.Error("tier stopped taking jobs", "tier", names[i], "err", err)
+				log.Error("every tier has stopped; shutting down")
+				cancel()
+			default:
+				log.Error("tier stopped taking jobs; other tiers keep running", "tier", names[i], "err", err)
+			}
+		}()
+	}
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if restart || stopped == len(runs) {
+		return first
+	}
+	return nil
+}
+
+// tierPending returns the pending-launch counter a tier's scheduler shares.
+// Firecracker tiers share one, because their launches draw on the same host
+// slots. An EC2 tier draws on no host slots, so it gets nil (a private
+// counter): its launches must not shrink the capacity Firecracker tiers
+// advertise.
+func tierPending(t config.Tier, shared *scheduler.PendingLaunches) *scheduler.PendingLaunches {
+	if t.IsEC2() {
+		return nil
+	}
+	return shared
+}
+
+func tierNames(tiers []config.Tier) []string {
+	names := make([]string, len(tiers))
+	for i, t := range tiers {
+		names[i] = t.Name
+	}
+	return names
+}
+
+// healthInterval is how often the listener health file is rewritten.
+const healthInterval = 10 * time.Second
+
+// publishHealth writes the trackers' state to path now and every
+// healthInterval until the returned func is called, which writes it once more.
+func publishHealth(path string, trackers []*health.Tracker, log *slog.Logger) func() {
+	write := func() {
+		f := health.File{PID: os.Getpid(), WrittenAt: time.Now().UTC()}
+		for _, tr := range trackers {
+			f.Tiers = append(f.Tiers, tr.Snapshot())
+		}
+		if err := health.Write(path, f); err != nil {
+			log.Warn("write listener health", "path", path, "err", err)
+		}
+	}
+	write()
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(healthInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				write()
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+		write()
+	}
+}
+
+// serveJIT starts the endpoint EC2 instances fetch their JIT configs from, on
+// the control VM's VPC address. Binding fails fast if the address is not this
+// host's. The returned func shuts it down.
+func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitserver.Server, func(), error) {
+	jit := jitserver.New(cfg.JITTTL, log.With("component", "jitserver"))
+	ln, err := net.Listen("tcp", cfg.JITAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("--jit-addr: %w", err)
+	}
+	srv := &http.Server{Handler: jit, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Error("jit endpoint stopped", "err", err)
+		}
+	}()
+	log.Info("serving EC2 JIT configs", "addr", cfg.JITAddr)
+	return jit, func() {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}, nil
+}
+
+// newEC2Client builds the AWS clients shared by every EC2 tier from the
+// default credential chain (the control VM's instance role). The region is
+// --aws-region when set, else the SDK's usual sources, falling back to IMDS.
+func newEC2Client(ctx context.Context, cfg *config.Config, log *slog.Logger) (*ec2.Client, error) {
+	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithEC2IMDSRegion()}
+	if cfg.AWSRegion != "" {
+		opts = append(opts, awsconfig.WithRegion(cfg.AWSRegion))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+	if awsCfg.Region == "" {
+		return nil, errors.New("no AWS region: set --aws-region or run on EC2")
+	}
+	log.Info("EC2 provisioner ready", "region", awsCfg.Region)
+	return ec2.NewClient(awsec2.NewFromConfig(awsCfg), awsssm.NewFromConfig(awsCfg), 0, log.With("component", "ec2")), nil
 }
 
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
@@ -313,6 +485,31 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if cfg.UsesFirecracker() {
 		fc = provisioner.NewFirecracker(cfg.Firecracker, log)
 	}
+	var newEC2 func(config.Tier) provisioner.Provisioner
+	if cfg.UsesEC2() {
+		jit, stopJIT, err := serveJIT(ctx, cfg, log)
+		if err != nil {
+			return err
+		}
+		// Instances still running their jobs fetch nothing more, but stop the
+		// endpoint only after the drain all the same.
+		defer stopJIT()
+		client, err := newEC2Client(ctx, cfg, log)
+		if err != nil {
+			return err
+		}
+		newEC2 = func(t config.Tier) provisioner.Provisioner {
+			return client.Tier(ec2.Options{
+				Tier:        t.Name,
+				Owner:       owner,
+				EC2:         *t.EC2,
+				JIT:         jit,
+				JITURL:      jitserver.URL(cfg.JITAddr),
+				MaxLifetime: cfg.Firecracker.MaxVMLifetime,
+				Logger:      log.With("tier", t.Name),
+			})
+		}
+	}
 	tiers := cfg.EffectiveTiers()
 	provs := make([]provisioner.Provisioner, len(tiers))
 	for i, t := range tiers {
@@ -320,7 +517,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if fc != nil {
 			shared = fc
 		}
-		p, err := tierProvisioner(t, shared)
+		p, err := tierProvisioner(t, shared, newEC2)
 		if err != nil {
 			return fmt.Errorf("tier %q: %w", t.Name, err)
 		}
@@ -332,6 +529,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	var (
 		listeners []*listener.ScaleSet
 		scheds    []*scheduler.Scheduler
+		trackers  []*health.Tracker
 		pending   scheduler.PendingLaunches
 	)
 	closeAll := func() {
@@ -341,9 +539,12 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	for i, t := range tiers {
 		tlog := log.With("tier", t.Name)
+		tracker := health.NewTracker(t.Name)
+		trackers = append(trackers, tracker)
 		lis, err := listener.New(ctx, listener.Config{
 			URL:          cfg.URL,
 			OnJobStarted: onJobStarted,
+			Health:       tracker,
 			Name:         t.Name,
 			RunnerGroup:  cfg.RunnerGroup,
 			Labels:       t.Labels,
@@ -368,7 +569,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			JIT:         jit,
 			Remover:     jit,
 			Logger:      tlog,
-			Pending:     &pending,
+			Pending:     tierPending(t, &pending),
 		}))
 	}
 	defer closeAll()
@@ -404,35 +605,39 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		go fc.RefreshNetwork(ctx)
 	}
 
-	// Drive every tier's listener concurrently. runCtx lets the first fatal
-	// listener error tear down the rest; on SIGTERM the parent ctx cancels it.
-	// microVMs and the warm-pool top-up bind to runCtx too, so both a signal and
-	// a fatal error unwind identically (listeners stop, Reconcile no-ops, and
-	// Drain settles) — matching the single-tier lifecycle.
+	// Publish each tier's listener health for status and doctor.
+	healthPath := filepath.Join(cfg.Firecracker.WorkDir, health.FileName)
+	stopHealth := publishHealth(healthPath, trackers, log)
+
+	// Drive every tier's listener concurrently. A listener reconnects its own
+	// session; one that stops on a fatal error leaves the other tiers running.
+	// runCtx ends on SIGTERM, or once every tier has stopped. microVMs and the
+	// warm-pool top-up bind to runCtx too, so either way listeners stop,
+	// Reconcile no-ops, and Drain settles.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(listeners))
+	runs := make([]func(context.Context) error, len(listeners))
 	for i := range listeners {
 		lis, sched := listeners[i], scheds[i]
-		onDesired := func(_ context.Context, desired int) int {
-			sched.Reconcile(runCtx, desired)
-			return sched.Running()
-		}
-		onBusy := func(name string) { sched.MarkBusy(name) }
-		capacity := func() int { return sched.Capacity() }
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := lis.Run(runCtx, onDesired, onBusy, capacity); err != nil && runCtx.Err() == nil {
-				errCh <- err
-				cancel()
+		// tierCtx is this tier's own lifetime (see serveTiers): launches and
+		// the warm-pool top-up bind to it, so a tier that stops cancels its
+		// idle runners and stops replenishing, while busy ones finish.
+		runs[i] = func(tierCtx context.Context) error {
+			onDesired := func(_ context.Context, desired int) int {
+				sched.Reconcile(tierCtx, desired)
+				return sched.Running()
 			}
-		}()
+			onBusy := func(name string) { sched.MarkBusy(name) }
+			capacity := func() int { return sched.Capacity() }
+			return lis.Run(tierCtx, onDesired, onBusy, capacity)
+		}
 	}
-	wg.Wait()
-	close(errCh)
+	runErr := serveTiers(runCtx, cancel, tierNames(tiers), runs, log)
+	// No tier is listening any more. Stop refreshing the health file before
+	// the drain, which can wait out long jobs: a file that keeps its last
+	// write time ages into "stale" instead of claiming live listeners.
+	stopHealth()
 
 	log.Info("shutdown signalled, draining in-flight microVMs")
 	for _, sched := range scheds {
@@ -440,8 +645,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	log.Info("firerunner stopped")
 
-	if err := <-errCh; err != nil && ctx.Err() == nil {
-		return err
+	if runErr != nil && ctx.Err() == nil {
+		return runErr
 	}
 	return nil
 }

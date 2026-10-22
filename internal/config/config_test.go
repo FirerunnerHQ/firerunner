@@ -601,8 +601,8 @@ func TestEC2Tier_AMIKinds(t *testing.T) {
 			t.Errorf("AMIFromSSM(%q) = %v, want %v", ami, got, ssm)
 		}
 	}
-	if got := (EC2Tier{RootVolumeType: "io2"}).VolumeType(); got != "io2" {
-		t.Errorf("VolumeType = %q, want io2", got)
+	if got := (EC2Tier{RootVolumeType: "gp2"}).VolumeType(); got != "gp2" {
+		t.Errorf("VolumeType = %q, want gp2", got)
 	}
 }
 
@@ -660,6 +660,7 @@ func TestFromFlags_EC2TierErrors(t *testing.T) {
 		"bad market":           {`"market":"spot-then-on-demand"`, `"market":"reserved"`},
 		"negative root volume": {`"root_volume_gib":40`, `"root_volume_gib":-1`},
 		"bad volume type":      {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"st1"`},
+		"io2 needs iops":       {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"io2"`},
 		"zero max":             {`"max":20`, `"max":0`},
 		"min over max":         {`"min":1`, `"min":30`},
 	}
@@ -750,5 +751,16 @@ func TestFromFlags_JITAddr(t *testing.T) {
 	c, err = FromFlags(args())
 	if err != nil || c.JITAddr != "10.0.0.6:9000" || c.JITTTL != 2*time.Minute {
 		t.Fatalf("env fallback: c=%+v err=%v", c, err)
+	}
+}
+
+func TestExampleEC2Catalog(t *testing.T) {
+	// The README points at this file; keep it loadable and valid.
+	c, err := FromFlags(append(append(baseArgs(), jitAddr...), "--tiers", "../../examples/tiers-ec2.json", "--max-runners", "8"))
+	if err != nil {
+		t.Fatalf("examples/tiers-ec2.json: %v", err)
+	}
+	if !c.UsesEC2() || !c.UsesFirecracker() {
+		t.Fatalf("example should mix both provisioners: ec2=%v firecracker=%v", c.UsesEC2(), c.UsesFirecracker())
 	}
 }

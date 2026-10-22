@@ -2,13 +2,22 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/health"
+	"github.com/solcreek/firerunner/internal/listener"
+	"github.com/solcreek/firerunner/internal/provisioner"
+	"github.com/solcreek/firerunner/internal/scheduler"
 )
 
 func TestParseSize(t *testing.T) {
@@ -93,20 +102,157 @@ func TestTierProvisioner(t *testing.T) {
 	// Every Firecracker tier, implicit or explicit, shares the one host
 	// provisioner and its slot budget.
 	for _, tier := range []config.Tier{{Name: "a"}, {Name: "b", Provisioner: config.ProvisionerFirecracker}} {
-		p, err := tierProvisioner(tier, fc)
+		p, err := tierProvisioner(tier, fc, nil)
 		if err != nil || p != fc {
 			t.Fatalf("tier %q: got (%v, %v), want the shared firecracker provisioner", tier.Name, p, err)
 		}
 	}
 	// A Firecracker tier on a host without the Firecracker provisioner is a
 	// wiring bug and must fail before any scale set is registered.
-	if _, err := tierProvisioner(config.Tier{Name: "a"}, nil); err == nil {
+	if _, err := tierProvisioner(config.Tier{Name: "a"}, nil, nil); err == nil {
 		t.Fatal("expected an error for a firecracker tier without a firecracker provisioner")
 	}
-	if _, err := tierProvisioner(ec2, fc); err == nil || !strings.Contains(err.Error(), "ec2") {
-		t.Fatalf("ec2 tier: err = %v, want a not-available error until the ec2 provisioner lands", err)
+	// Each ec2 tier gets its own provisioner, built for that tier.
+	var built []string
+	newEC2 := func(t config.Tier) provisioner.Provisioner {
+		built = append(built, t.Name)
+		return stubProvisioner{name: "ec2:" + t.Name}
 	}
-	if _, err := tierProvisioner(config.Tier{Name: "x", Provisioner: "lambda"}, fc); err == nil {
+	p, err := tierProvisioner(ec2, fc, newEC2)
+	if err != nil || p.Name() != "ec2:cloud" || len(built) != 1 {
+		t.Fatalf("ec2 tier: got (%v, %v), built %v", p, err, built)
+	}
+	if _, err := tierProvisioner(ec2, fc, nil); err == nil {
+		t.Fatal("expected an error for an ec2 tier without the ec2 client")
+	}
+	if _, err := tierProvisioner(config.Tier{Name: "x", Provisioner: "lambda"}, fc, newEC2); err == nil {
 		t.Fatal("expected an error for an unknown provisioner")
+	}
+}
+
+func TestServeTiers_OneTierStoppingLeavesOthersRunning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bDone := make(chan struct{})
+	runs := []func(context.Context) error{
+		func(context.Context) error { return errors.New("401 Unauthorized") },
+		func(ctx context.Context) error {
+			defer close(bDone)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	res := make(chan error, 1)
+	go func() { res <- serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler)) }()
+
+	time.Sleep(50 * time.Millisecond) // tier a has failed by now
+	select {
+	case <-bDone:
+		t.Fatal("tier b stopped because tier a failed")
+	default:
+	}
+	// A shutdown signal still ends everything cleanly.
+	cancel()
+	if err := <-res; err != nil {
+		t.Fatalf("serveTiers after shutdown = %v, want nil", err)
+	}
+}
+
+func TestServeTiers_AllTiersStoppedShutsDown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runs := []func(context.Context) error{
+		func(context.Context) error { return errors.New("a: 401") },
+		func(context.Context) error { return errors.New("b: 403") },
+	}
+	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler))
+	// Which tier stopped first is up to the scheduler; either error names it.
+	if err == nil || !(strings.Contains(err.Error(), `tier "a": a: 401`) || strings.Contains(err.Error(), `tier "b": b: 403`)) {
+		t.Fatalf("err = %v, want one tier's error", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("ctx not cancelled once every tier stopped")
+	}
+}
+
+func TestPublishHealth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), health.FileName)
+	a, b := health.NewTracker("a"), health.NewTracker("b")
+	stop := publishHealth(path, []*health.Tracker{a, b}, slog.New(slog.DiscardHandler))
+	f, err := health.Read(path)
+	if err != nil || len(f.Tiers) != 2 || f.PID != os.Getpid() {
+		t.Fatalf("initial file = %+v, %v", f, err)
+	}
+	b.Failed(errors.New("401 Unauthorized"))
+	stop() // writes the final state
+	f, err = health.Read(path)
+	if err != nil || f.Tiers[1].State != health.Failed {
+		t.Fatalf("final file = %+v, %v; want tier b failed", f, err)
+	}
+}
+
+func TestServeTiers_StoppedTierContextIsCancelled(t *testing.T) {
+	// A tier that stops gets its own context cancelled, which is what makes
+	// its scheduler release idle runners, while the others' stay live.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctxs := make(chan context.Context, 2)
+	runs := []func(context.Context) error{
+		func(c context.Context) error { ctxs <- c; return errors.New("a: 401") },
+		func(c context.Context) error { ctxs <- c; <-c.Done(); return c.Err() },
+	}
+	res := make(chan error, 1)
+	go func() { res <- serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler)) }()
+	got := []context.Context{<-ctxs, <-ctxs}
+	var failed, live context.Context
+	deadline := time.Now().Add(2 * time.Second)
+	for failed == nil && time.Now().Before(deadline) {
+		for _, c := range got {
+			if c.Err() != nil {
+				failed = c
+			} else {
+				live = c
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if failed == nil {
+		t.Fatal("the stopped tier's context was never cancelled")
+	}
+	if live == nil || live.Err() != nil {
+		t.Fatal("the serving tier's context was cancelled too")
+	}
+	cancel()
+	if err := <-res; err != nil {
+		t.Fatalf("serveTiers = %v", err)
+	}
+}
+
+func TestServeTiers_RestartStopsEveryTier(t *testing.T) {
+	// A deleted scale set needs a fresh process to register it again: every
+	// tier stops and serveTiers returns the ErrRestart, so main exits non-zero
+	// for systemd to restart it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runs := []func(context.Context) error{
+		func(context.Context) error { return fmt.Errorf("%w: 404", listener.ErrRestart) },
+		func(c context.Context) error { <-c.Done(); return c.Err() },
+	}
+	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler))
+	if !errors.Is(err, listener.ErrRestart) {
+		t.Fatalf("serveTiers = %v, want ErrRestart", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("the other tiers were left running")
+	}
+}
+
+func TestTierPending(t *testing.T) {
+	var shared scheduler.PendingLaunches
+	if got := tierPending(config.Tier{Name: "fc"}, &shared); got != &shared {
+		t.Fatal("a firecracker tier must share the host's pending counter")
+	}
+	if got := tierPending(config.Tier{Name: "cloud", Provisioner: config.ProvisionerEC2}, &shared); got != nil {
+		t.Fatal("an ec2 tier must not share the firecracker tiers' pending counter")
 	}
 }

@@ -106,9 +106,9 @@ instead. The JIT config never appears in user-data:
      script retries.
    - A 404 means the config was claimed or expired, so the instance powers off.
    - It gives up after `FIRERUNNER_JIT_WAIT` seconds (default 600).
-3. Run `./run.sh --jitconfig <config>` for one job, then power off. On-demand
-   instances terminate on shutdown. Spot instances stop, and firerunner
-   terminates them.
+3. Run `./run.sh --jitconfig <config>` for one job, then power off. The
+   instance is launched to terminate on shutdown. A pooled persistent-spot
+   instance, which can only stop, is terminated by firerunner.
 
 The unit has no `network-online.target` or docker ordering: the retry loop
 starts the fetch as soon as the NIC has an address. `images/test-ec2-run.sh`

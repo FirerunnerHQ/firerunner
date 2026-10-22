@@ -48,6 +48,8 @@ type entry struct {
 	// entry stays as a tombstone, answering 404 instead of 403, until the
 	// launcher revokes it when the instance is gone.
 	claimed bool
+	// served is set when the instance actually received the config.
+	served bool
 }
 
 // Server serves each registered config exactly once, to the address it was
@@ -108,6 +110,16 @@ func (s *Server) Pending(ip netip.Addr) bool {
 	return ok && !e.claimed && s.now().Before(e.expires)
 }
 
+// Served reports whether ip's registered config has been handed out. With
+// Pending, it tells a launcher whose instance is still waiting (Pending), has
+// its config (Served), or let it expire unclaimed (neither).
+func (s *Server) Served(ip netip.Addr) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[ip.Unmap()]
+	return ok && e.served
+}
+
 // ServeHTTP answers GET /jit:
 //   - 200 with the config, the first time a registered address asks;
 //   - 404 when that address's config was already served or expired;
@@ -156,7 +168,7 @@ func (s *Server) claim(ip netip.Addr) (jit, runner string, status int) {
 		return "", e.runner, http.StatusNotFound
 	}
 	jit = e.jit
-	e.claimed, e.jit = true, ""
+	e.claimed, e.served, e.jit = true, true, ""
 	return jit, e.runner, http.StatusOK
 }
 

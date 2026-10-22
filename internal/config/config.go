@@ -58,6 +58,9 @@ type Config struct {
 	// how long a config waits to be fetched.
 	JITAddr string
 	JITTTL  time.Duration
+	// AWSRegion is the region EC2 tiers launch in; empty uses the SDK's
+	// sources (env, shared config, then IMDS on the control VM).
+	AWSRegion string
 
 	LogLevel  string
 	LogFormat string
@@ -252,6 +255,7 @@ func Parse(args []string) (*Config, error) {
 	fs.DurationVar(&c.Firecracker.ConnectTimeout, "vm-connect-timeout", er.duration("FR_VM_CONNECT_TIMEOUT", 5*time.Minute), "kill a booted microVM whose runner has not registered with GitHub (console shows neither \"Listening for Jobs\" nor \"Running job:\") within this long, freeing its slot and backing off replenishment; catches VMs wedged by lost DNS/egress or a rejected JIT config that would otherwise hold a slot until --max-vm-lifetime. 0 disables it")
 
 	fs.StringVar(&c.JITAddr, "jit-addr", env("FR_JIT_ADDR", ""), "VPC IP:port where EC2 runner instances fetch their JIT config, served once to each instance's private IP so no secret goes into user-data (e.g. 10.0.0.5:8098); required with an ec2 tier. Bind the control VM's VPC address, never a public one")
+	fs.StringVar(&c.AWSRegion, "aws-region", env("FR_AWS_REGION", ""), "AWS region for ec2 tiers; defaults to AWS_REGION/shared config, then the control VM's own region from IMDS")
 	fs.DurationVar(&c.JITTTL, "jit-ttl", er.duration("FR_JIT_TTL", 5*time.Minute), "how long an EC2 instance's JIT config waits to be fetched before it expires")
 
 	var egress, dnsServers string
@@ -569,10 +573,11 @@ func validateEC2Tier(t Tier) error {
 	case e.RootVolumeGiB < 0:
 		return fmt.Errorf("tier %q: ec2.root_volume_gib must be >= 0", t.Name)
 	}
+	// io1/io2 need a provisioned IOPS value, which the tier does not carry.
 	switch e.VolumeType() {
-	case "gp2", "gp3", "io1", "io2":
+	case "gp2", "gp3":
 	default:
-		return fmt.Errorf("tier %q: ec2.root_volume_type %q must be gp2, gp3, io1 or io2", t.Name, e.RootVolumeType)
+		return fmt.Errorf("tier %q: ec2.root_volume_type %q must be gp2 or gp3", t.Name, e.RootVolumeType)
 	}
 	return nil
 }

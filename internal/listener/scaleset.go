@@ -14,6 +14,7 @@ import (
 	sslistener "github.com/actions/scaleset/listener"
 
 	"github.com/solcreek/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/health"
 	"github.com/solcreek/firerunner/internal/jobidentity"
 )
 
@@ -36,6 +37,15 @@ type Config struct {
 
 	OnJobStarted func(context.Context, jobidentity.Job)
 	Logger       *slog.Logger
+	// Health, if set, records the tier's connection state.
+	Health *health.Tracker
+}
+
+// session is one open message session; *scaleset.MessageSessionClient
+// satisfies it.
+type session interface {
+	sslistener.Client
+	Close(ctx context.Context) error
 }
 
 // ScaleSet is the production Listener. Constructing it registers an ephemeral
@@ -50,8 +60,11 @@ type ScaleSet struct {
 	// removal delay the next scale-up. The scheduler issues one removal at a
 	// time per tier, so nothing ever waits on this client's mutex.
 	removeClient *scaleset.Client
-	session      *scaleset.MessageSessionClient
-	scaleSetID   int
+	session      session
+	// open opens a fresh message session after the current one fails.
+	open       func(context.Context) (session, error)
+	health     *health.Tracker
+	scaleSetID int
 	// created is true only when this process created the scale set (rather than
 	// reusing a pre-existing one). Close deletes the scale set only when created,
 	// so it never deregisters a set another instance is relying on.
@@ -76,12 +89,59 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Message sessions get a client of their own too: every session request
+	// (open, refresh, close) takes its parent client's mutex, which a JIT
+	// generation holds across its network round trip. During a GitHub outage
+	// that would queue a reconnect's close and reopen behind stuck JIT
+	// requests, past their own deadlines.
+	sessionClient, err := newClient(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	groupID, err := runnerGroupID(ctx, client, cfg.RunnerGroup)
 	if err != nil {
 		return nil, err
 	}
 
+	id, reused, err := registerScaleSet(ctx, client, cfg, groupID, removeClient, sessionClient)
+	if err != nil {
+		return nil, err
+	}
+
+	first, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.Logger)
+	if err != nil {
+		if !reused {
+			// Best-effort cleanup of the scale set we just created.
+			_ = client.DeleteRunnerScaleSet(context.WithoutCancel(ctx), id)
+		}
+		return nil, fmt.Errorf("open message session: %w", err)
+	}
+
+	cfg.Logger.Info("registered runner scale set",
+		"name", cfg.Name, "scaleSetID", id, "group", cfg.RunnerGroup, "reused", reused)
+
+	s := &ScaleSet{
+		cfg: cfg, log: cfg.Logger, client: client, removeClient: removeClient,
+		session: first, health: cfg.Health,
+		scaleSetID: id, created: !reused,
+	}
+	s.open = func(ctx context.Context) (session, error) {
+		sess, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.Logger)
+		if err != nil {
+			return nil, err
+		}
+		return sess, nil
+	}
+	return s, nil
+}
+
+// registerScaleSet gets or creates the tier's scale set through client and
+// returns its ID and whether it already existed. Reusing an existing set (from
+// a prior, possibly unclean, run) keeps restarts idempotent instead of failing
+// with "runner scale set already exists". Every client, including others,
+// reports the set's ID in its system info.
+func registerScaleSet(ctx context.Context, client *scaleset.Client, cfg Config, groupID int, others ...*scaleset.Client) (int, bool, error) {
 	desired := &scaleset.RunnerScaleSet{
 		Name:          cfg.Name,
 		RunnerGroupID: groupID,
@@ -90,43 +150,27 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		// not self-update (GitHub official guidance for image-based runners).
 		RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
 	}
-
-	// Get-or-create: a scale set with this name may already exist from a prior
-	// (possibly unclean) run. Reuse it so restarts are idempotent instead of
-	// failing with "runner scale set already exists".
 	existing, err := client.GetRunnerScaleSet(ctx, groupID, cfg.Name)
 	if err != nil {
-		return nil, fmt.Errorf("look up runner scale set: %w", err)
+		return 0, false, fmt.Errorf("look up runner scale set: %w", err)
 	}
 	var scaleSet *scaleset.RunnerScaleSet
 	reused := existing != nil
 	if reused {
 		scaleSet, err = client.UpdateRunnerScaleSet(ctx, existing.ID, desired)
 		if err != nil {
-			return nil, fmt.Errorf("update runner scale set: %w", err)
+			return 0, false, fmt.Errorf("update runner scale set: %w", err)
 		}
 	} else {
 		scaleSet, err = client.CreateRunnerScaleSet(ctx, desired)
 		if err != nil {
-			return nil, fmt.Errorf("create runner scale set: %w", err)
+			return 0, false, fmt.Errorf("create runner scale set: %w", err)
 		}
 	}
-	client.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
-	removeClient.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
-
-	session, err := openSessionWithRetry(ctx, client, scaleSet.ID, owner, cfg.Logger)
-	if err != nil {
-		if !reused {
-			// Best-effort cleanup of the scale set we just created.
-			_ = client.DeleteRunnerScaleSet(context.WithoutCancel(ctx), scaleSet.ID)
-		}
-		return nil, fmt.Errorf("open message session: %w", err)
+	for _, c := range append([]*scaleset.Client{client}, others...) {
+		c.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
 	}
-
-	cfg.Logger.Info("registered runner scale set",
-		"name", cfg.Name, "scaleSetID", scaleSet.ID, "group", cfg.RunnerGroup, "reused", reused)
-
-	return &ScaleSet{cfg: cfg, log: cfg.Logger, client: client, removeClient: removeClient, session: session, scaleSetID: scaleSet.ID, created: !reused}, nil
+	return scaleSet.ID, reused, nil
 }
 
 // openSessionWithRetry opens a message session, retrying while GitHub reports a
@@ -172,9 +216,96 @@ func (s *ScaleSet) JIT() *JITSource {
 	return &JITSource{client: s.client, remover: s.removeClient, scaleSetID: s.scaleSetID, namePrefix: s.cfg.Name}
 }
 
-// Run implements Listener: long-poll GitHub and drive onDesired.
+// ErrFatal marks a listener error that reconnecting cannot fix: GitHub
+// rejected the credentials. It stops that tier alone.
+var ErrFatal = errors.New("listener stopped")
+
+// ErrRestart marks a listener error that only a fresh process recovers from:
+// the scale set is gone. That happens when an instance that created it
+// deleted it on shutdown while this one reused it, as in an overlapping
+// redeploy. Startup registers the set again, so the daemon exits for its
+// supervisor to restart it.
+var ErrRestart = errors.New("runner scale set is gone; restart to register it again")
+
+// Reconnect pacing: the wait between attempts to re-open a session doubles
+// from reconnectMin to reconnectMax, with jitter. A session that stayed up for
+// reconnectReset counts as healthy, so the next failure starts from the
+// minimum again. Vars so tests can shorten them.
+var (
+	reconnectMin   = 2 * time.Second
+	reconnectMax   = 2 * time.Minute
+	reconnectReset = time.Minute
+)
+
+// Run implements Listener: long-poll GitHub and drive onDesired until ctx is
+// cancelled.
+//
+// When the session fails (GitHub unreachable past the library's own retries,
+// an expired session), Run closes it and opens a new one with backoff, without
+// returning: the tier's scheduler and its runners are untouched, and the new
+// session's statistics re-drive the desired count. Run ends only on an error
+// retrying cannot fix: rejected credentials (ErrFatal, which stops this tier
+// alone) or a deleted scale set (ErrRestart, which restarts the daemon).
 func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
-	l, err := sslistener.New(s.session, sslistener.Config{
+	sess := s.session
+	backoff := reconnectMin
+	for {
+		started := time.Now()
+		err := s.runSession(ctx, sess, onDesired, onBusy, capacity)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Since(started) >= reconnectReset {
+			backoff = reconnectMin
+		}
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		_ = sess.Close(closeCtx)
+		cancel()
+		for {
+			wait := jitter(backoff)
+			s.log.Warn("listener session ended; reconnecting", "err", err, "backoff", wait)
+			if s.health != nil {
+				s.health.Reconnecting(err, wait)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+			backoff = min(2*backoff, reconnectMax)
+			sess, err = s.open(ctx)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if isFatal(err) {
+				s.log.Error("listener cannot reconnect; this tier stops taking jobs", "err", err)
+				if s.health != nil {
+					s.health.Failed(err)
+				}
+				return fmt.Errorf("%w: %w", ErrFatal, err)
+			}
+			if isScaleSetGone(err) {
+				s.log.Error("runner scale set is gone; restarting to register it again", "err", err)
+				if s.health != nil {
+					s.health.Failed(err)
+				}
+				return fmt.Errorf("%w: %w", ErrRestart, err)
+			}
+		}
+		s.session = sess
+		s.log.Info("listener reconnected")
+		if s.health != nil {
+			s.health.Reconnected()
+		}
+	}
+}
+
+// runSession listens on one session until it fails or ctx ends.
+func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
+	l, err := sslistener.New(trackedSession{session: sess, health: s.health}, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
@@ -196,6 +327,54 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 		a.advertiseCapacity()
 	}
 	return l.Run(ctx, a)
+}
+
+// trackedSession records each successful GetMessage in the tier's health.
+type trackedSession struct {
+	session
+	health *health.Tracker
+}
+
+func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
+	m, err := t.session.GetMessage(ctx, lastMessageID, maxCapacity)
+	if err == nil && t.health != nil {
+		t.health.MessageOK()
+	}
+	return m, err
+}
+
+// isFatal reports whether a session error is one retrying cannot fix: GitHub
+// rejected the credentials (401/403). The library reports status only in the
+// error text. A 403 for rate limiting is transient, not fatal.
+func isFatal(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "rate limit") {
+		return false
+	}
+	for _, status := range []string{"401 unauthorized", "403 forbidden"} {
+		if strings.Contains(msg, status) {
+			return true
+		}
+	}
+	return false
+}
+
+// isScaleSetGone reports whether opening a session failed because GitHub no
+// longer knows the scale set (404).
+func isScaleSetGone(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "404 not found")
+}
+
+// jitter spreads d by ±20% so tiers that failed together do not reconnect in
+// lockstep.
+func jitter(d time.Duration) time.Duration {
+	var b [2]byte
+	_, _ = rand.Read(b[:])
+	f := 0.8 + 0.4*float64(int(b[0])<<8|int(b[1]))/65535
+	return time.Duration(float64(d) * f)
 }
 
 // Close deregisters the scale set and closes the message session. It deletes the
