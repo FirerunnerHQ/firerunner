@@ -43,13 +43,14 @@ type fakeEC2 struct {
 	describeErr error
 	// invisible IDs make DescribeInstances fail with InvalidInstanceID.NotFound
 	// whenever they are asked for, as for a just-launched instance.
-	invisible     map[string]bool
-	describeCalls int
-	describeIDs   [][]string
-	terminated    []string
-	terminateErr  error
-	images        map[string]string // image ID -> root device
-	imageCalls    int
+	invisible      map[string]bool
+	describeCalls  int
+	describeIDs    [][]string
+	terminated     []string
+	terminateErr   error
+	terminateCalls int
+	images         map[string]string // image ID -> root device
+	imageCalls     int
 	// afterRun runs (without the lock held) once an instance is created.
 	afterRun func(id string)
 }
@@ -157,6 +158,7 @@ func (f *fakeEC2) DescribeInstances(_ context.Context, in *ec2.DescribeInstances
 func (f *fakeEC2) TerminateInstances(_ context.Context, in *ec2.TerminateInstancesInput, _ ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.terminateCalls++
 	if f.terminateErr != nil {
 		return nil, f.terminateErr
 	}
