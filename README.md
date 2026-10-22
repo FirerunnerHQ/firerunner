@@ -495,6 +495,28 @@ total over the cap, the least-recently-used entries are evicted until it fits
 firerunner cache-server --dir /var/lib/firerunner/cache --max-size 50GB
 ```
 
+**Keeping the cache in S3.** With `--s3-bucket`, completed blobs and the
+entry index live in S3 instead of `--dir`, which then only stages uploads:
+
+```bash
+firerunner cache-server --dir /var/lib/firerunner/cache \
+  --s3-bucket my-ci-cache --s3-prefix firerunner-cache/
+```
+
+- **Where data goes.** An assembled blob goes to S3 before its upload is
+  acknowledged. Restores stream the requested byte ranges straight from S3,
+  and index changes are pushed within a few seconds.
+- **Replacing the server.** A new cache-server whose local index is empty loads
+  the index from the bucket, so it serves everything its predecessor finalized.
+- **Credentials and region** come from the default AWS chain, for example an
+  instance profile. The profile needs object read, write and delete on the
+  prefix, plus `s3:ListBucket` scoped to it. Without `ListBucket`, a missing
+  index reads as 403 rather than 404, and startup fails.
+- **One live server per prefix.** Entry ids are allocated by the server, so two
+  live servers on one prefix would overwrite each other's blobs.
+- **When S3 fails.** Uploads and downloads answer 507. The toolkit does not
+  retry that status, so a job drops the cache and carries on.
+
 The server also exposes `GET /stats` (JSON: entry count, bytes, hits, misses,
 saves, evictions) and `GET /metrics` (Prometheus text, no client library
 needed) for scraping. `firerunner status` reads `/stats` and shows the live
