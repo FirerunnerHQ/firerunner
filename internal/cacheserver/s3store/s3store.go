@@ -44,7 +44,8 @@ func New(ctx context.Context, bucket, prefix, region string) (*Store, error) {
 	}).WithTransportOptions(func(t *http.Transport) {
 		t.ResponseHeaderTimeout = 10 * time.Second
 	})
-	opts := []func(*config.LoadOptions) error{config.WithHTTPClient(httpClient)}
+	// The SDK does not fall back to instance metadata for the region on its own.
+	opts := []func(*config.LoadOptions) error{config.WithHTTPClient(httpClient), config.WithEC2IMDSRegion()}
 	if region != "" {
 		opts = append(opts, config.WithRegion(region))
 	}
