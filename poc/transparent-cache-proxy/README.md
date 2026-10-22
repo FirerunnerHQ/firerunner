@@ -59,17 +59,69 @@ us-east-2.
 - **The live log stream is a WebSocket** (`/_ws/ingest.sock`). The proxy must
   forward `Upgrade` and `Connection`.
 
-## Not covered yet
+## Follow-up, verified 2026-10-22
 
-- **Container jobs (`container:`).** `/etc/hosts` and the CA do not reach the
-  job container. It would need a resolver the Docker daemon points containers
-  at, plus the CA mounted into the container. `NODE_EXTRA_CA_CERTS` must also be
-  valid at the container's path (`/__e`).
-- **Identity.** The record here is static. Production derives it per job from
-  the scale-set `JobStarted` message, or from a per-job token on a remote cache.
-- **Storage.** The cache is on local disk, so it dies with the VM. A shared
-  cache needs cache-server on S3 or a remote store. It also needs `/upload` and
-  `/download` URLs that stay reachable through the same interception.
+### Container jobs (run 39730793524)
+
+Two things carry the interception into a `container:` job:
+
+- **DNS.** Docker hands job containers its own resolver (`127.0.0.11`), not the
+  VM's `/etc/hosts`. A dnsmasq bound to the VM's private address answers the
+  results host with that address, and `/etc/docker/daemon.json` points the
+  daemon at it.
+- **CA.** The runner's bundled node is replaced by `nodewrap`, a static binary
+  that sets `NODE_EXTRA_CA_CERTS` to a CA file relative to itself. `externals`
+  is mounted into job containers at `/__e`, so the same relative path holds on
+  the host and in the container.
+
+The job used `ghcr.io/kaikhq/rails-ci-base:latest` with a redis service. Its
+cache requests reached cache-server from the container's address `172.18.0.2`.
+Save, restore, the sha256 check and upload-artifact all passed, and nginx logged
+0 errors.
+
+⚠️ **The wrapper must not be a shell script.** POSIX sh drops environment
+variables whose names are not identifiers. The runner passes action inputs as
+`INPUT_<NAME>` with the dashes intact (for example
+`INPUT_INCLUDE-HIDDEN-FILES`), so a `#!/bin/sh` wrapper silently loses every
+dashed input. `upload-artifact` then fails with `Input does not meet YAML 1.2
+"Core Schema"`, and `actions/cache` quietly ignores `fail-on-cache-miss`.
+
+### A shared cache node with per-job identity (runs 39731701940, 39731897383)
+
+- **The node.** One cache-server (`cache-node-setup.sh`) on a private address,
+  reachable on 8099 only from the runner security group. Runner VMs set
+  `CACHE_UPSTREAM`, and their nginx forwards cache paths to the node.
+- **Identity.** The node identifies a guest by its VPC source address, exactly
+  as a falcon does. VPC source and destination checks make that address
+  unspoofable. The control plane publishes one record per runner VM:
+  - pending (a fresh generation) at launch;
+  - resolved once the job starts, to `write_ref` = the job's branch and
+    `read_refs` = that branch plus the default branch;
+  - removed when the instance is gone.
+
+  In this POC the control plane is a script that resolves from the GitHub jobs
+  API. Production takes the same fields from the scale-set `JobStarted` message.
+- **Across VMs.** `writer` saved 100 MB on 172.31.40.109. `reader` restored it
+  on 172.31.38.31 with `cache-hit=true` and a matching sha256.
+- **Across refs.** `intruder`, on another branch, restored with
+  `restore-keys: poc-shared-` and got `Cache not found`. The node still held an
+  entry of the same compression version under that prefix, on the first branch.
+  The miss is the ref scope, not a version mismatch.
+
+⚠️ **A host job and a container job do not share entries.**
+`rails-ci-base` has no `zstd`, so `actions/cache` falls back to gzip there.
+The compression method is part of the cache version, so a host save (zstd) is a
+miss for a container restore (gzip). GitHub's own cache behaves the same way.
+Add zstd to the image if host and container jobs should share.
+
+## Still open
+
+- **Storage.** The node keeps entries on its own disk. A single node already
+  shares across VMs. S3 (or replicated nodes) is for durability and for scaling
+  past one node, not for sharing.
+- **Cache-node availability.** If the node is down, cache calls fail. They must
+  degrade to a miss quickly rather than hang; Blacksmith's 2026-08-13 outage is
+  the cautionary tale.
 - **Trust.** Every job on the VM trusts the POC CA for this one name. The CA key
   must never be on the runner. Scope the leaf certificate to the results host
   only, as here.
