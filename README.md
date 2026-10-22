@@ -357,8 +357,7 @@ user-data**:
 firerunner also terminates an instance in these cases:
 
 - it is idle when the scale set shrinks;
-- it never fetched its config, or its runner exited without taking a job (both
-  back off, as for a failed microVM boot);
+- it never fetched its config (this backs off, as a failed microVM boot does);
 - it is older than `--max-vm-lifetime`.
 
 Instances and volumes are tagged `firerunner:tier`, `firerunner:runner` and
