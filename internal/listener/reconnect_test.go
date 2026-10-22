@@ -465,3 +465,30 @@ func TestTrackedSessionRecordsMessages(t *testing.T) {
 		t.Fatal("a failed GetMessage counted as a message")
 	}
 }
+
+func TestAdoptTracksOwnershipOfTheCurrentScaleSet(t *testing.T) {
+	cases := []struct {
+		name        string
+		created     bool
+		newID       int
+		reused      bool
+		wantCreated bool
+	}{
+		// This process created set 1; it was deleted and another instance
+		// created set 2 first. Reusing 2 must not inherit ownership of 1.
+		{"replacement made by another instance", true, 2, true, false},
+		{"replacement made by us", false, 2, false, true},
+		{"same set, still ours", true, 1, true, true},
+		{"same set, never ours", false, 1, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ss := testScaleSet("a", newFakeSession(0, false), &opener{}, nil)
+			ss.created = c.created
+			ss.adopt(c.newID, c.reused)
+			if ss.created != c.wantCreated || ss.scaleSetID.Load() != int64(c.newID) {
+				t.Fatalf("created=%v id=%d, want created=%v id=%d", ss.created, ss.scaleSetID.Load(), c.wantCreated, c.newID)
+			}
+		})
+	}
+}
