@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/health"
 	"github.com/solcreek/firerunner/internal/provisioner"
 )
 
@@ -119,5 +124,65 @@ func TestTierProvisioner(t *testing.T) {
 	}
 	if _, err := tierProvisioner(config.Tier{Name: "x", Provisioner: "lambda"}, fc, newEC2); err == nil {
 		t.Fatal("expected an error for an unknown provisioner")
+	}
+}
+
+func TestServeTiers_OneTierStoppingLeavesOthersRunning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bDone := make(chan struct{})
+	runs := []func(context.Context) error{
+		func(context.Context) error { return errors.New("401 Unauthorized") },
+		func(ctx context.Context) error {
+			defer close(bDone)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	res := make(chan error, 1)
+	go func() { res <- serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler)) }()
+
+	time.Sleep(50 * time.Millisecond) // tier a has failed by now
+	select {
+	case <-bDone:
+		t.Fatal("tier b stopped because tier a failed")
+	default:
+	}
+	// A shutdown signal still ends everything cleanly.
+	cancel()
+	if err := <-res; err != nil {
+		t.Fatalf("serveTiers after shutdown = %v, want nil", err)
+	}
+}
+
+func TestServeTiers_AllTiersStoppedShutsDown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runs := []func(context.Context) error{
+		func(context.Context) error { return errors.New("a: 401") },
+		func(context.Context) error { time.Sleep(10 * time.Millisecond); return errors.New("b: 404") },
+	}
+	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler))
+	if err == nil || !strings.Contains(err.Error(), `tier "a"`) {
+		t.Fatalf("err = %v, want the first tier's error", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("ctx not cancelled once every tier stopped")
+	}
+}
+
+func TestPublishHealth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), health.FileName)
+	a, b := health.NewTracker("a"), health.NewTracker("b")
+	stop := publishHealth(path, []*health.Tracker{a, b}, slog.New(slog.DiscardHandler))
+	f, err := health.Read(path)
+	if err != nil || len(f.Tiers) != 2 || f.PID != os.Getpid() {
+		t.Fatalf("initial file = %+v, %v", f, err)
+	}
+	b.Failed(errors.New("401 Unauthorized"))
+	stop() // writes the final state
+	f, err = health.Read(path)
+	if err != nil || f.Tiers[1].State != health.Failed {
+		t.Fatalf("final file = %+v, %v; want tier b failed", f, err)
 	}
 }
