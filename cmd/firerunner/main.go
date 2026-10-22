@@ -33,6 +33,7 @@ import (
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/diag"
 	"github.com/solcreek/firerunner/internal/ec2"
+	"github.com/solcreek/firerunner/internal/health"
 	"github.com/solcreek/firerunner/internal/jitserver"
 	"github.com/solcreek/firerunner/internal/jobidentity"
 	"github.com/solcreek/firerunner/internal/listener"
@@ -283,6 +284,96 @@ func tierProvisioner(t config.Tier, fc provisioner.Provisioner, newEC2 func(conf
 	}
 }
 
+// serveTiers runs every tier's listener until ctx ends. A tier whose listener
+// stops on its own error is logged and left stopped (its health tracker says
+// why) while the others keep serving; when every tier has stopped there is
+// nothing left to serve, so it cancels ctx and returns the first error.
+func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, runs []func(context.Context) error, log *slog.Logger) error {
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		stopped int
+		first   error
+	)
+	for i, run := range runs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := run(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			if err == nil {
+				err = errors.New("listener returned without an error")
+			}
+			log.Error("tier stopped taking jobs; other tiers keep running", "tier", names[i], "err", err)
+			mu.Lock()
+			defer mu.Unlock()
+			stopped++
+			if first == nil {
+				first = fmt.Errorf("tier %q: %w", names[i], err)
+			}
+			if stopped == len(runs) {
+				log.Error("every tier has stopped; shutting down")
+				cancel()
+			}
+		}()
+	}
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if stopped == len(runs) {
+		return first
+	}
+	return nil
+}
+
+func tierNames(tiers []config.Tier) []string {
+	names := make([]string, len(tiers))
+	for i, t := range tiers {
+		names[i] = t.Name
+	}
+	return names
+}
+
+// healthInterval is how often the listener health file is rewritten.
+const healthInterval = 10 * time.Second
+
+// publishHealth writes the trackers' state to path now and every
+// healthInterval until the returned func is called, which writes it once more.
+func publishHealth(path string, trackers []*health.Tracker, log *slog.Logger) func() {
+	write := func() {
+		f := health.File{PID: os.Getpid(), WrittenAt: time.Now().UTC()}
+		for _, tr := range trackers {
+			f.Tiers = append(f.Tiers, tr.Snapshot())
+		}
+		if err := health.Write(path, f); err != nil {
+			log.Warn("write listener health", "path", path, "err", err)
+		}
+	}
+	write()
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(healthInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				write()
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+		write()
+	}
+}
+
 // serveJIT starts the endpoint EC2 instances fetch their JIT configs from, on
 // the control VM's VPC address. Binding fails fast if the address is not this
 // host's. The returned func shuts it down.
@@ -409,6 +500,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	var (
 		listeners []*listener.ScaleSet
 		scheds    []*scheduler.Scheduler
+		trackers  []*health.Tracker
 		pending   scheduler.PendingLaunches
 	)
 	closeAll := func() {
@@ -418,9 +510,12 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	for i, t := range tiers {
 		tlog := log.With("tier", t.Name)
+		tracker := health.NewTracker(t.Name)
+		trackers = append(trackers, tracker)
 		lis, err := listener.New(ctx, listener.Config{
 			URL:          cfg.URL,
 			OnJobStarted: onJobStarted,
+			Health:       tracker,
 			Name:         t.Name,
 			RunnerGroup:  cfg.RunnerGroup,
 			Labels:       t.Labels,
@@ -481,16 +576,20 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		go fc.RefreshNetwork(ctx)
 	}
 
-	// Drive every tier's listener concurrently. runCtx lets the first fatal
-	// listener error tear down the rest; on SIGTERM the parent ctx cancels it.
-	// microVMs and the warm-pool top-up bind to runCtx too, so both a signal and
-	// a fatal error unwind identically (listeners stop, Reconcile no-ops, and
-	// Drain settles) — matching the single-tier lifecycle.
+	// Publish each tier's listener health for status and doctor.
+	healthPath := filepath.Join(cfg.Firecracker.WorkDir, health.FileName)
+	stopHealth := publishHealth(healthPath, trackers, log)
+	defer stopHealth()
+
+	// Drive every tier's listener concurrently. A listener reconnects its own
+	// session; one that stops on a fatal error leaves the other tiers running.
+	// runCtx ends on SIGTERM, or once every tier has stopped. microVMs and the
+	// warm-pool top-up bind to runCtx too, so either way listeners stop,
+	// Reconcile no-ops, and Drain settles.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(listeners))
+	runs := make([]func(context.Context) error, len(listeners))
 	for i := range listeners {
 		lis, sched := listeners[i], scheds[i]
 		onDesired := func(_ context.Context, desired int) int {
@@ -499,17 +598,9 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		onBusy := func(name string) { sched.MarkBusy(name) }
 		capacity := func() int { return sched.Capacity() }
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := lis.Run(runCtx, onDesired, onBusy, capacity); err != nil && runCtx.Err() == nil {
-				errCh <- err
-				cancel()
-			}
-		}()
+		runs[i] = func(ctx context.Context) error { return lis.Run(ctx, onDesired, onBusy, capacity) }
 	}
-	wg.Wait()
-	close(errCh)
+	runErr := serveTiers(runCtx, cancel, tierNames(tiers), runs, log)
 
 	log.Info("shutdown signalled, draining in-flight microVMs")
 	for _, sched := range scheds {
@@ -517,8 +608,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	log.Info("firerunner stopped")
 
-	if err := <-errCh; err != nil && ctx.Err() == nil {
-		return err
+	if runErr != nil && ctx.Err() == nil {
+		return runErr
 	}
 	return nil
 }
