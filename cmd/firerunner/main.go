@@ -284,10 +284,14 @@ func tierProvisioner(t config.Tier, fc provisioner.Provisioner, newEC2 func(conf
 	}
 }
 
-// serveTiers runs every tier's listener until ctx ends. A tier whose listener
-// stops on its own error is logged and left stopped (its health tracker says
-// why) while the others keep serving; when every tier has stopped there is
-// nothing left to serve, so it cancels ctx and returns the first error.
+// serveTiers runs every tier's listener until ctx ends. Each run gets its own
+// child context, cancelled once that run returns, so a tier that stops also
+// stops scheduling: its idle runners are cancelled and its warm pool no
+// longer refills, freeing shared slots and instances for the tiers still
+// serving. A tier whose listener stops on its own error is logged and left
+// stopped (its health tracker says why) while the others keep serving; when
+// every tier has stopped there is nothing left to serve, so it cancels ctx and
+// returns the first error.
 func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, runs []func(context.Context) error, log *slog.Logger) error {
 	var (
 		wg      sync.WaitGroup
@@ -299,7 +303,10 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := run(ctx)
+			tierCtx, tierCancel := context.WithCancel(ctx)
+			defer tierCancel()
+			err := run(tierCtx)
+			tierCancel()
 			if ctx.Err() != nil {
 				return
 			}
@@ -592,13 +599,18 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	runs := make([]func(context.Context) error, len(listeners))
 	for i := range listeners {
 		lis, sched := listeners[i], scheds[i]
-		onDesired := func(_ context.Context, desired int) int {
-			sched.Reconcile(runCtx, desired)
-			return sched.Running()
+		// tierCtx is this tier's own lifetime (see serveTiers): launches and
+		// the warm-pool top-up bind to it, so a tier that stops cancels its
+		// idle runners and stops replenishing, while busy ones finish.
+		runs[i] = func(tierCtx context.Context) error {
+			onDesired := func(_ context.Context, desired int) int {
+				sched.Reconcile(tierCtx, desired)
+				return sched.Running()
+			}
+			onBusy := func(name string) { sched.MarkBusy(name) }
+			capacity := func() int { return sched.Capacity() }
+			return lis.Run(tierCtx, onDesired, onBusy, capacity)
 		}
-		onBusy := func(name string) { sched.MarkBusy(name) }
-		capacity := func() int { return sched.Capacity() }
-		runs[i] = func(ctx context.Context) error { return lis.Run(ctx, onDesired, onBusy, capacity) }
 	}
 	runErr := serveTiers(runCtx, cancel, tierNames(tiers), runs, log)
 
