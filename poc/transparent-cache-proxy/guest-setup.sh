@@ -65,5 +65,6 @@ if command -v docker > /dev/null; then
   systemctl restart docker
 fi
 
-until curl -sf "http://$CACHE_UPSTREAM/stats" > /dev/null; do sleep 0.2; done
+# Bounded: a cache node that is down must not hold the runner back.
+for _ in $(seq 25); do curl -sf --max-time 1 "http://$CACHE_UPSTREAM/stats" > /dev/null && break; sleep 0.2; done
 curl -sf --resolve "$host:443:127.0.0.1" "https://$host/" -o /dev/null -w 'proxy tls ok: %{http_code}\n' || true

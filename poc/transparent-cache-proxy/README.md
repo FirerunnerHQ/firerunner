@@ -114,14 +114,35 @@ The compression method is part of the cache version, so a host save (zstd) is a
 miss for a container restore (gzip). GitHub's own cache behaves the same way.
 Add zstd to the image if host and container jobs should share.
 
+## S3 storage and fail-fast, verified 2026-10-22
+
+The cache node runs cache-server from branch `feat/cacheserver-s3`, with
+`--s3-bucket` and an instance profile scoped to the prefix.
+
+| scenario | run | result |
+|---|---|---|
+| writer and reader on different VMs, S3 store | 39776645728 | 300 MB entry in S3 (`blobs/1` plus `index.json`); restored with `cache-hit=true` and a matching sha256, 286 MB in about 0.8 s |
+| node replaced, then restore only | 39777134486 | a fresh node logged `cache index loaded from store entries=1` and served the same entry, sha256 OK |
+| cache node down, save then restore | 39777535606 | save 1 s (`Cache reservation failed: cache unavailable`), restore 1 s (`Cache not found`), job green |
+
+**How fail-fast works.** nginx connects with a 1 s timeout. When the node is
+unreachable, a CacheService RPC is answered `200 {"ok":false}` and a blob path
+`507`. The toolkit retries a 5xx RPC with backoff, but treats `ok:false` as a
+miss or a skipped save and does not retry a 507. cache-server answers 507 the
+same way when S3 itself fails.
+
+Two traps found on the way:
+
+- **The S3 region.** `aws-sdk-go-v2`'s `LoadDefaultConfig` does not read the
+  region from instance metadata unless `config.WithEC2IMDSRegion()` is set.
+  Without it, every call failed with `Invalid region`.
+- **`s3:ListBucket`.** It is needed even for a single known key: without it, a
+  missing `index.json` is a 403, not a 404.
+
 ## Still open
 
-- **Storage.** The node keeps entries on its own disk. A single node already
-  shares across VMs. S3 (or replicated nodes) is for durability and for scaling
-  past one node, not for sharing.
-- **Cache-node availability.** If the node is down, cache calls fail. They must
-  degrade to a miss quickly rather than hang; Blacksmith's 2026-08-13 outage is
-  the cautionary tale.
+- **One live cache-server per prefix.** Ids are server-allocated. Scaling past
+  one node needs either shared allocation or sharding by tenant or repository.
 - **Trust.** Every job on the VM trusts the POC CA for this one name. The CA key
   must never be on the runner. Scope the leaf certificate to the results host
   only, as here.

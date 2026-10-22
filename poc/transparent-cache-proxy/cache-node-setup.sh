@@ -6,6 +6,8 @@
 #
 # Inputs (env): CACHE_BIN       path to a linux firerunner binary
 #               IDENTITIES_URL  URL of a JSON array of jobidentity.Identity
+#               S3_BUCKET, S3_PREFIX  optional: keep blobs and the index in S3
+#                               (instance profile credentials)
 set -euo pipefail
 : "${CACHE_BIN:?}" "${IDENTITIES_URL:?}"
 
@@ -42,6 +44,8 @@ EOF
 chmod 0755 /usr/local/bin/firerunner-identity-sync
 nohup /usr/local/bin/firerunner-identity-sync "$IDENTITIES_URL" /run/firerunner/jobs > /var/log/firerunner-identity-sync.log 2>&1 &
 
+s3=()
+[ -n "${S3_BUCKET:-}" ] && s3=(--s3-bucket "$S3_BUCKET" --s3-prefix "${S3_PREFIX:-firerunner-cache/}")
 nohup /usr/local/bin/firerunner cache-server --addr 0.0.0.0:8099 --dir /var/lib/firerunner/cache \
-  --jobs-dir /run/firerunner/jobs --artifact-upstream "" > /var/log/firerunner-cache.log 2>&1 &
+  --jobs-dir /run/firerunner/jobs --artifact-upstream "" "${s3[@]}" > /var/log/firerunner-cache.log 2>&1 &
 until curl -sf http://127.0.0.1:8099/stats > /dev/null; do sleep 0.2; done
