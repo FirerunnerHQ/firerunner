@@ -145,12 +145,24 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		if err != nil {
 			return err
 		}
-		s.scaleSetID.Store(int64(id))
-		s.created = s.created || !reused
+		s.adopt(id, reused)
 		cfg.Logger.Info("registered runner scale set again", "scaleSetID", id, "reused", reused)
 		return nil
 	}
 	return s, nil
+}
+
+// adopt switches to the scale set registration returned, recording whether
+// this process owns it, so Close deletes only a set this process created. A
+// set another instance created in the meantime is reused, not owned, even if
+// this process had created the one it replaces.
+func (s *ScaleSet) adopt(id int, reused bool) {
+	owned := !reused
+	if int64(id) == s.scaleSetID.Load() {
+		owned = owned || s.created
+	}
+	s.created = owned
+	s.scaleSetID.Store(int64(id))
 }
 
 // registerScaleSet gets or creates the tier's scale set through client and
