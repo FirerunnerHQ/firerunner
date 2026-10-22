@@ -64,6 +64,10 @@ type Config struct {
 
 	LogLevel  string
 	LogFormat string
+
+	// offline skips checks that depend on this host's files (image paths), for
+	// validating a catalog away from the machine that will run it.
+	offline bool
 }
 
 // Provisioner names a tier may select.
@@ -218,10 +222,13 @@ func Parse(args []string) (*Config, error) {
 	fs.IntVar(&c.MaxRunners, "max-runners", er.int("FR_MAX_RUNNERS", 4), "max concurrent microVMs")
 	fs.IntVar(&c.MinRunners, "min-runners", er.int("FR_MIN_RUNNERS", 0), "warm pool size: microVMs kept pre-booted and registered so jobs start without a cold boot (0 = on-demand; higher = faster pickup, more idle RAM)")
 
-	fs.StringVar(&c.Token, "token", env("FR_TOKEN", ""), "GitHub PAT (use a GitHub App in production)")
+	// Credentials are not flag defaults: the flag package prints defaults in
+	// -h output and on every parse error, which would echo FR_TOKEN and
+	// FR_APP_PRIVATE_KEY to stderr. They fall back to the env after parsing.
+	fs.StringVar(&c.Token, "token", "", "GitHub PAT (use a GitHub App in production); default FR_TOKEN")
 	fs.StringVar(&c.AppClientID, "app-client-id", env("FR_APP_CLIENT_ID", ""), "GitHub App client id")
 	fs.Int64Var(&c.AppInstallID, "app-installation-id", int64(er.int("FR_APP_INSTALLATION_ID", 0)), "GitHub App installation id")
-	fs.StringVar(&c.AppPrivateKey, "app-private-key", env("FR_APP_PRIVATE_KEY", ""), "GitHub App private key (PEM path or contents)")
+	fs.StringVar(&c.AppPrivateKey, "app-private-key", "", "GitHub App private key (PEM path or contents); default FR_APP_PRIVATE_KEY")
 
 	fs.IntVar(&c.VCPU, "vcpu", er.int("FR_VCPU", 4), "vCPUs per microVM")
 	fs.IntVar(&c.MemMiB, "mem-mib", er.int("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
@@ -270,6 +277,12 @@ func Parse(args []string) (*Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
+	if c.Token == "" {
+		c.Token = env("FR_TOKEN", "")
+	}
+	if c.AppPrivateKey == "" {
+		c.AppPrivateKey = env("FR_APP_PRIVATE_KEY", "")
+	}
 	// Surface any malformed FR_* env values now, so a typo fails closed instead
 	// of silently running with a default.
 	if err := er.err(); err != nil {
@@ -299,6 +312,23 @@ func Parse(args []string) (*Config, error) {
 		RefreshInterval: metaRefresh,
 	}
 	return c, nil
+}
+
+// CheckCatalog loads and validates a tier catalog on its own, with the
+// per-tier rules the daemon applies, so an edit can be checked without
+// credentials or the host that will run it: image paths are not checked for
+// existence. maxRunners is the Firecracker slot budget the catalog will run
+// under (--max-runners).
+func CheckCatalog(path string, maxRunners int) ([]Tier, error) {
+	tiers, err := loadTiers(path)
+	if err != nil {
+		return nil, err
+	}
+	c := &Config{Tiers: tiers, MaxRunners: maxRunners, offline: true}
+	if err := c.validateTiers(); err != nil {
+		return nil, err
+	}
+	return tiers, nil
 }
 
 // loadTiers reads and decodes a JSON tier-catalog file.
@@ -492,7 +522,7 @@ func (c *Config) validateFirecrackerTier(t Tier) error {
 	case t.Max > c.MaxRunners:
 		return fmt.Errorf("tier %q: max (%d) exceeds --max-runners (%d), the shared slot budget, so the tier can never reach its max", t.Name, t.Max, c.MaxRunners)
 	}
-	if t.ToolCache != "" {
+	if t.ToolCache != "" && !c.offline {
 		if _, err := os.Stat(t.ToolCache); err != nil {
 			return fmt.Errorf("tier %q: toolcache image %q not accessible: %w", t.Name, t.ToolCache, err)
 		}

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -762,5 +763,70 @@ func TestExampleEC2Catalog(t *testing.T) {
 	}
 	if !c.UsesEC2() || !c.UsesFirecracker() {
 		t.Fatalf("example should mix both provisioners: ec2=%v firecracker=%v", c.UsesEC2(), c.UsesFirecracker())
+	}
+}
+
+func TestCheckCatalog(t *testing.T) {
+	// The example catalogs in the repo pass on their own, without any of the
+	// daemon's credentials or host flags.
+	for _, p := range []string{"../../examples/tiers.json", "../../examples/tiers-ec2.json"} {
+		tiers, err := CheckCatalog(p, 8)
+		if err != nil || len(tiers) == 0 {
+			t.Fatalf("CheckCatalog(%s) = %d tiers, %v", p, len(tiers), err)
+		}
+	}
+	// Per-tier rules still apply, including the slot budget.
+	bad := writeTiers(t, `[{"name":"t","vcpu":2,"mem_mib":4096,"golden":"/g","max":8}]`)
+	if _, err := CheckCatalog(bad, 4); err == nil || !strings.Contains(err.Error(), "--max-runners") {
+		t.Fatalf("over-budget tier: err = %v", err)
+	}
+	mixed := writeTiers(t, `[`+strings.Replace(ec2TierJSON, `"min":1`, `"min":1,"vcpu":4`, 1)+`]`)
+	if _, err := CheckCatalog(mixed, 4); err == nil {
+		t.Fatal("mixed-field tier accepted")
+	}
+	if _, err := CheckCatalog(filepath.Join(t.TempDir(), "none.json"), 4); err == nil {
+		t.Fatal("missing file accepted")
+	}
+}
+
+// captureStderr runs f and returns what it wrote to os.Stderr, where the flag
+// package prints usage.
+func captureStderr(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	f()
+	os.Stderr = old
+	w.Close()
+	b, _ := io.ReadAll(r)
+	return string(b)
+}
+
+func TestParse_NeverEchoesCredentials(t *testing.T) {
+	// The flag package prints every flag's default on -h and on any parse
+	// error; credentials from the env must not be among them.
+	t.Setenv("FR_TOKEN", "ghp_SECRET")
+	t.Setenv("FR_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----SECRET")
+	for _, args := range [][]string{{"-h"}, {"--bogus"}, {"--vcpu", "x"}} {
+		out := captureStderr(t, func() { _, _ = Parse(args) })
+		if strings.Contains(out, "SECRET") {
+			t.Fatalf("%v printed a credential:\n%s", args, out)
+		}
+		if !strings.Contains(out, "FR_TOKEN") {
+			t.Fatalf("%v: usage should still name the env var:\n%s", args, out)
+		}
+	}
+	// The env still supplies them, and a flag still wins.
+	c, err := Parse(nil)
+	if err != nil || c.Token != "ghp_SECRET" || !strings.Contains(c.AppPrivateKey, "BEGIN") {
+		t.Fatalf("env fallback: %+v %v", c, err)
+	}
+	c, err = Parse([]string{"--token", "flag-token"})
+	if err != nil || c.Token != "flag-token" {
+		t.Fatalf("flag override: %q %v", c.Token, err)
 	}
 }
