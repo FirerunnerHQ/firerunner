@@ -540,3 +540,165 @@ func TestFromFlags_VMConnectTimeout(t *testing.T) {
 		t.Fatalf("connect timeout with lifetime disabled: %v", err)
 	}
 }
+
+// ec2TierJSON is a valid EC2 tier; tests splice it into catalogs. The IDs are
+// placeholders in AWS's format, not real resources.
+const ec2TierJSON = `{"name":"cloud-4c","provisioner":"ec2","labels":["cloud"],"min":1,"max":20,
+  "ec2":{"instance_types":["c8a.xlarge","c7a.xlarge"],"ami":"/firerunner/ami/runner",
+         "subnets":["subnet-aaaa","subnet-bbbb"],"security_groups":["sg-cccc"],
+         "market":"spot-then-on-demand","root_volume_gib":40}}`
+
+func TestFromFlags_MixedProvisionerCatalog(t *testing.T) {
+	// One process serves a Firecracker tier and an EC2 tier side by side.
+	p := writeTiers(t, `[
+	  {"name":"local","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":1,"max":4},
+	  `+ec2TierJSON+`
+	]`)
+	c, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "4"))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	tiers := c.EffectiveTiers()
+	if tiers[0].IsEC2() || tiers[0].ProvisionerName() != ProvisionerFirecracker {
+		t.Fatalf("tier[0] provisioner = %q, want firecracker by default", tiers[0].ProvisionerName())
+	}
+	cloud := tiers[1]
+	if !cloud.IsEC2() || cloud.EC2 == nil {
+		t.Fatalf("tier[1] = %+v, want an ec2 tier", cloud)
+	}
+	e := cloud.EC2
+	if len(e.InstanceTypes) != 2 || e.InstanceTypes[0] != "c8a.xlarge" || e.InstanceTypes[1] != "c7a.xlarge" {
+		t.Fatalf("instance_types = %v, want order preserved", e.InstanceTypes)
+	}
+	if len(e.Subnets) != 2 || len(e.SecurityGroups) != 1 || e.Market != MarketSpotThenOnDemand || e.RootVolumeGiB != 40 {
+		t.Fatalf("ec2 block = %+v", e)
+	}
+	if !e.AMIFromSSM() || e.VolumeType() != "gp3" {
+		t.Fatalf("AMIFromSSM=%v VolumeType=%q, want SSM name and gp3 default", e.AMIFromSSM(), e.VolumeType())
+	}
+	// The EC2 tier's max (20) is far above --max-runners (4): EC2 tiers draw no
+	// host slots, so only Firecracker tiers are bounded by the budget.
+	if cloud.Max != 20 {
+		t.Fatalf("ec2 max = %d", cloud.Max)
+	}
+	if !c.UsesFirecracker() {
+		t.Fatal("UsesFirecracker = false with a firecracker tier present")
+	}
+}
+
+func TestEC2Tier_AMIKinds(t *testing.T) {
+	cases := map[string]bool{
+		"ami-0123456789abcdef0":           false,
+		"/firerunner/ami/runner":          true,
+		"firerunner-runner-ami":           true,
+		"resolve:ssm:/aws/service/x/y/id": true,
+	}
+	for ami, ssm := range cases {
+		if got := (EC2Tier{AMI: ami}).AMIFromSSM(); got != ssm {
+			t.Errorf("AMIFromSSM(%q) = %v, want %v", ami, got, ssm)
+		}
+	}
+	if got := (EC2Tier{RootVolumeType: "io2"}).VolumeType(); got != "io2" {
+		t.Errorf("VolumeType = %q, want io2", got)
+	}
+}
+
+func TestFromFlags_EC2OnlyCatalogNeedsNoFirecrackerHost(t *testing.T) {
+	// A control VM serving only EC2 tiers has no KVM, kernel or microVM
+	// egress interface, so those flags are not required.
+	p := writeTiers(t, `[`+ec2TierJSON+`]`)
+	c, err := FromFlags([]string{"--url", "https://github.com/org", "--token", "t", "--tiers", p})
+	if err != nil {
+		t.Fatalf("EC2-only catalog without --kernel/--ext-iface: %v", err)
+	}
+	if c.UsesFirecracker() {
+		t.Fatal("UsesFirecracker = true for an EC2-only catalog")
+	}
+	// The same flags are still required as soon as a Firecracker tier joins.
+	mixed := writeTiers(t, `[{"name":"local","vcpu":2,"mem_mib":4096,"golden":"/g","max":2},`+ec2TierJSON+`]`)
+	if _, err := FromFlags([]string{"--url", "u", "--token", "t", "--tiers", mixed}); err == nil {
+		t.Fatal("expected --kernel to be required once a firecracker tier is present")
+	}
+	// The single tier derived from scalar flags is a Firecracker tier.
+	if _, err := FromFlags([]string{"--url", "u", "--token", "t", "--golden", "/g"}); err == nil {
+		t.Fatal("expected --kernel to be required without a tier catalog")
+	}
+}
+
+func TestFromFlags_EC2WarmPoolOutsideSlotBudget(t *testing.T) {
+	// EC2 warm runners do not count against the Firecracker slot budget.
+	p := writeTiers(t, `[
+	  {"name":"local","vcpu":2,"mem_mib":4096,"golden":"/g","min":2,"max":2},
+	  `+strings.Replace(ec2TierJSON, `"min":1`, `"min":10`, 1)+`
+	]`)
+	if _, err := FromFlags(append(baseArgs(), "--tiers", p, "--max-runners", "2")); err != nil {
+		t.Fatalf("EC2 min should not count against --max-runners: %v", err)
+	}
+}
+
+func TestFromFlags_EC2TierErrors(t *testing.T) {
+	// Each case replaces one fragment of the valid ec2TierJSON.
+	cases := map[string][2]string{
+		"unknown provisioner":  {`"provisioner":"ec2"`, `"provisioner":"lambda"`},
+		"missing ec2 block":    {`"ec2":{`, `"x":{`},
+		"vcpu on ec2":          {`"min":1`, `"min":1,"vcpu":4`},
+		"mem_mib on ec2":       {`"min":1`, `"min":1,"mem_mib":8192`},
+		"golden on ec2":        {`"min":1`, `"min":1,"golden":"/g"`},
+		"toolcache on ec2":     {`"min":1`, `"min":1,"toolcache":"/tc"`},
+		"no instance types":    {`["c8a.xlarge","c7a.xlarge"]`, `[]`},
+		"blank instance type":  {`["c8a.xlarge","c7a.xlarge"]`, `["c8a.xlarge",""]`},
+		"dup instance type":    {`["c8a.xlarge","c7a.xlarge"]`, `["c8a.xlarge","c8a.xlarge"]`},
+		"no ami":               {`"ami":"/firerunner/ami/runner"`, `"ami":""`},
+		"bare ami prefix":      {`"ami":"/firerunner/ami/runner"`, `"ami":"ami-"`},
+		"no subnets":           {`["subnet-aaaa","subnet-bbbb"]`, `[]`},
+		"dup subnet":           {`["subnet-aaaa","subnet-bbbb"]`, `["subnet-aaaa","subnet-aaaa"]`},
+		"no security groups":   {`["sg-cccc"]`, `[]`},
+		"no market":            {`"market":"spot-then-on-demand",`, ``},
+		"bad market":           {`"market":"spot-then-on-demand"`, `"market":"reserved"`},
+		"negative root volume": {`"root_volume_gib":40`, `"root_volume_gib":-1`},
+		"bad volume type":      {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"st1"`},
+		"zero max":             {`"max":20`, `"max":0`},
+		"min over max":         {`"min":1`, `"min":30`},
+	}
+	for name, r := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := strings.Replace(ec2TierJSON, r[0], r[1], 1)
+			if body == ec2TierJSON {
+				t.Fatalf("fragment %q not found; the case tests nothing", r[0])
+			}
+			p := writeTiers(t, `[`+body+`]`)
+			if _, err := FromFlags(append(baseArgs(), "--tiers", p)); err == nil {
+				t.Fatalf("expected error for %q", name)
+			}
+		})
+	}
+}
+
+func TestFromFlags_EC2BlockOnFirecrackerTier(t *testing.T) {
+	// An ec2 block without "provisioner":"ec2" is a mixed tier and is rejected
+	// rather than silently booting a microVM.
+	for name, body := range map[string]string{
+		"implicit firecracker": `[{"name":"t","vcpu":2,"mem_mib":4096,"golden":"/g","max":2,"ec2":{"instance_types":["c8a.xlarge"]}}]`,
+		"explicit firecracker": `[{"name":"t","provisioner":"firecracker","vcpu":2,"mem_mib":4096,"golden":"/g","max":2,"ec2":{}}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := writeTiers(t, body)
+			_, err := FromFlags(append(baseArgs(), "--tiers", p))
+			if err == nil || !strings.Contains(err.Error(), "ec2 block") {
+				t.Fatalf("err = %v, want an ec2-block error", err)
+			}
+		})
+	}
+}
+
+func TestFromFlags_ExplicitFirecrackerProvisioner(t *testing.T) {
+	// "provisioner":"firecracker" is the same as leaving it out.
+	p := writeTiers(t, `[{"name":"t","provisioner":"firecracker","vcpu":2,"mem_mib":4096,"golden":"/g","max":2}]`)
+	c, err := FromFlags(append(baseArgs(), "--tiers", p))
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Tiers[0].IsEC2() {
+		t.Fatal("explicit firecracker tier reported as ec2")
+	}
+}

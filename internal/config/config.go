@@ -56,25 +56,94 @@ type Config struct {
 	LogFormat string
 }
 
-// Tier is one runner tier: a named scale set with its own microVM shape and
+// Provisioner names a tier may select.
+const (
+	ProvisionerFirecracker = "firecracker"
+	ProvisionerEC2         = "ec2"
+)
+
+// EC2 market policies.
+const (
+	MarketSpot               = "spot"
+	MarketSpotThenOnDemand   = "spot-then-on-demand"
+	MarketOnDemand           = "on-demand"
+	defaultEC2RootVolumeType = "gp3"
+	ec2AMIIDPrefix           = "ami-"
+)
+
+// Tier is one runner tier: a named scale set with its own runner shape and
 // warm/max bounds. Developers pick a tier by its name via runs-on; the operator
-// defines the catalog. vcpu/mem, the golden image and (optionally) the tool
-// cache vary per tier; the kernel and network are shared by all tiers in the
-// process.
+// defines the catalog.
+//
+// A Firecracker tier (the default) sets vcpu/mem, the golden image and
+// (optionally) the tool cache; the kernel, network and --max-runners slot
+// budget are shared by all Firecracker tiers in the process. An EC2 tier sets
+// the ec2 block instead and launches one instance per job; it draws on no host
+// resources, so it is bounded only by its own max.
 type Tier struct {
 	Name   string   `json:"name"`
 	Labels []string `json:"labels,omitempty"`
-	VCPU   int      `json:"vcpu"`
-	MemMiB int      `json:"mem_mib"`
-	Golden string   `json:"golden"`
+	// Provisioner selects how this tier's runners are launched: "firecracker"
+	// (the default when empty) or "ec2".
+	Provisioner string `json:"provisioner,omitempty"`
+	VCPU        int    `json:"vcpu,omitempty"`
+	MemMiB      int    `json:"mem_mib,omitempty"`
+	Golden      string `json:"golden,omitempty"`
 	// ToolCache optionally binds a read-only "hostedtoolcache" ext4 image to
 	// this tier, overriding the process-global --toolcache/FR_TOOLCACHE. Empty
 	// falls back to the global default. This lets a lean tier attach a drive
 	// while a fat tier keeps its baked-in cache.
 	ToolCache string `json:"toolcache,omitempty"`
-	Min       int    `json:"min"`
-	Max       int    `json:"max"`
+	// EC2 configures an EC2 tier; it must be set exactly when Provisioner is
+	// "ec2".
+	EC2 *EC2Tier `json:"ec2,omitempty"`
+	Min int      `json:"min"`
+	Max int      `json:"max"`
 }
+
+// EC2Tier is the launch template of an EC2 tier: one ephemeral instance per
+// job, shaped by the first instance type that has capacity.
+type EC2Tier struct {
+	// InstanceTypes is tried in order when capacity runs out, e.g.
+	// ["c8a.xlarge", "c7a.xlarge", "m8azn.xlarge"].
+	InstanceTypes []string `json:"instance_types"`
+	// AMI is an image ID ("ami-...") or the name of an SSM parameter that
+	// holds one, resolved at launch time so an image rebuild needs no config
+	// change.
+	AMI string `json:"ami"`
+	// Subnets are tried in order on insufficient capacity; one per AZ spreads
+	// launches across zones.
+	Subnets        []string `json:"subnets"`
+	SecurityGroups []string `json:"security_groups"`
+	// Market is "spot", "spot-then-on-demand" or "on-demand".
+	Market string `json:"market"`
+	// RootVolumeGiB sizes the root EBS volume; 0 keeps the AMI's size.
+	RootVolumeGiB int `json:"root_volume_gib,omitempty"`
+	// RootVolumeType is the root EBS volume type; empty means gp3.
+	RootVolumeType string `json:"root_volume_type,omitempty"`
+}
+
+// AMIFromSSM reports whether AMI names an SSM parameter rather than an image ID.
+func (e EC2Tier) AMIFromSSM() bool { return !strings.HasPrefix(e.AMI, ec2AMIIDPrefix) }
+
+// VolumeType returns the root volume type, defaulting to gp3.
+func (e EC2Tier) VolumeType() string {
+	if e.RootVolumeType == "" {
+		return defaultEC2RootVolumeType
+	}
+	return e.RootVolumeType
+}
+
+// ProvisionerName returns the tier's provisioner, defaulting to firecracker.
+func (t Tier) ProvisionerName() string {
+	if t.Provisioner == "" {
+		return ProvisionerFirecracker
+	}
+	return t.Provisioner
+}
+
+// IsEC2 reports whether the tier launches EC2 instances.
+func (t Tier) IsEC2() bool { return t.ProvisionerName() == ProvisionerEC2 }
 
 // Spec returns the microVM spec for the tier.
 func (t Tier) Spec() core.RunnerSpec {
@@ -147,7 +216,7 @@ func Parse(args []string) (*Config, error) {
 	fs.IntVar(&c.VCPU, "vcpu", er.int("FR_VCPU", 4), "vCPUs per microVM")
 	fs.IntVar(&c.MemMiB, "mem-mib", er.int("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
 
-	fs.StringVar(&c.TiersPath, "tiers", env("FR_TIERS", ""), "path to a JSON tier catalog (array of {name,vcpu,mem_mib,golden,toolcache,min,max,labels}). When set, firerunner serves every tier from this one process and developers pick one with runs-on: <name>; --max-runners is the shared slot budget. When unset, a single tier is derived from --name/--vcpu/--mem-mib/--golden.")
+	fs.StringVar(&c.TiersPath, "tiers", env("FR_TIERS", ""), "path to a JSON tier catalog (array of {name,labels,provisioner,min,max} plus {vcpu,mem_mib,golden,toolcache} for a firecracker tier or an ec2 block for an ec2 tier). When set, firerunner serves every tier from this one process and developers pick one with runs-on: <name>; --max-runners is the slot budget shared by the firecracker tiers. When unset, a single firecracker tier is derived from --name/--vcpu/--mem-mib/--golden.")
 
 	fs.StringVar(&c.Firecracker.Binary, "firecracker-bin", env("FR_FIRECRACKER_BIN", "firecracker"), "path to firecracker binary")
 	fs.StringVar(&c.Firecracker.KernelImage, "kernel", env("FR_KERNEL", ""), "path to guest kernel (vmlinux) (required)")
@@ -258,15 +327,28 @@ func splitSemi(s string) []string {
 	return out
 }
 
+// UsesFirecracker reports whether any effective tier boots Firecracker
+// microVMs, and so needs the host kernel, network and slot budget. A catalog of
+// only EC2 tiers runs on a host without KVM.
+func (c *Config) UsesFirecracker() bool {
+	for _, t := range c.EffectiveTiers() {
+		if !t.IsEC2() {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Config) validate() error {
+	fc := c.UsesFirecracker()
 	switch {
 	case c.URL == "":
 		return fmt.Errorf("--url is required")
-	case c.Firecracker.KernelImage == "":
+	case fc && c.Firecracker.KernelImage == "":
 		return fmt.Errorf("--kernel is required")
 	case c.Firecracker.GoldenRootFS == "" && len(c.Tiers) == 0:
 		return fmt.Errorf("--golden is required (or configure a tier catalog with --tiers)")
-	case c.Firecracker.ExtIface == "":
+	case fc && c.Firecracker.ExtIface == "":
 		return fmt.Errorf("--ext-iface is required for microVM egress")
 	case c.MaxRunners < 1:
 		return fmt.Errorf("--max-runners must be >= 1")
@@ -339,9 +421,10 @@ func (c *Config) validate() error {
 }
 
 // validateTiers checks a tier catalog: each tier must be well-formed and
-// uniquely named, no tier's max may exceed the shared slot budget
-// (--max-runners) — or it could never reach that max — and the tiers' warm
-// pools must fit within the budget so they can all stay warm at once.
+// uniquely named, no Firecracker tier's max may exceed the shared slot budget
+// (--max-runners) — or it could never reach that max — and the Firecracker
+// tiers' warm pools must fit within the budget so they can all stay warm at
+// once. EC2 tiers draw on no host slots, so only their own bounds apply.
 func (c *Config) validateTiers() error {
 	seen := make(map[string]bool, len(c.Tiers))
 	totalMin := 0
@@ -351,31 +434,114 @@ func (c *Config) validateTiers() error {
 			return fmt.Errorf("tier %d: name is required", i)
 		case seen[t.Name]:
 			return fmt.Errorf("tier %q: duplicate name", t.Name)
-		case t.VCPU < 1:
-			return fmt.Errorf("tier %q: vcpu must be >= 1", t.Name)
-		case t.MemMiB < 128:
-			return fmt.Errorf("tier %q: mem_mib must be >= 128", t.Name)
-		case t.Golden == "":
-			return fmt.Errorf("tier %q: golden is required", t.Name)
 		case t.Max < 1:
 			return fmt.Errorf("tier %q: max must be >= 1", t.Name)
 		case t.Min < 0:
 			return fmt.Errorf("tier %q: min must be >= 0", t.Name)
 		case t.Min > t.Max:
 			return fmt.Errorf("tier %q: min (%d) must not exceed max (%d)", t.Name, t.Min, t.Max)
-		case t.Max > c.MaxRunners:
-			return fmt.Errorf("tier %q: max (%d) exceeds --max-runners (%d), the shared slot budget, so the tier can never reach its max", t.Name, t.Max, c.MaxRunners)
-		}
-		if t.ToolCache != "" {
-			if _, err := os.Stat(t.ToolCache); err != nil {
-				return fmt.Errorf("tier %q: toolcache image %q not accessible: %w", t.Name, t.ToolCache, err)
-			}
 		}
 		seen[t.Name] = true
-		totalMin += t.Min
+		switch t.ProvisionerName() {
+		case ProvisionerFirecracker:
+			if err := c.validateFirecrackerTier(t); err != nil {
+				return err
+			}
+			totalMin += t.Min
+		case ProvisionerEC2:
+			if err := validateEC2Tier(t); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("tier %q: unknown provisioner %q (want %q or %q)", t.Name, t.Provisioner, ProvisionerFirecracker, ProvisionerEC2)
+		}
 	}
 	if totalMin > c.MaxRunners {
 		return fmt.Errorf("tiers' warm pools sum to %d but --max-runners (the shared slot budget) is %d", totalMin, c.MaxRunners)
+	}
+	return nil
+}
+
+func (c *Config) validateFirecrackerTier(t Tier) error {
+	switch {
+	case t.EC2 != nil:
+		return fmt.Errorf("tier %q: an ec2 block needs \"provisioner\": %q", t.Name, ProvisionerEC2)
+	case t.VCPU < 1:
+		return fmt.Errorf("tier %q: vcpu must be >= 1", t.Name)
+	case t.MemMiB < 128:
+		return fmt.Errorf("tier %q: mem_mib must be >= 128", t.Name)
+	case t.Golden == "":
+		return fmt.Errorf("tier %q: golden is required", t.Name)
+	case t.Max > c.MaxRunners:
+		return fmt.Errorf("tier %q: max (%d) exceeds --max-runners (%d), the shared slot budget, so the tier can never reach its max", t.Name, t.Max, c.MaxRunners)
+	}
+	if t.ToolCache != "" {
+		if _, err := os.Stat(t.ToolCache); err != nil {
+			return fmt.Errorf("tier %q: toolcache image %q not accessible: %w", t.Name, t.ToolCache, err)
+		}
+	}
+	return nil
+}
+
+// validateEC2Tier rejects Firecracker-only fields on an EC2 tier, so a tier
+// never half-describes a microVM it will not boot, and checks the ec2 block.
+func validateEC2Tier(t Tier) error {
+	for _, f := range []struct {
+		name string
+		set  bool
+	}{
+		{"vcpu", t.VCPU != 0},
+		{"mem_mib", t.MemMiB != 0},
+		{"golden", t.Golden != ""},
+		{"toolcache", t.ToolCache != ""},
+	} {
+		if f.set {
+			return fmt.Errorf("tier %q: %s is a firecracker field; an ec2 tier is shaped by ec2.instance_types", t.Name, f.name)
+		}
+	}
+	e := t.EC2
+	if e == nil {
+		return fmt.Errorf("tier %q: provisioner %q needs an ec2 block", t.Name, ProvisionerEC2)
+	}
+	if err := nonEmptyUnique(e.InstanceTypes); err != nil {
+		return fmt.Errorf("tier %q: ec2.instance_types: %w", t.Name, err)
+	}
+	if err := nonEmptyUnique(e.Subnets); err != nil {
+		return fmt.Errorf("tier %q: ec2.subnets: %w", t.Name, err)
+	}
+	if err := nonEmptyUnique(e.SecurityGroups); err != nil {
+		return fmt.Errorf("tier %q: ec2.security_groups: %w", t.Name, err)
+	}
+	switch {
+	case strings.TrimSpace(e.AMI) == "" || e.AMI == ec2AMIIDPrefix:
+		return fmt.Errorf("tier %q: ec2.ami is required (an image ID or an SSM parameter name)", t.Name)
+	case e.Market != MarketSpot && e.Market != MarketSpotThenOnDemand && e.Market != MarketOnDemand:
+		return fmt.Errorf("tier %q: ec2.market %q must be %q, %q or %q", t.Name, e.Market, MarketSpot, MarketSpotThenOnDemand, MarketOnDemand)
+	case e.RootVolumeGiB < 0:
+		return fmt.Errorf("tier %q: ec2.root_volume_gib must be >= 0", t.Name)
+	}
+	switch e.VolumeType() {
+	case "gp2", "gp3", "io1", "io2":
+	default:
+		return fmt.Errorf("tier %q: ec2.root_volume_type %q must be gp2, gp3, io1 or io2", t.Name, e.RootVolumeType)
+	}
+	return nil
+}
+
+// nonEmptyUnique requires at least one entry, with no blanks or repeats.
+func nonEmptyUnique(vals []string) error {
+	if len(vals) == 0 {
+		return errors.New("at least one entry is required")
+	}
+	seen := make(map[string]bool, len(vals))
+	for _, v := range vals {
+		switch {
+		case strings.TrimSpace(v) == "":
+			return errors.New("entries must not be empty")
+		case seen[v]:
+			return fmt.Errorf("duplicate entry %q", v)
+		}
+		seen[v] = true
 	}
 	return nil
 }
