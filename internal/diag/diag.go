@@ -7,6 +7,7 @@ package diag
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/solcreek/firerunner/internal/cacheserver"
 	"github.com/solcreek/firerunner/internal/config"
+	"github.com/solcreek/firerunner/internal/health"
 	"github.com/solcreek/firerunner/internal/provisioner"
 )
 
@@ -44,7 +46,31 @@ type StatusReport struct {
 	Cache     *CacheInfo  `json:"cache,omitempty"`
 	Workdir   WorkdirInfo `json:"workdir"`
 	Tiers     []TierInfo  `json:"tiers,omitempty"`
-	MicroVMs  VMSummary   `json:"microvms"`
+	// Listeners is the running daemon's per-tier listener health, absent
+	// when the daemon has not published any.
+	Listeners *ListenerInfo `json:"listeners,omitempty"`
+	MicroVMs  VMSummary     `json:"microvms"`
+}
+
+// ListenerInfo is the daemon's published listener health.
+type ListenerInfo struct {
+	health.File
+	// Stale is set when the file has not been rewritten recently: the
+	// daemon is likely not running, so the states may be out of date.
+	Stale bool `json:"stale"`
+}
+
+// listenerStaleAfter is how old the health file may get before status calls
+// it stale; the daemon rewrites it every 10 s.
+const listenerStaleAfter = 30 * time.Second
+
+// readListeners loads the daemon's listener health from its work dir.
+func readListeners(fc provisioner.FirecrackerConfig, now time.Time) (*ListenerInfo, error) {
+	f, err := health.Read(filepath.Join(fc.WorkDir, health.FileName))
+	if err != nil {
+		return nil, err
+	}
+	return &ListenerInfo{File: f, Stale: now.Sub(f.WrittenAt) > listenerStaleAfter}, nil
 }
 
 // TierInfo is one configured runner tier as seen by status.
@@ -249,6 +275,10 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 		r.Tiers = append(r.Tiers, ti)
 	}
 
+	if li, err := readListeners(fc, time.Now()); err == nil {
+		r.Listeners = li
+	}
+
 	// Live microVMs, cross-checked three ways: work dirs (per-job rootfs clone +
 	// socket), tap devices and firecracker processes.
 	vms := activeVMs(fc)
@@ -328,6 +358,29 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				t.Name, t.Provisioner, t.VCPU, t.MemMiB, t.Min, t.Max, t.Golden.describe(), tc)
 		}
 		ttw.Flush()
+	}
+
+	if l := r.Listeners; l != nil {
+		age := humanDuration(time.Since(l.WrittenAt).Truncate(time.Second))
+		note := ""
+		if l.Stale {
+			note = "  STALE: the daemon may not be running"
+		}
+		fmt.Fprintf(w, "\nlisteners: (pid %d, updated %s ago)%s\n", l.PID, age, note)
+		ltw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(ltw, "  TIER\tSTATE\tRECONNECTS\tLAST MESSAGE\tLAST ERROR")
+		for _, t := range l.Tiers {
+			last := "never"
+			if !t.LastMessage.IsZero() {
+				last = humanDuration(time.Since(t.LastMessage).Truncate(time.Second)) + " ago"
+			}
+			state := string(t.State)
+			if t.State == health.Reconnecting && t.BackoffSeconds > 0 {
+				state += fmt.Sprintf(" (next in %.0fs)", t.BackoffSeconds)
+			}
+			fmt.Fprintf(ltw, "  %s\t%s\t%d\t%s\t%s\n", t.Name, state, t.Reconnects, last, or(truncate(t.LastError, 80), "-"))
+		}
+		ltw.Flush()
 	}
 
 	fmt.Fprintf(w, "\nmicroVMs: %d active  (firecracker procs=%d, taps=%d, max=%d)\n",
@@ -467,6 +520,8 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 		checks = append(checks, *c)
 	}
 
+	checks = append(checks, listenerChecks(fc, time.Now())...)
+
 	failed := 0
 	for _, c := range checks {
 		if c.Level == levelFail {
@@ -483,6 +538,45 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 }
 
 // --- checks ---------------------------------------------------------------
+
+// listenerChecks reports each tier's listener health from the running
+// daemon's state file: FAIL for a tier that stopped on a fatal error, WARN for
+// one reconnecting. With no state file (doctor run before the daemon starts)
+// or a stale one, there is nothing current to judge, so it only says so.
+func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
+	li, err := readListeners(fc, now)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return []Check{pass("listeners", "no listener state published (daemon not running yet)")}
+	case err != nil:
+		return []Check{warn("listeners", "unreadable listener state: %v", err)}
+	case li.Stale:
+		return []Check{warn("listeners", "listener state last updated %s ago; is the daemon running?", humanDuration(now.Sub(li.WrittenAt).Truncate(time.Second)))}
+	}
+	var checks []Check
+	for _, t := range li.Tiers {
+		name := "listener[" + t.Name + "]"
+		switch t.State {
+		case health.Failed:
+			checks = append(checks, fail(name, "stopped taking jobs: %s", truncate(t.LastError, 200)))
+		case health.Reconnecting:
+			checks = append(checks, warn(name, "reconnecting since %s ago (%d reconnects so far): %s",
+				humanDuration(now.Sub(t.Since).Truncate(time.Second)), t.Reconnects, truncate(t.LastError, 200)))
+		default:
+			checks = append(checks, pass(name, "connected, %d reconnects", t.Reconnects))
+		}
+	}
+	return checks
+}
+
+// truncate shortens s to at most n runes, marking the cut.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}
 
 const (
 	levelPass = "PASS"

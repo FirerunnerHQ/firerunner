@@ -9,9 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/solcreek/firerunner/internal/cacheserver"
 	"github.com/solcreek/firerunner/internal/config"
+	"github.com/solcreek/firerunner/internal/health"
 	"github.com/solcreek/firerunner/internal/provisioner"
 )
 
@@ -523,5 +525,121 @@ func TestDoctor_SkipsEC2TierGolden(t *testing.T) {
 		if strings.HasPrefix(c.Name, "golden") || strings.HasPrefix(c.Name, "toolcache") {
 			t.Errorf("doctor checked an image for an ec2 tier: %v", c)
 		}
+	}
+}
+
+// writeListenerHealth publishes a daemon health file in dir, written at at.
+func writeListenerHealth(t *testing.T, dir string, at time.Time, tiers ...health.Tier) {
+	t.Helper()
+	if err := health.Write(filepath.Join(dir, health.FileName), health.File{PID: 7, WrittenAt: at, Tiers: tiers}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStatus_ShowsFailedTierListener(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	writeListenerHealth(t, dir, now,
+		health.Tier{Name: "a", State: health.Failed, LastError: `status="401 Unauthorized"`, Since: now},
+		health.Tier{Name: "b", State: health.Connected, Reconnects: 2, LastMessage: now, Since: now},
+	)
+	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: dir, TapPrefix: "fr", NetBase: 16}}
+
+	var text bytes.Buffer
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	out := text.String()
+	for _, want := range []string{"listeners:", "failed", "401 Unauthorized", "connected"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status text missing %q\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "STALE") {
+		t.Errorf("fresh health reported stale\n%s", out)
+	}
+
+	var js bytes.Buffer
+	if err := Status(cfg, "test", &js, true); err != nil {
+		t.Fatal(err)
+	}
+	var r StatusReport
+	if err := json.Unmarshal(js.Bytes(), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Listeners == nil || len(r.Listeners.Tiers) != 2 || r.Listeners.Tiers[0].State != health.Failed || r.Listeners.Stale {
+		t.Fatalf("listeners = %+v", r.Listeners)
+	}
+}
+
+func TestStatus_StaleListenerHealth(t *testing.T) {
+	dir := t.TempDir()
+	writeListenerHealth(t, dir, time.Now().Add(-5*time.Minute), health.Tier{Name: "a", State: health.Connected})
+	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: dir, TapPrefix: "fr", NetBase: 16}}
+	var text bytes.Buffer
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "STALE") {
+		t.Fatalf("old health not marked stale\n%s", text.String())
+	}
+}
+
+func TestListenerChecks(t *testing.T) {
+	now := time.Now()
+	level := func(checks []Check, name string) string {
+		for _, c := range checks {
+			if c.Name == name {
+				return c.Level
+			}
+		}
+		return "missing"
+	}
+
+	dir := t.TempDir()
+	fc := provisioner.FirecrackerConfig{WorkDir: dir}
+	// No daemon yet: nothing to judge, and doctor must not fail on it.
+	if c := listenerChecks(fc, now); len(c) != 1 || c[0].Level != levelPass {
+		t.Fatalf("no state file: %+v", c)
+	}
+
+	writeListenerHealth(t, dir, now,
+		health.Tier{Name: "a", State: health.Failed, LastError: "401", Since: now},
+		health.Tier{Name: "b", State: health.Reconnecting, LastError: "503", Since: now.Add(-time.Minute)},
+		health.Tier{Name: "c", State: health.Connected},
+	)
+	c := listenerChecks(fc, now)
+	if level(c, "listener[a]") != levelFail || level(c, "listener[b]") != levelWarn || level(c, "listener[c]") != levelPass {
+		t.Fatalf("checks = %+v", c)
+	}
+
+	// A stale file only warns: its states may be out of date.
+	writeListenerHealth(t, dir, now.Add(-time.Hour), health.Tier{Name: "a", State: health.Failed})
+	if c := listenerChecks(fc, now); len(c) != 1 || c[0].Level != levelWarn {
+		t.Fatalf("stale file: %+v", c)
+	}
+}
+
+func TestDoctor_FailsOnFailedListener(t *testing.T) {
+	dir := t.TempDir()
+	writeListenerHealth(t, dir, time.Now(), health.Tier{Name: "a", State: health.Failed, LastError: "401"})
+	r := runDoctor(&config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: dir}}, "test")
+	found := false
+	for _, c := range r.Checks {
+		if c.Name == "listener[a]" && c.Level == levelFail {
+			found = true
+		}
+	}
+	if !found || r.OK {
+		t.Fatalf("doctor did not fail on a failed tier listener: %+v", r.Checks)
+	}
+}
+
+func TestTruncate(t *testing.T) {
+	if got := truncate("abcdef", 4); got != "abc…" {
+		t.Fatalf("truncate = %q", got)
+	}
+	if got := truncate("abc", 4); got != "abc" {
+		t.Fatalf("truncate short = %q", got)
 	}
 }
