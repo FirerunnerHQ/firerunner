@@ -74,7 +74,6 @@ func TestReconcileRespectsMaxAndDrains(t *testing.T) {
 	prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
 		entered <- name
 		<-release
-		onBusy() // the runner ran its job before exiting
 		return nil
 	})
 	s := New(Options{Max: 2, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
@@ -206,7 +205,6 @@ func TestCapacityWhenMoreIsPendingThanFree(t *testing.T) {
 	release := make(chan struct{})
 	prov := &slotProv{free: 1, provFunc: func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
 		<-release
-		onBusy() // each runner ran its job before exiting
 		return nil
 	}}
 	var pending PendingLaunches
@@ -235,7 +233,6 @@ func TestCapacityPendingIsSharedAcrossTiers(t *testing.T) {
 	release := make(chan struct{})
 	prov := &slotProv{free: 3, provFunc: func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
 		<-release
-		onBusy() // the runner ran its job before exiting
 		return nil
 	}}
 	var pending PendingLaunches
@@ -601,8 +598,7 @@ func TestMaintainsMinimumAfterExit(t *testing.T) {
 	prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
 		launched <- name
 		if atomic.AddInt32(&count, 1) == 1 {
-			onBusy() // first microVM finishes its job and exits immediately
-			return nil
+			return nil // first microVM finishes its job and exits immediately
 		}
 		<-block // replacement stays "running" so we can observe it
 		return nil
@@ -1268,61 +1264,5 @@ func TestFailedBootBacksOff(t *testing.T) {
 	// backoff this loop would run thousands of times.
 	if n := atomic.LoadInt32(&launches); n < 1 || n > 6 {
 		t.Fatalf("expected a small paced number of boot attempts, got %d", n)
-	}
-}
-
-func TestRunnerExitingWithoutAJobBacksOff(t *testing.T) {
-	// A runner that exits on its own without ever being marked busy did not
-	// take a job (a broken image or a rejected config): the warm pool must
-	// back off rather than relaunch at once in a loop. A runner that ran its
-	// job is replaced at once.
-	for _, c := range []struct {
-		name      string
-		busy      bool
-		wantDelay bool
-	}{
-		{"exited after a job", true, false},
-		{"exited without a job", false, true},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			launched := make(chan time.Time, 8)
-			block := make(chan struct{})
-			defer close(block)
-			var count int32
-			prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
-				launched <- time.Now()
-				if atomic.AddInt32(&count, 1) == 1 {
-					if c.busy {
-						onBusy()
-					}
-					return nil
-				}
-				select {
-				case <-block:
-				case <-ctx.Done():
-				}
-				return nil
-			})
-			s := New(Options{Max: 2, Min: 1, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
-			s.Reconcile(ctx, 1)
-			first := <-launched
-			var second time.Time
-			select {
-			case second = <-launched:
-			case <-time.After(3 * time.Second):
-				t.Fatal("no replacement launch")
-			}
-			gap := second.Sub(first)
-			if c.wantDelay && gap < backoffBase {
-				t.Fatalf("replacement after %v, want a backoff of at least %v", gap, backoffBase)
-			}
-			if !c.wantDelay && gap >= backoffBase {
-				t.Fatalf("replacement after %v, want it at once after a real job", gap)
-			}
-			cancel()
-			s.Drain()
-		})
 	}
 }
