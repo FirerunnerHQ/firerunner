@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"os"
 	"strings"
 	"testing"
 )
@@ -77,6 +79,9 @@ func TestConfigCheckUsage(t *testing.T) {
 		{"check", "--catalog"},
 		{"check", "--catalog", "x.json", "--url", "u"},
 		{"check", "--catalog", "x.json", "--max-runners", "many"},
+		{"check", "--catalog", "x.json", "--max-runners", "0"},
+		{"check", "--bogus"},
+		{"check", "--vcpu", "x"},
 	} {
 		if code, _, _ := runConfig(t, args...); code != 2 {
 			t.Errorf("%v: exit %d, want 2", args, code)
@@ -85,4 +90,60 @@ func TestConfigCheckUsage(t *testing.T) {
 	if code, out, _ := runConfig(t, "check", "--help"); code != 0 || !strings.Contains(out, "exit status") {
 		t.Errorf("--help: exit %d\n%s", code, out)
 	}
+}
+
+func TestConfigCheckMatchesStartup(t *testing.T) {
+	// A malformed FR_MAX_RUNNERS fails the daemon at startup; the catalog
+	// check must not silently fall back to 4.
+	t.Setenv("FR_MAX_RUNNERS", "abc")
+	if code, _, errOut := runConfig(t, "check", "--catalog", "../../examples/tiers-ec2.json"); code != 2 || !strings.Contains(errOut, "FR_MAX_RUNNERS") {
+		t.Fatalf("malformed FR_MAX_RUNNERS: exit %d %s", code, errOut)
+	}
+	t.Setenv("FR_MAX_RUNNERS", "")
+	if code, out, _ := runConfig(t, "check", "--catalog", "../../examples/tiers-ec2.json", "--max-runners=8"); code != 0 {
+		t.Fatalf("--max-runners=8: exit %d\n%s", code, out)
+	}
+	// Startup resolves the App key; a key file that does not exist is
+	// invalid here too, and the message never contains the key's value.
+	// (An empty FR_MAX_RUNNERS is itself malformed for the daemon.)
+	t.Setenv("FR_MAX_RUNNERS", "4")
+	code, out, _ := runConfig(t, "check", "--url", "https://github.com/o", "--app-client-id", "Iv1",
+		"--app-installation-id", "1", "--app-private-key", "/no/such/key.pem", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0")
+	if code != 1 || !strings.Contains(out, "does not exist") {
+		t.Fatalf("missing app key: exit %d\n%s", code, out)
+	}
+}
+
+func TestConfigCheckUnknownFlagNeverPrintsSecrets(t *testing.T) {
+	t.Setenv("FR_TOKEN", "ghp_SECRET")
+	t.Setenv("FR_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----SECRET")
+	out := captureStderrMain(t, func() {
+		var o, e bytes.Buffer
+		if code := configCmd([]string{"check", "--json", "--bogus"}, &o, &e); code != 2 {
+			t.Errorf("exit %d, want 2", code)
+		}
+		if strings.Contains(o.String()+e.String(), "SECRET") {
+			t.Errorf("credential in output:\n%s%s", o.String(), e.String())
+		}
+	})
+	if strings.Contains(out, "SECRET") {
+		t.Fatalf("credential on stderr:\n%s", out)
+	}
+}
+
+// captureStderrMain returns what f wrote to os.Stderr, where the flag
+// package prints usage.
+func captureStderrMain(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	f()
+	os.Stderr = old
+	w.Close()
+	b, _ := io.ReadAll(r)
+	return string(b)
 }

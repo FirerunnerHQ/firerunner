@@ -59,8 +59,13 @@ func configCmd(args []string, stdout, stderr io.Writer) int {
 	// The catalog's slot budget defaults like the daemon's: FR_MAX_RUNNERS,
 	// else 4.
 	maxRunners := 4
-	if v, err := strconv.Atoi(os.Getenv("FR_MAX_RUNNERS")); err == nil {
-		maxRunners = v
+	if v := os.Getenv("FR_MAX_RUNNERS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			fmt.Fprintf(stderr, "FR_MAX_RUNNERS=%q: %v\n", v, err)
+			return 2
+		}
+		maxRunners = n
 	}
 	asJSON, catalog := false, ""
 	var rest []string
@@ -90,19 +95,27 @@ func configCmd(args []string, stdout, stderr io.Writer) int {
 	if catalog != "" {
 		r.Mode = "catalog"
 		for i := 0; i < len(rest); i++ {
-			switch a := rest[i]; {
+			a, val := rest[i], ""
+			switch {
 			case (a == "--max-runners" || a == "-max-runners") && i+1 < len(rest):
 				i++
-				n, err := strconv.Atoi(rest[i])
-				if err != nil {
-					fmt.Fprintf(stderr, "--max-runners %q: %v\n", rest[i], err)
-					return 2
-				}
-				maxRunners = n
+				val = rest[i]
+			case strings.HasPrefix(a, "--max-runners="), strings.HasPrefix(a, "-max-runners="):
+				val = a[strings.Index(a, "=")+1:]
 			default:
 				fmt.Fprintf(stderr, "--catalog takes only --max-runners, not %q\n%s", a, configUsage)
 				return 2
 			}
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				fmt.Fprintf(stderr, "--max-runners %q: %v\n", val, err)
+				return 2
+			}
+			maxRunners = n
+		}
+		if maxRunners < 1 {
+			fmt.Fprintf(stderr, "--max-runners must be >= 1, as the daemon requires\n")
+			return 2
 		}
 		tiers, err := config.CheckCatalog(catalog, maxRunners)
 		if err != nil {
@@ -115,7 +128,19 @@ func configCmd(args []string, stdout, stderr io.Writer) int {
 		}
 	} else {
 		r.Mode = "daemon"
+		// A flag or FR_* value that does not even parse is a usage error,
+		// as for the daemon; anything the daemon's validation refuses is
+		// "invalid".
+		if _, err := config.Parse(rest); err != nil {
+			fmt.Fprintf(stderr, "%v\n", err)
+			return 2
+		}
 		cfg, err := config.FromFlags(rest)
+		if err == nil {
+			// Startup resolves the App private key before contacting
+			// anything; so does the check. Its error never echoes the key.
+			_, err = cfg.ResolvePrivateKey()
+		}
 		if err != nil {
 			r.Error = err.Error()
 		} else {
