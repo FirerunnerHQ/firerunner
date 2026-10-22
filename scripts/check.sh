@@ -56,7 +56,12 @@ skip() {
 # shellcheck disable=SC2329
 gofmt_clean() {
 	local out
-	out="$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
+	# gofmt prints nothing to stdout for a file it cannot parse, so its exit
+	# status is checked too: an empty list alone would read as clean.
+	out="$(git ls-files -z '*.go' | xargs -0 gofmt -l)" || {
+		echo "gofmt failed (a file does not parse?)"
+		return 1
+	}
 	[ -z "$out" ] || {
 		echo "not gofmt-clean:"
 		echo "$out"
