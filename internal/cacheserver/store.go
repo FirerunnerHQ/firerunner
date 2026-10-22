@@ -35,6 +35,7 @@ var errStoreUnavailable = errors.New("cache store unavailable")
 const (
 	storeCallTimeout  = 10 * time.Second
 	indexSyncInterval = 5 * time.Second
+	localFillTimeout  = 30 * time.Minute
 )
 
 type indexSync struct {
@@ -43,12 +44,23 @@ type indexSync struct {
 	dirty bool
 }
 
+// SetLocalCacheSize keeps up to n bytes of completed blobs on local disk in
+// front of the store, least recently used dropped first; 0 keeps none.
+func (s *Server) SetLocalCacheSize(n int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.localCap = n
+	s.trimLocal(0)
+}
+
 // SetBlobStore moves blob storage to store. An empty local index is seeded from
-// the store's, so a fresh server serves what its predecessor finalized.
+// the store's, so a fresh server serves what its predecessor finalized; blobs
+// already on local disk become local copies.
 func (s *Server) SetBlobStore(store BlobStore) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.store = store
+	defer s.adoptLocal()
 	if len(s.entries) > 0 {
 		return nil
 	}
@@ -110,28 +122,157 @@ func (s *Server) flushIndex() {
 	}
 }
 
-// putBlob hands an assembled local blob to the store and drops the local copy.
+// putBlob hands an assembled local blob to the store, keeping it as a local copy
+// when there is room for one.
 func (s *Server) putBlob(r *http.Request, id uint64) error {
 	if s.store == nil {
 		return nil
 	}
 	path := s.blobPath(id)
-	defer os.Remove(path)
 	fi, err := os.Stat(path)
 	if err != nil {
 		return err
 	}
 	if err := s.store.Put(r.Context(), id, path); err != nil {
+		_ = os.Remove(path)
 		s.log.Warn("cache blob upload to store failed", "id", id, "err", err)
 		return errStoreUnavailable
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.stored == nil {
 		s.stored = make(map[uint64]int64)
 	}
 	s.stored[id] = fi.Size()
-	s.mu.Unlock()
+	s.keepLocal(id, fi.Size())
 	return nil
+}
+
+// keepLocal records the blob at blobPath(id) as a local copy, or removes it when
+// copies are off or it cannot fit. The caller holds s.mu.
+func (s *Server) keepLocal(id uint64, size int64) {
+	if s.localCap <= 0 || size > s.localCap {
+		_ = os.Remove(s.blobPath(id))
+		return
+	}
+	if s.local == nil {
+		s.local = make(map[uint64]int64)
+	}
+	s.local[id] = size
+	s.trimLocal(id)
+}
+
+// adoptLocal turns blobs already on disk for completed entries into local
+// copies, e.g. after a restart. The caller holds s.mu.
+func (s *Server) adoptLocal() {
+	for id, e := range s.entries {
+		if !e.Complete {
+			continue
+		}
+		if fi, err := os.Stat(s.blobPath(id)); err == nil && fi.Size() == e.Size {
+			s.keepLocal(id, e.Size)
+		}
+	}
+}
+
+// trimLocal drops the least recently used local copies until they fit the cap,
+// never keep. The store still holds every dropped blob. The caller holds s.mu.
+func (s *Server) trimLocal(keep uint64) {
+	var total int64
+	for _, n := range s.local {
+		total += n
+	}
+	for total > s.localCap && len(s.local) > 0 {
+		var victim *Entry
+		for id := range s.local {
+			e := s.entries[id]
+			if id == keep || e == nil {
+				continue
+			}
+			if victim == nil || lessRecentlyUsed(e, victim) {
+				victim = e
+			}
+		}
+		if victim == nil {
+			return
+		}
+		total -= s.local[victim.ID]
+		delete(s.local, victim.ID)
+		_ = os.Remove(s.blobPath(victim.ID))
+	}
+}
+
+// openLocal opens blob id from local disk: always without a store, and only a
+// recorded local copy with one.
+func (s *Server) openLocal(id uint64) (*os.File, error) {
+	if s.store != nil {
+		s.mu.Lock()
+		_, ok := s.local[id]
+		s.mu.Unlock()
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+	}
+	return os.Open(s.blobPath(id))
+}
+
+// fillLocal fetches a completed blob from the store into a local copy in the
+// background, once at a time per blob, so the next restore reads from disk.
+func (s *Server) fillLocal(e *Entry) {
+	s.mu.Lock()
+	if s.localCap <= 0 || e.Size <= 0 || e.Size > s.localCap || s.filling[e.ID] {
+		s.mu.Unlock()
+		return
+	}
+	if _, ok := s.local[e.ID]; ok {
+		s.mu.Unlock()
+		return
+	}
+	if s.filling == nil {
+		s.filling = make(map[uint64]bool)
+	}
+	s.filling[e.ID] = true
+	s.mu.Unlock()
+
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			delete(s.filling, e.ID)
+			s.mu.Unlock()
+		}()
+		tmp := s.blobPath(e.ID) + ".fill"
+		if err := s.fetchBlob(e.ID, e.Size, tmp); err != nil {
+			_ = os.Remove(tmp)
+			s.log.Warn("cache local copy fetch failed", "id", e.ID, "err", err)
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if cur := s.entries[e.ID]; cur != e || !e.Complete {
+			_ = os.Remove(tmp)
+			return
+		}
+		if err := os.Rename(tmp, s.blobPath(e.ID)); err != nil {
+			_ = os.Remove(tmp)
+			return
+		}
+		s.keepLocal(e.ID, e.Size)
+	}()
+}
+
+func (s *Server) fetchBlob(id uint64, size int64, path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), localFillTimeout)
+	defer cancel()
+	body, err := s.store.Get(ctx, id, 0, size)
+	if err != nil {
+		return err
+	}
+	defer body.Close()
+	n, err := writeFile(path, body)
+	if err == nil && n != size {
+		err = fmt.Errorf("fetched %d of %d bytes", n, size)
+	}
+	return err
 }
 
 // removeBlob deletes a blob wherever it lives; the caller holds s.mu. Store deletes run in the
@@ -142,6 +283,7 @@ func (s *Server) removeBlob(id uint64) {
 		return
 	}
 	delete(s.stored, id)
+	delete(s.local, id)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), storeCallTimeout)
 		defer cancel()

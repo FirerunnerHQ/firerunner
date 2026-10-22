@@ -128,6 +128,12 @@ type Server struct {
 	stored map[uint64]int64 // with a store: entries whose whole blob reached it, by size
 	index  indexSync
 
+	// With a store, local copies of completed blobs serve restores at disk speed;
+	// the store stays the durable tier. localCap 0 keeps no copies.
+	localCap int64
+	local    map[uint64]int64 // local copies by size
+	filling  map[uint64]bool  // copies being fetched from the store
+
 	// counters (under mu) for observability via /stats and /metrics.
 	hits      uint64
 	misses    uint64
@@ -684,16 +690,17 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if s.store != nil {
+	f, err := s.openLocal(e.ID)
+	if err != nil {
+		if s.store == nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
 		if r.Method == http.MethodHead || r.Header.Get("Range") == "" {
 			s.log.Info("cache entry served", "id", e.ID, "key", e.Key, "size", e.Size, "method", r.Method, "from", "store")
 		}
 		s.serveFromStore(w, r, e)
-		return
-	}
-	f, err := os.Open(s.blobPath(e.ID))
-	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
+		s.fillLocal(e)
 		return
 	}
 	defer f.Close()
