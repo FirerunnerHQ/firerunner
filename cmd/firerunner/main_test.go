@@ -187,3 +187,40 @@ func TestPublishHealth(t *testing.T) {
 		t.Fatalf("final file = %+v, %v; want tier b failed", f, err)
 	}
 }
+
+func TestServeTiers_StoppedTierContextIsCancelled(t *testing.T) {
+	// A tier that stops gets its own context cancelled, which is what makes
+	// its scheduler release idle runners, while the others' stay live.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctxs := make(chan context.Context, 2)
+	runs := []func(context.Context) error{
+		func(c context.Context) error { ctxs <- c; return errors.New("a: 401") },
+		func(c context.Context) error { ctxs <- c; <-c.Done(); return c.Err() },
+	}
+	res := make(chan error, 1)
+	go func() { res <- serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler)) }()
+	got := []context.Context{<-ctxs, <-ctxs}
+	var failed, live context.Context
+	deadline := time.Now().Add(2 * time.Second)
+	for failed == nil && time.Now().Before(deadline) {
+		for _, c := range got {
+			if c.Err() != nil {
+				failed = c
+			} else {
+				live = c
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if failed == nil {
+		t.Fatal("the stopped tier's context was never cancelled")
+	}
+	if live == nil || live.Err() != nil {
+		t.Fatal("the serving tier's context was cancelled too")
+	}
+	cancel()
+	if err := <-res; err != nil {
+		t.Fatalf("serveTiers = %v", err)
+	}
+}
