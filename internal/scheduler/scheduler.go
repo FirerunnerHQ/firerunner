@@ -443,9 +443,19 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 	// freed slot together; the window is a few instructions and closing it
 	// would tie the provisioner's slot lifecycle to this lock. A failed launch
 	// keeps its place in running through backoff so plan bounds the retries.
+	//
+	// A runner that exits on its own without ever being marked busy did not
+	// take a job: an ephemeral runner leaves only after one. Its image or
+	// boot is broken (the runner crashed, or GitHub rejected its config), so
+	// it counts as a failed launch and backs off rather than relaunching at
+	// once in a loop.
 	s.mu.Lock()
+	idleExit := false
+	if h := s.active[name]; h != nil && !h.busy && launchErr == nil && vmCtx.Err() == nil {
+		idleExit = true
+	}
 	delete(s.active, name)
-	failed := launchErr != nil && vmCtx.Err() == nil
+	failed := (launchErr != nil || idleExit) && vmCtx.Err() == nil
 	if !failed {
 		finish()
 	}
@@ -457,6 +467,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		s.resetBackoff()
 	case launchErr != nil:
 		s.opts.Logger.Error("launch microVM", "runner", name, "err", launchErr)
+		s.backoff(ctx)
+	case idleExit:
+		s.opts.Logger.Error("runner exited without taking a job; backing off", "runner", name)
 		s.backoff(ctx)
 	default:
 		s.resetBackoff()
