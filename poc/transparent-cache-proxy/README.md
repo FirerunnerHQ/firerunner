@@ -121,7 +121,7 @@ The cache node runs cache-server from branch `feat/cacheserver-s3`, with
 
 | scenario | run | result |
 |---|---|---|
-| writer and reader on different VMs, S3 store | 39776645728 | 300 MB entry in S3 (`blobs/1` plus `index.json`); restored with `cache-hit=true` and a matching sha256, 286 MB in about 0.8 s |
+| writer and reader on different VMs, S3 store | 39776645728 | 300 MB entry in S3 (`blobs/1` plus `index.json`); restored with `cache-hit=true` and a matching sha256 |
 | node replaced, then restore only | 39777134486 | a fresh node logged `cache index loaded from store entries=1` and served the same entry, sha256 OK |
 | cache node down, save then restore | 39777535606 | save 1 s (`Cache reservation failed: cache unavailable`), restore 1 s (`Cache not found`), job green |
 
@@ -130,6 +130,41 @@ unreachable, a CacheService RPC is answered `200 {"ok":false}` and a blob path
 `507`. The toolkit retries a 5xx RPC with backoff, but treats `ok:false` as a
 miss or a skipped save and does not retry a 507. cache-server answers 507 the
 same way when S3 itself fails.
+
+### Measured: where a cache step's time goes
+
+The breakdown comes from the job logs' millisecond timestamps; containers use
+gzip because the image has no zstd.
+
+| | local-disk node, 100 MB | S3 node, 300 MB |
+|---|---:|---:|
+| restore lookup (`Cache hit for`) | 0.01 s | 0.01 s |
+| restore download | 0.23 s (~430 MB/s) | 3.6 s (~83 MB/s) |
+| restore extract | 0.28 s | 0.80 s |
+| save: tar + gzip | — | 5.6 s |
+| save: upload, including the node's put to S3 | — | 1.3 s |
+
+Downloads served from S3 run at about a fifth of the local-disk rate. That
+argues for keeping a bounded local read-through copy on the node, with S3 as
+the durable tier. This is not built yet.
+
+### Measured: what fail-fast saves (cache node gone, one save plus one restore)
+
+| nginx config | run | save | restore | job |
+|---|---|---:|---:|---:|
+| fail-fast (`ok:false` / 507, 1 s connect) | 39777535606 | 1 s | 1 s | 22 s |
+| 1 s connect, 502 passed through | 39780169408 | 35 s | 36 s | 90 s |
+| stock nginx (60 s connect, 502) | 39780112904 | 48 s | 44 s | 112 s |
+
+- **The toolkit's retries.** Without fail-fast, the toolkit makes 5 attempts per
+  RPC with backoff. Attempts land about 4, 7, 9 and 13 s apart, so the retries
+  alone cost about 35 s per cache step.
+- **Why stock nginx was only ~3 s per attempt.** The dead node's address was
+  gone from the subnet, so each connect failed on ARP in about 3 s rather than
+  on the 60 s connect timeout. **Not measured:** a node that is still up but
+  silently drops packets. There each attempt would wait the full connect
+  timeout, about 5 × 60 s per step with stock nginx. The 1 s timeout caps this
+  case too.
 
 Two traps found on the way:
 

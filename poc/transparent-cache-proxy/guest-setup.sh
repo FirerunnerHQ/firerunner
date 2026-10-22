@@ -11,6 +11,9 @@
 #               RUNNER_DIR   actions runner install dir
 #               CACHE_UPSTREAM  host:port of a shared cache node; unset runs a
 #                            local cache-server with a static identity
+#               FAILFAST     "off" drops the fail-fast rules, "retry" keeps the
+#                            1 s connect timeout but lets 502s through (both
+#                            exist only to measure what fail-fast saves)
 set -euo pipefail
 : "${POC_DIR:?}" "${CACHE_BIN:?}" "${REPO:?}" "${REF:?}" "${RUNNER_DIR:?}"
 host=results-receiver.actions.githubusercontent.com
@@ -39,6 +42,10 @@ EOF
 fi
 
 sed "s|__CACHE_UPSTREAM__|$CACHE_UPSTREAM|" "$POC_DIR/nginx.conf" > /etc/nginx/nginx.conf
+case "${FAILFAST:-on}" in
+  off)   sed -i '/error_page 502 504/d; /proxy_connect_timeout 1s/d' /etc/nginx/nginx.conf ;;
+  retry) sed -i '/error_page 502 504/d' /etc/nginx/nginx.conf ;;
+esac
 nginx -t
 systemctl restart nginx
 
