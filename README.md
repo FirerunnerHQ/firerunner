@@ -350,9 +350,9 @@ user-data**:
    address gets 403, a second fetch gets 404, and a config nobody fetches
    within `--jit-ttl` (default 5m) expires. The VPC delivers real source
    addresses, so a guest cannot claim another instance's config.
-3. The runner takes one job and the instance powers off. On-demand instances
-   terminate on shutdown. Spot instances only stop, so firerunner terminates
-   them.
+3. The runner takes one job and the instance powers off. Instances are
+   launched to terminate on shutdown, for both on-demand and one-time spot. If
+   one ever stops instead, firerunner terminates it.
 
 firerunner also terminates an instance that is idle when the scale set shrinks,
 one that never fetched its config (and backs off, as for a failed microVM
