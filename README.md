@@ -299,6 +299,127 @@ poll can still be over-assigned by up to the free count until their next poll �
 the pool is not split between tiers, since a split would strand jobs on a single
 host whenever the busy tier had exhausted its share while other tiers sat idle.
 
+### EC2 tiers (`"provisioner": "ec2"`)
+
+A tier can launch **one ephemeral EC2 instance per job** instead of a microVM.
+It sits in the same catalog as Firecracker tiers, and developers still pick it
+with `runs-on: <name>`. firerunner runs on a small **control VM inside the
+runner VPC**, and the instances reach it over the VPC. A catalog of only EC2
+tiers needs no KVM, `--kernel` or `--ext-iface`.
+See [`examples/tiers-ec2.json`](examples/tiers-ec2.json):
+
+```json
+{
+  "name": "firerunner-cloud-4c",
+  "provisioner": "ec2",
+  "min": 0, "max": 40,
+  "ec2": {
+    "instance_types": ["c8a.xlarge", "c7a.xlarge", "m8a.xlarge"],
+    "ami": "/firerunner/ami/runner",
+    "subnets": ["subnet-0aaa…", "subnet-0bbb…"],
+    "security_groups": ["sg-0ccc…"],
+    "market": "spot-then-on-demand",
+    "root_volume_gib": 40
+  }
+}
+```
+
+| field | meaning |
+|---|---|
+| `instance_types` | tried in order; the first with capacity wins |
+| `ami` | an image ID (`ami-…`) or an SSM parameter holding one, re-read every 5 minutes so a rebuilt image needs no config change |
+| `subnets` | tried in order for each type; one per AZ spreads launches across zones |
+| `security_groups` | for the instances; they need **no inbound rules** |
+| `market` | `spot`, `on-demand`, or `spot-then-on-demand` (every spot option before any on-demand one) |
+| `root_volume_gib`, `root_volume_type` | optional root EBS override (default: the AMI's size, type `gp3`) |
+
+`vcpu`, `mem_mib`, `golden` and `toolcache` are Firecracker fields and are
+rejected on an EC2 tier. EC2 tiers do not count against `--max-runners`, which
+stays the Firecracker hosts' slot budget; each EC2 tier is bounded by its own
+`max`.
+
+**How an instance gets its job.** The JIT runner config **never goes into
+user-data**:
+
+1. firerunner launches the instance with IMDSv2 required (hop limit 1, so
+   job containers cannot reach IMDS), **no instance profile**, and user-data
+   holding one line, `FIRERUNNER_JIT_URL=http://<--jit-addr>/jit`.
+2. It registers the config under the instance's private IP. The instance's
+   boot service ([`images/assets/firerunner-ec2-run.sh`](images/assets/firerunner-ec2-run.sh))
+   fetches it. The config is served **once**, to that IP only: another
+   address gets 403, a second fetch gets 404, and a config nobody fetches
+   within `--jit-ttl` (default 5m) expires. The VPC delivers real source
+   addresses, so a guest cannot claim another instance's config.
+3. The runner takes one job and the instance powers off. On-demand instances
+   terminate on shutdown. Spot instances only stop, so firerunner terminates
+   them.
+
+firerunner also terminates an instance that is idle when the scale set shrinks,
+one that never fetched its config (and backs off, as for a failed microVM
+boot), and one older than `--max-vm-lifetime`. Instances and volumes are tagged
+`firerunner:tier`, `firerunner:runner` and `firerunner:owner` (this host's name).
+
+When a type has no capacity in a subnet, firerunner tries the next subnet, then
+the next type: `InsufficientInstanceCapacity`, `Unsupported` and
+`InsufficientFreeAddressesInSubnet` all move on. Any other error (a quota,
+permissions) fails the launch, and the scheduler backs off.
+
+**Flags:**
+
+- `--jit-addr` / `FR_JIT_ADDR` (required with an EC2 tier): the control VM's
+  VPC `IP:port`, for example `10.0.0.5:8098`.
+- `--jit-ttl` / `FR_JIT_TTL`: how long a config waits to be fetched.
+- `--aws-region` / `FR_AWS_REGION`: defaults to the SDK's sources, then the
+  control VM's own region.
+
+**Control VM permissions.** Credentials come from the default chain,
+normally the control VM's instance role. It needs no `iam:PassRole`, because
+the runners get no role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Action": ["ec2:RunInstances", "ec2:CreateTags"],
+      "Resource": "*" },
+    { "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeImages"],
+      "Resource": "*" },
+    { "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/firerunner:owner": "<control-vm-hostname>" } } },
+    { "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:*:*:parameter/firerunner/*" }
+  ]
+}
+```
+
+Scope `RunInstances` to your subnets, security groups and AMIs as tightly as
+your account allows.
+
+**Security groups.** The runners' group needs no inbound rules. The control
+VM's group must allow TCP to the `--jit-addr` port **from the runners' group
+only**. Never expose that port publicly.
+
+**Verifying a deployment end to end.** These steps create real, billable
+resources:
+
+1. Build the runner AMI with `firerunner-ec2-runner.service` enabled, and
+   publish its ID to the SSM parameter.
+2. On the control VM, run `firerunner` with an EC2-only catalog (`max: 1`)
+   against a test repository.
+3. Push a workflow with `runs-on: <tier>`. Expect, in the firerunner log:
+   `instance launched` → `served jit config` → `instance gone`. The job should
+   be green.
+4. Check that no secret is in user-data:
+   `aws ec2 describe-instance-attribute --instance-id <id> --attribute userData`
+   decodes to the single `FIRERUNNER_JIT_URL=` line.
+5. Check that nothing is left behind: the instance is `terminated`, and the
+   runner no longer appears under the repository's runners.
+
 ### Inspecting a deployment (`status`, `doctor`)
 
 Two read-only subcommands help operators inspect and diagnose a runner host.

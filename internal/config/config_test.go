@@ -752,3 +752,14 @@ func TestFromFlags_JITAddr(t *testing.T) {
 		t.Fatalf("env fallback: c=%+v err=%v", c, err)
 	}
 }
+
+func TestExampleEC2Catalog(t *testing.T) {
+	// The README points at this file; keep it loadable and valid.
+	c, err := FromFlags(append(append(baseArgs(), jitAddr...), "--tiers", "../../examples/tiers-ec2.json", "--max-runners", "8"))
+	if err != nil {
+		t.Fatalf("examples/tiers-ec2.json: %v", err)
+	}
+	if !c.UsesEC2() || !c.UsesFirecracker() {
+		t.Fatalf("example should mix both provisioners: ec2=%v firecracker=%v", c.UsesEC2(), c.UsesFirecracker())
+	}
+}
