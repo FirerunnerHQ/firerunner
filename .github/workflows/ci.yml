@@ -28,6 +28,8 @@ jobs:
         run: make cover-check
       - name: Test golden docker shim
         run: images/test-docker-shim.sh
+      - name: Test EC2 runner boot script
+        run: images/test-ec2-run.sh
 
   # The egress firewall against the real kernel's nftables, in throwaway
   # network namespaces: what a guest can and cannot reach in each egress mode.
