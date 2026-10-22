@@ -39,8 +39,11 @@ type fakeEC2 struct {
 	next      int
 	// noIPInRun leaves PrivateIpAddress out of the RunInstances response, as
 	// AWS may, so the launcher has to describe the instance for it.
-	noIPInRun     bool
-	describeErr   error
+	noIPInRun   bool
+	describeErr error
+	// invisible IDs make DescribeInstances fail with InvalidInstanceID.NotFound
+	// whenever they are asked for, as for a just-launched instance.
+	invisible     map[string]bool
 	describeCalls int
 	describeIDs   [][]string
 	terminated    []string
@@ -54,6 +57,7 @@ type fakeEC2 struct {
 func newFakeEC2() *fakeEC2 {
 	return &fakeEC2{
 		runErrs:   map[string]error{},
+		invisible: map[string]bool{},
 		instances: map[string]*fakeInstance{},
 		images:    map[string]string{"ami-0abc": "/dev/sda1"},
 	}
@@ -135,6 +139,11 @@ func (f *fakeEC2) DescribeInstances(_ context.Context, in *ec2.DescribeInstances
 	f.describeIDs = append(f.describeIDs, append([]string(nil), in.InstanceIds...))
 	if f.describeErr != nil {
 		return nil, f.describeErr
+	}
+	for _, id := range in.InstanceIds {
+		if f.invisible[id] {
+			return nil, apiErr("InvalidInstanceID.NotFound")
+		}
 	}
 	var res types.Reservation
 	for _, id := range in.InstanceIds {
