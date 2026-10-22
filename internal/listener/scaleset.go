@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -62,9 +63,14 @@ type ScaleSet struct {
 	removeClient *scaleset.Client
 	session      session
 	// open opens a fresh message session after the current one fails.
-	open       func(context.Context) (session, error)
-	health     *health.Tracker
-	scaleSetID int
+	open func(context.Context) (session, error)
+	// register re-runs get-or-create when the scale set has disappeared (an
+	// instance that created it deleted it on shutdown), updating scaleSetID.
+	register func(context.Context) error
+	health   *health.Tracker
+	// scaleSetID is shared with the JIT sources, so a re-registered scale set
+	// gets its new runners.
+	scaleSetID *atomic.Int64
 	// created is true only when this process created the scale set (rather than
 	// reusing a pre-existing one). Close deletes the scale set only when created,
 	// so it never deregisters a set another instance is relying on.
@@ -95,6 +101,54 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		return nil, err
 	}
 
+	id, reused, err := registerScaleSet(ctx, client, removeClient, cfg, groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	first, err := openSessionWithRetry(ctx, client, id, owner, cfg.Logger)
+	if err != nil {
+		if !reused {
+			// Best-effort cleanup of the scale set we just created.
+			_ = client.DeleteRunnerScaleSet(context.WithoutCancel(ctx), id)
+		}
+		return nil, fmt.Errorf("open message session: %w", err)
+	}
+
+	cfg.Logger.Info("registered runner scale set",
+		"name", cfg.Name, "scaleSetID", id, "group", cfg.RunnerGroup, "reused", reused)
+
+	s := &ScaleSet{
+		cfg: cfg, log: cfg.Logger, client: client, removeClient: removeClient,
+		session: first, health: cfg.Health,
+		scaleSetID: new(atomic.Int64), created: !reused,
+	}
+	s.scaleSetID.Store(int64(id))
+	s.open = func(ctx context.Context) (session, error) {
+		sess, err := openSessionWithRetry(ctx, client, int(s.scaleSetID.Load()), owner, cfg.Logger)
+		if err != nil {
+			return nil, err
+		}
+		return sess, nil
+	}
+	s.register = func(ctx context.Context) error {
+		id, reused, err := registerScaleSet(ctx, client, removeClient, cfg, groupID)
+		if err != nil {
+			return err
+		}
+		s.scaleSetID.Store(int64(id))
+		s.created = s.created || !reused
+		cfg.Logger.Info("registered runner scale set again", "scaleSetID", id, "reused", reused)
+		return nil
+	}
+	return s, nil
+}
+
+// registerScaleSet gets or creates the tier's scale set and returns its ID and
+// whether it already existed. Reusing an existing set (from a prior, possibly
+// unclean, run) keeps restarts idempotent instead of failing with "runner
+// scale set already exists".
+func registerScaleSet(ctx context.Context, client, removeClient *scaleset.Client, cfg Config, groupID int) (int, bool, error) {
 	desired := &scaleset.RunnerScaleSet{
 		Name:          cfg.Name,
 		RunnerGroupID: groupID,
@@ -103,54 +157,26 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		// not self-update (GitHub official guidance for image-based runners).
 		RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
 	}
-
-	// Get-or-create: a scale set with this name may already exist from a prior
-	// (possibly unclean) run. Reuse it so restarts are idempotent instead of
-	// failing with "runner scale set already exists".
 	existing, err := client.GetRunnerScaleSet(ctx, groupID, cfg.Name)
 	if err != nil {
-		return nil, fmt.Errorf("look up runner scale set: %w", err)
+		return 0, false, fmt.Errorf("look up runner scale set: %w", err)
 	}
 	var scaleSet *scaleset.RunnerScaleSet
 	reused := existing != nil
 	if reused {
 		scaleSet, err = client.UpdateRunnerScaleSet(ctx, existing.ID, desired)
 		if err != nil {
-			return nil, fmt.Errorf("update runner scale set: %w", err)
+			return 0, false, fmt.Errorf("update runner scale set: %w", err)
 		}
 	} else {
 		scaleSet, err = client.CreateRunnerScaleSet(ctx, desired)
 		if err != nil {
-			return nil, fmt.Errorf("create runner scale set: %w", err)
+			return 0, false, fmt.Errorf("create runner scale set: %w", err)
 		}
 	}
 	client.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
 	removeClient.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
-
-	first, err := openSessionWithRetry(ctx, client, scaleSet.ID, owner, cfg.Logger)
-	if err != nil {
-		if !reused {
-			// Best-effort cleanup of the scale set we just created.
-			_ = client.DeleteRunnerScaleSet(context.WithoutCancel(ctx), scaleSet.ID)
-		}
-		return nil, fmt.Errorf("open message session: %w", err)
-	}
-
-	cfg.Logger.Info("registered runner scale set",
-		"name", cfg.Name, "scaleSetID", scaleSet.ID, "group", cfg.RunnerGroup, "reused", reused)
-
-	open := func(ctx context.Context) (session, error) {
-		sess, err := openSessionWithRetry(ctx, client, scaleSet.ID, owner, cfg.Logger)
-		if err != nil {
-			return nil, err
-		}
-		return sess, nil
-	}
-	return &ScaleSet{
-		cfg: cfg, log: cfg.Logger, client: client, removeClient: removeClient,
-		session: first, open: open, health: cfg.Health,
-		scaleSetID: scaleSet.ID, created: !reused,
-	}, nil
+	return scaleSet.ID, reused, nil
 }
 
 // openSessionWithRetry opens a message session, retrying while GitHub reports a
@@ -197,7 +223,7 @@ func (s *ScaleSet) JIT() *JITSource {
 }
 
 // ErrFatal marks a listener error that reconnecting cannot fix: GitHub
-// rejected the credentials or no longer knows the scale set.
+// rejected the credentials.
 var ErrFatal = errors.New("listener stopped")
 
 // Reconnect pacing: the wait between attempts to re-open a session doubles
@@ -216,9 +242,10 @@ var (
 // When the session fails (GitHub unreachable past the library's own retries,
 // an expired session), Run closes it and opens a new one with backoff, without
 // returning: the tier's scheduler and its runners are untouched, and the new
-// session's statistics re-drive the desired count. Only an error retrying
-// cannot fix (bad credentials, scale set deleted) ends Run, wrapped in
-// ErrFatal, and that stops this tier alone.
+// session's statistics re-drive the desired count. A scale set that has
+// disappeared (another instance that created it deleted it on shutdown) is
+// registered again. Only an error retrying cannot fix (bad credentials) ends
+// Run, wrapped in ErrFatal, and that stops this tier alone.
 func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
 	sess := s.session
 	backoff := reconnectMin
@@ -247,6 +274,12 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 			}
 			backoff = min(2*backoff, reconnectMax)
 			sess, err = s.open(ctx)
+			if isScaleSetGone(err) && s.register != nil {
+				s.log.Warn("runner scale set is gone; registering it again", "err", err)
+				if err = s.register(ctx); err == nil {
+					sess, err = s.open(ctx)
+				}
+			}
 			if err == nil {
 				break
 			}
@@ -272,7 +305,7 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 // runSession listens on one session until it fails or ctx ends.
 func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
 	l, err := sslistener.New(trackedSession{session: sess, health: s.health}, sslistener.Config{
-		ScaleSetID: s.scaleSetID,
+		ScaleSetID: int(s.scaleSetID.Load()),
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
 	})
@@ -310,9 +343,8 @@ func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapaci
 }
 
 // isFatal reports whether a session error is one retrying cannot fix: GitHub
-// rejected the credentials (401/403) or the scale set is gone (404). The
-// library reports status only in the error text. A 403 for rate limiting is
-// transient, not fatal.
+// rejected the credentials (401/403). The library reports status only in the
+// error text. A 403 for rate limiting is transient, not fatal.
 func isFatal(err error) bool {
 	if err == nil {
 		return false
@@ -321,12 +353,18 @@ func isFatal(err error) bool {
 	if strings.Contains(msg, "rate limit") {
 		return false
 	}
-	for _, status := range []string{"401 unauthorized", "403 forbidden", "404 not found"} {
+	for _, status := range []string{"401 unauthorized", "403 forbidden"} {
 		if strings.Contains(msg, status) {
 			return true
 		}
 	}
 	return false
+}
+
+// isScaleSetGone reports whether opening a session failed because GitHub no
+// longer knows the scale set (404).
+func isScaleSetGone(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "404 not found")
 }
 
 // jitter spreads d by ±20% so tiers that failed together do not reconnect in
@@ -345,13 +383,13 @@ func jitter(d time.Duration) time.Duration {
 func (s *ScaleSet) Close(ctx context.Context) error {
 	_ = s.session.Close(ctx)
 	if !s.created {
-		s.log.Info("leaving reused runner scale set registered", "scaleSetID", s.scaleSetID)
+		s.log.Info("leaving reused runner scale set registered", "scaleSetID", s.scaleSetID.Load())
 		return nil
 	}
-	if err := s.client.DeleteRunnerScaleSet(ctx, s.scaleSetID); err != nil {
+	if err := s.client.DeleteRunnerScaleSet(ctx, int(s.scaleSetID.Load())); err != nil {
 		return fmt.Errorf("delete runner scale set: %w", err)
 	}
-	s.log.Info("deregistered runner scale set", "scaleSetID", s.scaleSetID)
+	s.log.Info("deregistered runner scale set", "scaleSetID", s.scaleSetID.Load())
 	return nil
 }
 
@@ -433,14 +471,14 @@ func (a *scaler) HandleJobCompleted(_ context.Context, j *scaleset.JobCompleted)
 type JITSource struct {
 	client     *scaleset.Client
 	remover    runnerRemover
-	scaleSetID int
+	scaleSetID *atomic.Int64
 	namePrefix string
 }
 
 // Generate implements scheduler.JITSource.
 func (j *JITSource) Generate(ctx context.Context, _ core.RunnerSpec) (name, jitConfig string, err error) {
 	name = j.namePrefix + "-" + randSuffix()
-	cfg, err := j.client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, j.scaleSetID)
+	cfg, err := j.client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, int(j.scaleSetID.Load()))
 	if err != nil {
 		return "", "", fmt.Errorf("generate JIT config: %w", err)
 	}
