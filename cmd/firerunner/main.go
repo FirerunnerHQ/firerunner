@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,10 +25,15 @@ import (
 	"time"
 
 	"github.com/actions/scaleset"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
+	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 
 	"github.com/solcreek/firerunner/internal/cacheserver"
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/diag"
+	"github.com/solcreek/firerunner/internal/ec2"
+	"github.com/solcreek/firerunner/internal/jitserver"
 	"github.com/solcreek/firerunner/internal/jobidentity"
 	"github.com/solcreek/firerunner/internal/listener"
 	"github.com/solcreek/firerunner/internal/provisioner"
@@ -258,8 +264,9 @@ cache-server flags:
 
 // tierProvisioner returns the provisioner that launches t's runners. fc is the
 // host's Firecracker provisioner, shared by every Firecracker tier because they
-// draw on one slot budget; it is nil when no tier uses Firecracker.
-func tierProvisioner(t config.Tier, fc provisioner.Provisioner) (provisioner.Provisioner, error) {
+// draw on one slot budget; it is nil when no tier uses Firecracker. newEC2
+// builds an ec2 tier's own provisioner; it is nil when no tier uses EC2.
+func tierProvisioner(t config.Tier, fc provisioner.Provisioner, newEC2 func(config.Tier) provisioner.Provisioner) (provisioner.Provisioner, error) {
 	switch t.ProvisionerName() {
 	case config.ProvisionerFirecracker:
 		if fc == nil {
@@ -267,10 +274,55 @@ func tierProvisioner(t config.Tier, fc provisioner.Provisioner) (provisioner.Pro
 		}
 		return fc, nil
 	case config.ProvisionerEC2:
-		return nil, fmt.Errorf("provisioner %q is not available in this build yet", config.ProvisionerEC2)
+		if newEC2 == nil || t.EC2 == nil {
+			return nil, errors.New("no ec2 provisioner configured")
+		}
+		return newEC2(t), nil
 	default:
 		return nil, fmt.Errorf("unknown provisioner %q", t.Provisioner)
 	}
+}
+
+// serveJIT starts the endpoint EC2 instances fetch their JIT configs from, on
+// the control VM's VPC address. Binding fails fast if the address is not this
+// host's. The returned func shuts it down.
+func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitserver.Server, func(), error) {
+	jit := jitserver.New(cfg.JITTTL, log.With("component", "jitserver"))
+	ln, err := net.Listen("tcp", cfg.JITAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("--jit-addr: %w", err)
+	}
+	srv := &http.Server{Handler: jit, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Error("jit endpoint stopped", "err", err)
+		}
+	}()
+	log.Info("serving EC2 JIT configs", "addr", cfg.JITAddr)
+	return jit, func() {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}, nil
+}
+
+// newEC2Client builds the AWS clients shared by every EC2 tier from the
+// default credential chain (the control VM's instance role). The region is
+// --aws-region when set, else the SDK's usual sources, falling back to IMDS.
+func newEC2Client(ctx context.Context, cfg *config.Config, log *slog.Logger) (*ec2.Client, error) {
+	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithEC2IMDSRegion()}
+	if cfg.AWSRegion != "" {
+		opts = append(opts, awsconfig.WithRegion(cfg.AWSRegion))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+	if awsCfg.Region == "" {
+		return nil, errors.New("no AWS region: set --aws-region or run on EC2")
+	}
+	log.Info("EC2 provisioner ready", "region", awsCfg.Region)
+	return ec2.NewClient(awsec2.NewFromConfig(awsCfg), awsssm.NewFromConfig(awsCfg), 0, log.With("component", "ec2")), nil
 }
 
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
@@ -313,6 +365,31 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if cfg.UsesFirecracker() {
 		fc = provisioner.NewFirecracker(cfg.Firecracker, log)
 	}
+	var newEC2 func(config.Tier) provisioner.Provisioner
+	if cfg.UsesEC2() {
+		jit, stopJIT, err := serveJIT(ctx, cfg, log)
+		if err != nil {
+			return err
+		}
+		// Instances still running their jobs fetch nothing more, but stop the
+		// endpoint only after the drain all the same.
+		defer stopJIT()
+		client, err := newEC2Client(ctx, cfg, log)
+		if err != nil {
+			return err
+		}
+		newEC2 = func(t config.Tier) provisioner.Provisioner {
+			return client.Tier(ec2.Options{
+				Tier:        t.Name,
+				Owner:       owner,
+				EC2:         *t.EC2,
+				JIT:         jit,
+				JITURL:      jitserver.URL(cfg.JITAddr),
+				MaxLifetime: cfg.Firecracker.MaxVMLifetime,
+				Logger:      log.With("tier", t.Name),
+			})
+		}
+	}
 	tiers := cfg.EffectiveTiers()
 	provs := make([]provisioner.Provisioner, len(tiers))
 	for i, t := range tiers {
@@ -320,7 +397,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if fc != nil {
 			shared = fc
 		}
-		p, err := tierProvisioner(t, shared)
+		p, err := tierProvisioner(t, shared, newEC2)
 		if err != nil {
 			return fmt.Errorf("tier %q: %w", t.Name, err)
 		}
