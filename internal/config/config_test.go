@@ -764,3 +764,26 @@ func TestExampleEC2Catalog(t *testing.T) {
 		t.Fatalf("example should mix both provisioners: ec2=%v firecracker=%v", c.UsesEC2(), c.UsesFirecracker())
 	}
 }
+
+func TestCheckCatalog(t *testing.T) {
+	// The example catalogs in the repo pass on their own, without any of the
+	// daemon's credentials or host flags.
+	for _, p := range []string{"../../examples/tiers.json", "../../examples/tiers-ec2.json"} {
+		tiers, err := CheckCatalog(p, 8)
+		if err != nil || len(tiers) == 0 {
+			t.Fatalf("CheckCatalog(%s) = %d tiers, %v", p, len(tiers), err)
+		}
+	}
+	// Per-tier rules still apply, including the slot budget.
+	bad := writeTiers(t, `[{"name":"t","vcpu":2,"mem_mib":4096,"golden":"/g","max":8}]`)
+	if _, err := CheckCatalog(bad, 4); err == nil || !strings.Contains(err.Error(), "--max-runners") {
+		t.Fatalf("over-budget tier: err = %v", err)
+	}
+	mixed := writeTiers(t, `[`+strings.Replace(ec2TierJSON, `"min":1`, `"min":1,"vcpu":4`, 1)+`]`)
+	if _, err := CheckCatalog(mixed, 4); err == nil {
+		t.Fatal("mixed-field tier accepted")
+	}
+	if _, err := CheckCatalog(filepath.Join(t.TempDir(), "none.json"), 4); err == nil {
+		t.Fatal("missing file accepted")
+	}
+}

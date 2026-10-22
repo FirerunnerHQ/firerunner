@@ -64,6 +64,10 @@ type Config struct {
 
 	LogLevel  string
 	LogFormat string
+
+	// offline skips checks that depend on this host's files (image paths), for
+	// validating a catalog away from the machine that will run it.
+	offline bool
 }
 
 // Provisioner names a tier may select.
@@ -301,6 +305,23 @@ func Parse(args []string) (*Config, error) {
 	return c, nil
 }
 
+// CheckCatalog loads and validates a tier catalog on its own, with the
+// per-tier rules the daemon applies, so an edit can be checked without
+// credentials or the host that will run it: image paths are not checked for
+// existence. maxRunners is the Firecracker slot budget the catalog will run
+// under (--max-runners).
+func CheckCatalog(path string, maxRunners int) ([]Tier, error) {
+	tiers, err := loadTiers(path)
+	if err != nil {
+		return nil, err
+	}
+	c := &Config{Tiers: tiers, MaxRunners: maxRunners, offline: true}
+	if err := c.validateTiers(); err != nil {
+		return nil, err
+	}
+	return tiers, nil
+}
+
 // loadTiers reads and decodes a JSON tier-catalog file.
 func loadTiers(path string) ([]Tier, error) {
 	b, err := os.ReadFile(path)
@@ -492,7 +513,7 @@ func (c *Config) validateFirecrackerTier(t Tier) error {
 	case t.Max > c.MaxRunners:
 		return fmt.Errorf("tier %q: max (%d) exceeds --max-runners (%d), the shared slot budget, so the tier can never reach its max", t.Name, t.Max, c.MaxRunners)
 	}
-	if t.ToolCache != "" {
+	if t.ToolCache != "" && !c.offline {
 		if _, err := os.Stat(t.ToolCache); err != nil {
 			return fmt.Errorf("tier %q: toolcache image %q not accessible: %w", t.Name, t.ToolCache, err)
 		}
