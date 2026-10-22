@@ -49,14 +49,19 @@ type StatusReport struct {
 
 // TierInfo is one configured runner tier as seen by status.
 type TierInfo struct {
-	Name      string    `json:"name"`
-	Labels    []string  `json:"labels,omitempty"`
-	VCPU      int       `json:"vcpu"`
-	MemMiB    int       `json:"mem_mib"`
-	Golden    FileStat  `json:"golden"`
+	Name        string   `json:"name"`
+	Labels      []string `json:"labels,omitempty"`
+	Provisioner string   `json:"provisioner"`
+	// VCPU, MemMiB, Golden and ToolCache describe a firecracker tier.
+	VCPU      int       `json:"vcpu,omitempty"`
+	MemMiB    int       `json:"mem_mib,omitempty"`
+	Golden    *FileStat `json:"golden,omitempty"`
 	ToolCache *FileStat `json:"toolcache,omitempty"`
-	Min       int       `json:"min"`
-	Max       int       `json:"max"`
+	// InstanceTypes and Market describe an ec2 tier.
+	InstanceTypes []string `json:"instance_types,omitempty"`
+	Market        string   `json:"market,omitempty"`
+	Min           int      `json:"min"`
+	Max           int      `json:"max"`
 }
 
 // FileStat describes an image file on disk.
@@ -220,14 +225,23 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 	// its own microVM shape and golden image, all sharing this host.
 	for _, t := range cfg.Tiers {
 		ti := TierInfo{
-			Name:   t.Name,
-			Labels: t.Labels,
-			VCPU:   t.VCPU,
-			MemMiB: t.MemMiB,
-			Golden: statFile(t.Golden),
-			Min:    t.Min,
-			Max:    t.Max,
+			Name:        t.Name,
+			Labels:      t.Labels,
+			Provisioner: t.ProvisionerName(),
+			Min:         t.Min,
+			Max:         t.Max,
 		}
+		if t.IsEC2() {
+			if t.EC2 != nil {
+				ti.InstanceTypes = t.EC2.InstanceTypes
+				ti.Market = t.EC2.Market
+			}
+			r.Tiers = append(r.Tiers, ti)
+			continue
+		}
+		ti.VCPU, ti.MemMiB = t.VCPU, t.MemMiB
+		g := statFile(t.Golden)
+		ti.Golden = &g
 		if t.ToolCache != "" {
 			f := statFile(t.ToolCache)
 			ti.ToolCache = &f
@@ -298,14 +312,20 @@ func renderStatusText(r StatusReport, w io.Writer) {
 	if len(r.Tiers) > 0 {
 		fmt.Fprintf(w, "\ntiers: %d  (developers select one via runs-on: <name>; shared slot budget max=%d)\n", len(r.Tiers), r.Max)
 		ttw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-		fmt.Fprintln(ttw, "  RUNS-ON\tVCPU\tMEM\tWARM\tMAX\tGOLDEN\tTOOLCACHE")
+		fmt.Fprintln(ttw, "  RUNS-ON\tPROVISIONER\tVCPU\tMEM\tWARM\tMAX\tIMAGE\tTOOLCACHE")
 		for _, t := range r.Tiers {
+			if t.Golden == nil {
+				// An ec2 tier: shaped by its instance types, not a microVM.
+				fmt.Fprintf(ttw, "  %s\t%s\t-\t-\t%d\t%d\t%s (%s)\t-\n",
+					t.Name, t.Provisioner, t.Min, t.Max, strings.Join(t.InstanceTypes, ","), t.Market)
+				continue
+			}
 			tc := "(global default)"
 			if t.ToolCache != nil {
 				tc = t.ToolCache.describe()
 			}
-			fmt.Fprintf(ttw, "  %s\t%d\t%dMiB\t%d\t%d\t%s\t%s\n",
-				t.Name, t.VCPU, t.MemMiB, t.Min, t.Max, t.Golden.describe(), tc)
+			fmt.Fprintf(ttw, "  %s\t%s\t%d\t%dMiB\t%d\t%d\t%s\t%s\n",
+				t.Name, t.Provisioner, t.VCPU, t.MemMiB, t.Min, t.Max, t.Golden.describe(), tc)
 		}
 		ttw.Flush()
 	}
@@ -380,6 +400,10 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 		// toolcache); the top-level --golden may be unset, so check per tier
 		// instead of failing on an empty top-level path.
 		for _, t := range cfg.Tiers {
+			if t.IsEC2() {
+				// An ec2 tier boots no image from this host.
+				continue
+			}
 			checks = append(checks, fileCheck("golden["+t.Name+"]", t.Golden, 64<<20))
 			goldens = append(goldens, t.Golden)
 			if t.ToolCache != "" {
