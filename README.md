@@ -450,6 +450,25 @@ read-only credential check), and API reachability (against the derived API base,
 so GitHub Enterprise Server works too) — and prints one `PASS`/`WARN`/`FAIL`
 line each. It exits non-zero when any check fails, so it can gate a deploy.
 
+**Listener health.** Each tier's listener reconnects on its own. When its
+message session fails, for example when GitHub is unreachable for longer than
+the client library retries, it reopens the session with backoff (2 s doubling
+to 2 min, with jitter). The tier's scheduler and running jobs are untouched, and
+the new session's statistics restore the desired count. A tier stops only on an
+error that retrying cannot fix: GitHub rejecting the credentials (401/403, not
+rate limiting) or the scale set no longer existing (404). Even then the other
+tiers keep serving; the process exits only once every tier has stopped.
+
+The daemon writes each tier's state to `<--workdir>/listener-health.json` every
+10 s. The state is `connected`, `reconnecting` or `failed`, and the file also
+records reconnect counts, the time of the last successful poll and the last
+error. `status` shows it, and marks it stale if the daemon stopped updating it.
+`doctor` fails a `failed` tier and warns on a `reconnecting` one:
+
+```bash
+firerunner status --json | jq '.listeners.tiers[] | {name, state, reconnects, last_message}'
+```
+
 ### Warm pool (`--min-runners`)
 
 Every job runs in a fresh microVM, so by default a runner is cold-booted only
