@@ -53,7 +53,11 @@ func New(ctx context.Context, bucket, prefix, region string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3store: load AWS config: %w", err)
 	}
-	client := s3.NewFromConfig(cfg)
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		// Ranged reads of multipart objects can never validate a whole-object
+		// checksum; the SDK would log that on every restore.
+		o.DisableLogOutputChecksumValidationSkipped = true
+	})
 	return &Store{
 		client: client,
 		uploader: manager.NewUploader(client, func(u *manager.Uploader) {
