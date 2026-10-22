@@ -9,6 +9,7 @@ import (
 
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/core"
+	"github.com/solcreek/firerunner/internal/provisioner"
 )
 
 func TestParseSize(t *testing.T) {
@@ -93,20 +94,30 @@ func TestTierProvisioner(t *testing.T) {
 	// Every Firecracker tier, implicit or explicit, shares the one host
 	// provisioner and its slot budget.
 	for _, tier := range []config.Tier{{Name: "a"}, {Name: "b", Provisioner: config.ProvisionerFirecracker}} {
-		p, err := tierProvisioner(tier, fc)
+		p, err := tierProvisioner(tier, fc, nil)
 		if err != nil || p != fc {
 			t.Fatalf("tier %q: got (%v, %v), want the shared firecracker provisioner", tier.Name, p, err)
 		}
 	}
 	// A Firecracker tier on a host without the Firecracker provisioner is a
 	// wiring bug and must fail before any scale set is registered.
-	if _, err := tierProvisioner(config.Tier{Name: "a"}, nil); err == nil {
+	if _, err := tierProvisioner(config.Tier{Name: "a"}, nil, nil); err == nil {
 		t.Fatal("expected an error for a firecracker tier without a firecracker provisioner")
 	}
-	if _, err := tierProvisioner(ec2, fc); err == nil || !strings.Contains(err.Error(), "ec2") {
-		t.Fatalf("ec2 tier: err = %v, want a not-available error until the ec2 provisioner lands", err)
+	// Each ec2 tier gets its own provisioner, built for that tier.
+	var built []string
+	newEC2 := func(t config.Tier) provisioner.Provisioner {
+		built = append(built, t.Name)
+		return stubProvisioner{name: "ec2:" + t.Name}
 	}
-	if _, err := tierProvisioner(config.Tier{Name: "x", Provisioner: "lambda"}, fc); err == nil {
+	p, err := tierProvisioner(ec2, fc, newEC2)
+	if err != nil || p.Name() != "ec2:cloud" || len(built) != 1 {
+		t.Fatalf("ec2 tier: got (%v, %v), built %v", p, err, built)
+	}
+	if _, err := tierProvisioner(ec2, fc, nil); err == nil {
+		t.Fatal("expected an error for an ec2 tier without the ec2 client")
+	}
+	if _, err := tierProvisioner(config.Tier{Name: "x", Provisioner: "lambda"}, fc, newEC2); err == nil {
 		t.Fatal("expected an error for an unknown provisioner")
 	}
 }
