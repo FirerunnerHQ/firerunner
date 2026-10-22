@@ -6,8 +6,10 @@
 #
 # User-data holds only the endpoint (FIRERUNNER_JIT_URL=http://<vpc-ip>:<port>/jit),
 # never the config itself: the control VM hands the config out once, to this
-# instance's private IP, and answers 404 afterwards. A job on this instance can
-# therefore read neither the config nor anything reusable from IMDS.
+# instance's private IP, and answers 404 afterwards. So neither user-data nor
+# IMDS holds anything reusable. The job itself runs as root alongside the
+# runner and can read the config the runner was started with; it is single-use
+# and dies with the instance.
 #
 # Every wait below is a retry loop rather than a systemd ordering dependency, so
 # the fetch starts as soon as the NIC has an address instead of waiting for
