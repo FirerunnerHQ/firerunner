@@ -454,12 +454,13 @@ line each. It exits non-zero when any check fails, so it can gate a deploy.
 message session fails, for example when GitHub is unreachable for longer than
 the client library retries, it reopens the session with backoff (2 s doubling
 to 2 min, with jitter). The tier's scheduler and running jobs are untouched, and
-the new session's statistics restore the desired count. If the scale set has
-disappeared (404), the listener registers it again. This happens when another
-instance created the set and deleted it on shutdown. A tier stops only on an
-error that retrying cannot fix: GitHub rejecting the credentials (401/403, not
-rate limiting). Even then the other tiers keep serving; the process exits only
-once every tier has stopped.
+the new session's statistics restore the desired count. A tier stops only on an
+error that retrying cannot fix. If GitHub rejects the credentials (401/403, not
+rate limiting), only that tier stops: the others keep serving, and the process
+exits once every tier has stopped. If the scale set itself is gone (404), the
+daemon exits non-zero so its supervisor restarts it and startup registers the
+set again. That happens when an instance that created the set deleted it on
+shutdown while this one reused it, as in an overlapping redeploy.
 
 The daemon writes each tier's state to `<--workdir>/listener-health.json` every
 10 s. The state is `connected`, `reconnecting` or `failed`, and the file also

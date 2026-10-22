@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -63,14 +62,9 @@ type ScaleSet struct {
 	removeClient *scaleset.Client
 	session      session
 	// open opens a fresh message session after the current one fails.
-	open func(context.Context) (session, error)
-	// register re-runs get-or-create when the scale set has disappeared (an
-	// instance that created it deleted it on shutdown), updating scaleSetID.
-	register func(context.Context) error
-	health   *health.Tracker
-	// scaleSetID is shared with the JIT sources, so a re-registered scale set
-	// gets its new runners.
-	scaleSetID *atomic.Int64
+	open       func(context.Context) (session, error)
+	health     *health.Tracker
+	scaleSetID int
 	// created is true only when this process created the scale set (rather than
 	// reusing a pre-existing one). Close deletes the scale set only when created,
 	// so it never deregisters a set another instance is relying on.
@@ -130,39 +124,16 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	s := &ScaleSet{
 		cfg: cfg, log: cfg.Logger, client: client, removeClient: removeClient,
 		session: first, health: cfg.Health,
-		scaleSetID: new(atomic.Int64), created: !reused,
+		scaleSetID: id, created: !reused,
 	}
-	s.scaleSetID.Store(int64(id))
 	s.open = func(ctx context.Context) (session, error) {
-		sess, err := openSessionWithRetry(ctx, sessionClient, int(s.scaleSetID.Load()), owner, cfg.Logger)
+		sess, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.Logger)
 		if err != nil {
 			return nil, err
 		}
 		return sess, nil
 	}
-	s.register = func(ctx context.Context) error {
-		id, reused, err := registerScaleSet(ctx, client, cfg, groupID, removeClient, sessionClient)
-		if err != nil {
-			return err
-		}
-		s.adopt(id, reused)
-		cfg.Logger.Info("registered runner scale set again", "scaleSetID", id, "reused", reused)
-		return nil
-	}
 	return s, nil
-}
-
-// adopt switches to the scale set registration returned, recording whether
-// this process owns it, so Close deletes only a set this process created. A
-// set another instance created in the meantime is reused, not owned, even if
-// this process had created the one it replaces.
-func (s *ScaleSet) adopt(id int, reused bool) {
-	owned := !reused
-	if int64(id) == s.scaleSetID.Load() {
-		owned = owned || s.created
-	}
-	s.created = owned
-	s.scaleSetID.Store(int64(id))
 }
 
 // registerScaleSet gets or creates the tier's scale set through client and
@@ -246,8 +217,15 @@ func (s *ScaleSet) JIT() *JITSource {
 }
 
 // ErrFatal marks a listener error that reconnecting cannot fix: GitHub
-// rejected the credentials.
+// rejected the credentials. It stops that tier alone.
 var ErrFatal = errors.New("listener stopped")
+
+// ErrRestart marks a listener error that only a fresh process recovers from:
+// the scale set is gone. That happens when an instance that created it
+// deleted it on shutdown while this one reused it, as in an overlapping
+// redeploy. Startup registers the set again, so the daemon exits for its
+// supervisor to restart it.
+var ErrRestart = errors.New("runner scale set is gone; restart to register it again")
 
 // Reconnect pacing: the wait between attempts to re-open a session doubles
 // from reconnectMin to reconnectMax, with jitter. A session that stayed up for
@@ -265,10 +243,9 @@ var (
 // When the session fails (GitHub unreachable past the library's own retries,
 // an expired session), Run closes it and opens a new one with backoff, without
 // returning: the tier's scheduler and its runners are untouched, and the new
-// session's statistics re-drive the desired count. A scale set that has
-// disappeared (another instance that created it deleted it on shutdown) is
-// registered again. Only an error retrying cannot fix (bad credentials) ends
-// Run, wrapped in ErrFatal, and that stops this tier alone.
+// session's statistics re-drive the desired count. Run ends only on an error
+// retrying cannot fix: rejected credentials (ErrFatal, which stops this tier
+// alone) or a deleted scale set (ErrRestart, which restarts the daemon).
 func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
 	sess := s.session
 	backoff := reconnectMin
@@ -297,12 +274,6 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 			}
 			backoff = min(2*backoff, reconnectMax)
 			sess, err = s.open(ctx)
-			if isScaleSetGone(err) && s.register != nil {
-				s.log.Warn("runner scale set is gone; registering it again", "err", err)
-				if err = s.register(ctx); err == nil {
-					sess, err = s.open(ctx)
-				}
-			}
 			if err == nil {
 				break
 			}
@@ -316,6 +287,13 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 				}
 				return fmt.Errorf("%w: %w", ErrFatal, err)
 			}
+			if isScaleSetGone(err) {
+				s.log.Error("runner scale set is gone; restarting to register it again", "err", err)
+				if s.health != nil {
+					s.health.Failed(err)
+				}
+				return fmt.Errorf("%w: %w", ErrRestart, err)
+			}
 		}
 		s.session = sess
 		s.log.Info("listener reconnected")
@@ -328,7 +306,7 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 // runSession listens on one session until it fails or ctx ends.
 func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
 	l, err := sslistener.New(trackedSession{session: sess, health: s.health}, sslistener.Config{
-		ScaleSetID: int(s.scaleSetID.Load()),
+		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
 	})
@@ -406,13 +384,13 @@ func jitter(d time.Duration) time.Duration {
 func (s *ScaleSet) Close(ctx context.Context) error {
 	_ = s.session.Close(ctx)
 	if !s.created {
-		s.log.Info("leaving reused runner scale set registered", "scaleSetID", s.scaleSetID.Load())
+		s.log.Info("leaving reused runner scale set registered", "scaleSetID", s.scaleSetID)
 		return nil
 	}
-	if err := s.client.DeleteRunnerScaleSet(ctx, int(s.scaleSetID.Load())); err != nil {
+	if err := s.client.DeleteRunnerScaleSet(ctx, s.scaleSetID); err != nil {
 		return fmt.Errorf("delete runner scale set: %w", err)
 	}
-	s.log.Info("deregistered runner scale set", "scaleSetID", s.scaleSetID.Load())
+	s.log.Info("deregistered runner scale set", "scaleSetID", s.scaleSetID)
 	return nil
 }
 
@@ -494,14 +472,14 @@ func (a *scaler) HandleJobCompleted(_ context.Context, j *scaleset.JobCompleted)
 type JITSource struct {
 	client     *scaleset.Client
 	remover    runnerRemover
-	scaleSetID *atomic.Int64
+	scaleSetID int
 	namePrefix string
 }
 
 // Generate implements scheduler.JITSource.
 func (j *JITSource) Generate(ctx context.Context, _ core.RunnerSpec) (name, jitConfig string, err error) {
 	name = j.namePrefix + "-" + randSuffix()
-	cfg, err := j.client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, int(j.scaleSetID.Load()))
+	cfg, err := j.client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, j.scaleSetID)
 	if err != nil {
 		return "", "", fmt.Errorf("generate JIT config: %w", err)
 	}

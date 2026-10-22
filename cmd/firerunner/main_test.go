@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/solcreek/firerunner/internal/config"
 	"github.com/solcreek/firerunner/internal/core"
 	"github.com/solcreek/firerunner/internal/health"
+	"github.com/solcreek/firerunner/internal/listener"
 	"github.com/solcreek/firerunner/internal/provisioner"
 )
 
@@ -222,5 +224,24 @@ func TestServeTiers_StoppedTierContextIsCancelled(t *testing.T) {
 	cancel()
 	if err := <-res; err != nil {
 		t.Fatalf("serveTiers = %v", err)
+	}
+}
+
+func TestServeTiers_RestartStopsEveryTier(t *testing.T) {
+	// A deleted scale set needs a fresh process to register it again: every
+	// tier stops and serveTiers returns the ErrRestart, so main exits non-zero
+	// for systemd to restart it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runs := []func(context.Context) error{
+		func(context.Context) error { return fmt.Errorf("%w: 404", listener.ErrRestart) },
+		func(c context.Context) error { <-c.Done(); return c.Err() },
+	}
+	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler))
+	if !errors.Is(err, listener.ErrRestart) {
+		t.Fatalf("serveTiers = %v, want ErrRestart", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("the other tiers were left running")
 	}
 }
