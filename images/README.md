@@ -90,6 +90,30 @@ by [`assets/firerunner-runner.service`](assets/firerunner-runner.service):
 A static `/etc/resolv.conf` (matching `--dns-servers`) is baked in because the
 egress allowlist only permits the configured resolvers.
 
+### EC2 runner instances
+
+An EC2 runner AMI runs [`assets/firerunner-ec2-run.sh`](assets/firerunner-ec2-run.sh)
+from [`assets/firerunner-ec2-runner.service`](assets/firerunner-ec2-runner.service)
+instead. The JIT config never appears in user-data:
+
+1. Read user-data through IMDSv2. It holds one line,
+   `FIRERUNNER_JIT_URL=http://<control-vm-vpc-ip>:<port>/jit` (firerunner's
+   `--jit-addr`). With no such line, for example during a warm-up or image-build
+   boot, the instance powers off.
+2. `GET` that URL until it answers. firerunner serves the config **once**, to
+   this instance's private IP, then answers 404.
+   - Connection errors and 403 mean the address is not registered yet, so the
+     script retries.
+   - A 404 means the config was claimed or expired, so the instance powers off.
+   - It gives up after `FIRERUNNER_JIT_WAIT` seconds (default 600).
+3. Run `./run.sh --jitconfig <config>` for one job, then power off. On-demand
+   instances terminate on shutdown. Spot instances stop, and firerunner
+   terminates them.
+
+The unit has no `network-online.target` or docker ordering: the retry loop
+starts the fetch as soon as the NIC has an address. `images/test-ec2-run.sh`
+exercises the script against a fake IMDS and endpoint.
+
 ## Building
 
 ```bash
