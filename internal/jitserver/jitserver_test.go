@@ -43,8 +43,8 @@ func TestServesOnceThen404(t *testing.T) {
 	if code != http.StatusOK || body != "eyJqaXQiOiJ4In0=" {
 		t.Fatalf("first fetch = %d %q, want 200 with the config", code, body)
 	}
-	if s.Pending(guest) {
-		t.Fatal("Pending = true after the config was served")
+	if s.Pending(guest) || !s.Served(guest) {
+		t.Fatalf("after the fetch Pending=%v Served=%v, want false/true", s.Pending(guest), s.Served(guest))
 	}
 	// The config is revoked once served: a job on the instance cannot read it
 	// back, even from the same address.
@@ -77,12 +77,15 @@ func TestExpiresWhenNeverFetched(t *testing.T) {
 		t.Fatal(err)
 	}
 	now = now.Add(time.Minute) // exactly at expiry counts as expired
-	if s.Pending(guest) {
-		t.Fatal("Pending = true after the TTL")
+	if s.Pending(guest) || s.Served(guest) {
+		t.Fatalf("after the TTL Pending=%v Served=%v, want both false", s.Pending(guest), s.Served(guest))
 	}
 	code, body := fetch(t, s, http.MethodGet, Path, from(guest))
 	if code != http.StatusNotFound || strings.Contains(body, "secret") {
 		t.Fatalf("fetch after expiry = %d %q, want 404", code, body)
+	}
+	if s.Served(guest) {
+		t.Fatal("a fetch after expiry counted as served")
 	}
 }
 
