@@ -394,7 +394,14 @@ func TestReconnect_DeletedScaleSetRestarts(t *testing.T) {
 		{err: errors.New(`request POST .../sessions failed(status="404 Not Found"): runner scale set not found`)},
 	}}
 	ss := testScaleSet("a", newFakeSession(0, true), o, tr)
-	err := ss.Run(ctx, func(context.Context, int) int { return 0 }, nil, nil)
+	done := make(chan error, 1)
+	go func() { done <- ss.Run(ctx, func(context.Context, int) int { return 0 }, nil, nil) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run kept retrying a deleted scale set")
+	}
 	if !errors.Is(err, ErrRestart) || errors.Is(err, ErrFatal) {
 		t.Fatalf("Run = %v, want ErrRestart (not ErrFatal)", err)
 	}
