@@ -27,8 +27,8 @@ type ParamAPI interface {
 	GetParameter(context.Context, *ssm.GetParameterInput, ...func(*ssm.Options)) (*ssm.GetParameterOutput, error)
 }
 
-// Tag keys on every instance and volume this package creates. The reaper finds
-// an install's leftovers by TagOwner.
+// Tag keys on every instance and volume this package creates. An install's
+// leftovers are found by TagOwner.
 const (
 	TagTier   = "firerunner:tier"
 	TagRunner = "firerunner:runner"

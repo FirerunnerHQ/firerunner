@@ -354,10 +354,20 @@ user-data**:
    launched to terminate on shutdown, for both on-demand and one-time spot. If
    one ever stops instead, firerunner terminates it.
 
-firerunner also terminates an instance that is idle when the scale set shrinks,
-one that never fetched its config (and backs off, as for a failed microVM
-boot), and one older than `--max-vm-lifetime`. Instances and volumes are tagged
-`firerunner:tier`, `firerunner:runner` and `firerunner:owner` (this host's name).
+firerunner also terminates an instance in these cases:
+
+- it is idle when the scale set shrinks;
+- it never fetched its config, or its runner exited without taking a job (both
+  back off, as for a failed microVM boot);
+- it is older than `--max-vm-lifetime`.
+
+Instances and volumes are tagged `firerunner:tier`, `firerunner:runner` and
+`firerunner:owner` (this host's name).
+
+> **No sweep of leftovers yet.** firerunner follows only the instances it
+> launched in its current process. Instances still running after a crash or
+> restart, or ones whose termination kept failing, must be terminated by hand
+> until the reaper lands. Find them by the `firerunner:owner` tag.
 
 When a type has no capacity in a subnet, firerunner tries the next subnet, then
 the next type: `InsufficientInstanceCapacity`, `Unsupported` and

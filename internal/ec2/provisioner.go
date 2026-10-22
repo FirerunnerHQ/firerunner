@@ -36,8 +36,8 @@ var capacityCodes = []string{
 const (
 	DefaultPollInterval = 3 * time.Second
 	// terminateWait bounds how long Launch keeps asking for a termination it
-	// cannot see take effect before it gives up and leaves the instance to
-	// the reaper.
+	// cannot see take effect before it gives up and reports the instance
+	// for manual cleanup.
 	terminateWait = 5 * time.Minute
 	// terminateRetry paces repeated termination requests.
 	terminateRetry = 10 * time.Second
@@ -68,8 +68,8 @@ func NewClient(api API, params ParamAPI, pollInterval time.Duration, log *slog.L
 type Options struct {
 	// Tier is the tier name, tagged on every instance.
 	Tier string
-	// Owner identifies this firerunner install, so the reaper only ever
-	// touches what it launched.
+	// Owner identifies this firerunner install, so cleanup of leftover
+	// instances only ever touches what it launched.
 	Owner string
 	EC2   config.EC2Tier
 	// JIT serves instances their configs; JITURL is its endpoint as instances
@@ -190,7 +190,7 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			now := p.now()
 			switch {
 			case w.terminating && now.Sub(w.termSince) >= p.termWait:
-				return errors.Join(result, fmt.Errorf("instance %s did not terminate within %s; leaving it to the reaper", w.id, p.termWait))
+				return errors.Join(result, fmt.Errorf("instance %s did not terminate within %s; terminate it by hand", w.id, p.termWait))
 			case w.terminating && now.Sub(w.termLast) >= p.termRetry:
 				// The request may have been throttled or lost; repeat it.
 				w.terminate(context.WithoutCancel(ctx), "retry")
