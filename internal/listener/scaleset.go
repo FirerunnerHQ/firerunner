@@ -95,18 +95,27 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Message sessions get a client of their own too: every session request
+	// (open, refresh, close) takes its parent client's mutex, which a JIT
+	// generation holds across its network round trip. During a GitHub outage
+	// that would queue a reconnect's close and reopen behind stuck JIT
+	// requests, past their own deadlines.
+	sessionClient, err := newClient(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	groupID, err := runnerGroupID(ctx, client, cfg.RunnerGroup)
 	if err != nil {
 		return nil, err
 	}
 
-	id, reused, err := registerScaleSet(ctx, client, removeClient, cfg, groupID)
+	id, reused, err := registerScaleSet(ctx, client, cfg, groupID, removeClient, sessionClient)
 	if err != nil {
 		return nil, err
 	}
 
-	first, err := openSessionWithRetry(ctx, client, id, owner, cfg.Logger)
+	first, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.Logger)
 	if err != nil {
 		if !reused {
 			// Best-effort cleanup of the scale set we just created.
@@ -125,14 +134,14 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	}
 	s.scaleSetID.Store(int64(id))
 	s.open = func(ctx context.Context) (session, error) {
-		sess, err := openSessionWithRetry(ctx, client, int(s.scaleSetID.Load()), owner, cfg.Logger)
+		sess, err := openSessionWithRetry(ctx, sessionClient, int(s.scaleSetID.Load()), owner, cfg.Logger)
 		if err != nil {
 			return nil, err
 		}
 		return sess, nil
 	}
 	s.register = func(ctx context.Context) error {
-		id, reused, err := registerScaleSet(ctx, client, removeClient, cfg, groupID)
+		id, reused, err := registerScaleSet(ctx, client, cfg, groupID, removeClient, sessionClient)
 		if err != nil {
 			return err
 		}
@@ -144,11 +153,12 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	return s, nil
 }
 
-// registerScaleSet gets or creates the tier's scale set and returns its ID and
-// whether it already existed. Reusing an existing set (from a prior, possibly
-// unclean, run) keeps restarts idempotent instead of failing with "runner
-// scale set already exists".
-func registerScaleSet(ctx context.Context, client, removeClient *scaleset.Client, cfg Config, groupID int) (int, bool, error) {
+// registerScaleSet gets or creates the tier's scale set through client and
+// returns its ID and whether it already existed. Reusing an existing set (from
+// a prior, possibly unclean, run) keeps restarts idempotent instead of failing
+// with "runner scale set already exists". Every client, including others,
+// reports the set's ID in its system info.
+func registerScaleSet(ctx context.Context, client *scaleset.Client, cfg Config, groupID int, others ...*scaleset.Client) (int, bool, error) {
 	desired := &scaleset.RunnerScaleSet{
 		Name:          cfg.Name,
 		RunnerGroupID: groupID,
@@ -174,8 +184,9 @@ func registerScaleSet(ctx context.Context, client, removeClient *scaleset.Client
 			return 0, false, fmt.Errorf("create runner scale set: %w", err)
 		}
 	}
-	client.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
-	removeClient.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
+	for _, c := range append([]*scaleset.Client{client}, others...) {
+		c.SetSystemInfo(systemInfo(cfg, scaleSet.ID))
+	}
 	return scaleSet.ID, reused, nil
 }
 
