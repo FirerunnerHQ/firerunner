@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -51,6 +52,12 @@ type Config struct {
 
 	CacheJobsDir string
 	Firecracker  provisioner.FirecrackerConfig
+
+	// JITAddr is the VPC IP:port where EC2 runner instances fetch their JIT
+	// config; required when any tier uses the ec2 provisioner. JITTTL bounds
+	// how long a config waits to be fetched.
+	JITAddr string
+	JITTTL  time.Duration
 
 	LogLevel  string
 	LogFormat string
@@ -244,6 +251,9 @@ func Parse(args []string) (*Config, error) {
 	fs.DurationVar(&c.Firecracker.MaxVMLifetime, "max-vm-lifetime", er.duration("FR_MAX_VM_LIFETIME", 6*time.Hour), "host-side backstop: kill a microVM still running after this long to reclaim its slot (a healthy VM self-destructs when its job ends, so this only fires on a stuck VM). Keep it larger than any real job; 0 disables it")
 	fs.DurationVar(&c.Firecracker.ConnectTimeout, "vm-connect-timeout", er.duration("FR_VM_CONNECT_TIMEOUT", 5*time.Minute), "kill a booted microVM whose runner has not registered with GitHub (console shows neither \"Listening for Jobs\" nor \"Running job:\") within this long, freeing its slot and backing off replenishment; catches VMs wedged by lost DNS/egress or a rejected JIT config that would otherwise hold a slot until --max-vm-lifetime. 0 disables it")
 
+	fs.StringVar(&c.JITAddr, "jit-addr", env("FR_JIT_ADDR", ""), "VPC IP:port where EC2 runner instances fetch their JIT config, served once to each instance's private IP so no secret goes into user-data (e.g. 10.0.0.5:8098); required with an ec2 tier. Bind the control VM's VPC address, never a public one")
+	fs.DurationVar(&c.JITTTL, "jit-ttl", er.duration("FR_JIT_TTL", 5*time.Minute), "how long an EC2 instance's JIT config waits to be fetched before it expires")
+
 	var egress, dnsServers string
 	var metaRefresh time.Duration
 	fs.StringVar(&egress, "egress", env("FR_EGRESS", "api,actions,git,dns,packages,ntp"), "comma-separated egress allowlist: GitHub /meta categories (api,actions,git,packages) plus dns,ntp; or 'open' for no allowlist")
@@ -372,6 +382,9 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
+	if err := c.validateJIT(); err != nil {
+		return err
+	}
 	if c.Firecracker.ToolCacheImage != "" {
 		if _, err := os.Stat(c.Firecracker.ToolCacheImage); err != nil {
 			return fmt.Errorf("--toolcache image %q not accessible: %w", c.Firecracker.ToolCacheImage, err)
@@ -479,6 +492,42 @@ func (c *Config) validateFirecrackerTier(t Tier) error {
 		if _, err := os.Stat(t.ToolCache); err != nil {
 			return fmt.Errorf("tier %q: toolcache image %q not accessible: %w", t.Name, t.ToolCache, err)
 		}
+	}
+	return nil
+}
+
+// UsesEC2 reports whether any effective tier launches EC2 instances.
+func (c *Config) UsesEC2() bool {
+	for _, t := range c.EffectiveTiers() {
+		if t.IsEC2() {
+			return true
+		}
+	}
+	return false
+}
+
+// validateJIT requires a reachable JIT endpoint for EC2 tiers. Instances are
+// told this address in user-data, so it must be a concrete unicast IP they can
+// route to: not a wildcard, loopback or a hostname to resolve.
+func (c *Config) validateJIT() error {
+	if c.JITAddr == "" {
+		if c.UsesEC2() {
+			return fmt.Errorf("--jit-addr is required with an ec2 tier")
+		}
+		return nil
+	}
+	ap, err := netip.ParseAddrPort(c.JITAddr)
+	if err != nil {
+		return fmt.Errorf("--jit-addr %q must be <ip>:<port>: %w", c.JITAddr, err)
+	}
+	switch ip := ap.Addr().Unmap(); {
+	case ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast():
+		return fmt.Errorf("--jit-addr %q must be the control VM's VPC address, which instances can reach", c.JITAddr)
+	case ap.Port() == 0:
+		return fmt.Errorf("--jit-addr %q needs a non-zero port", c.JITAddr)
+	}
+	if c.JITTTL < 30*time.Second {
+		return fmt.Errorf("--jit-ttl %s is too small; an instance needs time to boot before it asks (use >= 30s)", c.JITTTL)
 	}
 	return nil
 }
