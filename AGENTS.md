@@ -75,6 +75,7 @@ Placeholders such as `subnet-0aaa…` are fine.
   walks, termination, JIT handoff, error classification), break the code on
   purpose once and watch a test fail.
   `scripts/mutate.sh FILE 'old' 'new'` does it and always restores the file;
+  add `--exec CMD…` for a non-Go test, e.g. `--exec images/test-ec2-run.sh`;
   it ends in `CAUGHT`, `SURVIVED` or `INVALID` (see its header).
 - Shell scripts under `images/` have shell tests (`images/test-*.sh`) that
   stub external commands. Keep them shellcheck-clean.
