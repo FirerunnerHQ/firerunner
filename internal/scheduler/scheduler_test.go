@@ -1420,24 +1420,38 @@ func TestIdleRunnersAndCancelLost(t *testing.T) {
 // guest console marker or GitHub's JobStarted would) and then run until the
 // test ends that job with finish. Each Launch sends its runner name on
 // entered.
+//
+// With bootIdle set, a runner takes no job by itself: it stays idle (booting)
+// until the test calls MarkBusy, and a cancel ends it, reported on cancelled.
 type jobProv struct {
-	entered chan string
-	mu      sync.Mutex
-	done    map[string]chan struct{}
+	entered   chan string
+	cancelled chan string
+	bootIdle  bool
+	mu        sync.Mutex
+	done      map[string]chan struct{}
 }
 
 func newJobProv() *jobProv {
-	return &jobProv{entered: make(chan string, 64), done: map[string]chan struct{}{}}
+	return &jobProv{entered: make(chan string, 64), cancelled: make(chan string, 64), done: map[string]chan struct{}{}}
 }
 
-func (p *jobProv) Launch(_ context.Context, name, _ string, _ core.RunnerSpec, onBusy func()) error {
+func (p *jobProv) Launch(ctx context.Context, name, _ string, _ core.RunnerSpec, onBusy func()) error {
 	ch := make(chan struct{})
 	p.mu.Lock()
 	p.done[name] = ch
 	p.mu.Unlock()
-	onBusy()
+	if !p.bootIdle {
+		onBusy()
+		p.entered <- name
+		<-ch
+		return nil
+	}
 	p.entered <- name
-	<-ch
+	select {
+	case <-ch:
+	case <-ctx.Done():
+		p.cancelled <- name
+	}
 	return nil
 }
 
@@ -1511,6 +1525,41 @@ func TestRunnerExitAtMaxLaunchesForQueuedJob(t *testing.T) {
 	prov.finish(c)
 	prov.finish(d)
 	s.Drain()
+	prov.noMore(t)
+}
+
+// TestCompletedRunnerIsNotLiveForScaleDown is issue #92: at Max 2, runner a has
+// taken a job and b is still booting for the job queued behind it. The message
+// reporting a's job completed carries desired 1 (the queued job). a can never
+// take another job, so it must not count as live: counting it made scaleDown
+// see one VM too many and cancel b, the runner the queued job needed.
+func TestCompletedRunnerIsNotLiveForScaleDown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prov := newJobProv()
+	prov.bootIdle = true
+	s := New(Options{Max: 2, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 2)
+	a, b := prov.next(t), prov.next(t)
+	s.MarkBusy(a)
+
+	message(ctx, s, 1, a) // a's job done; b's job is the one still queued
+	// scaleDown decides under the lock inside Reconcile: a VM it picked is
+	// marked cancelled before Reconcile returns, and IdleRunners leaves it out.
+	if got := s.IdleRunners(0); len(got) != 1 || got[0] != b {
+		t.Fatalf("idle runners = %v, want [%s]: the completed runner was counted as live", got, b)
+	}
+	if got := s.Capacity(); got != 1 {
+		t.Fatalf("capacity=%d want 1: b can take the queued job, a cannot take another", got)
+	}
+
+	cancel()
+	prov.finish(a)
+	s.Drain()
+	if got := <-prov.cancelled; got != b {
+		t.Fatalf("cancelled %s at shutdown, want %s", got, b)
+	}
 	prov.noMore(t)
 }
 
