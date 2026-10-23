@@ -420,6 +420,13 @@ permissions) fails the launch, and the scheduler backs off.
 - `--aws-region` / `FR_AWS_REGION`: defaults to the SDK's sources, then the
   control VM's own region.
 
+**Running the control VM.** [`deploy/aws/`](deploy/aws/README.md) has a
+CloudFormation template that does this for you:
+
+- an Auto Scaling group of one, which replaces a failed VM;
+- a private DNS name for `--jit-host`;
+- `deploy-control.sh`, which deploys a release in one command.
+
 **Control VM permissions.** Credentials come from the default chain,
 normally the control VM's instance role. It needs no `iam:PassRole`, because
 the runners get no role:
