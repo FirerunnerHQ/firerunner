@@ -28,12 +28,13 @@ type Schedule struct {
 // Window is one sized period. Days is "daily", or a comma list of days and
 // day ranges ("mon-fri", "sat,sun"). Hours is "HH:MM-HH:MM"; an end at or
 // before the start runs past midnight, and the window belongs to the day it
-// starts on. The first window that covers a moment sizes it.
+// starts on. The first window that covers a moment sizes it. Min or Pool
+// left out keeps the tier's base value.
 type Window struct {
 	Days  string `json:"days"`
 	Hours string `json:"hours"`
-	Min   int    `json:"min"`
-	Pool  int    `json:"pool"`
+	Min   *int   `json:"min,omitempty"`
+	Pool  *int   `json:"pool,omitempty"`
 
 	days       [7]bool
 	start, end int // minutes after midnight
@@ -89,8 +90,11 @@ var dayNames = map[string]time.Weekday{
 }
 
 func (w *Window) init() error {
-	if w.Min < 0 || w.Pool < 0 {
+	if (w.Min != nil && *w.Min < 0) || (w.Pool != nil && *w.Pool < 0) {
 		return fmt.Errorf("min and pool must be >= 0")
+	}
+	if w.Min == nil && w.Pool == nil {
+		return fmt.Errorf("set min, pool or both")
 	}
 	days := strings.ToLower(strings.TrimSpace(w.Days))
 	switch days {
@@ -141,13 +145,17 @@ func clock(s string, end bool) (int, error) {
 	h, m, ok := strings.Cut(strings.TrimSpace(s), ":")
 	hh, err1 := strconv.Atoi(h)
 	mm, err2 := strconv.Atoi(m)
-	if !ok || err1 != nil || err2 != nil || len(h) != 2 || len(m) != 2 || mm < 0 || mm > 59 || hh < 0 {
+	if !ok || err1 != nil || err2 != nil || !digits(h) || !digits(m) || mm > 59 {
 		return 0, fmt.Errorf("%q is not HH:MM", s)
 	}
 	if hh > 23 && !(end && hh == 24 && mm == 0) {
 		return 0, fmt.Errorf("%q is past 23:59", s)
 	}
 	return hh*60 + mm, nil
+}
+
+func digits(s string) bool {
+	return len(s) == 2 && s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9'
 }
 
 // covers reports whether the window covers t (already in the schedule's zone).
@@ -164,15 +172,24 @@ func (w *Window) covers(t time.Time) bool {
 
 func (w *Window) name() string { return w.Days + " " + w.Hours }
 
-// At returns the sizes for t: the first covering window's, or base.
+// At returns the sizes for t: the first covering window's, or base. A
+// Schedule must come from JSON (or Parse), which loads its zone.
 func (s *Schedule) At(t time.Time, base Sizes) Sizes {
 	local := t.In(s.loc)
+	base.Window = ""
 	for i := range s.Windows {
 		if w := &s.Windows[i]; w.covers(local) {
-			return Sizes{Min: w.Min, Pool: w.Pool, Window: w.name()}
+			out := base
+			if w.Min != nil {
+				out.Min = *w.Min
+			}
+			if w.Pool != nil {
+				out.Pool = *w.Pool
+			}
+			out.Window = w.name()
+			return out
 		}
 	}
-	base.Window = ""
 	return base
 }
 
@@ -180,7 +197,9 @@ func (s *Schedule) At(t time.Time, base Sizes) Sizes {
 func (s *Schedule) MaxPool() int {
 	n := 0
 	for _, w := range s.Windows {
-		n = max(n, w.Pool)
+		if w.Pool != nil {
+			n = max(n, *w.Pool)
+		}
 	}
 	return n
 }
@@ -189,7 +208,9 @@ func (s *Schedule) MaxPool() int {
 func (s *Schedule) MaxMin() int {
 	n := 0
 	for _, w := range s.Windows {
-		n = max(n, w.Min)
+		if w.Min != nil {
+			n = max(n, *w.Min)
+		}
 	}
 	return n
 }

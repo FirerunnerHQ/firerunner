@@ -119,18 +119,20 @@ func TestDayLists(t *testing.T) {
 
 func TestInvalid(t *testing.T) {
 	for name, js := range map[string]string{
-		"no timezone":  `{"windows": [{"days": "daily", "hours": "00:00-01:00"}]}`,
-		"bad timezone": `{"timezone": "Mars/Olympus", "windows": [{"days": "daily", "hours": "00:00-01:00"}]}`,
+		"no timezone":  `{"windows": [{"days": "daily", "hours": "00:00-01:00", "min": 1}]}`,
+		"bad timezone": `{"timezone": "Mars/Olympus", "windows": [{"days": "daily", "hours": "00:00-01:00", "min": 1}]}`,
 		"no windows":   `{"timezone": "UTC", "windows": []}`,
-		"no days":      `{"timezone": "UTC", "windows": [{"hours": "00:00-01:00"}]}`,
-		"bad day":      `{"timezone": "UTC", "windows": [{"days": "monday", "hours": "00:00-01:00"}]}`,
-		"bad range":    `{"timezone": "UTC", "windows": [{"days": "mon-xyz", "hours": "00:00-01:00"}]}`,
-		"no dash":      `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "06:00"}]}`,
-		"one digit":    `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "6:00-13:00"}]}`,
-		"25 o'clock":   `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "06:00-25:00"}]}`,
-		"24 as start":  `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "24:00-01:00"}]}`,
-		"bad minute":   `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "06:60-07:00"}]}`,
+		"no days":      `{"timezone": "UTC", "windows": [{"hours": "00:00-01:00", "min": 1}]}`,
+		"bad day":      `{"timezone": "UTC", "windows": [{"days": "monday", "hours": "00:00-01:00", "min": 1}]}`,
+		"bad range":    `{"timezone": "UTC", "windows": [{"days": "mon-xyz", "hours": "00:00-01:00", "min": 1}]}`,
+		"no dash":      `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "06:00", "min": 1}]}`,
+		"one digit":    `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "6:00-13:00", "min": 1}]}`,
+		"25 o'clock":   `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "06:00-25:00", "min": 1}]}`,
+		"24 as start":  `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "24:00-01:00", "min": 1}]}`,
+		"bad minute":   `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "06:60-07:00", "min": 1}]}`,
 		"negative":     `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "06:00-07:00", "pool": -1}]}`,
+		"plus sign":    `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "+6:00-07:00", "min": 1}]}`,
+		"sizes none":   `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "06:00-07:00"}]}`,
 		"unknown key":  `{"timezone": "UTC", "windows": [{"days": "daily", "hours": "06:00-07:00", "hot": 2}]}`,
 	} {
 		var s Schedule
@@ -140,5 +142,16 @@ func TestInvalid(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "schedule") && !strings.Contains(err.Error(), "unknown field") {
 			t.Errorf("%s: error %q does not say it is the schedule", name, err)
 		}
+	}
+}
+
+func TestOmittedSizeKeepsTheBase(t *testing.T) {
+	s := parse(t, `{"timezone": "UTC", "windows": [{"days": "sat,sun", "hours": "00:00-24:00", "min": 1}]}`)
+	sat := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	if got := s.At(sat, Sizes{Min: 0, Pool: 4}); got.Min != 1 || got.Pool != 4 {
+		t.Fatalf("got %+v, want min from the window and the base pool", got)
+	}
+	if s.MaxPool() != 0 {
+		t.Fatalf("MaxPool %d for windows that set no pool", s.MaxPool())
 	}
 }

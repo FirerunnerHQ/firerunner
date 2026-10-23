@@ -576,9 +576,9 @@ func (c *Config) validateTiers() error {
 		if t.Schedule != nil {
 			for _, w := range t.Schedule.Windows {
 				switch {
-				case w.Min > t.Max:
-					return fmt.Errorf("tier %q: schedule window %s %s: min (%d) must not exceed max (%d)", t.Name, w.Days, w.Hours, w.Min, t.Max)
-				case w.Pool > 0 && t.ProvisionerName() != ProvisionerEC2:
+				case w.Min != nil && *w.Min > t.Max:
+					return fmt.Errorf("tier %q: schedule window %s %s: min (%d) must not exceed max (%d)", t.Name, w.Days, w.Hours, *w.Min, t.Max)
+				case w.Pool != nil && *w.Pool > 0 && t.ProvisionerName() != ProvisionerEC2:
 					return fmt.Errorf("tier %q: schedule window %s %s: pool needs an ec2 tier", t.Name, w.Days, w.Hours)
 				}
 			}

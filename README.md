@@ -396,7 +396,8 @@ starts one in seconds:
 ```
 
 - **Windows.** The first window covering the current time sets `min` and
-  `pool`. Outside every window, the tier keeps its own `min` and `ec2.pool`.
+  `pool`; one it leaves out keeps the tier's own value. Outside every window,
+  the tier keeps its own `min` and `ec2.pool`.
 - **Days** are `daily` or a list such as `mon-fri` or `sat,sun`.
 - **Hours** are `HH:MM-HH:MM`, with the end exclusive. A window that ends at
   or before its start runs past midnight and belongs to the day it starts on.
