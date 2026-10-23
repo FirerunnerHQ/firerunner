@@ -74,12 +74,28 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-  # Shell tests for the image scripts: no Go needed. One step per script.
+  # Shell tests for the scripts in images/ and scripts/, one step per test
+  # script. Go is here for test-mutate.sh, which builds a throwaway module; its
+  # cache holds only that and the standard library.
   shell:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        id: go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: false
+      - name: Restore build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: go-shell-${{ runner.os }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('**/*.sh') }}
+          restore-keys: |
+            go-shell-${{ runner.os }}-${{ steps.go.outputs.go-version }}-
       - name: Test golden docker shim
         run: images/test-docker-shim.sh
       - name: Test EC2 runner boot script
