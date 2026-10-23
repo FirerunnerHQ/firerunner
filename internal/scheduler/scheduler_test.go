@@ -608,7 +608,7 @@ func TestMaintainsMinimumAfterExit(t *testing.T) {
 	})
 	s := New(Options{Max: 4, Min: 1, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
 
-	s.Reconcile(ctx, 1) // warm pool of 1; that VM exits and must be replenished
+	s.Reconcile(ctx, 0) // no jobs: a warm pool of 1; that VM exits and must be replenished
 
 	for i := 0; i < 2; i++ {
 		select {
@@ -839,7 +839,7 @@ func TestScaleDownPreservesMin(t *testing.T) {
 	})
 	s := New(Options{Max: 4, Min: 1, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
 
-	s.Reconcile(ctx, 3)
+	s.Reconcile(ctx, 2) // two jobs plus Min=1
 	for i := 0; i < 3; i++ {
 		select {
 		case <-entered:
@@ -1258,7 +1258,7 @@ func TestFailedBootBacksOff(t *testing.T) {
 	})
 	s := New(Options{Max: 4, Min: 1, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
 
-	s.Reconcile(ctx, 1)
+	s.Reconcile(ctx, 0) // the warm runner alone keeps failing
 	time.Sleep(1200 * time.Millisecond)
 	cancel()
 	s.Drain()
@@ -1803,7 +1803,7 @@ func TestSetMinRaisesAndLowersTheFloor(t *testing.T) {
 	s := New(Options{Max: 6, Min: 0, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
 	defer func() { close(busy); cancel(); s.Drain() }()
 
-	// The listener's count is Min (0) plus one job.
+	// One job; no floor yet.
 	startIdle(t, ctx, s, entered, 1)
 
 	// A window opens: 3 hot runners on top of the job.
@@ -1813,8 +1813,8 @@ func TestSetMinRaisesAndLowersTheFloor(t *testing.T) {
 	if s.Min() != 3 {
 		t.Fatalf("Min = %d", s.Min())
 	}
-	// The listener's next message carries the new floor; nothing changes.
-	s.Reconcile(ctx, 4)
+	// The next message still counts one job; the floor stays added.
+	s.Reconcile(ctx, 1)
 	waitRunning(t, s, 4)
 
 	// The window closes: the idle hot runners go, the busy one stays.

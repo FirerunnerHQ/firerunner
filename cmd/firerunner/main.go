@@ -395,14 +395,10 @@ func reaperOptions(cfg *config.Config, owner string, tiers []config.Tier, listen
 }
 
 // scheduleTarget is what a tier's schedule resizes: its stopped pool, if it
-// keeps one, then the hot runners the listener adds to GitHub's counts and
-// the scheduler keeps.
-func scheduleTarget(lis *listener.ScaleSet, sched *scheduler.Scheduler, prov provisioner.Provisioner, tracker *health.Tracker) schedule.Target {
+// keeps one, then the hot runners the scheduler keeps beside GitHub's jobs.
+func scheduleTarget(sched *scheduler.Scheduler, prov provisioner.Provisioner, tracker *health.Tracker) schedule.Target {
 	t := schedule.Target{
-		SetMin: func(ctx context.Context, n int) {
-			lis.SetMinRunners(n)
-			sched.SetMin(ctx, n)
-		},
+		SetMin: sched.SetMin,
 		Applied: func(s schedule.Sizes) {
 			tracker.SetSizes(health.Sizes{Min: s.Min, Pool: s.Pool, Window: s.Window, Since: time.Now()})
 		},
@@ -668,7 +664,6 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			RunnerGroup:  cfg.RunnerGroup,
 			Labels:       t.Labels,
 			MaxRunners:   t.Max,
-			MinRunners:   t.SizesAt(time.Now()).Min,
 			Token:        cfg.Token,
 			App:          app,
 			Version:      version,
@@ -774,7 +769,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				Health: tracker, Logger: log.With("tier", tiers[i].Name, "component", "reconcile"),
 			}).Run(tierCtx)
 			if tiers[i].Schedule != nil {
-				go schedule.Follow(tierCtx, tiers[i].SizesAt, scheduleTarget(lis, sched, prov, tracker),
+				go schedule.Follow(tierCtx, tiers[i].SizesAt, scheduleTarget(sched, prov, tracker),
 					30*time.Second, nil, log.With("tier", tiers[i].Name, "component", "schedule"))
 			}
 			return lis.Run(tierCtx, onDesired, onBusy, onCompleted, capacity)
