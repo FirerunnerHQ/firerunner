@@ -201,6 +201,7 @@ func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 	}
 	s.commit(n)
 	running := s.running
+	floor := s.opts.Min
 	stopped := 0
 	startRemover := false
 	if n == 0 {
@@ -220,7 +221,7 @@ func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 		return
 	}
 	if stopped > 0 {
-		s.opts.Logger.Info("scaling down", "desired", desired, "cancelling", stopped, "running", running, "min", s.opts.Min)
+		s.opts.Logger.Info("scaling down", "desired", desired, "cancelling", stopped, "running", running, "min", floor)
 	}
 	if startRemover {
 		go s.removeLoop(ctx)
@@ -736,6 +737,39 @@ func (s *Scheduler) cancelIfIdle(name string) {
 	h.cancel()
 }
 
+// SetMin changes the warm-pool floor (Min) while the scheduler runs, as a
+// tier's schedule moves between windows. The listener's desired count
+// includes Min, so the last one is moved by the same step and re-planned:
+// a higher floor launches runners now, a lower one scales idle runners down
+// (busy ones are never cancelled). Before any message from GitHub, a higher
+// floor is filled as after a runner exits.
+func (s *Scheduler) SetMin(ctx context.Context, n int) {
+	s.mu.Lock()
+	old := s.opts.Min
+	if n == old {
+		s.mu.Unlock()
+		return
+	}
+	s.opts.Min = n
+	has, desired, lctx := s.hasDesired, max(0, s.lastDesired+n-old), s.lastCtx
+	s.mu.Unlock()
+	s.opts.Logger.Info("warm-pool floor changed", "from", old, "to", n)
+	if has && lctx.Err() == nil {
+		s.Reconcile(lctx, desired)
+		return
+	}
+	if n > old {
+		s.maintainMinimum(ctx)
+	}
+}
+
+// Min is the current warm-pool floor.
+func (s *Scheduler) Min() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opts.Min
+}
+
 // maintainMinimum tops the warm pool back up to Min after a microVM exits. GitHub
 // only pushes a desired-count message when job demand changes, so without this a
 // burst that drains the pool would leave it below Min until the next job arrives —
@@ -746,10 +780,14 @@ func (s *Scheduler) cancelIfIdle(name string) {
 // during shutdown (ctx cancelled) so it never relaunches VMs that Drain is
 // trying to reap.
 func (s *Scheduler) maintainMinimum(ctx context.Context) {
-	if s.opts.Min <= 0 || ctx.Err() != nil {
+	if ctx.Err() != nil {
 		return
 	}
 	s.mu.Lock()
+	if s.opts.Min <= 0 {
+		s.mu.Unlock()
+		return
+	}
 	// The floor is measured against running rather than live on purpose: a
 	// launch sleeping in backoff is the pool's pending replenishment, and
 	// counting it keeps a failing golden from being retried faster than backoff
@@ -760,12 +798,12 @@ func (s *Scheduler) maintainMinimum(ctx context.Context) {
 		n = plan(s.opts.Min, s.running, s.running, s.opts.Max)
 	}
 	s.commit(n)
-	running := s.running
+	running, floor := s.running, s.opts.Min
 	s.mu.Unlock()
 	if n == 0 {
 		return
 	}
-	s.opts.Logger.Info("replenishing warm pool", "min", s.opts.Min, "launching", n, "running", running)
+	s.opts.Logger.Info("replenishing warm pool", "min", floor, "launching", n, "running", running)
 	for i := 0; i < n; i++ {
 		s.wg.Add(1)
 		go s.launchOne(ctx, time.Now())
