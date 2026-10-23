@@ -135,6 +135,11 @@ type EC2Tier struct {
 	RootVolumeGiB int `json:"root_volume_gib,omitempty"`
 	// RootVolumeType is the root EBS volume type; empty means gp3.
 	RootVolumeType string `json:"root_volume_type,omitempty"`
+	// Pool is how many pre-warmed, stopped instances to keep ready. A job
+	// starts one in seconds instead of booting a new instance; spot pools use
+	// persistent requests and are still billed at the spot price. 0 disables
+	// the pool, and every job cold-launches.
+	Pool int `json:"pool,omitempty"`
 }
 
 // AMIFromSSM reports whether AMI names an SSM parameter rather than an image ID.
@@ -602,6 +607,8 @@ func validateEC2Tier(t Tier) error {
 		return fmt.Errorf("tier %q: ec2.market %q must be %q, %q or %q", t.Name, e.Market, MarketSpot, MarketSpotThenOnDemand, MarketOnDemand)
 	case e.RootVolumeGiB < 0:
 		return fmt.Errorf("tier %q: ec2.root_volume_gib must be >= 0", t.Name)
+	case e.Pool < 0:
+		return fmt.Errorf("tier %q: ec2.pool must be >= 0", t.Name)
 	}
 	// io1/io2 need a provisioned IOPS value, which the tier does not carry.
 	switch e.VolumeType() {

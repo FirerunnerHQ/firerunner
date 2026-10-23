@@ -574,7 +574,7 @@ func TestFromFlags_MixedProvisionerCatalog(t *testing.T) {
 	if len(e.InstanceTypes) != 2 || e.InstanceTypes[0] != "c8a.xlarge" || e.InstanceTypes[1] != "c7a.xlarge" {
 		t.Fatalf("instance_types = %v, want order preserved", e.InstanceTypes)
 	}
-	if len(e.Subnets) != 2 || len(e.SecurityGroups) != 1 || e.Market != MarketSpotThenOnDemand || e.RootVolumeGiB != 40 {
+	if len(e.Subnets) != 2 || len(e.SecurityGroups) != 1 || e.Market != MarketSpotThenOnDemand || e.RootVolumeGiB != 40 || e.Pool != 0 {
 		t.Fatalf("ec2 block = %+v", e)
 	}
 	if !e.AMIFromSSM() || e.VolumeType() != "gp3" {
@@ -660,6 +660,7 @@ func TestFromFlags_EC2TierErrors(t *testing.T) {
 		"no market":            {`"market":"spot-then-on-demand",`, ``},
 		"bad market":           {`"market":"spot-then-on-demand"`, `"market":"reserved"`},
 		"negative root volume": {`"root_volume_gib":40`, `"root_volume_gib":-1`},
+		"negative pool":        {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":-1`},
 		"bad volume type":      {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"st1"`},
 		"io2 needs iops":       {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"io2"`},
 		"zero max":             {`"max":20`, `"max":0`},
