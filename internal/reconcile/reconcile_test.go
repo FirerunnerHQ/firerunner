@@ -14,11 +14,18 @@ type fakeScaleSet struct {
 	stats    Stats
 	at       time.Time // when the statistics' message arrived
 	ok       bool
+	noLive   bool // no live session to recycle
 	recycles []string
 }
 
 func (f *fakeScaleSet) Stats() (Stats, time.Time, bool) { return f.stats, f.at, f.ok }
-func (f *fakeScaleSet) Recycle(reason string)           { f.recycles = append(f.recycles, reason) }
+func (f *fakeScaleSet) Recycle(reason string) bool {
+	if f.noLive {
+		return false
+	}
+	f.recycles = append(f.recycles, reason)
+	return true
+}
 
 type fakeRunners struct {
 	idle      []string
@@ -182,5 +189,25 @@ func TestNoStatsNoAction(t *testing.T) {
 	r.Check(context.Background())
 	if len(rn.cancelled) != 0 || tr.Snapshot().GitHub != nil {
 		t.Fatal("acted before any statistics arrived")
+	}
+}
+
+func TestRecycleWithNoLiveSessionIsRetried(t *testing.T) {
+	// While the listener reconnects there is no session to recycle: that is
+	// not counted, and does not hold off the next attempt.
+	ss := &fakeScaleSet{ok: true, stats: Stats{Available: 1}, noLive: true}
+	c := newClock()
+	r, tr := newRec(ss, &fakeRunners{}, nil, c)
+	r.Check(context.Background())
+	c.advance(61 * time.Second)
+	r.Check(context.Background())
+	if tr.Snapshot().Recycles != 0 {
+		t.Fatalf("counted %d recycles that did nothing", tr.Snapshot().Recycles)
+	}
+	ss.noLive = false
+	c.advance(10 * time.Second)
+	r.Check(context.Background())
+	if len(ss.recycles) != 1 || tr.Snapshot().Recycles != 1 {
+		t.Fatalf("recycles = %v (counted %d), want the retry at once", ss.recycles, tr.Snapshot().Recycles)
 	}
 }

@@ -362,7 +362,7 @@ func (s statsSource) Stats() (reconcile.Stats, time.Time, bool) {
 	}, at, ok
 }
 
-func (s statsSource) Recycle(reason string) { s.lis.Recycle(reason) }
+func (s statsSource) Recycle(reason string) bool { return s.lis.Recycle(reason) }
 
 // tierPending returns the pending-launch counter a tier's scheduler shares.
 // Firecracker tiers share one, because their launches draw on the same host

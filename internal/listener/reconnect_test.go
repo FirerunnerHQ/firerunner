@@ -467,10 +467,16 @@ func TestRecycleReconnectsAndStatsAreRecorded(t *testing.T) {
 		return ok && st.TotalAvailableJobs == 3 && st.TotalRegisteredRunners == 5 && !at.IsZero()
 	})
 
-	ss.Recycle("test")
+	if !ss.Recycle("test") {
+		t.Fatal("Recycle reported no live session")
+	}
 	eventually(t, "a new session after the recycle", func() bool { return o.opened() == 1 && next.gets.Load() > 0 })
 	if !first.closed.Load() {
 		t.Fatal("the recycled session was not closed")
+	}
+	// A recycle is not a failure: no reconnect, no error, no backoff.
+	if h := tr.Snapshot(); h.State != health.Connected || h.Reconnects != 0 || h.LastError != "" {
+		t.Fatalf("health after a recycle = %+v", h)
 	}
 	// The new session's statistics drive demand as after any reconnect.
 	eventually(t, "launches from the new session", func() bool { l, _ := tier.prov.counts(); return l == 2 })
@@ -501,5 +507,12 @@ func TestChaosExitAfterDelete(t *testing.T) {
 	f := newFakeSession(0, false)
 	if err := (trackedSession{session: f}).DeleteMessage(context.Background(), 1); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRecycleWithoutALiveSession(t *testing.T) {
+	ss := testScaleSet("a", newFakeSession(0, false), &opener{}, nil)
+	if ss.Recycle("before Run") {
+		t.Fatal("Recycle reported success with no session running")
 	}
 }

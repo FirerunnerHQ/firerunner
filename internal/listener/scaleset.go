@@ -66,9 +66,10 @@ type ScaleSet struct {
 	jitClients *clientPool
 	// stats holds the latest statistics GitHub sent with a message.
 	stats statsRecorder
-	// mu guards recycle, the cancel func of the current session's context.
+	// mu guards recycle, the cancel func of the live session's context; nil
+	// when no session is live.
 	mu      sync.Mutex
-	recycle context.CancelFunc
+	recycle context.CancelCauseFunc
 	session session
 	// open opens a fresh message session after the current one fails.
 	open       func(context.Context) (session, error)
@@ -280,6 +281,19 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		_ = sess.Close(closeCtx)
 		cancel()
+		if errors.Is(err, errRecycled) {
+			// Asked for, not a failure: reopen at once, with no backoff and
+			// nothing recorded against the listener's health. Only if the
+			// reopen fails does the usual reconnect path take over.
+			if sess, err = s.open(ctx); err == nil {
+				s.session = sess
+				s.log.Info("listener session recycled")
+				continue
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
 		for {
 			wait := jitter(backoff)
 			s.log.Warn("listener session ended; reconnecting", "err", err, "backoff", wait)
@@ -324,13 +338,18 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 
 // runSession listens on one session until it fails or ctx ends.
 func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
-	// Recycle ends this session (and only this one) to make Run reconnect.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// Recycle ends this session (and only this one) to make Run reopen it.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	s.mu.Lock()
 	s.recycle = cancel
 	s.mu.Unlock()
-	l, err := sslistener.New(trackedSession{session: sess, health: s.health, chaos: chaosExitAfterDelete()}, sslistener.Config{
+	defer func() {
+		s.mu.Lock()
+		s.recycle = nil
+		s.mu.Unlock()
+	}()
+	l, err := sslistener.New(trackedSession{session: sess, health: s.health, log: s.log, chaos: chaosExitAfterDelete()}, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
@@ -351,8 +370,15 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		a.setCapacity = l.SetMaxRunners
 		a.advertiseCapacity()
 	}
-	return l.Run(ctx, a)
+	err = l.Run(ctx, a)
+	if errors.Is(context.Cause(ctx), errRecycled) {
+		return errRecycled
+	}
+	return err
 }
+
+// errRecycled ends a session that Recycle asked to replace.
+var errRecycled = errors.New("session recycled")
 
 // Stats returns the scale set statistics GitHub sent with the latest
 // message, and when they arrived; ok is false before the first.
@@ -361,16 +387,19 @@ func (s *ScaleSet) Stats() (stats scaleset.RunnerScaleSetStatistic, at time.Time
 }
 
 // Recycle ends the current message session, so Run closes it and opens a new
-// one as after any session failure. A fresh session gets GitHub's current
-// statistics, and possibly re-offers jobs the old one never acquired.
-func (s *ScaleSet) Recycle(reason string) {
+// one at once. A fresh session gets GitHub's current statistics, and possibly
+// re-offers jobs the old one never acquired. It reports whether a live session
+// was there to recycle; there is none before the first or while reconnecting.
+func (s *ScaleSet) Recycle(reason string) bool {
 	s.mu.Lock()
 	cancel := s.recycle
 	s.mu.Unlock()
-	if cancel != nil {
-		s.log.Warn("recycling the message session", "reason", reason)
-		cancel()
+	if cancel == nil {
+		return false
 	}
+	s.log.Warn("recycling the message session", "reason", reason)
+	cancel(errRecycled)
+	return true
 }
 
 // statsRecorder keeps the latest statistics GitHub sent (an
@@ -408,10 +437,12 @@ func (r *statsRecorder) latest() (scaleset.RunnerScaleSetStatistic, time.Time, b
 // moment a crash loses the message.
 func chaosExitAfterDelete() bool { return os.Getenv("FR_CHAOS_EXIT_AFTER_DELETE") == "1" }
 
-// trackedSession records each successful GetMessage in the tier's health.
+// trackedSession records each successful GetMessage in the tier's health, and
+// logs at debug level what each message carries.
 type trackedSession struct {
 	session
 	health *health.Tracker
+	log    *slog.Logger
 	// chaos exits the process after DeleteMessage (see chaosExitAfterDelete).
 	chaos bool
 }
@@ -429,6 +460,11 @@ func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapaci
 	m, err := t.session.GetMessage(ctx, lastMessageID, maxCapacity)
 	if err == nil && t.health != nil {
 		t.health.MessageOK()
+	}
+	if err == nil && m != nil && t.log != nil {
+		t.log.Debug("message", "id", m.MessageID,
+			"jobAvailable", len(m.JobAvailableMessages), "jobAssigned", len(m.JobAssignedMessages),
+			"jobStarted", len(m.JobStartedMessages), "jobCompleted", len(m.JobCompletedMessages))
 	}
 	return m, err
 }

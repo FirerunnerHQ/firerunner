@@ -559,9 +559,6 @@ func (s *Scheduler) MarkBusy(name string) {
 	s.mu.Unlock()
 }
 
-// cancelIfIdle cancels the named microVM's context only if no job has been
-// assigned to it, so shutdown reaps idle warm-pool VMs at once while leaving
-// busy VMs to finish their job.
 // IdleRunners returns the runners launched more than olderThan ago that have
 // not taken a job and are not being removed: the ones a reconciler checks
 // against GitHub.
@@ -594,6 +591,9 @@ func (s *Scheduler) CancelLost(name string) bool {
 	return true
 }
 
+// cancelIfIdle cancels the named microVM's context only if no job has been
+// assigned to it, so shutdown reaps idle warm-pool VMs at once while leaving
+// busy VMs to finish their job.
 func (s *Scheduler) cancelIfIdle(name string) {
 	// Cancel under the lock (the CancelFunc only closes a channel, so it never
 	// blocks) so a MarkBusy cannot slip between the busy check and the cancel

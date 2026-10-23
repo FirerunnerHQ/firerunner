@@ -33,7 +33,8 @@ type Stats struct {
 // start a fresh message session.
 type ScaleSet interface {
 	Stats() (Stats, time.Time, bool)
-	Recycle(reason string)
+	// Recycle reports whether a live session was recycled.
+	Recycle(reason string) bool
 }
 
 // Runners is the scheduler side.
@@ -136,10 +137,13 @@ func (r *Reconciler) Check(ctx context.Context) {
 		if waited >= r.o.StuckAfter {
 			drift = append(drift, fmt.Sprintf("%d job(s) available but unacquired for %s", st.Available, waited.Round(time.Second)))
 			if r.lastRecycle.IsZero() || now.Sub(r.lastRecycle) >= r.o.RecycleEvery {
-				r.lastRecycle = now
-				r.ss.Recycle(fmt.Sprintf("%d job(s) available but unacquired for %s", st.Available, waited.Round(time.Second)))
-				if r.o.Health != nil {
-					r.o.Health.Recycled()
+				// No live session (reconnecting): nothing was recycled, and
+				// the next tick tries again.
+				if r.ss.Recycle(fmt.Sprintf("%d job(s) available but unacquired for %s", st.Available, waited.Round(time.Second))) {
+					r.lastRecycle = now
+					if r.o.Health != nil {
+						r.o.Health.Recycled()
+					}
 				}
 			}
 		}
