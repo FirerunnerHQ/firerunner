@@ -1304,10 +1304,12 @@ func TestLaunchLogsPhaseTimings(t *testing.T) {
 	}
 }
 
-// TestConcurrentLaunchesDoNotSerialize is #49's acceptance check on the
-// scheduler: with a JIT source of fixed latency and a provisioner that starts
-// at once, 20 launches decided together all reach the provisioner within
-// 1.5x of a single launch's time.
+// TestConcurrentLaunchesDoNotSerialize guards the scheduler itself: with a
+// JIT source of fixed latency that does not serialize and a provisioner that
+// starts at once, 20 launches decided together all reach the provisioner
+// within 1.5x of a single launch's time. (#49's serialization was in the JIT
+// client; listener's TestJITSource_ConcurrentGenerateDoesNotSerialize covers
+// that.)
 func TestConcurrentLaunchesDoNotSerialize(t *testing.T) {
 	const delay = 100 * time.Millisecond
 	measure := func(n int) []time.Duration {
