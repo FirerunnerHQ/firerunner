@@ -19,8 +19,7 @@ func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 func TestScalerHandleDesiredRunnerCount(t *testing.T) {
 	var gotDesired int
 	a := &scaler{
-		minRunners: 2,
-		log:        testLogger(),
+		log: testLogger(),
 		onDesired: func(_ context.Context, desired int) int {
 			gotDesired = desired
 			return 3
@@ -30,8 +29,8 @@ func TestScalerHandleDesiredRunnerCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotDesired != 6 {
-		t.Fatalf("desired = %d, want minRunners(2)+count(4)=6", gotDesired)
+	if gotDesired != 4 {
+		t.Fatalf("desired = %d, want GitHub's count (4): the scheduler adds its floor", gotDesired)
 	}
 	if running != 3 {
 		t.Fatalf("running = %d, want 3 (value returned by onDesired)", running)
@@ -146,7 +145,6 @@ func TestScalerWithoutCapacityFuncNeverAdvertises(t *testing.T) {
 func TestScalerJobCallbacks(t *testing.T) {
 	var busy, completed []string
 	a := &scaler{
-		minRunners:  0,
 		log:         testLogger(),
 		onDesired:   func(context.Context, int) int { return 0 },
 		onBusy:      func(name string) { busy = append(busy, name) },
@@ -186,7 +184,7 @@ func TestScalerJobCallbacks(t *testing.T) {
 }
 
 func TestScalerJobStartedNilBusyFunc(t *testing.T) {
-	a := &scaler{minRunners: 0, log: testLogger(), onDesired: func(context.Context, int) int { return 0 }}
+	a := &scaler{log: testLogger(), onDesired: func(context.Context, int) int { return 0 }}
 	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: "r"}); err != nil {
 		t.Fatalf("HandleJobStarted with nil onBusy must not panic: %v", err)
 	}

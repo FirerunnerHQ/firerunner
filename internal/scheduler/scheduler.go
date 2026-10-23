@@ -98,13 +98,13 @@ type Scheduler struct {
 	// mu.
 	removeQ       []string
 	removerActive bool
-	// lastDesired and lastCtx are the desired count and context of the latest
-	// Reconcile, kept so a runner that finishes its job can re-run the plan
-	// (see replan). hasDesired is false until the first Reconcile. Guarded by
-	// mu.
-	lastDesired int
-	lastCtx     context.Context
-	hasDesired  bool
+	// lastJobs and lastCtx are the job count and context of the latest
+	// Reconcile, kept so a runner that finishes its job, or a change of Min,
+	// can re-run the plan (see replan, SetMin). hasDesired is false until the
+	// first Reconcile. Guarded by mu.
+	lastJobs   int
+	lastCtx    context.Context
+	hasDesired bool
 	// reconciles counts Reconcile calls, so an exit can tell whether a
 	// desired count arrived after its job's completion was seen (see
 	// MarkCompleted). Guarded by mu.
@@ -186,14 +186,28 @@ func (s *Scheduler) live() int {
 // and cancels idle VMs when desired drops below the number running. It is safe
 // for concurrent use; each launched runner handles exactly one job.
 //
+// jobs is the count GitHub asks for; the desired count adds Min, the warm
+// runners kept with no job queued, under the same lock SetMin changes it
+// with, so a schedule moving Min never races a message.
+//
 // The listener calls it on every message from GitHub. Between messages, a
 // runner that finishes its job re-runs the plan with the desired count given
 // here (see replan), so a job queued at Max starts when a slot frees rather
 // than at the next message.
-func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
+func (s *Scheduler) Reconcile(ctx context.Context, jobs int) {
 	s.mu.Lock()
-	s.lastDesired, s.lastCtx, s.hasDesired = desired, ctx, true
+	s.lastJobs, s.lastCtx, s.hasDesired = jobs, ctx, true
 	s.reconciles++
+	act := s.reconcileLocked(ctx)
+	s.mu.Unlock()
+	act()
+}
+
+// reconcileLocked plans for the last job count plus Min and returns what to
+// do once s.mu is released: log, launch, start the remover. Callers must hold
+// s.mu.
+func (s *Scheduler) reconcileLocked(ctx context.Context) func() {
+	desired := s.desired()
 	reclaimed := s.reclaimQueued(desired)
 	n := 0
 	if !s.draining {
@@ -201,31 +215,35 @@ func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 	}
 	s.commit(n)
 	running := s.running
+	floor := s.opts.Min
 	stopped := 0
 	startRemover := false
 	if n == 0 {
 		stopped, startRemover = s.scaleDown(desired)
 	}
-	s.mu.Unlock()
-
-	if reclaimed > 0 {
-		s.opts.Logger.Info("demand rose: kept runners queued for removal", "desired", desired, "reclaimed", reclaimed)
-	}
-	if n > 0 {
-		s.opts.Logger.Info("scaling up", "desired", desired, "launching", n, "running", running, "max", s.opts.Max)
-		for i := 0; i < n; i++ {
-			s.wg.Add(1)
-			go s.launchOne(ctx, time.Now())
+	return func() {
+		if reclaimed > 0 {
+			s.opts.Logger.Info("demand rose: kept runners queued for removal", "desired", desired, "reclaimed", reclaimed)
 		}
-		return
-	}
-	if stopped > 0 {
-		s.opts.Logger.Info("scaling down", "desired", desired, "cancelling", stopped, "running", running, "min", s.opts.Min)
-	}
-	if startRemover {
-		go s.removeLoop(ctx)
+		if n > 0 {
+			s.opts.Logger.Info("scaling up", "desired", desired, "launching", n, "running", running, "max", s.opts.Max)
+			for i := 0; i < n; i++ {
+				s.wg.Add(1)
+				go s.launchOne(ctx, time.Now())
+			}
+			return
+		}
+		if stopped > 0 {
+			s.opts.Logger.Info("scaling down", "desired", desired, "cancelling", stopped, "running", running, "min", floor)
+		}
+		if startRemover {
+			go s.removeLoop(ctx)
+		}
 	}
 }
+
+// desired is the last job count plus Min. Callers must hold s.mu.
+func (s *Scheduler) desired() int { return s.lastJobs + s.opts.Min }
 
 // commit adds n launches to running and to the pending counts, before their
 // goroutines start. Callers must hold s.mu.
@@ -275,14 +293,14 @@ func (s *Scheduler) replan(ctx context.Context) (int, context.Context) {
 	if !s.hasDesired || s.draining || ctx.Err() != nil || s.lastCtx.Err() != nil {
 		return 0, nil
 	}
-	if s.reclaimQueued(s.lastDesired) > 0 {
-		s.opts.Logger.Info("runner exited: kept a runner queued for removal", "desired", s.lastDesired)
+	if s.reclaimQueued(s.desired()) > 0 {
+		s.opts.Logger.Info("runner exited: kept a runner queued for removal", "desired", s.desired())
 		return 0, nil
 	}
-	n := min(1, plan(s.lastDesired, s.live(), s.running, s.opts.Max))
+	n := min(1, plan(s.desired(), s.live(), s.running, s.opts.Max))
 	s.commit(n)
 	if n > 0 {
-		s.opts.Logger.Info("runner exited: scaling up", "desired", s.lastDesired, "launching", n, "running", s.running, "max", s.opts.Max)
+		s.opts.Logger.Info("runner exited: scaling up", "desired", s.desired(), "launching", n, "running", s.running, "max", s.opts.Max)
 	}
 	return n, s.lastCtx
 }
@@ -736,6 +754,39 @@ func (s *Scheduler) cancelIfIdle(name string) {
 	h.cancel()
 }
 
+// SetMin changes the warm-pool floor (Min) while the scheduler runs, as a
+// tier's schedule moves between windows, and re-plans in the same critical
+// section: a higher floor launches runners now, a lower one scales idle
+// runners down (busy ones are never cancelled). Before any message from
+// GitHub, a higher floor is filled as after a runner exits.
+func (s *Scheduler) SetMin(ctx context.Context, n int) {
+	s.mu.Lock()
+	old := s.opts.Min
+	if n == old {
+		s.mu.Unlock()
+		return
+	}
+	s.opts.Min = n
+	var act func()
+	if s.hasDesired && s.lastCtx.Err() == nil {
+		act = s.reconcileLocked(s.lastCtx)
+	}
+	s.mu.Unlock()
+	s.opts.Logger.Info("warm-pool floor changed", "from", old, "to", n)
+	if act != nil {
+		act()
+	} else if n > old {
+		s.maintainMinimum(ctx)
+	}
+}
+
+// Min is the current warm-pool floor.
+func (s *Scheduler) Min() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opts.Min
+}
+
 // maintainMinimum tops the warm pool back up to Min after a microVM exits. GitHub
 // only pushes a desired-count message when job demand changes, so without this a
 // burst that drains the pool would leave it below Min until the next job arrives —
@@ -746,10 +797,14 @@ func (s *Scheduler) cancelIfIdle(name string) {
 // during shutdown (ctx cancelled) so it never relaunches VMs that Drain is
 // trying to reap.
 func (s *Scheduler) maintainMinimum(ctx context.Context) {
-	if s.opts.Min <= 0 || ctx.Err() != nil {
+	if ctx.Err() != nil {
 		return
 	}
 	s.mu.Lock()
+	if s.opts.Min <= 0 {
+		s.mu.Unlock()
+		return
+	}
 	// The floor is measured against running rather than live on purpose: a
 	// launch sleeping in backoff is the pool's pending replenishment, and
 	// counting it keeps a failing golden from being retried faster than backoff
@@ -760,12 +815,12 @@ func (s *Scheduler) maintainMinimum(ctx context.Context) {
 		n = plan(s.opts.Min, s.running, s.running, s.opts.Max)
 	}
 	s.commit(n)
-	running := s.running
+	running, floor := s.running, s.opts.Min
 	s.mu.Unlock()
 	if n == 0 {
 		return
 	}
-	s.opts.Logger.Info("replenishing warm pool", "min", s.opts.Min, "launching", n, "running", running)
+	s.opts.Logger.Info("replenishing warm pool", "min", floor, "launching", n, "running", running)
 	for i := 0; i < n; i++ {
 		s.wg.Add(1)
 		go s.launchOne(ctx, time.Now())

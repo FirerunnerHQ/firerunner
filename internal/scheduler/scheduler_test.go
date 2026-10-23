@@ -608,7 +608,7 @@ func TestMaintainsMinimumAfterExit(t *testing.T) {
 	})
 	s := New(Options{Max: 4, Min: 1, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
 
-	s.Reconcile(ctx, 1) // warm pool of 1; that VM exits and must be replenished
+	s.Reconcile(ctx, 0) // no jobs: a warm pool of 1; that VM exits and must be replenished
 
 	for i := 0; i < 2; i++ {
 		select {
@@ -839,7 +839,7 @@ func TestScaleDownPreservesMin(t *testing.T) {
 	})
 	s := New(Options{Max: 4, Min: 1, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
 
-	s.Reconcile(ctx, 3)
+	s.Reconcile(ctx, 2) // two jobs plus Min=1
 	for i := 0; i < 3; i++ {
 		select {
 		case <-entered:
@@ -1258,7 +1258,7 @@ func TestFailedBootBacksOff(t *testing.T) {
 	})
 	s := New(Options{Max: 4, Min: 1, Provisioner: prov, JIT: jitStub{}, Logger: testLogger()})
 
-	s.Reconcile(ctx, 1)
+	s.Reconcile(ctx, 0) // the warm runner alone keeps failing
 	time.Sleep(1200 * time.Millisecond)
 	cancel()
 	s.Drain()
@@ -1778,6 +1778,76 @@ func waitRunningWithin(t *testing.T, s *Scheduler, want int, within time.Duratio
 		case <-deadline:
 			t.Fatalf("running=%d want %d", s.Running(), want)
 		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func TestSetMinRaisesAndLowersTheFloor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{}, 16)
+	busy := make(chan struct{})
+	var launches int32
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		// The first runner takes a job and keeps it; the rest stay idle.
+		if atomic.AddInt32(&launches, 1) == 1 {
+			onBusy()
+			entered <- struct{}{}
+			<-busy
+			return nil
+		}
+		entered <- struct{}{}
+		<-vmCtx.Done()
+		return nil
+	})
+	s := New(Options{Max: 6, Min: 0, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+	defer func() { close(busy); cancel(); s.Drain() }()
+
+	// One job; no floor yet.
+	startIdle(t, ctx, s, entered, 1)
+
+	// A window opens: 3 hot runners on top of the job.
+	s.SetMin(ctx, 3)
+	waitEntered(t, entered, 3)
+	waitRunning(t, s, 4)
+	if s.Min() != 3 {
+		t.Fatalf("Min = %d", s.Min())
+	}
+	// The next message still counts one job; the floor stays added.
+	s.Reconcile(ctx, 1)
+	waitRunning(t, s, 4)
+
+	// The window closes: the idle hot runners go, the busy one stays.
+	s.SetMin(ctx, 0)
+	waitRunning(t, s, 1)
+	if got := atomic.LoadInt32(&launches); got != 4 {
+		t.Fatalf("launches = %d, want 4", got)
+	}
+}
+
+func TestSetMinBeforeAnyMessage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{}, 8)
+	s := New(Options{Max: 4, Min: 0, Provisioner: idleProv(entered), JIT: &jitSeq{}, Logger: testLogger()})
+	defer func() { cancel(); s.Drain() }()
+	s.SetMin(ctx, 2)
+	waitEntered(t, entered, 2)
+	waitRunning(t, s, 2)
+	// Without a desired count to re-plan, lowering only moves the floor;
+	// the next message scales down.
+	s.SetMin(ctx, 0)
+	s.Reconcile(ctx, 0)
+	waitRunning(t, s, 0)
+}
+
+func waitEntered(t *testing.T, entered <-chan struct{}, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%d of %d launches entered the provisioner", i, n)
 		}
 	}
 }

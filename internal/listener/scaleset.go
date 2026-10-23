@@ -27,7 +27,6 @@ type Config struct {
 	RunnerGroup string
 	Labels      []string
 	MaxRunners  int
-	MinRunners  int
 
 	// Auth: a personal access token, or a GitHub App (preferred, per GitHub).
 	Token string
@@ -362,7 +361,6 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		onJobStarted: s.cfg.OnJobStarted,
 		onBusy:       onBusy,
 		onCompleted:  onCompleted,
-		minRunners:   s.cfg.MinRunners,
 		maxRunners:   s.cfg.MaxRunners,
 		log:          s.log,
 	}
@@ -545,7 +543,6 @@ type scaler struct {
 	onCompleted  CompletedFunc
 	capacity     CapacityFunc
 	setCapacity  func(int)
-	minRunners   int
 	maxRunners   int
 	log          *slog.Logger
 	lastAdvert   int
@@ -554,8 +551,8 @@ type scaler struct {
 var _ sslistener.Scaler = (*scaler)(nil)
 
 func (a *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
-	desired := a.minRunners + count
-	running := a.onDesired(ctx, desired)
+	// The scheduler adds its warm-runner floor to GitHub's count itself.
+	running := a.onDesired(ctx, count)
 	a.advertiseCapacity()
 	return running, nil
 }

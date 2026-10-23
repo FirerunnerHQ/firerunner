@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 	"github.com/solcreek/firerunner/internal/health"
 	"github.com/solcreek/firerunner/internal/listener"
 	"github.com/solcreek/firerunner/internal/provisioner"
+	"github.com/solcreek/firerunner/internal/schedule"
 	"github.com/solcreek/firerunner/internal/scheduler"
 )
 
@@ -285,8 +287,19 @@ func TestPooledTiers(t *testing.T) {
 		{Name: "fc"},
 		{Name: "cold", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{}},
 		{Name: "pooled", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{Pool: 2}},
+		{Name: "scheduled", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{},
+			Schedule: mustSchedule(t, `{"timezone":"UTC","windows":[{"days":"daily","hours":"06:00-07:00","pool":3}]}`)},
 	})
-	if len(got) != 1 || !got["pooled"] {
-		t.Fatalf("pooledTiers = %v, want only the tier with a pool", got)
+	if len(got) != 2 || !got["pooled"] || !got["scheduled"] {
+		t.Fatalf("pooledTiers = %v, want the tiers that keep a pool at some time", got)
 	}
+}
+
+func mustSchedule(t *testing.T, js string) *schedule.Schedule {
+	t.Helper()
+	var s schedule.Schedule
+	if err := json.Unmarshal([]byte(js), &s); err != nil {
+		t.Fatal(err)
+	}
+	return &s
 }

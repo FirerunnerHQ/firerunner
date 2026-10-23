@@ -39,6 +39,7 @@ import (
 	"github.com/solcreek/firerunner/internal/listener"
 	"github.com/solcreek/firerunner/internal/provisioner"
 	"github.com/solcreek/firerunner/internal/reconcile"
+	"github.com/solcreek/firerunner/internal/schedule"
 	"github.com/solcreek/firerunner/internal/scheduler"
 )
 
@@ -393,12 +394,28 @@ func reaperOptions(cfg *config.Config, owner string, tiers []config.Tier, listen
 	}
 }
 
-// pooledTiers names the EC2 tiers that keep a stopped pool: the reaper leaves
-// their ready and warming instances to the pool.
+// scheduleTarget is what a tier's schedule resizes: its stopped pool, if it
+// keeps one, then the hot runners the scheduler keeps beside GitHub's jobs.
+func scheduleTarget(sched *scheduler.Scheduler, prov provisioner.Provisioner, tracker *health.Tracker) schedule.Target {
+	t := schedule.Target{
+		SetMin: sched.SetMin,
+		Applied: func(s schedule.Sizes) {
+			tracker.SetSizes(health.Sizes{Min: s.Min, Pool: s.Pool, Window: s.Window, Since: time.Now()})
+		},
+	}
+	if p, ok := prov.(interface{ Pool() *ec2.Pool }); ok && p.Pool() != nil {
+		t.SetPool = p.Pool().SetTarget
+	}
+	return t
+}
+
+// pooledTiers names the EC2 tiers that keep a stopped pool at some time of
+// their schedule: the reaper leaves their ready and warming instances to the
+// pool, which trims itself when its window closes.
 func pooledTiers(tiers []config.Tier) map[string]bool {
 	pooled := map[string]bool{}
 	for _, t := range tiers {
-		if t.IsEC2() && t.EC2.Pool > 0 {
+		if t.IsEC2() && t.MaxPool() > 0 {
 			pooled[t.Name] = true
 		}
 	}
@@ -585,10 +602,15 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		ec2Client = client
 		newEC2 = func(t config.Tier) provisioner.Provisioner {
+			// A scheduled pool starts at the current window's size; the
+			// schedule follower resizes it from there.
+			e := *t.EC2
+			e.Pool = t.SizesAt(time.Now()).Pool
 			p := client.Tier(ec2.Options{
 				Tier:        t.Name,
 				Owner:       owner,
-				EC2:         *t.EC2,
+				EC2:         e,
+				Pooled:      t.MaxPool() > 0,
 				JIT:         jit,
 				JITURL:      jitserver.URL(cfg.JITEndpoint()),
 				MaxLifetime: cfg.Firecracker.MaxVMLifetime,
@@ -642,7 +664,6 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			RunnerGroup:  cfg.RunnerGroup,
 			Labels:       t.Labels,
 			MaxRunners:   t.Max,
-			MinRunners:   t.Min,
 			Token:        cfg.Token,
 			App:          app,
 			Version:      version,
@@ -656,7 +677,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		jit := lis.JIT()
 		scheds = append(scheds, scheduler.New(scheduler.Options{
 			Max:         t.Max,
-			Min:         t.Min,
+			Min:         t.SizesAt(time.Now()).Min,
 			Spec:        t.Spec(),
 			Provisioner: provs[i],
 			JIT:         jit,
@@ -728,7 +749,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	runs := make([]func(context.Context) error, len(listeners))
 	for i := range listeners {
-		lis, sched, tracker := listeners[i], scheds[i], trackers[i]
+		lis, sched, tracker, prov := listeners[i], scheds[i], trackers[i], provs[i]
 		// tierCtx is this tier's own lifetime (see serveTiers): launches, the
 		// re-plan after a runner exits and the warm-pool top-up bind to it,
 		// so a tier that stops cancels its idle runners and stops launching,
@@ -747,6 +768,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			go reconcile.New(statsSource{lis}, sched, jit.Exists, reconcile.Options{
 				Health: tracker, Logger: log.With("tier", tiers[i].Name, "component", "reconcile"),
 			}).Run(tierCtx)
+			if tiers[i].Schedule != nil {
+				go schedule.Follow(tierCtx, tiers[i].SizesAt, scheduleTarget(sched, prov, tracker),
+					30*time.Second, nil, log.With("tier", tiers[i].Name, "component", "schedule"))
+			}
 			return lis.Run(tierCtx, onDesired, onBusy, onCompleted, capacity)
 		}
 	}

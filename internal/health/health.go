@@ -51,6 +51,18 @@ type Tier struct {
 	// LostRunners counts runners cancelled because GitHub no longer listed
 	// them.
 	LostRunners int `json:"lost_runners,omitempty"`
+	// Sizes are the hot runners and pool size the tier's schedule set last;
+	// nil for a tier without a schedule.
+	Sizes *Sizes `json:"sizes,omitempty"`
+}
+
+// Sizes are a scheduled tier's current sizes and the window that set them
+// (empty: outside every window, at the tier's base sizes).
+type Sizes struct {
+	Min    int       `json:"min"`
+	Pool   int       `json:"pool"`
+	Window string    `json:"window,omitempty"`
+	Since  time.Time `json:"since"`
 }
 
 // GitHubStats is a scale set's statistics as GitHub reported them.
@@ -137,6 +149,13 @@ func (tr *Tracker) SetDrift(d string) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	tr.t.Drift = d
+}
+
+// SetSizes records the sizes a schedule applied.
+func (tr *Tracker) SetSizes(sz Sizes) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.t.Sizes = &sz
 }
 
 // Recycled counts a session recycled by the reconciler.
