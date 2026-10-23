@@ -372,10 +372,11 @@ starts one in seconds:
   runner's files, so EBS has fetched their blocks from the snapshot, then powers
   off. Spot pools use persistent requests that stop on interruption, and are
   still billed at the spot price. A stopped instance costs only its EBS volume.
-- **Claim.** A job takes a ready instance. firerunner tags it, cancels its spot
-  request (or AWS would replace it after terminate), writes the JIT endpoint
-  into its user-data, and starts it. When the job ends the instance stops, and
-  firerunner terminates it.
+- **Claim.** A job takes a ready instance. firerunner tags it, writes the JIT
+  endpoint into its user-data, and starts it. Then it cancels the spot request,
+  or AWS would replace the instance after terminate. The order matters: AWS
+  will not start a stopped spot instance whose request is already cancelled.
+  When the job ends the instance stops, and firerunner terminates it.
 - **Refill and restart.** The pool refills in the background. Its state lives
   in the `firerunner:pool` tag, so a restarted firerunner finds its ready
   instances again and terminates any a crash left mid-claim.

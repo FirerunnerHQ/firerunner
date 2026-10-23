@@ -61,6 +61,11 @@ type fakeEC2 struct {
 	startErr  error
 	started   []string
 	cancelled map[string]bool // spot request ID -> cancelled
+	// cancelErrs fails this many CancelSpotInstanceRequests calls first.
+	cancelErrs int
+	// termBeforeCancel records terminates of an instance whose persistent
+	// request was still open: AWS would launch a replacement.
+	termBeforeCancel []string
 }
 
 func newFakeEC2() *fakeEC2 {
@@ -194,6 +199,11 @@ func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput,
 		if !ok || i.state != types.InstanceStateNameStopped {
 			return nil, apiErr("IncorrectInstanceState")
 		}
+		// As on AWS: a stopped spot instance whose request was cancelled
+		// can never be started again.
+		if i.spotReq != "" && f.cancelled[i.spotReq] {
+			return nil, apiErr("IncorrectSpotRequestState")
+		}
 		i.state = types.InstanceStateNamePending
 		f.started = append(f.started, id)
 	}
@@ -233,6 +243,10 @@ func (f *fakeEC2) CreateTags(_ context.Context, in *ec2.CreateTagsInput, _ ...fu
 func (f *fakeEC2) CancelSpotInstanceRequests(_ context.Context, in *ec2.CancelSpotInstanceRequestsInput, _ ...func(*ec2.Options)) (*ec2.CancelSpotInstanceRequestsOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.cancelErrs > 0 {
+		f.cancelErrs--
+		return nil, apiErr("RequestLimitExceeded")
+	}
 	for _, id := range in.SpotInstanceRequestIds {
 		f.cancelled[id] = true
 	}
@@ -310,6 +324,9 @@ func (f *fakeEC2) TerminateInstances(_ context.Context, in *ec2.TerminateInstanc
 		return nil, f.terminateErr
 	}
 	for _, id := range in.InstanceIds {
+		if i, ok := f.instances[id]; ok && i.spotReq != "" && !f.cancelled[i.spotReq] && i.tags[TagPool] == PoolClaimed {
+			f.termBeforeCancel = append(f.termBeforeCancel, id)
+		}
 		f.terminated = append(f.terminated, id)
 		if i, ok := f.instances[id]; ok && i.state != types.InstanceStateNameTerminated {
 			i.state = types.InstanceStateNameShuttingDown

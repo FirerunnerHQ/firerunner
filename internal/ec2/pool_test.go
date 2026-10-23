@@ -286,3 +286,34 @@ func TestPool_ClaimDiscardsAnUnpreparableInstance(t *testing.T) {
 		t.Fatalf("claim on an empty pool = %v", err)
 	}
 }
+
+func TestLaunch_SpotCancelRetriedBeforeTerminate(t *testing.T) {
+	// The cancel after the start fails: the request must still be cancelled
+	// before the instance is terminated, or AWS would replace it.
+	h := poolHarness(t, 1, config.MarketSpot)
+	h.runPool(t)
+	eventually(t, "a warming instance", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
+	h.stopWarming()
+	eventually(t, "a ready instance", func() bool { r, _ := h.p.pool.Ready(); return r == 1 })
+	id := h.f.launched()[0].id
+	h.f.mu.Lock()
+	h.f.cancelErrs = 1
+	h.f.mu.Unlock()
+
+	errc := h.launch(context.Background())
+	eventually(t, "the start", func() bool { h.f.mu.Lock(); defer h.f.mu.Unlock(); return len(h.f.started) == 1 })
+	h.f.setState(id, types.InstanceStateNameRunning)
+	time.Sleep(20 * time.Millisecond)
+	h.f.setState(id, types.InstanceStateNameStopped) // the job ends
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+	h.f.mu.Lock()
+	defer h.f.mu.Unlock()
+	if len(h.f.termBeforeCancel) != 0 {
+		t.Fatalf("terminated %v while its spot request was open", h.f.termBeforeCancel)
+	}
+	if !h.f.cancelled[h.f.instances[id].spotReq] {
+		t.Fatal("the spot request was never cancelled")
+	}
+}

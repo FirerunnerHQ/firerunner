@@ -196,18 +196,30 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string) error 
 	claimed := time.Now()
 	if _, err := p.c.api.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{in.id}}); err != nil {
 		// A stopped spot instance can lack capacity to start again.
-		p.pool.discard(context.WithoutCancel(ctx), in.id, "")
+		p.pool.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
 		return fmt.Errorf("%w: start %s: %w", errPoolStart, in.id, err)
+	}
+	started := time.Now()
+	// Now that it runs, release the persistent request: a terminate later
+	// must not bring a replacement. (Cancelling it before the start would
+	// make the start fail.) If this fails, terminate retries it first.
+	spotReq := in.spotReq
+	if spotReq != "" {
+		if err := p.pool.cancelSpot(context.WithoutCancel(ctx), spotReq); err != nil {
+			log.Warn("cancel spot request; retrying before terminate", "request", spotReq, "err", err)
+		} else {
+			spotReq = ""
+		}
 	}
 	log.Info("pool instance started",
 		"claim", claimed.Sub(entered).Round(time.Millisecond),
-		"startInstances", time.Since(claimed).Round(time.Millisecond))
+		"startInstances", started.Sub(claimed).Round(time.Millisecond))
 
 	states, stopWatch := p.c.watch.watch(in.id)
 	defer stopWatch()
 	// Until it is seen running, a "stopped" state is the instance before
 	// the start took effect, not its job ending.
-	w := &waiter{p: p, id: in.id, log: log, states: states, awaitStart: true}
+	w := &waiter{p: p, id: in.id, log: log, states: states, awaitStart: true, spotReq: spotReq}
 	return w.run(ctx, ip)
 }
 
@@ -224,6 +236,9 @@ type waiter struct {
 	// awaitStart is set for a pool instance started from stopped: stop
 	// states are ignored until the instance has been seen running.
 	awaitStart bool
+	// spotReq is a persistent spot request still to cancel before the
+	// instance may be terminated.
+	spotReq string
 }
 
 // run waits for the instance to finish its job, terminating it when ctx is
@@ -291,6 +306,15 @@ func (w *waiter) terminate(ctx context.Context, reason string) {
 		w.log.Info("terminating instance", "reason", reason)
 	}
 	w.termLast = now
+	if w.spotReq != "" {
+		// An open persistent request would replace the instance after the
+		// terminate; it must be cancelled first.
+		if _, err := w.p.c.api.CancelSpotInstanceRequests(ctx, &ec2.CancelSpotInstanceRequestsInput{SpotInstanceRequestIds: []string{w.spotReq}}); err != nil {
+			w.log.Warn("cancel spot request before terminate", "request", w.spotReq, "err", err)
+			return
+		}
+		w.spotReq = ""
+	}
 	if _, err := w.p.c.api.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{w.id}}); err != nil {
 		w.log.Warn("terminate instance", "err", err)
 	}

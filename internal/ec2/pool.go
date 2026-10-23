@@ -25,9 +25,11 @@ import (
 // instance stays on a persistent request, still billed at the spot price
 // while running. A job claims a ready instance:
 //   - tag it claimed;
-//   - cancel its spot request, or AWS would replace it after terminate;
 //   - write the JIT endpoint into its user-data;
-//   - start it.
+//   - start it;
+//   - then cancel its spot request, or AWS would replace the instance after
+//     terminate. The order matters: AWS refuses to start a stopped spot
+//     instance whose request is already cancelled.
 //
 // From then on it is an ordinary job instance, terminated when it stops.
 //
@@ -229,9 +231,9 @@ func (pl *Pool) failed(err error) {
 var errPoolEmpty = errors.New("no ready pool instance")
 
 // claim takes a ready instance for the runner and prepares it to start: it is
-// tagged claimed, its spot request is cancelled, and the JIT endpoint is
-// written into its user-data. An instance that cannot be prepared is
-// terminated and the next one is tried.
+// tagged claimed and the JIT endpoint is written into its user-data. Its spot
+// request stays open until it has started (see cancelSpot). An instance that
+// cannot be prepared is terminated and the next one is tried.
 func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 	defer pl.poke() // refill behind the claim
 	for {
@@ -264,15 +266,6 @@ func (pl *Pool) prepare(ctx context.Context, in pooled, runner string) error {
 	}); err != nil {
 		return fmt.Errorf("tag claimed: %w", err)
 	}
-	if in.spotReq != "" {
-		// Cancelled before start: otherwise, once the job's instance is
-		// terminated, the persistent request launches a replacement.
-		if _, err := api.CancelSpotInstanceRequests(ctx, &ec2.CancelSpotInstanceRequestsInput{
-			SpotInstanceRequestIds: []string{in.spotReq},
-		}); err != nil {
-			return fmt.Errorf("cancel spot request %s: %w", in.spotReq, err)
-		}
-	}
 	if _, err := api.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
 		InstanceId: aws.String(in.id),
 		UserData:   &types.SecureBlobAttributeValue{Value: []byte(jitserver.UserData(pl.p.o.JITURL))},
@@ -280,6 +273,14 @@ func (pl *Pool) prepare(ctx context.Context, in pooled, runner string) error {
 		return fmt.Errorf("set user-data: %w", err)
 	}
 	return nil
+}
+
+// cancelSpot cancels a persistent spot request, so terminating its instance
+// does not make AWS launch a replacement. Cancelling an already cancelled
+// request succeeds.
+func (pl *Pool) cancelSpot(ctx context.Context, req string) error {
+	_, err := pl.p.c.api.CancelSpotInstanceRequests(ctx, &ec2.CancelSpotInstanceRequestsInput{SpotInstanceRequestIds: []string{req}})
+	return err
 }
 
 // discard cancels an instance's spot request, if any, then terminates it.
