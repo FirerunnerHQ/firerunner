@@ -111,6 +111,8 @@ jobs:
         run: scripts/test-mutate.sh
       - name: Test stacked-PR merge script
         run: scripts/test-merge-stack.sh
+      - name: Test PR wait script
+        run: scripts/test-pr-wait.sh && shellcheck scripts/pr-wait.sh scripts/test-pr-wait.sh
       - name: Test e2e harness
         run: scripts/e2e/test-e2e.sh && shellcheck -x scripts/e2e/*.sh
       - name: Test dev environment scripts and git hooks
