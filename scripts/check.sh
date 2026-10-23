@@ -112,14 +112,17 @@ step ec2-ami-build images/test-build-ec2-ami.sh
 step mutate-script scripts/test-mutate.sh
 if command -v jq >/dev/null; then
 	step merge-stack scripts/test-merge-stack.sh
+	step e2e-harness scripts/e2e/test-e2e.sh
 else
 	skip merge-stack "jq not installed"
+	skip e2e-harness "jq not installed"
 fi
 if command -v shellcheck >/dev/null; then
 	step shellcheck shellcheck images/assets/firerunner-ec2-run.sh images/test-ec2-run.sh \
 		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh scripts/check.sh \
 		scripts/mutate.sh scripts/test-mutate.sh \
 		scripts/merge-stack.sh scripts/test-merge-stack.sh
+	step shellcheck-e2e shellcheck -x scripts/e2e/*.sh
 else
 	skip shellcheck "shellcheck not installed"
 fi
