@@ -102,8 +102,11 @@ jobs:
         run: images/test-ec2-run.sh
       - name: Test EC2 AMI build script
         run: images/test-build-ec2-ami.sh
-      - name: Test control VM bootstrap
-        run: deploy/aws/test-control-bootstrap.sh && shellcheck deploy/aws/*.sh scripts/release-build.sh
+      - name: Test control plane deploy scripts
+        run: |
+          deploy/aws/test-control-bootstrap.sh
+          deploy/aws/test-deploy-control.sh
+          shellcheck deploy/aws/*.sh scripts/release-build.sh
       - name: Test mutation script
         run: scripts/test-mutate.sh
       - name: Test stacked-PR merge script
