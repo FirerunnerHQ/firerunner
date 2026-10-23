@@ -831,3 +831,18 @@ func TestParse_NeverEchoesCredentials(t *testing.T) {
 		t.Fatalf("flag override: %q %v", c.Token, err)
 	}
 }
+
+func TestFromFlags_EC2Reaper(t *testing.T) {
+	c, err := FromFlags(baseArgs())
+	if err != nil || c.EC2Reaper != "on" {
+		t.Fatalf("default = %q, %v; want on", c.EC2Reaper, err)
+	}
+	for _, v := range []string{"dry-run", "off"} {
+		if c, err := FromFlags(append(baseArgs(), "--ec2-reaper", v)); err != nil || c.EC2Reaper != v {
+			t.Fatalf("%s: %q, %v", v, c.EC2Reaper, err)
+		}
+	}
+	if _, err := FromFlags(append(baseArgs(), "--ec2-reaper", "maybe")); err == nil {
+		t.Fatal("accepted --ec2-reaper maybe")
+	}
+}

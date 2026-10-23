@@ -350,6 +350,37 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 	return nil
 }
 
+// reaperOptions configures the EC2 reaper for this install: which tiers keep
+// a pool, how to deregister each tier's runners, and the lifetime backstop.
+func reaperOptions(cfg *config.Config, owner string, tiers []config.Tier, listeners []*listener.ScaleSet, log *slog.Logger) ec2.ReaperOptions {
+	pooled := map[string]bool{}
+	removers := map[string]*listener.JITSource{}
+	for i, t := range tiers {
+		if t.IsEC2() {
+			removers[t.Name] = listeners[i].JIT()
+			if t.EC2.Pool > 0 {
+				pooled[t.Name] = true
+			}
+		}
+	}
+	return ec2.ReaperOptions{
+		Owner:       owner,
+		PooledTiers: pooled,
+		Remove: func(ctx context.Context, tier, runner string) error {
+			jit, ok := removers[tier]
+			if !ok {
+				// A tier no longer configured: its runner cannot be asked
+				// about; the lifetime backstop ends the instance.
+				return fmt.Errorf("tier %q is not configured", tier)
+			}
+			return jit.RemoveRunner(ctx, runner)
+		},
+		MaxLifetime: cfg.Firecracker.MaxVMLifetime,
+		DryRun:      cfg.EC2Reaper == "dry-run",
+		Logger:      log,
+	}
+}
+
 // statsSource adapts a listener to the reconciler.
 type statsSource struct{ lis *listener.ScaleSet }
 
@@ -504,7 +535,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if cfg.UsesFirecracker() {
 		fc = provisioner.NewFirecracker(cfg.Firecracker, log)
 	}
-	var newEC2 func(config.Tier) provisioner.Provisioner
+	var (
+		newEC2    func(config.Tier) provisioner.Provisioner
+		ec2Client *ec2.Client
+	)
 	if cfg.UsesEC2() {
 		jit, stopJIT, err := serveJIT(ctx, cfg, log)
 		if err != nil {
@@ -517,6 +551,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		ec2Client = client
 		newEC2 = func(t config.Tier) provisioner.Provisioner {
 			p := client.Tier(ec2.Options{
 				Tier:        t.Name,
@@ -599,6 +634,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}))
 	}
 	defer closeAll()
+
+	if ec2Client != nil && cfg.EC2Reaper != "off" {
+		go ec2Client.NewReaper(reaperOptions(cfg, owner, tiers, listeners, log)).Run(ctx)
+	}
 
 	log.Info("firerunner starting",
 		"url", cfg.URL,

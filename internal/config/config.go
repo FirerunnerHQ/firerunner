@@ -58,6 +58,9 @@ type Config struct {
 	// how long a config waits to be fetched.
 	JITAddr string
 	JITTTL  time.Duration
+	// EC2Reaper is "on", "dry-run" or "off": whether instances and spot
+	// requests this install left behind are cleaned up.
+	EC2Reaper string
 	// AWSRegion is the region EC2 tiers launch in; empty uses the SDK's
 	// sources (env, shared config, then IMDS on the control VM).
 	AWSRegion string
@@ -269,6 +272,7 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.JITAddr, "jit-addr", env("FR_JIT_ADDR", ""), "VPC IP:port where EC2 runner instances fetch their JIT config, served once to each instance's private IP so no secret goes into user-data (e.g. 10.0.0.5:8098); required with an ec2 tier. Bind the control VM's VPC address, never a public one")
 	fs.StringVar(&c.AWSRegion, "aws-region", env("FR_AWS_REGION", ""), "AWS region for ec2 tiers; defaults to AWS_REGION/shared config, then the control VM's own region from IMDS")
 	fs.DurationVar(&c.JITTTL, "jit-ttl", er.duration("FR_JIT_TTL", 5*time.Minute), "how long an EC2 instance's JIT config waits to be fetched before it expires")
+	fs.StringVar(&c.EC2Reaper, "ec2-reaper", env("FR_EC2_REAPER", "on"), "clean up EC2 instances and spot requests this install left behind (after a crash or restart): on, dry-run (log only), or off")
 
 	var egress, dnsServers string
 	var metaRefresh time.Duration
@@ -423,6 +427,11 @@ func (c *Config) validate() error {
 	}
 	if err := c.validateJIT(); err != nil {
 		return err
+	}
+	switch c.EC2Reaper {
+	case "on", "dry-run", "off":
+	default:
+		return fmt.Errorf("--ec2-reaper %q must be on, dry-run or off", c.EC2Reaper)
 	}
 	if c.Firecracker.ToolCacheImage != "" {
 		if _, err := os.Stat(c.Firecracker.ToolCacheImage); err != nil {

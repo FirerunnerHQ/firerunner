@@ -383,10 +383,22 @@ starts one in seconds:
 - **Fallback.** With the pool empty, or if a stopped instance cannot start
   (spot capacity), the job cold-launches instead.
 
-> **No sweep of leftovers yet.** firerunner follows only the instances it
-> launched in its current process. Instances still running after a crash or
-> restart, or ones whose termination kept failing, must be terminated by hand
-> until the reaper lands. Find them by the `firerunner:owner` tag.
+**Cleaning up after a crash (`--ec2-reaper`).** A reaper sweeps this host's
+`firerunner:owner` instances at startup and every 5 minutes. It skips what the
+running process tracks, and anything younger than 2 minutes.
+
+- **A job instance left stopped:** firerunner cancels its spot request and
+  terminates it.
+- **A job instance still running:** firerunner asks GitHub to deregister its
+  runner. If GitHub agrees, the runner had no job and the instance is
+  terminated. If the runner is busy, its job is left to finish; it powers off,
+  and the next sweep ends it. Past `--max-vm-lifetime`, it is terminated
+  regardless.
+- **A pool instance of a tier that no longer keeps a pool:** terminated.
+- **A persistent spot request whose instance is gone:** cancelled.
+
+Use `--ec2-reaper dry-run` to only log what it would do, or `off` to disable it.
+No instance is terminated while its spot request may still be open.
 
 When a type has no capacity in a subnet, firerunner tries the next subnet, then
 the next type: `InsufficientInstanceCapacity`, `Unsupported` and
@@ -413,7 +425,7 @@ the runners get no role:
       "Action": ["ec2:RunInstances", "ec2:CreateTags"],
       "Resource": "*" },
     { "Effect": "Allow",
-      "Action": ["ec2:DescribeInstances", "ec2:DescribeImages"],
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeSpotInstanceRequests"],
       "Resource": "*" },
     { "Effect": "Allow",
       "Action": ["ec2:TerminateInstances", "ec2:StartInstances", "ec2:ModifyInstanceAttribute"],

@@ -256,3 +256,22 @@ func TestTierPending(t *testing.T) {
 		t.Fatal("an ec2 tier must not share the firecracker tiers' pending counter")
 	}
 }
+
+func TestReaperOptions(t *testing.T) {
+	cfg := &config.Config{EC2Reaper: "dry-run"}
+	cfg.Firecracker.MaxVMLifetime = 6 * time.Hour
+	tiers := []config.Tier{
+		{Name: "fc"},
+		{Name: "cold", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{}},
+		{Name: "pooled", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{Pool: 2}},
+	}
+	// Only the Firecracker tier: building an ec2 tier's remover needs a live
+	// listener. The fields and the unknown-tier path are what is checked.
+	o := reaperOptions(cfg, "me", tiers[:1], []*listener.ScaleSet{nil}, slog.New(slog.DiscardHandler))
+	if o.Owner != "me" || !o.DryRun || o.MaxLifetime != 6*time.Hour || len(o.PooledTiers) != 0 {
+		t.Fatalf("options = %+v", o)
+	}
+	if err := o.Remove(context.Background(), "gone-tier", "r"); err == nil {
+		t.Fatal("removing a runner of an unconfigured tier must fail, not succeed")
+	}
+}
