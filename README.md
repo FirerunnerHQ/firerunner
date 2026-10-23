@@ -383,6 +383,32 @@ starts one in seconds:
 - **Fallback.** With the pool empty, or if a stopped instance cannot start
   (spot capacity), the job cold-launches instead.
 
+**Sizing by schedule (`"schedule"`).** A tier can keep more hot runners
+(`min`) and a bigger stopped pool at busy times. It works on any tier;
+`pool` needs an EC2 tier.
+
+```json
+{"name": "cloud", "provisioner": "ec2", "min": 0, "max": 20,
+ "ec2": {"pool": 2, "...": "..."},
+ "schedule": {"timezone": "Asia/Taipei", "windows": [
+   {"days": "mon-fri", "hours": "06:00-13:00", "min": 2, "pool": 12},
+   {"days": "mon-fri", "hours": "20:00-23:00", "min": 2, "pool": 12}]}}
+```
+
+- **Windows.** The first window covering the current time sets `min` and
+  `pool`. Outside every window, the tier keeps its own `min` and `ec2.pool`.
+- **Days** are `daily` or a list such as `mon-fri` or `sat,sun`.
+- **Hours** are `HH:MM-HH:MM`, with the end exclusive. A window that ends at
+  or before its start runs past midnight and belongs to the day it starts on.
+- **Applying changes.** firerunner checks every 30 s and logs each change.
+  `status` shows the current window.
+- **Shrinking** terminates stopped pool instances first, then idle hot
+  runners. A runner with a job is never stopped.
+- **Validation.** `firerunner config check` rejects:
+  - a window `min` above the tier's `max`;
+  - a `pool` on a Firecracker tier;
+  - Firecracker tiers whose largest window `min`s sum above `--max-runners`.
+
 **Cleaning up after a crash (`--ec2-reaper`).** A reaper sweeps this host's
 `firerunner:owner` instances at startup and every 5 minutes. It skips what the
 running process tracks, and anything younger than 2 minutes.
