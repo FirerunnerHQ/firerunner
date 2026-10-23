@@ -128,6 +128,7 @@ run
 expect "no user-data: runner not started" "runner ran" lacks runner-argv
 expect "no user-data: powers off" "no poweroff" has poweroff
 expect "no user-data: no jit request" "jit requests=$(jit_requests)" [ "$(jit_requests)" = 0 ]
+expect "no user-data: warms the runner's files" "$(cat "$STATE/stderr")" grep -q "warm-up boot" "$STATE/stderr"
 
 # 3. 404: the config was already claimed or expired. Give up at once rather
 #    than retrying forever.
