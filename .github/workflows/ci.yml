@@ -104,7 +104,9 @@ jobs:
           go-version-file: go.mod
           check-latest: true
       - name: Install nftables
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+        run: |
+          if command -v nft >/dev/null; then nft --version; exit 0; fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq nftables
       - name: Identity records readable but not writable by a separate UID
         run: |
           go test -c -o /tmp/fr-identity.test ./internal/jobidentity
