@@ -7,7 +7,7 @@ and `gh` calls such a check needs, with deadlines, so a person or an agent
 gets an answer, not a hung terminal.
 
 **These touch real resources.** `dispatch-and-measure.sh` starts workflow runs,
-which launch billable runner instances. `remote-exec.sh` runs commands as root on
+which launch billable runner instances, and so does `lifecycle.sh` without `--run`. `remote-exec.sh` runs commands as root on
 an instance. The others only read.
 
 | script | does |
@@ -17,6 +17,7 @@ an instance. The others only read.
 | `console.sh [INSTANCE] [-n LINES]` | prints the tail of an instance's serial console |
 | `watch-run.sh RUN_ID` | waits for a workflow run and fails as soon as a job fails or none starts |
 | `dispatch-and-measure.sh [WORKFLOW] N [-f K=V]…` | dispatches N runs and reports each job's queue and run seconds |
+| `lifecycle.sh [WORKFLOW] N` or `--run RUN_ID…` | each job's runner instance from launch to terminated, sampled every `-i` seconds (1), e.g. job end to shutting-down |
 
 Each script has `--help`. Exit statuses are shared: 0 success, 1 the thing
 under test failed, 2 usage or configuration, 3 no job started in time, 124 a
