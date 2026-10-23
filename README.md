@@ -437,7 +437,9 @@ VM's group must allow TCP to the `--jit-addr` port **from the runners' group
 only**. Never expose that port publicly.
 
 **Verifying a deployment end to end.** These steps create real, billable
-resources:
+resources. [`scripts/e2e/`](scripts/e2e/README.md) has tested helpers for them:
+remote commands on the control VM, instance consoles, and run watching and
+timing with deadlines.
 
 1. Build the runner AMI with `firerunner-ec2-runner.service` enabled, and
    publish its ID to the SSM parameter.

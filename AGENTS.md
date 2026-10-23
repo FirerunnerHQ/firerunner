@@ -127,6 +127,7 @@ The usual dev box is macOS with zsh; much of the code and CI is Linux.
 | `internal/health` | per-tier listener state, published for `status`/`doctor` |
 | `internal/diag` | `status` and `doctor` |
 | `images/` | guest images, boot scripts and their tests |
+| `scripts/e2e/` | helpers for end-to-end checks against a real deployment (SSM exec, console, run watch and timing) |
 
 ## Operating a deployment
 
