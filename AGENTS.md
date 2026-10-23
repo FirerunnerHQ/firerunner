@@ -39,8 +39,11 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
   relevant lines, the reviews and every unresolved review thread, as JSON
   lines; exit 0 means green with no open thread. See its `--help`.
 - Merge with a merge commit: `gh pr merge --auto --merge --delete-branch`.
-  `main` requires no status check yet, so `--auto` merges at once rather than
-  waiting: run `scripts/pr-wait.sh` first.
+  `--auto` waits for the six checks the ruleset "main: required CI checks"
+  requires (`test`, `build`, `shell`, `netns`, `cache-protocol`,
+  `sign-off`). Renaming one of those jobs needs the ruleset updated in the
+  same PR, or every PR waits forever. `pr-wait.sh` still shows why a PR is
+  not merging: failed logs and open threads.
 - **Review gate.** A PR touching cost or security code (`internal/scheduler`,
   `ec2`, `jitserver`, `listener`, `cacheserver`, `jobidentity`, or the egress
   firewall in `internal/provisioner/egress*.go`) gets an independent review
