@@ -20,6 +20,7 @@ import (
 
 	"github.com/solcreek/firerunner/internal/core"
 	"github.com/solcreek/firerunner/internal/provisioner"
+	"github.com/solcreek/firerunner/internal/schedule"
 )
 
 // Config is the fully-resolved firerunner configuration.
@@ -124,6 +125,45 @@ type Tier struct {
 	EC2 *EC2Tier `json:"ec2,omitempty"`
 	Min int      `json:"min"`
 	Max int      `json:"max"`
+	// Schedule, when set, replaces Min (and ec2.pool) during its windows;
+	// outside them the tier keeps Min and ec2.pool.
+	Schedule *schedule.Schedule `json:"schedule,omitempty"`
+}
+
+// BaseSizes are the tier's sizes outside every schedule window.
+func (t Tier) BaseSizes() schedule.Sizes {
+	s := schedule.Sizes{Min: t.Min}
+	if t.EC2 != nil {
+		s.Pool = t.EC2.Pool
+	}
+	return s
+}
+
+// SizesAt returns the tier's hot-runner and pool sizes at a moment.
+func (t Tier) SizesAt(now time.Time) schedule.Sizes {
+	if t.Schedule == nil {
+		return t.BaseSizes()
+	}
+	return t.Schedule.At(now, t.BaseSizes())
+}
+
+// MaxPool is the largest stopped pool the tier ever keeps; 0 means it keeps
+// none.
+func (t Tier) MaxPool() int {
+	n := t.BaseSizes().Pool
+	if t.Schedule != nil {
+		n = max(n, t.Schedule.MaxPool())
+	}
+	return n
+}
+
+// MaxMin is the most hot runners the tier ever keeps.
+func (t Tier) MaxMin() int {
+	n := t.Min
+	if t.Schedule != nil {
+		n = max(n, t.Schedule.MaxMin())
+	}
+	return n
 }
 
 // EC2Tier is the launch template of an EC2 tier: one ephemeral instance per
@@ -533,12 +573,23 @@ func (c *Config) validateTiers() error {
 			return fmt.Errorf("tier %q: min (%d) must not exceed max (%d)", t.Name, t.Min, t.Max)
 		}
 		seen[t.Name] = true
+		if t.Schedule != nil {
+			for _, w := range t.Schedule.Windows {
+				switch {
+				case w.Min > t.Max:
+					return fmt.Errorf("tier %q: schedule window %s %s: min (%d) must not exceed max (%d)", t.Name, w.Days, w.Hours, w.Min, t.Max)
+				case w.Pool > 0 && t.ProvisionerName() != ProvisionerEC2:
+					return fmt.Errorf("tier %q: schedule window %s %s: pool needs an ec2 tier", t.Name, w.Days, w.Hours)
+				}
+			}
+		}
 		switch t.ProvisionerName() {
 		case ProvisionerFirecracker:
 			if err := c.validateFirecrackerTier(t); err != nil {
 				return err
 			}
-			totalMin += t.Min
+			// Windows of different tiers may overlap: budget for the most.
+			totalMin += t.MaxMin()
 		case ProvisionerEC2:
 			if err := validateEC2Tier(t); err != nil {
 				return err

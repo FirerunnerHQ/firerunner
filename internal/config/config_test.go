@@ -857,3 +857,50 @@ func TestFromFlags_Owner(t *testing.T) {
 		}
 	}
 }
+
+func TestTierSchedule(t *testing.T) {
+	ec2 := func(sched string) string {
+		return `[{"name":"cloud","provisioner":"ec2","min":0,"max":4,"schedule":` + sched + `,
+		  "ec2":{"instance_types":["c7a.large"],"ami":"ami-1","subnets":["subnet-a"],"security_groups":["sg-a"],"market":"spot","pool":2}}]`
+	}
+	load := func(body string) (*Config, error) {
+		return FromFlags(append(append(baseArgs(), jitAddr...), "--tiers", writeTiers(t, body)))
+	}
+	c, err := load(ec2(`{"timezone":"UTC","windows":[{"days":"mon-fri","hours":"06:00-13:00","min":2,"pool":12}]}`))
+	if err != nil {
+		t.Fatalf("valid schedule: %v", err)
+	}
+	tier := c.Tiers[0]
+	monday9 := time.Date(2026, 10, 19, 9, 0, 0, 0, time.UTC)
+	if s := tier.SizesAt(monday9); s.Min != 2 || s.Pool != 12 {
+		t.Fatalf("Monday 09:00: %+v, want the window", s)
+	}
+	if s := tier.SizesAt(monday9.Add(6 * time.Hour)); s.Min != 0 || s.Pool != 2 || s.Window != "" {
+		t.Fatalf("Monday 15:00: %+v, want the base", s)
+	}
+	if tier.MaxPool() != 12 || tier.MaxMin() != 2 {
+		t.Fatalf("MaxPool %d MaxMin %d", tier.MaxPool(), tier.MaxMin())
+	}
+
+	for name, body := range map[string]string{
+		"window min over max": ec2(`{"timezone":"UTC","windows":[{"days":"daily","hours":"00:00-01:00","min":5}]}`),
+		"bad window":          ec2(`{"timezone":"UTC","windows":[{"days":"someday","hours":"00:00-01:00"}]}`),
+		"pool on firecracker": `[{"name":"local","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":0,"max":2,
+			"schedule":{"timezone":"UTC","windows":[{"days":"daily","hours":"00:00-01:00","pool":1}]}}]`,
+	} {
+		if _, err := load(body); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+
+	// The shared slot budget counts a Firecracker tier's largest window.
+	fcTier := func(name string) string {
+		return `{"name":"` + name + `","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":0,"max":2,
+		"schedule":{"timezone":"UTC","windows":[{"days":"daily","hours":"00:00-01:00","min":2}]}}`
+	}
+	fc := `[` + fcTier("a") + `,` + fcTier("b") + `]`
+	if _, err := FromFlags(append(baseArgs(), "--tiers", writeTiers(t, fc), "--max-runners", "3")); err == nil ||
+		!strings.Contains(err.Error(), "warm pools sum to 4") {
+		t.Fatalf("budget: err = %v, want the window's min counted", err)
+	}
+}
