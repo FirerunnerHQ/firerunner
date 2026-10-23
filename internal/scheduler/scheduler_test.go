@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/core"
 )
 
 func testLogger() *slog.Logger {

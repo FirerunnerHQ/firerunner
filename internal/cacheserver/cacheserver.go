@@ -70,7 +70,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/jobidentity"
+	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 )
 
 const (

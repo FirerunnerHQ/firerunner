@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/solcreek/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/config"
 )
 
 // The flag package prints every flag's default in -h output and on every

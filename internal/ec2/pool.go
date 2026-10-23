@@ -14,7 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
-	"github.com/solcreek/firerunner/internal/jitserver"
+	"github.com/firerunnerhq/firerunner/internal/jitserver"
 )
 
 // Pool keeps a tier's pre-warmed instances stopped and ready to start.

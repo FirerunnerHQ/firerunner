@@ -10,8 +10,8 @@ import (
 
 	"github.com/actions/scaleset"
 
-	"github.com/solcreek/firerunner/internal/core"
-	"github.com/solcreek/firerunner/internal/jobidentity"
+	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

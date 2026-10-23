@@ -11,7 +11,7 @@ import (
 
 	"github.com/actions/scaleset"
 
-	"github.com/solcreek/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/core"
 )
 
 // libClient behaves like scaleset.Client: it holds one mutex across each

@@ -5,7 +5,7 @@ package provisioner
 import (
 	"context"
 
-	"github.com/solcreek/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/core"
 )
 
 // Provisioner boots exactly one ephemeral microVM per call and blocks until it

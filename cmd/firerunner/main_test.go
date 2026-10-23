@@ -13,13 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/config"
-	"github.com/solcreek/firerunner/internal/core"
-	"github.com/solcreek/firerunner/internal/health"
-	"github.com/solcreek/firerunner/internal/listener"
-	"github.com/solcreek/firerunner/internal/provisioner"
-	"github.com/solcreek/firerunner/internal/schedule"
-	"github.com/solcreek/firerunner/internal/scheduler"
+	"github.com/firerunnerhq/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/listener"
+	"github.com/firerunnerhq/firerunner/internal/provisioner"
+	"github.com/firerunnerhq/firerunner/internal/schedule"
+	"github.com/firerunnerhq/firerunner/internal/scheduler"
 )
 
 func TestParseSize(t *testing.T) {

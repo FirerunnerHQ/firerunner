@@ -15,9 +15,9 @@ import (
 	"github.com/actions/scaleset"
 	sslistener "github.com/actions/scaleset/listener"
 
-	"github.com/solcreek/firerunner/internal/core"
-	"github.com/solcreek/firerunner/internal/health"
-	"github.com/solcreek/firerunner/internal/jobidentity"
+	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 )
 
 // Config configures the scale-set listener.

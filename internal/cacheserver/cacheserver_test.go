@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/solcreek/firerunner/internal/jobidentity"
+	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 	"io"
 	"log/slog"
 	"net/http"
