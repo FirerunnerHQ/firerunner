@@ -10,7 +10,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -73,11 +72,8 @@ type ScaleSet struct {
 	recycle context.CancelCauseFunc
 	session session
 	// open opens a fresh message session after the current one fails.
-	open   func(context.Context) (session, error)
-	health *health.Tracker
-	// minRunners is added to every desired count GitHub sends: the hot
-	// runners kept with no job queued. A schedule changes it.
-	minRunners atomic.Int64
+	open       func(context.Context) (session, error)
+	health     *health.Tracker
 	scaleSetID int
 	// created is true only when this process created the scale set (rather than
 	// reusing a pre-existing one). Close deletes the scale set only when created,
@@ -140,7 +136,6 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		session: first, health: cfg.Health,
 		scaleSetID: id, created: !reused,
 	}
-	s.minRunners.Store(int64(cfg.MinRunners))
 	// The registration client is warm (it holds a token): it seeds the pool.
 	s.jitClients = newClientPool(jitParallelism(cfg.MaxRunners), func() (jitClient, error) {
 		c, err := newClient(cfg)
@@ -367,7 +362,7 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		onJobStarted: s.cfg.OnJobStarted,
 		onBusy:       onBusy,
 		onCompleted:  onCompleted,
-		minRunners:   &s.minRunners,
+		minRunners:   s.cfg.MinRunners,
 		maxRunners:   s.cfg.MaxRunners,
 		log:          s.log,
 	}
@@ -385,11 +380,6 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 
 // errRecycled ends a session that Recycle asked to replace.
 var errRecycled = errors.New("session recycled")
-
-// SetMinRunners changes the hot runners added to each desired count from
-// GitHub's next message on. The scheduler must be told the same (SetMin):
-// it re-plans now, while this only keeps the next message consistent.
-func (s *ScaleSet) SetMinRunners(n int) { s.minRunners.Store(int64(n)) }
 
 // Stats returns the scale set statistics GitHub sent with the latest
 // message, and when they arrived; ok is false before the first.
@@ -555,7 +545,7 @@ type scaler struct {
 	onCompleted  CompletedFunc
 	capacity     CapacityFunc
 	setCapacity  func(int)
-	minRunners   *atomic.Int64 // the ScaleSet's, which a schedule changes
+	minRunners   int
 	maxRunners   int
 	log          *slog.Logger
 	lastAdvert   int
@@ -564,10 +554,7 @@ type scaler struct {
 var _ sslistener.Scaler = (*scaler)(nil)
 
 func (a *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
-	desired := count
-	if a.minRunners != nil {
-		desired += int(a.minRunners.Load())
-	}
+	desired := a.minRunners + count
 	running := a.onDesired(ctx, desired)
 	a.advertiseCapacity()
 	return running, nil

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"sync/atomic"
 	"testing"
 
 	"github.com/actions/scaleset"
@@ -20,7 +19,7 @@ func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 func TestScalerHandleDesiredRunnerCount(t *testing.T) {
 	var gotDesired int
 	a := &scaler{
-		minRunners: minOf(2),
+		minRunners: 2,
 		log:        testLogger(),
 		onDesired: func(_ context.Context, desired int) int {
 			gotDesired = desired
@@ -147,7 +146,7 @@ func TestScalerWithoutCapacityFuncNeverAdvertises(t *testing.T) {
 func TestScalerJobCallbacks(t *testing.T) {
 	var busy, completed []string
 	a := &scaler{
-		minRunners:  minOf(0),
+		minRunners:  0,
 		log:         testLogger(),
 		onDesired:   func(context.Context, int) int { return 0 },
 		onBusy:      func(name string) { busy = append(busy, name) },
@@ -187,7 +186,7 @@ func TestScalerJobCallbacks(t *testing.T) {
 }
 
 func TestScalerJobStartedNilBusyFunc(t *testing.T) {
-	a := &scaler{minRunners: minOf(0), log: testLogger(), onDesired: func(context.Context, int) int { return 0 }}
+	a := &scaler{minRunners: 0, log: testLogger(), onDesired: func(context.Context, int) int { return 0 }}
 	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: "r"}); err != nil {
 		t.Fatalf("HandleJobStarted with nil onBusy must not panic: %v", err)
 	}
@@ -355,25 +354,5 @@ func TestJITSourceExists(t *testing.T) {
 		if got != c.want || (err != nil) != c.fail {
 			t.Errorf("%s: Exists = %v, %v", name, got, err)
 		}
-	}
-}
-
-func minOf(n int) *atomic.Int64 {
-	var v atomic.Int64
-	v.Store(int64(n))
-	return &v
-}
-
-func TestScalerFollowsAChangedMin(t *testing.T) {
-	var got int
-	ss := &ScaleSet{}
-	ss.SetMinRunners(2)
-	a := &scaler{minRunners: &ss.minRunners, log: testLogger(), onDesired: func(_ context.Context, d int) int { got = d; return d }}
-	if _, err := a.HandleDesiredRunnerCount(context.Background(), 1); err != nil || got != 3 {
-		t.Fatalf("desired %d err %v, want 2+1", got, err)
-	}
-	ss.SetMinRunners(0) // a window closed
-	if _, err := a.HandleDesiredRunnerCount(context.Background(), 1); err != nil || got != 1 {
-		t.Fatalf("desired %d after the floor dropped to 0, want 1", got)
 	}
 }
