@@ -501,9 +501,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return err
 	}
 
-	owner, err := os.Hostname()
-	if err != nil || owner == "" {
-		owner = "firerunner"
+	// The owner identifies this install's instances across restarts, and
+	// across replacements of the host when --owner is set.
+	owner := cfg.Owner
+	if owner == "" {
+		if owner, err = os.Hostname(); err != nil || owner == "" {
+			owner = "firerunner"
+		}
 	}
 
 	app := scaleset.GitHubAppAuth{

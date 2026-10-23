@@ -61,6 +61,9 @@ type Config struct {
 	// EC2Reaper is "on", "dry-run" or "off": whether instances and spot
 	// requests this install left behind are cleaned up.
 	EC2Reaper string
+	// Owner names this install: the firerunner:owner tag on everything it
+	// launches, and its scale-set session owner. Empty means the host name.
+	Owner string
 	// AWSRegion is the region EC2 tiers launch in; empty uses the SDK's
 	// sources (env, shared config, then IMDS on the control VM).
 	AWSRegion string
@@ -272,6 +275,7 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.JITAddr, "jit-addr", env("FR_JIT_ADDR", ""), "VPC IP:port where EC2 runner instances fetch their JIT config, served once to each instance's private IP so no secret goes into user-data (e.g. 10.0.0.5:8098); required with an ec2 tier. Bind the control VM's VPC address, never a public one")
 	fs.StringVar(&c.AWSRegion, "aws-region", env("FR_AWS_REGION", ""), "AWS region for ec2 tiers; defaults to AWS_REGION/shared config, then the control VM's own region from IMDS")
 	fs.DurationVar(&c.JITTTL, "jit-ttl", er.duration("FR_JIT_TTL", 5*time.Minute), "how long an EC2 instance's JIT config waits to be fetched before it expires")
+	fs.StringVar(&c.Owner, "owner", env("FR_OWNER", ""), "name of this install: tagged as firerunner:owner on every instance it launches, so its pool and reaper find them again. Defaults to the host name; set a stable value when the control VM can be replaced")
 	fs.StringVar(&c.EC2Reaper, "ec2-reaper", env("FR_EC2_REAPER", "on"), "clean up EC2 instances and spot requests this install left behind (after a crash or restart): on, dry-run (log only), or off")
 
 	var egress, dnsServers string
@@ -432,6 +436,9 @@ func (c *Config) validate() error {
 	case "on", "dry-run", "off":
 	default:
 		return fmt.Errorf("--ec2-reaper %q must be on, dry-run or off", c.EC2Reaper)
+	}
+	if o := c.Owner; o != "" && (len(o) > 128 || strings.HasPrefix(strings.ToLower(o), "aws:") || strings.TrimSpace(o) != o) {
+		return fmt.Errorf("--owner %q must be at most 128 characters, not start with aws:, and have no surrounding spaces", o)
 	}
 	if c.Firecracker.ToolCacheImage != "" {
 		if _, err := os.Stat(c.Firecracker.ToolCacheImage); err != nil {

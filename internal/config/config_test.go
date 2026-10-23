@@ -846,3 +846,17 @@ func TestFromFlags_EC2Reaper(t *testing.T) {
 		t.Fatal("accepted --ec2-reaper maybe")
 	}
 }
+
+func TestFromFlags_Owner(t *testing.T) {
+	if c, err := FromFlags(baseArgs()); err != nil || c.Owner != "" {
+		t.Fatalf("default owner = %q, %v; want empty (host name)", c.Owner, err)
+	}
+	if c, err := FromFlags(append(baseArgs(), "--owner", "ci-control")); err != nil || c.Owner != "ci-control" {
+		t.Fatalf("--owner = %q, %v", c.Owner, err)
+	}
+	for _, bad := range []string{"aws:x", " padded", strings.Repeat("x", 129)} {
+		if _, err := FromFlags(append(baseArgs(), "--owner", bad)); err == nil {
+			t.Errorf("accepted --owner %q", bad)
+		}
+	}
+}
