@@ -156,6 +156,89 @@ touch "$STATE/check-fails"
 failed "config rejected"
 expect "config rejected: firerunner's reason is in the log" "$(cat "$STATE/out")" grep -q 'config: bad tier' "$STATE/out"
 
+# The launch template's user-data: rendered from control.yaml with test
+# values, /etc/firerunner moved under the scratch root. A fake release
+# server (curl) serves $STATE/release/<file>; the release's bootstrap is a
+# stub that records the directory it was handed.
+render_userdata() {
+	python3 - "$HERE/control.yaml" "$FR_ROOT" > "$TMP/userdata.sh" <<'PY2'
+import re, sys
+s = open(sys.argv[1]).read()
+m = re.search(r"Fn::Base64: !Sub\n            - \|\n(.*?)\n            - ZoneId", s, re.S)
+body = "\n".join(l[14:] for l in m.group(1).split("\n"))
+vals = {"AWS::Region": "us-west-2", "ParameterPrefix": "/fr", "Owner": "prod-a", "AWS::StackName": "fr",
+        "ZoneId": "Z123", "JitName": "control", "ZoneName": "fr.internal", "JitPort": "8098", "ReleaseRepo": "acme/fr"}
+body = re.sub(r"\$\{([A-Za-z:]+)\}", lambda m: vals[m.group(1)], body)
+print(body.replace("/etc/firerunner", sys.argv[2] + "/etc/firerunner"))
+PY2
+}
+release() {
+	mkdir -p "$STATE/release"
+	printf '#!/bin/sh\necho elf\n' > "$STATE/release/firerunner_linux_$1"
+	# shellcheck disable=SC2016 # expands in the stub
+	printf '#!/bin/sh\necho "$1" > "$STATE/bootstrapped"\n' > "$STATE/release/firerunner-control-bootstrap.sh"
+	(cd "$STATE/release" && sha256sum firerunner_linux_* firerunner-control-bootstrap.sh > SHA256SUMS)
+}
+cat > "$TMP/bin/curl-release" <<'FAKE'
+#!/usr/bin/env bash
+out="" url=""
+while [ $# -gt 0 ]; do
+	case "$1" in -o) out="$2"; shift ;; -X|-H) shift ;; http*) url="$1" ;; esac
+	shift
+done
+case "$url" in
+*/latest/api/token) echo tok; exit ;;
+*/meta-data/instance-id) echo i-0123; exit ;;
+https://github.com/*/releases/download/*) echo "$url" >> "$STATE/downloads" ;;
+*) exit 22 ;;
+esac
+f="$STATE/release/${url##*/}"
+[ -f "$f" ] || exit 22
+cp "$f" "$out"
+FAKE
+chmod +x "$TMP/bin/curl-release"
+mkdir -p "$TMP/bin-ud"
+for f in aws systemctl; do ln -sf "$TMP/bin/$f" "$TMP/bin-ud/$f"; done
+ln -sf "$TMP/bin/curl-release" "$TMP/bin-ud/curl"
+# The control VM is Linux on arm64 whatever runs this test.
+printf '#!/bin/sh\necho aarch64\n' > "$TMP/bin-ud/uname"
+chmod +x "$TMP/bin-ud/uname"
+arch=arm64
+userdata() { TMPDIR="$TMP" PATH="$TMP/bin-ud:$PATH" bash "$TMP/userdata.sh" > "$STATE/out" 2>&1; }
+export -f userdata
+
+{
+	# 6. A release that verifies is handed to its bootstrap.
+	setup
+	echo v1.2.3 > "$STATE/ssm/version"
+	release "$arch"
+	render_userdata
+	expect "user-data: succeeds" "$(cat "$STATE/out" 2>/dev/null)" userdata
+	expect "user-data: fetched the version's release" "$(cat "$STATE/downloads" 2>/dev/null)" \
+		grep -q "https://github.com/acme/fr/releases/download/v1.2.3/firerunner_linux_$arch" "$STATE/downloads"
+	expect "user-data: bootstrap env written" "" grep -qx 'FR_JIT_HOST=control.fr.internal' "$FR_ROOT/etc/firerunner/bootstrap.env"
+	expect "user-data: bootstrap ran with the verified binary" "$(cat "$STATE/bootstrapped" 2>/dev/null)" \
+		cmp -s "$STATE/release/firerunner_linux_arm64" "$(cat "$STATE/bootstrapped" 2>/dev/null)/firerunner"
+	expect "user-data: healthy" "" test ! -f "$STATE/autoscaling"
+
+	# 7. A tampered binary stops the boot and marks the instance unhealthy.
+	setup
+	echo v1.2.3 > "$STATE/ssm/version"
+	release "$arch"
+	echo tampered >> "$STATE/release/firerunner_linux_$arch"
+	expect "user-data, tampered: fails" "it succeeded" bash -c '! userdata'
+	expect "user-data, tampered: bootstrap never ran" "" test ! -f "$STATE/bootstrapped"
+	expect "user-data, tampered: marked unhealthy" "" grep -q 'set-instance-health --instance-id i-0123' "$STATE/autoscaling"
+
+	# 8. SHA256SUMS that does not list the binary is no verification.
+	setup
+	echo v1.2.3 > "$STATE/ssm/version"
+	release "$arch"
+	grep -v firerunner_linux "$STATE/release/SHA256SUMS" > "$STATE/s" && mv "$STATE/s" "$STATE/release/SHA256SUMS"
+	expect "user-data, unlisted: fails" "it succeeded" bash -c '! userdata'
+	expect "user-data, unlisted: bootstrap never ran" "" test ! -f "$STATE/bootstrapped"
+}
+
 if [ "$fails" -gt 0 ]; then
 	echo "$fails failure(s)"
 	exit 1

@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  firerunner control plane: one control VM in an Auto Scaling group of one,
+  replaced on failure, reachable by runners at a stable private DNS name.
+  See deploy/aws/README.md.
+
+Parameters:
+  Owner:
+    Type: String
+    AllowedPattern: "[A-Za-z0-9][A-Za-z0-9._-]{0,62}"
+    Description: >-
+      This install's firerunner:owner tag (FR_OWNER). Every replacement VM
+      uses it, so it takes over its predecessor's pool and leftovers. Scopes
+      the VM's terminate/start/modify permissions.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Where the control VM may run. It needs egress to GitHub (a public subnet, or NAT).
+  AssociatePublicIp:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Give the control VM a public IP for egress (inbound stays VPC-only either way).
+  RunnerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: The runners' security group; only it may reach the JIT port.
+  InstanceType:
+    Type: String
+    Default: t4g.small
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Amazon Linux 2023 (it ships the AWS CLI). Use the x86_64 parameter with an x86 instance type.
+  ParameterPrefix:
+    Type: String
+    Default: /firerunner
+    AllowedPattern: "/[A-Za-z0-9/_.-]*[A-Za-z0-9_.-]"
+    Description: >-
+      SSM path. The control VM reads <prefix>/control/{version,env,tiers,app-private-key|token}
+      and any runner AMI parameter under <prefix>/.
+  ReleaseRepo:
+    Type: String
+    Default: solcreek/firerunner
+    Description: GitHub repository whose releases the control VM installs.
+  ZoneName:
+    Type: String
+    Default: firerunner.internal
+    Description: The private zone's name; with HostedZoneId, that zone's name.
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: An existing private hosted zone associated with the VPC; empty creates one.
+  JitName:
+    Type: String
+    Default: control
+    Description: The JIT name is <JitName>.<zone>.
+  JitPort:
+    Type: Number
+    Default: 8098
+
+Conditions:
+  CreateZone: !Equals [!Ref HostedZoneId, ""]
+
+Resources:
+  Zone:
+    Type: AWS::Route53::HostedZone
+    Condition: CreateZone
+    Properties:
+      Name: !Ref ZoneName
+      VPCs: [{ VPCId: !Ref VpcId, VPCRegion: !Ref AWS::Region }]
+      HostedZoneConfig: { Comment: !Sub "firerunner control plane (${AWS::StackName})" }
+
+  ControlSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: firerunner control VM; JIT port from the runners only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref JitPort
+          ToPort: !Ref JitPort
+          SourceSecurityGroupId: !Ref RunnerSecurityGroupId
+          Description: runners fetch their JIT config
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0, Description: GitHub and AWS APIs }
+
+  ControlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+      # Session Manager: shell and remote commands without SSH or open ports.
+      ManagedPolicyArns: [!Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"]
+      Policies:
+        - PolicyName: firerunner-control
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ec2:RunInstances, ec2:CreateTags]
+                Resource: "*"
+                Condition: { StringEquals: { aws:RequestedRegion: !Ref AWS::Region } }
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeImages
+                  - ec2:DescribeSpotInstanceRequests
+                Resource: "*"
+              - Effect: Allow
+                Action: [ec2:TerminateInstances, ec2:StartInstances, ec2:ModifyInstanceAttribute]
+                Resource: "*"
+                Condition: { StringEquals: { "aws:ResourceTag/firerunner:owner": !Ref Owner } }
+              - Effect: Allow
+                Action: ec2:CancelSpotInstanceRequests
+                Resource: "*"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/*"
+              - Effect: Allow
+                Action: route53:ChangeResourceRecordSets
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:route53:::hostedzone/${Z}"
+                  - { Z: !If [CreateZone, !Ref Zone, !Ref HostedZoneId] }
+              - Effect: Allow
+                Action: autoscaling:SetInstanceHealth
+                Resource: !Sub "arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-control"
+
+  ControlProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref ControlRole] }
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt ControlProfile.Arn }
+        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: !Ref AssociatePublicIp
+            Groups: [!Ref ControlSecurityGroup]
+        TagSpecifications:
+          - ResourceType: volume
+            Tags: [{ Key: firerunner:control, Value: !Ref AWS::StackName }]
+        # Download the release named by <prefix>/control/version, verify it
+        # against its SHA256SUMS, and hand over to its bootstrap script. A
+        # failure marks the instance unhealthy, so the group replaces it.
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              export AWS_REGION=${AWS::Region}
+              unhealthy() {
+                t=$(curl -fsS -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" http://169.254.169.254/latest/api/token)
+                i=$(curl -fsS -H "X-aws-ec2-metadata-token: $t" http://169.254.169.254/latest/meta-data/instance-id)
+                echo "firerunner user-data failed (line $1); marking $i unhealthy" >&2
+                aws autoscaling set-instance-health --instance-id "$i" --health-status Unhealthy || true
+              }
+              trap 'unhealthy $LINENO' ERR
+              install -d -m 0700 /etc/firerunner
+              cat > /etc/firerunner/bootstrap.env <<'EOF'
+              FR_PREFIX=${ParameterPrefix}
+              FR_OWNER=${Owner}
+              FR_ASG=${AWS::StackName}-control
+              FR_ZONE_ID=${ZoneId}
+              FR_JIT_HOST=${JitName}.${ZoneName}
+              FR_JIT_PORT=${JitPort}
+              AWS_REGION=${AWS::Region}
+              EOF
+              version=$(aws ssm get-parameter --name ${ParameterPrefix}/control/version --query Parameter.Value --output text)
+              case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) false ;; esac
+              d=$(mktemp -d) && cd "$d"
+              for f in SHA256SUMS firerunner_linux_$arch firerunner-control-bootstrap.sh; do
+                curl -fsSL --retry 5 -o "$f" "https://github.com/${ReleaseRepo}/releases/download/$version/$f"
+              done
+              grep -E "  (firerunner_linux_$arch|firerunner-control-bootstrap\.sh)$" SHA256SUMS > want
+              [ "$(wc -l < want)" -eq 2 ]
+              sha256sum -c want
+              mv "firerunner_linux_$arch" firerunner
+              echo "firerunner user-data: installing $version" >&2
+              bash firerunner-control-bootstrap.sh "$d"
+            - ZoneId: !If [CreateZone, !Ref Zone, !Ref HostedZoneId]
+
+  ControlGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-control"
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-control", PropagateAtLaunch: true }
+        # Never firerunner:owner: the reaper would take the control VM for
+        # one of its own.
+        - { Key: firerunner:control, Value: !Ref AWS::StackName, PropagateAtLaunch: true }
+
+Outputs:
+  AutoScalingGroup:
+    Value: !Ref ControlGroup
+  JitHost:
+    Description: Resolves, inside the VPC, to the current control VM.
+    Value: !Sub "${JitName}.${ZoneName}"
+  HostedZoneId:
+    Value: !If [CreateZone, !Ref Zone, !Ref HostedZoneId]
+  ControlSecurityGroup:
+    Value: !Ref ControlSecurityGroup
+  ParameterPrefix:
+    Value: !Ref ParameterPrefix
