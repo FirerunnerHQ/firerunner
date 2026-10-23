@@ -120,6 +120,7 @@ else
 	skip e2e-harness "jq not installed"
 fi
 step dev-env scripts/test-dev-env.sh
+step check-remote scripts/test-check-remote.sh
 step control-bootstrap deploy/aws/test-control-bootstrap.sh
 step deploy-control deploy/aws/test-deploy-control.sh
 if command -v shellcheck >/dev/null; then
@@ -128,13 +129,18 @@ if command -v shellcheck >/dev/null; then
 		scripts/mutate.sh scripts/test-mutate.sh \
 		scripts/merge-stack.sh scripts/test-merge-stack.sh \
 		scripts/pr-wait.sh scripts/test-pr-wait.sh \
+		scripts/check-remote.sh scripts/test-check-remote.sh \
 		scripts/agent-env.sh scripts/setup-dev.sh scripts/test-dev-env.sh .githooks/commit-msg \
 		scripts/release-build.sh deploy/aws/*.sh
 	step shellcheck-e2e shellcheck -x scripts/e2e/*.sh
 else
 	skip shellcheck "shellcheck not installed"
 fi
-step dco-signoff signed_off
+if [ -n "${FR_CHECK_NO_HISTORY:-}" ]; then
+	skip dco-signoff "no git history in this copy (check-remote)"
+else
+	step dco-signoff signed_off
+fi
 
 echo
 echo "== summary"

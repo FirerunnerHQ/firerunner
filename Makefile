@@ -47,6 +47,12 @@ cover-check: cover
 check:
 	@scripts/check.sh $(CHECK_ARGS)
 
+# check on the Linux host FR_REMOTE_HOST (an ssh destination), for the steps
+# macOS skips. CHECK_ARGS as for check, plus --netns and --clean.
+.PHONY: check-remote
+check-remote:
+	@scripts/check-remote.sh $(CHECK_ARGS)
+
 # One-time setup of a clone: git hooks that sign off every commit (DCO).
 .PHONY: setup
 setup:
@@ -60,10 +66,12 @@ e2e:
 # The egress firewall against the real kernel: loads the generated nft ruleset
 # into throwaway network namespaces and probes what a guest can reach. Needs
 # Linux, root, ip and nft; the test binary is built as the user and run as root.
+# SUDO="sudo -n" fails at once where sudo would ask for a password.
+SUDO ?= sudo
 .PHONY: netns-test
 netns-test:
 	go test -c -tags netns -o egress-netns.test ./internal/provisioner/
-	sudo env FR_REQUIRE_NETNS="$(FR_REQUIRE_NETNS)" ./egress-netns.test -test.run EgressNetNS -test.count 1 -test.v
+	$(SUDO) env FR_REQUIRE_NETNS="$(FR_REQUIRE_NETNS)" ./egress-netns.test -test.run EgressNetNS -test.count 1 -test.v
 	rm -f egress-netns.test
 
 .PHONY: clean

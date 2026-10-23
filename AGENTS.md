@@ -14,6 +14,11 @@ A `SKIP` line always says why; for example, `docker-shim` needs Linux. CI also
 runs jobs `make check` cannot: `netns` (root, nftables), `cache-protocol` (npm)
 and `e2e` (a KVM host).
 
+On macOS, run the Linux-only steps before you push, not after the merge:
+`FR_REMOTE_HOST=user@linux-host make check-remote` copies the working tree to
+that host over ssh and runs `make check` there. Add `CHECK_ARGS=--netns` to run
+the `netns` job too (it needs passwordless sudo); see `scripts/check-remote.sh -h`.
+
 Narrower loops:
 
 ```bash
