@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -114,6 +115,8 @@ type fakeInstance struct {
 	userData              string            // decoded
 	state                 types.InstanceStateName
 	tags                  map[string]string
+	spotTags              map[string]string // tags on its spot request
+	launched              time.Time
 }
 
 // fakeEC2 is an in-memory EC2. RunInstances fails per type/subnet/market as
@@ -149,7 +152,13 @@ type fakeEC2 struct {
 	startErr          error
 	startStaysStopped bool
 	// tagErr fails CreateTags.
-	tagErr    error
+	tagErr error
+	// clock, when set, is the fake's notion of now (launch times).
+	clock func() time.Time
+	// modifyErr fails ModifyInstanceAttribute.
+	modifyErr error
+	// pageSize, when > 0, splits filtered listings into pages.
+	pageSize  int
 	started   []string
 	cancelled map[string]bool // spot request ID -> cancelled
 	// cancelErrs fails this many CancelSpotInstanceRequests calls first.
@@ -240,9 +249,13 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, _ .
 		b, _ := base64.StdEncoding.DecodeString(aws.ToString(in.UserData))
 		inst.userData = string(b)
 	}
+	inst.launched = f.now()
+	inst.spotTags = map[string]string{}
 	for _, ts := range in.TagSpecifications {
 		into := map[types.ResourceType]map[string]string{
-			types.ResourceTypeInstance: inst.tags, types.ResourceTypeVolume: inst.volumeTags,
+			types.ResourceTypeInstance:             inst.tags,
+			types.ResourceTypeVolume:               inst.volumeTags,
+			types.ResourceTypeSpotInstancesRequest: inst.spotTags,
 		}[ts.ResourceType]
 		for _, t := range ts.Tags {
 			if into != nil {
@@ -266,6 +279,7 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, _ .
 
 func (f *fakeEC2) view(i *fakeInstance) types.Instance {
 	v := types.Instance{
+		LaunchTime:       aws.Time(i.launched),
 		InstanceId:       aws.String(i.id),
 		PrivateIpAddress: aws.String(i.ip),
 		InstanceType:     types.InstanceType(i.itype),
@@ -307,6 +321,60 @@ func (i *fakeInstance) matches(filters []types.Filter) bool {
 	return true
 }
 
+func (f *fakeEC2) now() time.Time {
+	if f.clock != nil {
+		return f.clock()
+	}
+	return time.Now()
+}
+
+func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.DescribeSpotInstanceRequestsInput, _ ...func(*ec2.Options)) (*ec2.DescribeSpotInstanceRequestsOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []types.SpotInstanceRequest
+	for _, id := range f.order {
+		i := f.instances[id]
+		if i.spotReq == "" {
+			continue
+		}
+		state := types.SpotInstanceStateActive
+		switch {
+		case f.cancelled[i.spotReq]:
+			state = types.SpotInstanceStateCancelled
+		case i.state == types.InstanceStateNameStopped:
+			state = types.SpotInstanceStateDisabled
+		}
+		r := types.SpotInstanceRequest{
+			SpotInstanceRequestId: aws.String(i.spotReq),
+			InstanceId:            aws.String(i.id),
+			State:                 state,
+			CreateTime:            aws.Time(i.launched),
+		}
+		for k, v := range i.spotTags {
+			r.Tags = append(r.Tags, types.Tag{Key: aws.String(k), Value: aws.String(v)})
+		}
+		match := true
+		for _, fl := range in.Filters {
+			name := aws.ToString(fl.Name)
+			ok := false
+			for _, want := range fl.Values {
+				switch {
+				case name == "state":
+					ok = ok || string(state) == want
+				case strings.HasPrefix(name, "tag:"):
+					ok = ok || i.spotTags[strings.TrimPrefix(name, "tag:")] == want
+				}
+			}
+			match = match && ok
+		}
+		if match {
+			out = append(out, r)
+		}
+	}
+	out, next := page(out, in.NextToken, f.pageSize)
+	return &ec2.DescribeSpotInstanceRequestsOutput{SpotInstanceRequests: out, NextToken: next}, nil
+}
+
 func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput, _ ...func(*ec2.Options)) (*ec2.StartInstancesOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -335,6 +403,7 @@ func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput,
 		if !f.startStaysStopped {
 			i.state = types.InstanceStateNamePending
 		}
+		i.launched = f.now() // as on AWS, LaunchTime is the latest start
 		f.started = append(f.started, id)
 	}
 	return &ec2.StartInstancesOutput{}, nil
@@ -343,6 +412,9 @@ func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput,
 func (f *fakeEC2) ModifyInstanceAttribute(_ context.Context, in *ec2.ModifyInstanceAttributeInput, _ ...func(*ec2.Options)) (*ec2.ModifyInstanceAttributeOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.modifyErr != nil {
+		return nil, f.modifyErr
+	}
 	i, ok := f.instances[aws.ToString(in.InstanceId)]
 	if !ok {
 		return nil, apiErr(errNotFound) // R7
@@ -437,19 +509,39 @@ func (f *fakeEC2) DescribeInstances(_ context.Context, in *ec2.DescribeInstances
 		}
 	}
 	var res types.Reservation
+	var next *string
 	if len(in.InstanceIds) == 0 {
+		var all []types.Instance
 		for _, id := range f.order {
-			if i := f.instances[id]; i.matches(in.Filters) {
-				res.Instances = append(res.Instances, f.view(i))
+			// An invisible instance is too new to show in a listing yet.
+			if i := f.instances[id]; i.matches(in.Filters) && !f.invisible[id] {
+				all = append(all, f.view(i))
 			}
 		}
+		res.Instances, next = page(all, in.NextToken, f.pageSize)
 	}
 	for _, id := range in.InstanceIds {
 		if i, ok := f.instances[id]; ok {
 			res.Instances = append(res.Instances, f.view(i))
 		}
 	}
-	return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{res}}, nil
+	return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{res}, NextToken: next}, nil
+}
+
+// page returns one page of items from token (an index), and the next token.
+func page[T any](items []T, token *string, size int) ([]T, *string) {
+	if size <= 0 {
+		return items, nil
+	}
+	start := 0
+	if token != nil {
+		fmt.Sscan(*token, &start)
+	}
+	end := min(start+size, len(items))
+	if end >= len(items) {
+		return items[start:end], nil
+	}
+	return items[start:end], aws.String(fmt.Sprint(end))
 }
 
 func (f *fakeEC2) TerminateInstances(_ context.Context, in *ec2.TerminateInstancesInput, _ ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error) {

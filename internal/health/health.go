@@ -177,6 +177,19 @@ type File struct {
 	PID       int       `json:"pid"`
 	WrittenAt time.Time `json:"written_at"`
 	Tiers     []Tier    `json:"tiers"`
+	// Reaper is the EC2 reaper's latest sweep, when one runs.
+	Reaper *Reaper `json:"reaper,omitempty"`
+}
+
+// Reaper is what the EC2 reaper's latest sweep did.
+type Reaper struct {
+	At           time.Time `json:"at"`
+	DryRun       bool      `json:"dry_run,omitempty"`
+	Instances    []string  `json:"instances,omitempty"`
+	SpotRequests []string  `json:"spot_requests,omitempty"`
+	Busy         []string  `json:"busy,omitempty"`
+	Young        []string  `json:"young,omitempty"`
+	Error        string    `json:"error,omitempty"`
 }
 
 // FileName is the state file's name inside the daemon's work dir.

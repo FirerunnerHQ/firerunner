@@ -393,6 +393,17 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				fmt.Fprintf(w, "  %s repairs: %d session recycle(s), %d lost runner(s) cancelled\n", t.Name, t.Recycles, t.LostRunners)
 			}
 		}
+		if rp := l.Reaper; rp != nil {
+			mode := ""
+			if rp.DryRun {
+				mode = " (dry run: nothing changed)"
+			}
+			fmt.Fprintf(w, "\nEC2 reaper: last sweep %s ago%s: %d instance(s) terminated, %d spot request(s) cancelled, %d left running a job, %d too young to judge\n",
+				humanDuration(time.Since(rp.At).Truncate(time.Second)), mode, len(rp.Instances), len(rp.SpotRequests), len(rp.Busy), len(rp.Young))
+			if rp.Error != "" {
+				fmt.Fprintf(w, "  error: %s\n", truncate(rp.Error, 200))
+			}
+		}
 	}
 
 	fmt.Fprintf(w, "\nmicroVMs: %d active  (firecracker procs=%d, taps=%d, max=%d)\n",

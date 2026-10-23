@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -50,6 +51,29 @@ type Client struct {
 	amis  *amiResolver
 	watch *watcher
 	log   *slog.Logger
+
+	// live holds the instances some Launch in this process is responsible
+	// for; the reaper leaves them alone.
+	liveMu sync.Mutex
+	live   map[string]bool
+}
+
+func (c *Client) track(id string) {
+	c.liveMu.Lock()
+	c.live[id] = true
+	c.liveMu.Unlock()
+}
+
+func (c *Client) untrack(id string) {
+	c.liveMu.Lock()
+	delete(c.live, id)
+	c.liveMu.Unlock()
+}
+
+func (c *Client) isLive(id string) bool {
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	return c.live[id]
 }
 
 // NewClient returns a Client. params may be nil when no tier names its AMI by
@@ -61,7 +85,7 @@ func NewClient(api API, params ParamAPI, pollInterval time.Duration, log *slog.L
 	if pollInterval <= 0 {
 		pollInterval = DefaultPollInterval
 	}
-	return &Client{api: api, amis: newAMIResolver(api, params), watch: newWatcher(api, pollInterval, log), log: log}
+	return &Client{api: api, amis: newAMIResolver(api, params), watch: newWatcher(api, pollInterval, log), log: log, live: map[string]bool{}}
 }
 
 // Options configures one EC2 tier's provisioner.
@@ -148,6 +172,8 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 		return err
 	}
 	id := aws.ToString(inst.InstanceId)
+	p.c.track(id)
+	defer p.c.untrack(id)
 	log := p.log.With("runner", name, "instance", id, "type", inst.InstanceType, "subnet", aws.ToString(inst.SubnetId))
 	log.Info("instance launched",
 		"ami", resolved.Sub(entered).Round(time.Millisecond),
@@ -186,6 +212,7 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string) error 
 		// launches; the instance went back to the pool.
 		return fmt.Errorf("%w: claim: %w", errPoolStart, err)
 	}
+	defer p.c.untrack(in.id) // tracked by claim
 	log := p.log.With("runner", name, "instance", in.id, "type", in.itype, "pooled", true)
 	ip, err := netip.ParseAddr(in.ip)
 	if err != nil {
@@ -447,12 +474,16 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 		in.InstanceInitiatedShutdownBehavior = types.ShutdownBehaviorStop
 		if market == config.MarketSpot {
 			// Only a persistent request can be stopped and started again,
-			// and it rejects terminate-on-shutdown.
+			// and it rejects terminate-on-shutdown. The request is tagged
+			// too, so the reaper can find one left without its instance.
 			in.InstanceInitiatedShutdownBehavior = ""
 			in.InstanceMarketOptions.SpotOptions = &types.SpotMarketOptions{
 				SpotInstanceType:             types.SpotInstanceTypePersistent,
 				InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorStop,
 			}
+			in.TagSpecifications = append(in.TagSpecifications, types.TagSpecification{
+				ResourceType: types.ResourceTypeSpotInstancesRequest, Tags: tags,
+			})
 		}
 	}
 	if p.o.EC2.RootVolumeGiB > 0 || p.o.EC2.RootVolumeType != "" {

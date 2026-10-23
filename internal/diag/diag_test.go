@@ -668,3 +668,21 @@ func TestStatusAndDoctorShowDrift(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusShowsTheReaper(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	f := health.File{PID: 1, WrittenAt: now, Tiers: []health.Tier{{Name: "a", State: health.Connected, Since: now}},
+		Reaper: &health.Reaper{At: now, Instances: []string{"i-1", "i-2"}, Busy: []string{"i-3"}, Young: []string{"i-4"}}}
+	if err := health.Write(filepath.Join(dir, health.FileName), f); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: dir, TapPrefix: "fr", NetBase: 16}}
+	var text bytes.Buffer
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "2 instance(s) terminated, 0 spot request(s) cancelled, 1 left running a job, 1 too young to judge") {
+		t.Fatalf("status:\n%s", text.String())
+	}
+}

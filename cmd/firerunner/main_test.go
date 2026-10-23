@@ -178,7 +178,8 @@ func TestServeTiers_AllTiersStoppedShutsDown(t *testing.T) {
 func TestPublishHealth(t *testing.T) {
 	path := filepath.Join(t.TempDir(), health.FileName)
 	a, b := health.NewTracker("a"), health.NewTracker("b")
-	stop := publishHealth(path, []*health.Tracker{a, b}, slog.New(slog.DiscardHandler))
+	reaped := &health.Reaper{At: time.Unix(5, 0).UTC(), Instances: []string{"i-1"}}
+	stop := publishHealth(path, []*health.Tracker{a, b}, func() *health.Reaper { return reaped }, slog.New(slog.DiscardHandler))
 	f, err := health.Read(path)
 	if err != nil || len(f.Tiers) != 2 || f.PID != os.Getpid() {
 		t.Fatalf("initial file = %+v, %v", f, err)
@@ -188,6 +189,9 @@ func TestPublishHealth(t *testing.T) {
 	f, err = health.Read(path)
 	if err != nil || f.Tiers[1].State != health.Failed {
 		t.Fatalf("final file = %+v, %v; want tier b failed", f, err)
+	}
+	if f.Reaper == nil || len(f.Reaper.Instances) != 1 {
+		t.Fatalf("reaper state = %+v, want the latest sweep", f.Reaper)
 	}
 }
 
@@ -254,5 +258,35 @@ func TestTierPending(t *testing.T) {
 	}
 	if got := tierPending(config.Tier{Name: "cloud", Provisioner: config.ProvisionerEC2}, &shared); got != nil {
 		t.Fatal("an ec2 tier must not share the firecracker tiers' pending counter")
+	}
+}
+
+func TestReaperOptions(t *testing.T) {
+	cfg := &config.Config{EC2Reaper: "dry-run"}
+	cfg.Firecracker.MaxVMLifetime = 6 * time.Hour
+	tiers := []config.Tier{
+		{Name: "fc"},
+		{Name: "cold", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{}},
+		{Name: "pooled", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{Pool: 2}},
+	}
+	// Only the Firecracker tier: building an ec2 tier's remover needs a live
+	// listener. The fields and the unknown-tier path are what is checked.
+	o := reaperOptions(cfg, "me", tiers[:1], []*listener.ScaleSet{nil}, slog.New(slog.DiscardHandler))
+	if o.Owner != "me" || !o.DryRun || o.MaxLifetime != 6*time.Hour || len(o.PooledTiers) != 0 {
+		t.Fatalf("options = %+v", o)
+	}
+	if err := o.Remove(context.Background(), "gone-tier", "r"); err == nil {
+		t.Fatal("removing a runner of an unconfigured tier must fail, not succeed")
+	}
+}
+
+func TestPooledTiers(t *testing.T) {
+	got := pooledTiers([]config.Tier{
+		{Name: "fc"},
+		{Name: "cold", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{}},
+		{Name: "pooled", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{Pool: 2}},
+	})
+	if len(got) != 1 || !got["pooled"] {
+		t.Fatalf("pooledTiers = %v, want only the tier with a pool", got)
 	}
 }

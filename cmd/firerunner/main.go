@@ -366,6 +366,45 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 	return nil
 }
 
+// reaperOptions configures the EC2 reaper for this install: which tiers keep
+// a pool, how to deregister each tier's runners, and the lifetime backstop.
+func reaperOptions(cfg *config.Config, owner string, tiers []config.Tier, listeners []*listener.ScaleSet, log *slog.Logger) ec2.ReaperOptions {
+	removers := map[string]*listener.JITSource{}
+	for i, t := range tiers {
+		if t.IsEC2() {
+			removers[t.Name] = listeners[i].JIT()
+		}
+	}
+	return ec2.ReaperOptions{
+		Owner:       owner,
+		PooledTiers: pooledTiers(tiers),
+		Remove: func(ctx context.Context, tier, runner string) error {
+			jit, ok := removers[tier]
+			if !ok {
+				// A tier no longer configured: its runner cannot be asked
+				// about; the lifetime backstop ends the instance.
+				return fmt.Errorf("tier %q is not configured", tier)
+			}
+			return jit.RemoveRunner(ctx, runner)
+		},
+		MaxLifetime: cfg.Firecracker.MaxVMLifetime,
+		DryRun:      cfg.EC2Reaper == "dry-run",
+		Logger:      log,
+	}
+}
+
+// pooledTiers names the EC2 tiers that keep a stopped pool: the reaper leaves
+// their ready and warming instances to the pool.
+func pooledTiers(tiers []config.Tier) map[string]bool {
+	pooled := map[string]bool{}
+	for _, t := range tiers {
+		if t.IsEC2() && t.EC2.Pool > 0 {
+			pooled[t.Name] = true
+		}
+	}
+	return pooled
+}
+
 // statsSource adapts a listener to the reconciler.
 type statsSource struct{ lis *listener.ScaleSet }
 
@@ -403,13 +442,17 @@ func tierNames(tiers []config.Tier) []string {
 // healthInterval is how often the listener health file is rewritten.
 const healthInterval = 10 * time.Second
 
-// publishHealth writes the trackers' state to path now and every
-// healthInterval until the returned func is called, which writes it once more.
-func publishHealth(path string, trackers []*health.Tracker, log *slog.Logger) func() {
+// publishHealth writes the trackers' state, and the reaper's when reaper is
+// non-nil, to path now and every healthInterval until the returned func is
+// called, which writes it once more.
+func publishHealth(path string, trackers []*health.Tracker, reaper func() *health.Reaper, log *slog.Logger) func() {
 	write := func() {
 		f := health.File{PID: os.Getpid(), WrittenAt: time.Now().UTC()}
 		for _, tr := range trackers {
 			f.Tiers = append(f.Tiers, tr.Snapshot())
+		}
+		if reaper != nil {
+			f.Reaper = reaper()
 		}
 		if err := health.Write(path, f); err != nil {
 			log.Warn("write listener health", "path", path, "err", err)
@@ -486,9 +529,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return err
 	}
 
-	owner, err := os.Hostname()
-	if err != nil || owner == "" {
-		owner = "firerunner"
+	// The owner identifies this install's instances across restarts, and
+	// across replacements of the host when --owner is set.
+	owner := cfg.Owner
+	if owner == "" {
+		if owner, err = os.Hostname(); err != nil || owner == "" {
+			owner = "firerunner"
+		}
 	}
 
 	app := scaleset.GitHubAppAuth{
@@ -520,7 +567,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if cfg.UsesFirecracker() {
 		fc = provisioner.NewFirecracker(cfg.Firecracker, log)
 	}
-	var newEC2 func(config.Tier) provisioner.Provisioner
+	var (
+		newEC2    func(config.Tier) provisioner.Provisioner
+		ec2Client *ec2.Client
+	)
 	if cfg.UsesEC2() {
 		jit, stopJIT, err := serveJIT(ctx, cfg, log)
 		if err != nil {
@@ -533,6 +583,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		ec2Client = client
 		newEC2 = func(t config.Tier) provisioner.Provisioner {
 			p := client.Tier(ec2.Options{
 				Tier:        t.Name,
@@ -616,6 +667,22 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	defer closeAll()
 
+	var reaperState func() *health.Reaper
+	if ec2Client != nil && cfg.EC2Reaper != "off" {
+		reaper := ec2Client.NewReaper(reaperOptions(cfg, owner, tiers, listeners, log))
+		go reaper.Run(ctx)
+		reaperState = func() *health.Reaper {
+			rep, ok := reaper.Last()
+			if !ok {
+				return nil
+			}
+			return &health.Reaper{
+				At: rep.At, DryRun: rep.DryRun, Instances: rep.Instances, SpotRequests: rep.SpotRequests,
+				Busy: rep.Busy, Young: rep.Young, Error: rep.Err,
+			}
+		}
+	}
+
 	log.Info("firerunner starting",
 		"url", cfg.URL,
 		"tiers", len(tiers),
@@ -649,7 +716,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	// Publish each tier's listener health for status and doctor.
 	healthPath := filepath.Join(cfg.Firecracker.WorkDir, health.FileName)
-	stopHealth := publishHealth(healthPath, trackers, log)
+	stopHealth := publishHealth(healthPath, trackers, reaperState, log)
 
 	// Drive every tier's listener concurrently. A listener reconnects its own
 	// session; one that stops on a fatal error leaves the other tiers running.

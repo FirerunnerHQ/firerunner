@@ -34,7 +34,8 @@ import (
 // From then on it is an ordinary job instance, terminated when it stops.
 //
 // The pool's state lives in tags (TagPool), so a restarted firerunner finds
-// its ready instances again, and terminates the ones a crash left claimed.
+// its ready instances again. Ones a crash left claimed are the reaper's to
+// end, once GitHub confirms no job runs on them.
 type Pool struct {
 	p      *Provisioner
 	target int
@@ -115,8 +116,9 @@ func (pl *Pool) filters() []types.Filter {
 }
 
 // discover sorts this tier's pool instances by their tags: ready ones join the
-// pool, warming ones are followed until they stop, and claimed ones, left by a
-// firerunner that died mid-job, are terminated.
+// pool and warming ones are followed until they stop. Claimed ones, left by a
+// firerunner that died mid-claim or mid-job, are the reaper's: it checks with
+// GitHub whether their runner is still running a job before ending them.
 func (pl *Pool) discover(ctx context.Context) error {
 	out, err := pl.p.c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{Filters: pl.filters()})
 	if err != nil {
@@ -126,9 +128,6 @@ func (pl *Pool) discover(ctx context.Context) error {
 		for _, i := range r.Instances {
 			id, state := aws.ToString(i.InstanceId), i.State.Name
 			switch tagValue(i.Tags, TagPool) {
-			case PoolClaimed:
-				pl.log.Info("terminating a pool instance a previous run claimed", "instance", id)
-				pl.discard(ctx, id, aws.ToString(i.SpotInstanceRequestId))
 			case PoolReady, PoolWarming:
 				if state == types.InstanceStateNameStopped {
 					pl.markReady(ctx, i)
@@ -272,16 +271,21 @@ func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 		in := pl.ready[0]
 		pl.ready = pl.ready[1:]
 		pl.mu.Unlock()
-		err := pl.prepare(ctx, in, runner)
+		// From here this process owns the instance: the reaper must leave
+		// it alone even once it is tagged claimed.
+		pl.p.c.track(in.id)
+		tagged, err := pl.prepare(ctx, in, runner)
 		switch {
 		case err == nil:
 			return in, nil
 		case instanceGone(err):
 			pl.log.Warn("pool instance could not be prepared; discarding it", "instance", in.id, "err", err)
 			pl.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
+			pl.p.c.untrack(in.id)
 			continue
 		default:
-			pl.requeue(context.WithoutCancel(ctx), in)
+			pl.requeue(context.WithoutCancel(ctx), in, tagged)
+			pl.p.c.untrack(in.id)
 			return pooled{}, err
 		}
 	}
@@ -293,18 +297,37 @@ func instanceGone(err error) bool {
 	return isCode(err, "IncorrectInstanceState") || isCode(err, errNotFound)
 }
 
-// requeue returns an unused instance to the pool, retagging it ready if the
-// claim had tagged it.
-func (pl *Pool) requeue(ctx context.Context, in pooled) {
-	if err := pl.tag(ctx, in.id, TagPool, PoolReady); err != nil {
-		pl.log.Warn("retag pool instance ready", "instance", in.id, "err", err)
+// requeue returns an unused instance to the pool. One the claim had already
+// tagged is first tagged ready again, no longer naming the runner it was
+// claimed for (that name may now be used by a cold launch). If that retag
+// fails, the instance stays tagged claimed and out of the pool, and the
+// reaper ends it once it is untracked.
+func (pl *Pool) requeue(ctx context.Context, in pooled, tagged bool) {
+	if !tagged {
+		pl.mu.Lock()
+		pl.ready = append([]pooled{in}, pl.ready...)
+		pl.mu.Unlock()
+		return
+	}
+	_, err := pl.p.c.api.CreateTags(ctx, &ec2.CreateTagsInput{
+		Resources: []string{in.id},
+		Tags: []types.Tag{
+			{Key: aws.String(TagPool), Value: aws.String(PoolReady)},
+			{Key: aws.String(TagRunner), Value: aws.String("")},
+		},
+	})
+	if err != nil {
+		pl.log.Warn("retag pool instance ready; leaving it to the reaper", "instance", in.id, "err", err)
+		return
 	}
 	pl.mu.Lock()
 	pl.ready = append([]pooled{in}, pl.ready...)
 	pl.mu.Unlock()
 }
 
-func (pl *Pool) prepare(ctx context.Context, in pooled, runner string) error {
+// prepare readies a claimed instance to start. tagged reports whether it got
+// as far as tagging the instance claimed.
+func (pl *Pool) prepare(ctx context.Context, in pooled, runner string) (tagged bool, err error) {
 	api := pl.p.c.api
 	if _, err := api.CreateTags(ctx, &ec2.CreateTagsInput{
 		Resources: []string{in.id},
@@ -314,15 +337,15 @@ func (pl *Pool) prepare(ctx context.Context, in pooled, runner string) error {
 			{Key: aws.String("Name"), Value: aws.String(runner)},
 		},
 	}); err != nil {
-		return fmt.Errorf("tag claimed: %w", err)
+		return false, fmt.Errorf("tag claimed: %w", err)
 	}
 	if _, err := api.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
 		InstanceId: aws.String(in.id),
 		UserData:   &types.SecureBlobAttributeValue{Value: []byte(jitserver.UserData(pl.p.o.JITURL))},
 	}); err != nil {
-		return fmt.Errorf("set user-data: %w", err)
+		return true, fmt.Errorf("set user-data: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // cancelSpot cancels a persistent spot request, so terminating its instance
