@@ -13,5 +13,9 @@ cover.out
 *.out
 /egress-netns.test
 
+# Claude Code: per-machine settings and agent worktrees
+/.claude/settings.local.json
+/.claude/worktrees/
+
 # Protocol test dependencies
 /test/cache-protocol/node_modules/
