@@ -59,9 +59,10 @@ printf '%s\n' "$@" > "$STATE/runner-argv"
 FAKE
 chmod +x "$TMP/runner/run.sh"
 
+# Records which poweroff ran: "clean" or "fast" (its only argument).
 cat > "$TMP/bin/fake-poweroff" <<'FAKE'
 #!/bin/sh
-touch "$STATE/poweroff"
+echo "$1" >> "$STATE/poweroff"
 FAKE
 chmod +x "$TMP/bin/fake-poweroff"
 
@@ -80,6 +81,8 @@ expect() {
 has() { [ -f "$STATE/$1" ]; }
 lacks() { [ ! -f "$STATE/$1" ]; }
 jit_requests() { grep -c '/jit$' "$STATE/requests" 2>/dev/null || true; }
+# powered_off <mode>: the script powered off exactly once, in that mode.
+powered_off() { [ "$(cat "$STATE/poweroff" 2>/dev/null)" = "$1" ]; }
 
 # run: run the script against the $STATE prepared by the caller, killing it
 # if it hangs (no coreutils timeout on macOS).
@@ -87,7 +90,8 @@ run() {
 	PATH="$TMP/bin:$PATH" \
 		FIRERUNNER_IMDS=imds.test \
 		FIRERUNNER_RUNNER_DIR="$TMP/runner" \
-		FIRERUNNER_POWEROFF="$TMP/bin/fake-poweroff" \
+		FIRERUNNER_POWEROFF="$TMP/bin/fake-poweroff clean" \
+		FIRERUNNER_POWEROFF_FAST="$TMP/bin/fake-poweroff fast" \
 		FIRERUNNER_RETRY_SLEEP=0 \
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
 		sh "$SCRIPT" 2> "$STATE/stderr" &
@@ -117,7 +121,7 @@ printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
 run
 expect "runner gets the fetched config" "argv=$(cat "$STATE/runner-argv" 2>/dev/null)" \
 	[ "$(cat "$STATE/runner-argv" 2>/dev/null)" = "$(printf -- '--jitconfig\neyJqaXQiOiJ4In0=')" ]
-expect "powers off after the job" "no poweroff" has poweroff
+expect "powers off fast after the job" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
 expect "retries through 000 and 403" "jit requests=$(jit_requests)" [ "$(jit_requests)" = 4 ]
 expect "exits 0" "$(cat "$STATE/exit" 2>/dev/null)" lacks exit
 
@@ -126,7 +130,7 @@ expect "exits 0" "$(cat "$STATE/exit" 2>/dev/null)" lacks exit
 fresh no-url
 run
 expect "no user-data: runner not started" "runner ran" lacks runner-argv
-expect "no user-data: powers off" "no poweroff" has poweroff
+expect "no user-data: powers off cleanly (the disk boots again)" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off clean
 expect "no user-data: no jit request" "jit requests=$(jit_requests)" [ "$(jit_requests)" = 0 ]
 expect "no user-data: warms the runner's files" "$(cat "$STATE/stderr")" grep -q "warm-up boot" "$STATE/stderr"
 
@@ -138,7 +142,7 @@ echo "404 200" > "$STATE/jit-codes"
 printf 'late' > "$STATE/jit-body"
 run
 expect "404: runner not started" "runner ran" lacks runner-argv
-expect "404: powers off" "no poweroff" has poweroff
+expect "404: powers off fast" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
 expect "404: no retry" "jit requests=$(jit_requests)" [ "$(jit_requests)" = 1 ]
 
 # 4. The config never arrives: stop after FIRERUNNER_JIT_WAIT.
@@ -147,7 +151,7 @@ echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
 echo "403" > "$STATE/jit-codes"
 JIT_WAIT=1 run
 expect "timeout: runner not started" "runner ran" lacks runner-argv
-expect "timeout: powers off" "no poweroff" has poweroff
+expect "timeout: powers off fast" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
 expect "timeout: says why" "$(cat "$STATE/stderr")" grep -q "no JIT config after 1s" "$STATE/stderr"
 
 # 5. Only the FIRERUNNER_JIT_URL line is used, whatever else user-data holds.
@@ -168,7 +172,7 @@ echo "200" > "$STATE/jit-codes"
 printf 'cfg' > "$STATE/jit-body"
 printf '#!/bin/sh\nexit 3\n' > "$TMP/runner/run.sh"
 run
-expect "runner failure: powers off" "no poweroff" has poweroff
+expect "runner failure: powers off fast" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
 
 for st in "$TMP"/state-*; do
 	expect "$(basename "$st"): finished" "hung" [ ! -f "$st/hung" ]
