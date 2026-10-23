@@ -105,8 +105,10 @@ else
 	skip docker-shim "needs Linux (/proc)"
 fi
 step ec2-boot-script images/test-ec2-run.sh
+step ec2-ami-build images/test-build-ec2-ami.sh
 if command -v shellcheck >/dev/null; then
-	step shellcheck shellcheck images/assets/firerunner-ec2-run.sh images/test-ec2-run.sh scripts/check.sh
+	step shellcheck shellcheck images/assets/firerunner-ec2-run.sh images/test-ec2-run.sh \
+		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh scripts/check.sh
 else
 	skip shellcheck "shellcheck not installed"
 fi
