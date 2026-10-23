@@ -32,7 +32,7 @@ type harness struct {
 // polling; mut adjusts the options before the provisioner is built.
 func newHarness(t *testing.T, mut func(*Options)) *harness {
 	t.Helper()
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	srv := jitserver.New(time.Minute, nil)
 	o := Options{
 		Tier:  "cloud-4c",
@@ -333,18 +333,21 @@ func TestLaunch_CancelDuringCapacityWalk(t *testing.T) {
 }
 
 func TestLaunch_StoppedInstanceIsTerminated(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.EC2.Market = config.MarketSpot })
+	// On-demand: AWS cannot stop a one-time spot instance (R3 in
+	// fake_test.go), but an on-demand one can be stopped, by a StopInstances
+	// from outside if not by its own poweroff.
+	h := newHarness(t, nil)
 	errc := h.launch(context.Background())
 	inst := h.instance(t)
 	h.fetch(inst.ip)
-	// Belt and braces: should a poweroff ever leave the instance stopped
-	// rather than terminated, Launch terminates it.
+	// Belt and braces: should the instance ever stop rather than terminate,
+	// Launch terminates it.
 	h.f.setState(inst.id, types.InstanceStateNameStopped)
 	if err := waitErr(t, errc); err != nil {
 		t.Fatalf("Launch = %v, want nil after the job", err)
 	}
 	if ids := h.f.terminatedIDs(); len(ids) == 0 || ids[0] != inst.id {
-		t.Fatalf("terminated %v, want the stopped spot instance", ids)
+		t.Fatalf("terminated %v, want the stopped instance", ids)
 	}
 }
 

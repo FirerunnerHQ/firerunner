@@ -13,13 +13,22 @@ import (
 
 func quietLog() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
-// launchN creates n pending instances in f and returns their IDs.
+// launchN creates n pending instances in f, tagged as firerunner tags its
+// own, and returns their IDs.
 func launchN(t *testing.T, f *fakeEC2, n int) []string {
 	t.Helper()
+	tags := []types.Tag{
+		{Key: aws.String(TagOwner), Value: aws.String("test-owner")},
+		{Key: aws.String(TagTier), Value: aws.String("cloud-4c")},
+	}
 	var ids []string
 	for range n {
 		out, err := f.RunInstances(context.Background(), &ec2.RunInstancesInput{
 			InstanceType: types.InstanceTypeC7aXlarge, SubnetId: aws.String("subnet-a"),
+			TagSpecifications: []types.TagSpecification{
+				{ResourceType: types.ResourceTypeInstance, Tags: tags},
+				{ResourceType: types.ResourceTypeVolume, Tags: tags},
+			},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -41,7 +50,7 @@ func next(t *testing.T, ch <-chan types.InstanceStateName) types.InstanceStateNa
 }
 
 func TestWatcher_BatchesAllInstancesIntoOneCall(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	ids := launchN(t, f, 3)
 	w := newWatcher(f, 5*time.Millisecond, quietLog())
 	var chans []<-chan types.InstanceStateName
@@ -78,7 +87,7 @@ func TestWatcher_BatchesAllInstancesIntoOneCall(t *testing.T) {
 func TestWatcher_NotFoundFallsBackPerInstance(t *testing.T) {
 	// A just-launched instance unknown to DescribeInstances must not hide the
 	// state of the others in its batch.
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	ids := launchN(t, f, 2)
 	f.invisible[ids[0]] = true
 	f.setState(ids[1], types.InstanceStateNameStopped)
@@ -105,7 +114,7 @@ func TestWatcher_NotFoundFallsBackPerInstance(t *testing.T) {
 }
 
 func TestWatcher_StopsWhenNothingWatched(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	ids := launchN(t, f, 1)
 	w := newWatcher(f, 5*time.Millisecond, quietLog())
 	ch, stop := w.watch(ids[0])
@@ -141,7 +150,7 @@ func TestWatcher_StopsWhenNothingWatched(t *testing.T) {
 }
 
 func TestWatcher_DescribeErrorKeepsPolling(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	ids := launchN(t, f, 1)
 	f.describeErr = apiErr("RequestLimitExceeded")
 	w := newWatcher(f, 5*time.Millisecond, quietLog())
@@ -157,7 +166,7 @@ func TestWatcher_DescribeErrorKeepsPolling(t *testing.T) {
 }
 
 func TestWatcher_SplitsLargeBatches(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	ids := launchN(t, f, describeBatch+5)
 	w := newWatcher(f, 5*time.Millisecond, quietLog())
 	for _, id := range ids {

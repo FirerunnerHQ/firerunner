@@ -305,8 +305,8 @@ func TestLaunch_SpotCancelRetriedBeforeTerminate(t *testing.T) {
 	}
 	h.f.mu.Lock()
 	defer h.f.mu.Unlock()
-	if len(h.f.termBeforeCancel) != 0 {
-		t.Fatalf("terminated %v while its spot request was open", h.f.termBeforeCancel)
+	if len(h.f.termWithOpenRequest) != 0 {
+		t.Fatalf("terminated %v while its spot request was open", h.f.termWithOpenRequest)
 	}
 	if !h.f.cancelled[h.f.instances[id].spotReq] {
 		t.Fatal("the spot request was never cancelled")
