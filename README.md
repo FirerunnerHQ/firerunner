@@ -116,6 +116,36 @@ ephemeral runners.
   bundled `actions/runner` stays within GitHub's ≤30-day support window (see
   [`images/`](images/README.md)).
 
+## What a runner can see
+
+While a job runs, its VM holds what the job was given:
+
+- the checked-out source;
+- the secrets the workflow references;
+- the job's `GITHUB_TOKEN`, scoped by the workflow's `permissions:`;
+- any cloud credentials it obtains through OIDC.
+
+That holds for every self-hosted or hosted runner. firerunner limits how far
+that reaches and how long it lasts:
+
+- **One VM per job.** A Firecracker microVM's rootfs is a per-job clone, and
+  it is deleted when the job ends. An EC2 runner is terminated after its job,
+  along with its disk.
+- **Nothing reaches in.** The runners' security group has no inbound rules.
+  A Firecracker guest has its own tap device and subnet, and it can't reach
+  the host's private networks.
+- **No cloud identity.** EC2 runners get no instance role. IMDSv2 is
+  required with a hop limit of 1, so job containers cannot reach it.
+- **No secret at boot.** EC2 user-data carries only the JIT endpoint. The
+  JIT config is served once, to the instance's own private IP.
+- **No job logs kept.** firerunner keeps no job output; GitHub holds the job
+  logs. A Firecracker VM's serial console is kept only if you set
+  `--log-dir`.
+
+In your workflows, grant `GITHUB_TOKEN` the least it needs (start from
+`permissions: {}` and add per job). Prefer OIDC with narrowly scoped cloud
+roles over long-lived secrets.
+
 ## Requirements
 
 - Linux bare-metal host with KVM (`/dev/kvm`).
@@ -178,6 +208,19 @@ account tied to the runners). Set one up once per org (or repo):
    | --- | --- |
    | `https://github.com/ORG` (org-wide) | **Organization → Self-hosted runners: Read & write** |
    | `https://github.com/ORG/REPO` (single repo) | **Repository → Administration: Read & write** |
+
+   That permission, plus *Metadata: Read* (which every App has), is all
+   firerunner uses. It registers the scale set, generates each runner's JIT
+   config, and removes idle runners. **Grant nothing else.**
+   - Jobs pull images and packages with their own `GITHUB_TOKEN`, not with
+     the App.
+   - An extra permission only widens what a stolen key can do. For example,
+     *Packages: Read* exposes every private package and image.
+   - `firerunner doctor` warns about any extra permission and names what it
+     allows.
+   - A future feature that needs more access will be opt-in, behind a
+     separate App or an explicit permission request. It will never widen
+     this one.
 
 2. **Generate a private key** — on the App page, *Generate a private key*. This
    downloads a `.pem`. Install it where **only** the `firerunner` user can read

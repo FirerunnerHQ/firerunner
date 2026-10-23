@@ -9,8 +9,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -43,7 +45,11 @@ func githubAPIBase(rawURL string) string {
 // anything (a PAT hits /rate_limit; a GitHub App hits GET /app/installations/ID
 // with a short-lived JWT). It is best-effort: a transport error WARNs (the host
 // may simply be offline), an explicit 401/403 FAILs, anything else WARNs.
-func authVerify(cfg *config.Config, apiBase string) Check {
+//
+// For a GitHub App it also returns the app-permissions check: what the
+// installation was granted against the least-privilege set (see
+// appPermissions).
+func authVerify(cfg *config.Config, apiBase string) []Check {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -54,11 +60,11 @@ func authVerify(cfg *config.Config, apiBase string) Check {
 	} else {
 		key, err := cfg.ResolvePrivateKey()
 		if err != nil {
-			return fail("auth-verify", "GitHub App private key: %v", err)
+			return []Check{fail("auth-verify", "GitHub App private key: %v", err)}
 		}
 		jwt, err := appJWT(cfg.AppClientID, key, time.Now())
 		if err != nil {
-			return fail("auth-verify", "cannot sign GitHub App JWT: %v", err)
+			return []Check{fail("auth-verify", "cannot sign GitHub App JWT: %v", err)}
 		}
 		req, _ = http.NewRequestWithContext(ctx, http.MethodGet,
 			fmt.Sprintf("%s/app/installations/%d", apiBase, cfg.AppInstallID), nil)
@@ -68,17 +74,86 @@ func authVerify(cfg *config.Config, apiBase string) Check {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return warn("auth-verify", "could not verify credentials (offline?): %v", err)
+		return []Check{warn("auth-verify", "could not verify credentials (offline?): %v", err)}
 	}
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		return pass("auth-verify", "credentials accepted by %s", apiBase)
+		checks := []Check{pass("auth-verify", "credentials accepted by %s", apiBase)}
+		if cfg.Token == "" {
+			var inst struct {
+				Permissions map[string]string `json:"permissions"`
+			}
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&inst); err != nil {
+				checks = append(checks, warn("app-permissions", "could not read the installation's permissions: %v", err))
+			} else {
+				checks = append(checks, appPermissions(inst.Permissions, repoScoped(cfg.URL)))
+			}
+		}
+		return checks
 	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
-		return fail("auth-verify", "credentials rejected (HTTP %d)", resp.StatusCode)
+		return []Check{fail("auth-verify", "credentials rejected (HTTP %d)", resp.StatusCode)}
 	default:
-		return warn("auth-verify", "unexpected HTTP %d verifying credentials", resp.StatusCode)
+		return []Check{warn("auth-verify", "unexpected HTTP %d verifying credentials", resp.StatusCode)}
 	}
+}
+
+// repoScoped reports whether FR_URL names a single repository
+// (https://github.com/ORG/REPO) rather than an organization.
+func repoScoped(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return len(strings.Split(strings.Trim(u.Path, "/"), "/")) >= 2
+}
+
+// permissionRisk says what an App permission beyond firerunner's needs would
+// let a holder of its key do; others get a generic line.
+var permissionRisk = map[string]string{
+	"packages":                    "pull private packages and container images, which often hold source or dependencies",
+	"contents":                    "read (or write) repository source",
+	"actions":                     "read workflow runs and logs, and their artifacts",
+	"secrets":                     "manage Actions secrets",
+	"organization_secrets":        "manage organization Actions secrets",
+	"workflows":                   "change workflow files",
+	"pull_requests":               "read (or write) pull requests",
+	"issues":                      "read (or write) issues",
+	"members":                     "read (or change) organization membership",
+	"organization_administration": "change organization settings",
+	"administration":              "change repository settings",
+	"environments":                "read (or change) deployment environments and their secrets",
+}
+
+// appPermissions compares an installation's granted permissions with what
+// firerunner uses: metadata (read, every App has it) and self-hosted runners
+// (write), granted as organization_self_hosted_runners for an org, or as
+// administration for a single repository. Anything less FAILs (the scale-set
+// calls will be refused); anything more WARNs, naming what it allows.
+func appPermissions(granted map[string]string, repo bool) Check {
+	need := "organization_self_hosted_runners"
+	if repo {
+		need = "administration"
+	}
+	if granted[need] != "write" {
+		return fail("app-permissions", "the installation has %s: %q; firerunner needs write to manage runners", need, granted[need])
+	}
+	var extra []string
+	for name, level := range granted {
+		if name == need || name == "metadata" {
+			continue
+		}
+		risk := permissionRisk[name]
+		if risk == "" {
+			risk = "access GitHub beyond managing runners"
+		}
+		extra = append(extra, fmt.Sprintf("%s: %s (lets the key %s)", name, level, risk))
+	}
+	if len(extra) == 0 {
+		return pass("app-permissions", "least privilege: metadata (read), %s (write)", need)
+	}
+	sort.Strings(extra)
+	return warn("app-permissions", "the App grants more than firerunner uses; remove from the App's settings: %s", strings.Join(extra, "; "))
 }
 
 // appJWT builds the short-lived RS256 JWT GitHub requires to authenticate as a

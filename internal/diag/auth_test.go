@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -107,14 +108,14 @@ func TestAuthVerify_PAT(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if c := authVerify(&config.Config{Token: "ghp_valid"}, srv.URL); c.Level != levelPass {
+	if c := authVerify1(&config.Config{Token: "ghp_valid"}, srv.URL); c.Level != levelPass {
 		t.Errorf("valid PAT: got %s %s", c.Level, c.Detail)
 	}
-	if c := authVerify(&config.Config{Token: "ghp_wrong"}, srv.URL); c.Level != levelFail {
+	if c := authVerify1(&config.Config{Token: "ghp_wrong"}, srv.URL); c.Level != levelFail {
 		t.Errorf("wrong PAT: want FAIL, got %s", c.Level)
 	}
 	// Unreachable endpoint => WARN, not FAIL.
-	if c := authVerify(&config.Config{Token: "ghp_valid"}, "http://127.0.0.1:1"); c.Level != levelWarn {
+	if c := authVerify1(&config.Config{Token: "ghp_valid"}, "http://127.0.0.1:1"); c.Level != levelWarn {
 		t.Errorf("offline: want WARN, got %s %s", c.Level, c.Detail)
 	}
 }
@@ -135,12 +136,12 @@ func TestAuthVerify_App(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &config.Config{AppClientID: "Iv1.client", AppInstallID: 123, AppPrivateKey: pemStr}
-	if c := authVerify(cfg, srv.URL); c.Level != levelPass {
+	if c := authVerify1(cfg, srv.URL); c.Level != levelPass {
 		t.Errorf("valid App: got %s %s", c.Level, c.Detail)
 	}
 
 	bad := &config.Config{AppClientID: "Iv1.client", AppInstallID: 123, AppPrivateKey: "PRIVATE KEY garbage"}
-	if c := authVerify(bad, srv.URL); c.Level != levelFail {
+	if c := authVerify1(bad, srv.URL); c.Level != levelFail {
 		t.Errorf("bad key: want FAIL, got %s", c.Level)
 	}
 }
@@ -148,5 +149,58 @@ func TestAuthVerify_App(t *testing.T) {
 func TestReflinkProbe_BogusDir(t *testing.T) {
 	if reflinkProbe("/nonexistent/firerunner-does-not-exist") {
 		t.Error("reflinkProbe on missing dir should be false")
+	}
+}
+
+// authVerify1 is authVerify's first check, auth-verify itself.
+func authVerify1(cfg *config.Config, apiBase string) Check { return authVerify(cfg, apiBase)[0] }
+
+func TestAuthVerify_AppPermissions(t *testing.T) {
+	pemStr, _ := testRSAKeyPEM(t)
+	perms := `{"metadata":"read","organization_self_hosted_runners":"write","packages":"read"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"id":123,"permissions":%s}`, perms)
+	}))
+	defer srv.Close()
+	cfg := &config.Config{URL: "https://github.com/acme", AppClientID: "Iv1.client", AppInstallID: 123, AppPrivateKey: pemStr}
+	checks := authVerify(cfg, srv.URL)
+	if len(checks) != 2 || checks[1].Name != "app-permissions" {
+		t.Fatalf("checks = %+v, want auth-verify then app-permissions", checks)
+	}
+	if c := checks[1]; c.Level != levelWarn || !strings.Contains(c.Detail, "packages: read (lets the key pull private packages") {
+		t.Fatalf("extra packages: %s %s", c.Level, c.Detail)
+	}
+	perms = `{"metadata":"read","organization_self_hosted_runners":"write"}`
+	if c := authVerify(cfg, srv.URL)[1]; c.Level != levelPass {
+		t.Fatalf("least privilege: %s %s", c.Level, c.Detail)
+	}
+	// A PAT has no installation to inspect.
+	if n := len(authVerify(&config.Config{Token: "ghp_x"}, srv.URL)); n != 1 {
+		t.Fatalf("PAT returned %d checks", n)
+	}
+}
+
+func TestAppPermissions(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		granted map[string]string
+		repo    bool
+		level   string
+		detail  string
+	}{
+		{"org, minimal", map[string]string{"metadata": "read", "organization_self_hosted_runners": "write"}, false, levelPass, "least privilege"},
+		{"repo, minimal", map[string]string{"metadata": "read", "administration": "write"}, true, levelPass, "administration (write)"},
+		{"org, runners read only", map[string]string{"metadata": "read", "organization_self_hosted_runners": "read"}, false, levelFail, "needs write"},
+		{"repo given org permission", map[string]string{"organization_self_hosted_runners": "write"}, true, levelFail, "administration"},
+		{"org, extras sorted", map[string]string{"organization_self_hosted_runners": "write", "packages": "read", "contents": "read", "zz_new": "read"}, false, levelWarn,
+			"contents: read (lets the key read (or write) repository source); packages: read (lets the key pull private packages and container images, which often hold source or dependencies); zz_new: read (lets the key access GitHub beyond managing runners)"},
+	} {
+		got := appPermissions(c.granted, c.repo)
+		if got.Level != c.level || !strings.Contains(got.Detail, c.detail) {
+			t.Errorf("%s: %s %q, want %s containing %q", c.name, got.Level, got.Detail, c.level, c.detail)
+		}
+	}
+	if !repoScoped("https://github.com/acme/app") || repoScoped("https://github.com/acme") || repoScoped("https://github.com/acme/") {
+		t.Error("repoScoped")
 	}
 }
