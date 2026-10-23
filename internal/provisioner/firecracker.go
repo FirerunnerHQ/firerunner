@@ -226,6 +226,7 @@ func (f *Firecracker) FreeSlots() int { return f.ipam.available() }
 // delivered via MMDS v2, then block until the guest self-destructs (reboot -f)
 // and reap everything.
 func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec core.RunnerSpec, onBusy func()) error {
+	entered := time.Now()
 	// Draw the slot before anything else: the scheduler stops counting this
 	// launch as pending the moment Launch is entered, so FreeSlots must reflect
 	// it from the first instruction on.
@@ -258,6 +259,7 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 	if err := f.setupNet(ctx, vnet); err != nil {
 		return fmt.Errorf("setup network for %s: %w", vnet.tap, err)
 	}
+	netDone := time.Now()
 	defer func() { _ = f.teardownNet(context.WithoutCancel(ctx), vnet) }()
 
 	var connect connectWatchdog
@@ -272,6 +274,7 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 		return err
 	}
 	defer cleanup()
+	prepared := time.Now()
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", cmd.Path, err)
@@ -290,7 +293,10 @@ func (f *Firecracker) Launch(ctx context.Context, name, jitConfig string, spec c
 		return fmt.Errorf("configure microVM: %w", err)
 	}
 
-	f.log.Info("microVM started", "runner", name, "slot", slot, "guestIP", vnet.guestIP, "vcpu", spec.VCPU, "memMiB", spec.MemMiB)
+	f.log.Info("microVM started", "runner", name, "slot", slot, "guestIP", vnet.guestIP, "vcpu", spec.VCPU, "memMiB", spec.MemMiB,
+		"net", netDone.Sub(entered).Round(time.Millisecond),
+		"prepare", prepared.Sub(netDone).Round(time.Millisecond),
+		"start", time.Since(prepared).Round(time.Millisecond))
 	bootedAt := time.Now()
 
 	// Host-side lifetime backstop: a healthy microVM self-destructs the instant

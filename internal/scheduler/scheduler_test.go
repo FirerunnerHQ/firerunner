@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1265,4 +1268,98 @@ func TestFailedBootBacksOff(t *testing.T) {
 	if n := atomic.LoadInt32(&launches); n < 1 || n > 6 {
 		t.Fatalf("expected a small paced number of boot attempts, got %d", n)
 	}
+}
+
+// slowJIT generates configs after a fixed delay, concurrently.
+type slowJIT struct {
+	delay time.Duration
+	n     atomic.Int64
+}
+
+func (j *slowJIT) Generate(context.Context, core.RunnerSpec) (string, string, error) {
+	time.Sleep(j.delay)
+	return fmt.Sprintf("runner-%d", j.n.Add(1)), "jit", nil
+}
+
+func TestLaunchLogsPhaseTimings(t *testing.T) {
+	var buf safeBuffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	started := make(chan struct{}, 1)
+	prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		return nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(Options{Max: 1, Provisioner: prov, JIT: &slowJIT{delay: 20 * time.Millisecond}, Logger: log})
+	s.Reconcile(ctx, 1)
+	<-started
+	cancel()
+	s.Drain()
+	out := buf.String()
+	for _, want := range []string{`msg="launching runner"`, "jit=", "wait=", "sinceDecided="} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestConcurrentLaunchesDoNotSerialize is #49's acceptance check on the
+// scheduler: with a JIT source of fixed latency and a provisioner that starts
+// at once, 20 launches decided together all reach the provisioner within
+// 1.5x of a single launch's time.
+func TestConcurrentLaunchesDoNotSerialize(t *testing.T) {
+	const delay = 100 * time.Millisecond
+	measure := func(n int) []time.Duration {
+		var mu sync.Mutex
+		var lat []time.Duration
+		start := time.Now()
+		all := make(chan struct{})
+		prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+			mu.Lock()
+			lat = append(lat, time.Since(start))
+			if len(lat) == n {
+				close(all)
+			}
+			mu.Unlock()
+			<-ctx.Done()
+			return nil
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		s := New(Options{Max: n, Provisioner: prov, JIT: &slowJIT{delay: delay}, Logger: testLogger()})
+		s.Reconcile(ctx, n)
+		select {
+		case <-all:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d launches reached the provisioner", len(lat), n)
+		}
+		cancel()
+		s.Drain()
+		sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+		return lat
+	}
+	single := measure(1)[0]
+	lat := measure(20)
+	p95 := lat[len(lat)*95/100-1]
+	if limit := single * 3 / 2; p95 > limit {
+		t.Fatalf("p95 of 20 concurrent launches = %v, single = %v; want <= %v", p95, single, limit)
+	}
+}
+
+// safeBuffer is a bytes.Buffer safe for the concurrent writes of a logger.
+type safeBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
