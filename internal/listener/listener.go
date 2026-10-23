@@ -17,6 +17,11 @@ type DesiredFunc func(ctx context.Context, desired int) (running int)
 // guest console marker; either source flipping a VM to busy is enough.
 type BusyFunc func(runnerName string)
 
+// CompletedFunc is invoked with a runner's name when GitHub reports that
+// runner's job completed. It comes before the desired count of the same
+// message, which no longer counts the job.
+type CompletedFunc func(runnerName string)
+
 // CapacityFunc returns how many jobs the tier can hold concurrently right now.
 // It is advertised to GitHub on every poll so that jobs beyond it stay queued
 // at GitHub — where a sibling scale set on another host can take them — rather
@@ -26,9 +31,10 @@ type CapacityFunc func() int
 // Listener drives the scheduler from GitHub's assigned-job signal.
 type Listener interface {
 	// Run blocks until ctx is cancelled, calling onDesired with the latest
-	// desired runner count each time GitHub reports one and onBusy with a
-	// runner's name each time GitHub reports it started a job. capacity, when
-	// non-nil, is re-read after every onDesired and reported to GitHub as the
-	// scale set's current capacity. onBusy and capacity may be nil.
-	Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error
+	// desired runner count each time GitHub reports one, onBusy with a
+	// runner's name each time GitHub reports it started a job, and onCompleted
+	// each time GitHub reports its job completed. capacity, when non-nil, is
+	// re-read after every onDesired and reported to GitHub as the scale set's
+	// current capacity. onBusy, onCompleted and capacity may be nil.
+	Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc, onCompleted CompletedFunc, capacity CapacityFunc) error
 }

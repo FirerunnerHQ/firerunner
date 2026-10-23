@@ -144,12 +144,13 @@ func TestScalerWithoutCapacityFuncNeverAdvertises(t *testing.T) {
 }
 
 func TestScalerJobCallbacks(t *testing.T) {
-	var busy []string
+	var busy, completed []string
 	a := &scaler{
-		minRunners: 0,
-		log:        testLogger(),
-		onDesired:  func(context.Context, int) int { return 0 },
-		onBusy:     func(name string) { busy = append(busy, name) },
+		minRunners:  0,
+		log:         testLogger(),
+		onDesired:   func(context.Context, int) int { return 0 },
+		onBusy:      func(name string) { busy = append(busy, name) },
+		onCompleted: func(name string) { completed = append(completed, name) },
 	}
 	if err := a.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: "r"}); err != nil {
 		t.Fatal(err)
@@ -165,6 +166,21 @@ func TestScalerJobCallbacks(t *testing.T) {
 		t.Fatalf("nameless JobStarted should not mark busy: got %v", busy)
 	}
 	if err := a.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: "r", Result: "succeeded"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(completed) != 1 || completed[0] != "r" {
+		t.Fatalf("HandleJobCompleted should report the runner's completion: got %v", completed)
+	}
+	// A nameless JobCompleted reports nothing.
+	if err := a.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(completed) != 1 {
+		t.Fatalf("nameless JobCompleted should report nothing: got %v", completed)
+	}
+	// Nor does a scaler without the callback panic.
+	b := &scaler{log: testLogger(), onDesired: func(context.Context, int) int { return 0 }}
+	if err := b.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: "r"}); err != nil {
 		t.Fatal(err)
 	}
 }

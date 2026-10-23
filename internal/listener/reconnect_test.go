@@ -181,6 +181,7 @@ func startTier(ctx context.Context, ss *ScaleSet, max int) *tier {
 		t.done <- ss.Run(ctx,
 			func(ctx context.Context, desired int) int { sched.Reconcile(ctx, desired); return sched.Running() },
 			sched.MarkBusy,
+			sched.MarkCompleted,
 			sched.Capacity)
 	}()
 	return t
@@ -341,7 +342,7 @@ func TestReconnect_BackoffGrowsAndIsCapped(t *testing.T) {
 	o := &opener{} // every open fails with a 503
 	done := make(chan error, 1)
 	ss := testScaleSet("a", newFakeSession(0, true), o, tr)
-	go func() { done <- ss.Run(ctx, func(context.Context, int) int { return 0 }, nil, nil) }()
+	go func() { done <- ss.Run(ctx, func(context.Context, int) int { return 0 }, nil, nil, nil) }()
 
 	var peak float64
 	eventually(t, "several attempts", func() bool {
@@ -398,7 +399,7 @@ func TestReconnect_DeletedScaleSetRestarts(t *testing.T) {
 	}}
 	ss := testScaleSet("a", newFakeSession(0, true), o, tr)
 	done := make(chan error, 1)
-	go func() { done <- ss.Run(ctx, func(context.Context, int) int { return 0 }, nil, nil) }()
+	go func() { done <- ss.Run(ctx, func(context.Context, int) int { return 0 }, nil, nil, nil) }()
 	var err error
 	select {
 	case err = <-done:

@@ -1472,9 +1472,19 @@ func (p *jobProv) noMore(t *testing.T) {
 	}
 }
 
+// message models one listener message: GitHub reports the named runners'
+// jobs completed, then the desired count that no longer counts them.
+func message(ctx context.Context, s *Scheduler, desired int, completed ...string) {
+	for _, n := range completed {
+		s.MarkCompleted(n)
+	}
+	s.Reconcile(ctx, desired)
+}
+
 // TestRunnerExitAtMaxLaunchesForQueuedJob is issue #79: with the tier at Max
-// and jobs queued behind it, a runner finishing its job frees a place, and the
-// queued job must get a runner then, not at the listener's next message.
+// and jobs queued behind it, GitHub reports a job completed while its VM is
+// still live, so that message launches nothing; when the VM exits, the queued
+// job must get a runner then, not at the listener's next message.
 func TestRunnerExitAtMaxLaunchesForQueuedJob(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1483,18 +1493,79 @@ func TestRunnerExitAtMaxLaunchesForQueuedJob(t *testing.T) {
 
 	s.Reconcile(ctx, 4) // two jobs running, two queued
 	a, b := prov.next(t), prov.next(t)
+	message(ctx, s, 3, a) // a's job done: b's and the two queued remain
+	if got := s.Running(); got != 2 {
+		t.Fatalf("running=%d want 2: a's VM is still live, at Max", got)
+	}
 
 	prov.finish(a) // no Reconcile follows
 	c := prov.next(t)
 	if got := s.Running(); got != 2 {
 		t.Fatalf("running=%d want 2: the re-plan replaces the exited runner, no more", got)
 	}
+	message(ctx, s, 2, b) // c's job and the one still queued
 	prov.finish(b)
 	d := prov.next(t)
 
 	cancel()
 	prov.finish(c)
 	prov.finish(d)
+	s.Drain()
+	prov.noMore(t)
+}
+
+// TestRunnerExitBeforeItsCompletionLaunchesNothing: a VM can exit before the
+// message reporting its job completed. The last desired count still counts
+// that job, so a re-plan would launch a runner for a job that is over. The
+// exit must launch nothing; the completion message's own Reconcile then
+// launches exactly what is queued.
+func TestRunnerExitBeforeItsCompletionLaunchesNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prov := newJobProv()
+	s := New(Options{Max: 2, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 3) // two running, one queued
+	a, b := prov.next(t), prov.next(t)
+
+	prov.finish(a) // exits; GitHub has not reported a's completion yet
+	// The re-plan is decided in the critical section that takes the exit out
+	// of running, so once running reads 1 it has launched nothing.
+	waitRunning(t, s, 1)
+	prov.noMore(t)
+
+	message(ctx, s, 2, a) // completion arrives: b's job and the queued one
+	c := prov.next(t)
+	if got := s.Running(); got != 2 {
+		t.Fatalf("running=%d want 2: one launch for the one queued job", got)
+	}
+
+	cancel()
+	prov.finish(b)
+	prov.finish(c)
+	s.Drain()
+	prov.noMore(t)
+}
+
+// TestCompletionWithoutAReconcileDoesNotReplan: a VM that exits between its
+// completion and the desired count of the same message would re-plan with
+// the count before, which still counts its job. It must wait for that
+// Reconcile instead.
+func TestCompletionWithoutAReconcileDoesNotReplan(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prov := newJobProv()
+	s := New(Options{Max: 2, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 3)
+	a, b := prov.next(t), prov.next(t)
+	s.MarkCompleted(a) // the message's desired count has not been handled yet
+	prov.finish(a)
+	waitRunning(t, s, 1)
+	prov.noMore(t)
+
+	cancel()
+	prov.finish(b)
 	s.Drain()
 	prov.noMore(t)
 }
@@ -1509,12 +1580,9 @@ func TestRunnerExitWithDemandMetLaunchesNothing(t *testing.T) {
 
 	s.Reconcile(ctx, 3)
 	a, b, c := prov.next(t), prov.next(t), prov.next(t)
-	s.Reconcile(ctx, 2) // one job completed; its VM has not exited yet
+	message(ctx, s, 2, a) // a's job completed; its VM has not exited yet
 
 	prov.finish(a)
-	// The re-plan is decided in the critical section that takes the exit out
-	// of running, so once running reads 2 it has launched nothing, or it
-	// would read 3.
 	waitRunning(t, s, 2)
 	prov.noMore(t)
 
@@ -1536,7 +1604,7 @@ func TestManyRunnersExitingAtOnceReplaceOnlyWhatIsQueued(t *testing.T) {
 
 	s.Reconcile(ctx, 6) // four running, two queued
 	first := []string{prov.next(t), prov.next(t), prov.next(t), prov.next(t)}
-	s.Reconcile(ctx, 2) // the four complete: only the two queued remain
+	message(ctx, s, 2, first...) // the four complete: only the two queued remain
 
 	for _, n := range first {
 		go prov.finish(n)
@@ -1553,10 +1621,10 @@ func TestManyRunnersExitingAtOnceReplaceOnlyWhatIsQueued(t *testing.T) {
 	prov.noMore(t)
 }
 
-// TestReplanLaunchesAtMostOnePerExit: launches that failed without a job leave
-// the tier below Max with demand unmet (they wait for the next message). One
-// runner exiting frees one place, so its re-plan launches one, not the whole
-// shortfall a stale desired count would ask for.
+// TestReplanLaunchesAtMostOnePerExit: launches that failed without a job hold
+// the tier at Max through backoff, then leave it below Max with demand unmet
+// (they wait for the next message). One runner exiting frees one place, so
+// its re-plan launches one, not the whole shortfall.
 func TestReplanLaunchesAtMostOnePerExit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1572,7 +1640,13 @@ func TestReplanLaunchesAtMostOnePerExit(t *testing.T) {
 
 	s.Reconcile(ctx, 4)
 	a, b := jobs.next(t), jobs.next(t)
-	waitRunningWithin(t, s, 2, 5*time.Second) // both failed launches backed off and ended
+	// The two failed launches are in their 500 ms backoff, still in running,
+	// so this message (a's job done, three left) launches nothing.
+	message(ctx, s, 4, a)
+	if got := s.Running(); got != 4 {
+		t.Fatalf("running=%d want 4: the message should find the tier at Max", got)
+	}
+	waitRunningWithin(t, s, 2, 5*time.Second) // both backoffs ended
 
 	jobs.finish(a) // live 1, running 1, desired 4: plan alone would launch 3
 	c := jobs.next(t)
@@ -1587,38 +1661,41 @@ func TestReplanLaunchesAtMostOnePerExit(t *testing.T) {
 	jobs.noMore(t)
 }
 
-// TestFailedBootWithAJobReplansOnlyAfterBackoff:a launch that fails keeps its
+// TestFailedBootWithAJobReplansOnlyAfterBackoff: a launch that fails keeps its
 // place through backoff, so the re-plan its exit triggers is paced by the
 // backoff rather than retrying at once.
 func TestFailedBootWithAJobReplansOnlyAfterBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	attempts := make(chan time.Time, 16)
-	prov := provFunc(func(_ context.Context, _, _ string, _ core.RunnerSpec, onBusy func()) error {
-		onBusy() // the guest took the job, then the VM died
-		attempts <- time.Now()
+	entered := make(chan string, 16)
+	crash := make(chan struct{})
+	prov := provFunc(func(_ context.Context, name, _ string, _ core.RunnerSpec, onBusy func()) error {
+		onBusy()
+		entered <- name
+		<-crash // the job completes, then the VM dies with an error
 		return errors.New("vm crashed")
 	})
 	s := New(Options{Max: 1, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
 
 	s.Reconcile(ctx, 3)
-	var first, second time.Time
-	for i, at := range []*time.Time{&first, &second} {
-		select {
-		case *at = <-attempts:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("attempt %d never came", i+1)
-		}
+	message(ctx, s, 2, <-entered)
+	failedAt := time.Now()
+	crash <- struct{}{}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the re-plan never came")
 	}
 	// A timer never fires early, so this lower bound holds exactly.
-	if gap := second.Sub(first); gap < backoffDelay(1) {
+	if gap := time.Since(failedAt); gap < backoffDelay(1) {
 		t.Fatalf("re-plan after a failed boot came %s later, inside its %s backoff", gap, backoffDelay(1))
 	}
 	cancel()
+	close(crash)
 	s.Drain()
 }
 
-// TestFailedBootWithoutAJobDoesNotReplan: only a runner that took a job
+// TestFailedBootWithoutAJobDoesNotReplan: only a runner whose job completed
 // re-plans on exit; a boot that failed before getting one waits for the next
 // message, as before.
 func TestFailedBootWithoutAJobDoesNotReplan(t *testing.T) {
@@ -1638,7 +1715,7 @@ func TestFailedBootWithoutAJobDoesNotReplan(t *testing.T) {
 }
 
 // TestNoReplanAfterShutdown: once the scheduler's context is cancelled, a
-// busy runner finishing its job launches nothing, whatever was queued.
+// runner finishing its job launches nothing, whatever was queued.
 func TestNoReplanAfterShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	prov := newJobProv()
@@ -1646,6 +1723,7 @@ func TestNoReplanAfterShutdown(t *testing.T) {
 
 	s.Reconcile(ctx, 3)
 	a := prov.next(t)
+	message(ctx, s, 2, a)
 	cancel()
 	prov.finish(a)
 	// Drain waits for every launch a re-plan could have started: one would
@@ -1657,11 +1735,13 @@ func TestNoReplanAfterShutdown(t *testing.T) {
 // TestNoReplanDuringDrain: Drain stops re-plans even while the context is
 // still live, or a tier with queued jobs could never finish draining.
 func TestNoReplanDuringDrain(t *testing.T) {
+	ctx := context.Background()
 	prov := newJobProv()
 	s := New(Options{Max: 1, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
 
-	s.Reconcile(context.Background(), 3)
+	s.Reconcile(ctx, 3)
 	a := prov.next(t)
+	message(ctx, s, 2, a)
 	drained := make(chan struct{})
 	go func() { s.Drain(); close(drained) }()
 	deadline := time.After(2 * time.Second)

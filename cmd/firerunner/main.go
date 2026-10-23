@@ -739,6 +739,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				return sched.Running()
 			}
 			onBusy := func(name string) { sched.MarkBusy(name) }
+			onCompleted := func(name string) { sched.MarkCompleted(name) }
 			capacity := func() int { return sched.Capacity() }
 			// The reconciler compares GitHub's statistics with this tier's
 			// runners for as long as the tier serves.
@@ -746,7 +747,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			go reconcile.New(statsSource{lis}, sched, jit.Exists, reconcile.Options{
 				Health: tracker, Logger: log.With("tier", tiers[i].Name, "component", "reconcile"),
 			}).Run(tierCtx)
-			return lis.Run(tierCtx, onDesired, onBusy, capacity)
+			return lis.Run(tierCtx, onDesired, onBusy, onCompleted, capacity)
 		}
 	}
 	runErr := serveTiers(runCtx, cancel, tierNames(tiers), runs, log)
