@@ -26,25 +26,33 @@ import (
 //
 //	R1  RunInstances: a persistent spot request needs interruption behaviour
 //	    stop or hibernate.
-//	    Fake: InvalidParameterCombination (the code is not verified).
+//	    Fake: InvalidParameterCombination.
 //	    Source: EC2 API Reference, SpotMarketOptions ("persistent Spot
 //	    Instance requests are only supported when the instance interruption
-//	    behavior is either hibernate or stop").
+//	    behavior is either hibernate or stop"); the code observed on
+//	    2026-10-23.
 //	R2  RunInstances: a persistent spot request rejects instance-initiated
 //	    shutdown behaviour terminate. One-time spot and on-demand accept it.
-//	    Fake: InvalidParameterCombination (the code is not verified).
-//	    Source: observed on real instances on 2026-10-22 (commit 512f5da).
+//	    Fake: InvalidParameterCombination.
+//	    Source: observed on real instances on 2026-10-22 (commit 512f5da);
+//	    the code observed on 2026-10-23.
 //	R3  Only a spot instance from a persistent request can be stopped.
 //	    Fake: setState records a violation; the test scripted a state AWS
 //	    never produces.
-//	    Source: EC2 User Guide, stopping Spot Instances.
+//	    Source: EC2 User Guide, stopping Spot Instances; observed on
+//	    2026-10-23 (StopInstances on a one-time spot instance fails with
+//	    UnsupportedOperation).
 //	R4  StartInstances fails for a stopped spot instance whose persistent
 //	    request is cancelled; that instance can never start again.
 //	    Fake: IncorrectSpotRequestState.
-//	    Source: observed in e2e on 2026-10-23 (commit aae7d7e).
-//	R5  StartInstances needs a stopped instance.
-//	    Fake: IncorrectInstanceState.
-//	    Source: EC2 User Guide, instance lifecycle.
+//	    Source: observed in e2e on 2026-10-23 (commit aae7d7e), and again
+//	    on its own the same day.
+//	R5  StartInstances on a pending or running instance is a no-op that
+//	    succeeds; it starts a stopped one and fails in any other state.
+//	    Fake: success without a state change; IncorrectInstanceState for
+//	    stopping, shutting-down and terminated.
+//	    Source: the no-op observed on 2026-10-23 (spot and on-demand); the
+//	    failure from the EC2 User Guide, instance lifecycle (not observed).
 //	R6  ModifyInstanceAttribute can change user-data only while the instance
 //	    is stopped.
 //	    Fake: IncorrectInstanceState.
@@ -53,7 +61,11 @@ import (
 //	    StartInstances, TerminateInstances, ModifyInstanceAttribute and
 //	    CreateTags.
 //	    Fake: InvalidInstanceID.NotFound.
-//	    Source: EC2 API Reference, error codes.
+//	    Source: EC2 API Reference, error codes; observed on 2026-10-23 for
+//	    DescribeInstances, StartInstances, TerminateInstances and CreateTags
+//	    with a well-formed ID. (An ID that is not well formed fails with
+//	    InvalidInstanceID.Malformed, or InvalidID from CreateTags; firerunner
+//	    only uses IDs EC2 handed it.)
 //	R8  A just-launched instance can be missing from DescribeInstances for a
 //	    while, which fails the whole call.
 //	    Fake: InvalidInstanceID.NotFound for the IDs in invisible.
@@ -68,7 +80,11 @@ import (
 //	    Source: EC2 User Guide, persistent Spot requests and cancelling them.
 //	R11 Cancelling a spot request does not stop or terminate its instance.
 //	    Fake: the instance's state is unchanged.
-//	    Source: EC2 User Guide, cancel a Spot Instance request.
+//	    Source: EC2 User Guide, cancel a Spot Instance request; observed on
+//	    2026-10-23 (a stopped instance stayed stopped).
+//	R12 Cancelling an already cancelled spot request succeeds.
+//	    Fake: no error on a repeat.
+//	    Source: observed on 2026-10-23.
 //
 // Scripted per test, not enforced: capacity and quota errors (runErrs),
 // throttling and other failures (cancelErrs, describeErr, terminateErr,
@@ -77,10 +93,9 @@ import (
 //
 // Not modelled, so no test may rely on it: a spot interruption; the
 // replacement a persistent request launches (R10 fails the test instead); a
-// cap on IDs per DescribeInstances call (the watcher batches 100 on its own);
-// starting an instance that is already pending or running (rejected here, AWS
-// may treat it as a no-op); cancelling an already cancelled request (assumed
-// to succeed, as pool.go does).
+// cap on IDs per DescribeInstances call (the watcher batches 100 on its own;
+// on 2026-10-23 a call accepted 5000 copies of one ID, so a cap on distinct
+// IDs is not ruled out).
 //
 // newFakeEC2 also checks, when the test ends, the invariants real AWS and our
 // cost guarantees imply; see invariantErrors.
@@ -303,7 +318,13 @@ func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput,
 		if !ok {
 			return nil, apiErr(errNotFound) // R7
 		}
-		if i.state != types.InstanceStateNameStopped {
+		switch i.state {
+		case types.InstanceStateNamePending, types.InstanceStateNameRunning:
+			// R5: a no-op that succeeds.
+			f.started = append(f.started, id)
+			continue
+		case types.InstanceStateNameStopped:
+		default:
 			return nil, apiErr("IncorrectInstanceState") // R5
 		}
 		// R4: a stopped spot instance whose request was cancelled can
@@ -619,6 +640,57 @@ func TestFake_RunInstancesSpotRules(t *testing.T) {
 				t.Fatalf("RunInstances err = %v, want ok=%v", err, c.ok)
 			}
 		})
+	}
+}
+
+func TestFake_StartInstancesByState(t *testing.T) {
+	for _, c := range []struct {
+		state types.InstanceStateName
+		ok    bool
+	}{
+		{types.InstanceStateNamePending, true}, // R5: no-op
+		{types.InstanceStateNameRunning, true}, // R5: no-op
+		{types.InstanceStateNameStopped, true},
+		{types.InstanceStateNameStopping, false},
+		{types.InstanceStateNameShuttingDown, false},
+		{types.InstanceStateNameTerminated, false},
+	} {
+		t.Run(string(c.state), func(t *testing.T) {
+			f := newFakeEC2(t)
+			id, err := fakeLaunch(t, f, nil, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.setState(id, c.state)
+			_, err = f.StartInstances(context.Background(), &ec2.StartInstancesInput{InstanceIds: []string{id}})
+			if c.ok != (err == nil) {
+				t.Fatalf("StartInstances from %s: err = %v, want ok=%v", c.state, err, c.ok)
+			}
+			if !c.ok && !isCode(err, "IncorrectInstanceState") {
+				t.Fatalf("StartInstances from %s: err = %v, want IncorrectInstanceState", c.state, err)
+			}
+			if c.ok && c.state != types.InstanceStateNameStopped && f.state(id) != c.state {
+				t.Fatalf("a no-op start moved %s to %s", c.state, f.state(id))
+			}
+		})
+	}
+}
+
+// TestFake_CancelTwice covers R12.
+func TestFake_CancelTwice(t *testing.T) {
+	f := newFakeEC2(t)
+	id, err := fakeLaunch(t, f, spotOpts(types.SpotInstanceTypePersistent, types.InstanceInterruptionBehaviorStop), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := f.instance(id).spotReq
+	for i := 0; i < 2; i++ {
+		if _, err := f.CancelSpotInstanceRequests(context.Background(), &ec2.CancelSpotInstanceRequestsInput{SpotInstanceRequestIds: []string{req}}); err != nil {
+			t.Fatalf("cancel %d: %v", i+1, err)
+		}
+	}
+	if _, err := f.TerminateInstances(context.Background(), &ec2.TerminateInstancesInput{InstanceIds: []string{id}}); err != nil {
+		t.Fatal(err)
 	}
 }
 
