@@ -114,6 +114,50 @@ The unit has no `network-online.target` or docker ordering: the retry loop
 starts the fetch as soon as the NIC has an address. `images/test-ec2-run.sh`
 exercises the script against a fake IMDS and endpoint.
 
+### Building the EC2 runner AMI
+
+`images/build-ec2-ami.sh` builds the image from stock Ubuntu 24.04 and
+publishes its ID to an SSM parameter. Point a tier's `"ami"` at that
+parameter:
+
+```bash
+images/build-ec2-ami.sh \
+  --subnet subnet-0aaa… --security-group sg-0bbb… \
+  --ssm-param /firerunner/ami/runner --tag team=ci
+# {"ami":"ami-…","ssm_param":"/firerunner/ami/runner","runner_version":"2.338.1","arch":"x64"}
+```
+
+It launches a build instance with `images/ec2/provision.sh` as user-data,
+waits for it to power off, snapshots it, publishes the ID and terminates the
+build instance on every exit path. A build takes about 5 minutes.
+
+- The build instance needs egress to Ubuntu's mirrors and github.com, but no
+  inbound rules and no instance profile.
+- `--render` prints the user-data without touching AWS.
+- `images/test-build-ec2-ami.sh` tests the script against a fake `aws`.
+
+The image contains:
+
+- docker with the containerd image store;
+- `actions/runner`, `zstd` and the boot unit above.
+
+It leaves out cloud-init, snapd, and timers that could wake during a job.
+Two settings matter for any image made from a snapshot:
+
+- **netplan matches any NIC by name.** cloud-init's `50-cloud-init.yaml` matches
+  the build instance's MAC address. With cloud-init disabled, every instance
+  from the image would boot without network.
+- **The hostname and machine-id are emptied,** so each instance takes its own
+  from DHCP and at first boot, not the build instance's.
+
+Keep the image small. Do not bake CI container images into it: EBS restores
+snapshot blocks lazily, so a large image makes first reads, and jobs, slower
+than pulling from the registry.
+
+**Rebuild at least monthly.** GitHub accepts a runner version for about 30
+days after its release. A tier that names the SSM parameter picks up a new
+image within five minutes, with no config change.
+
 ## Building
 
 ```bash

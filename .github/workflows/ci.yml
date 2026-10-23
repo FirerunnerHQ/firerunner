@@ -30,6 +30,8 @@ jobs:
         run: images/test-docker-shim.sh
       - name: Test EC2 runner boot script
         run: images/test-ec2-run.sh
+      - name: Test EC2 AMI build script
+        run: images/test-build-ec2-ami.sh
 
   # The egress firewall against the real kernel's nftables, in throwaway
   # network namespaces: what a guest can and cannot reach in each egress mode.
