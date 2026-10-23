@@ -34,7 +34,22 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
   imperative, with a body that says why. Look at `git log` for the house style.
 - One issue per PR, linked with `Closes #N`. Every behaviour change ships with
   tests.
-- Merge with a merge commit (`gh pr merge --merge --delete-branch`).
+- **Wait with `scripts/pr-wait.sh PR`**, not by polling `gh pr checks` or
+  `gh run watch`. It returns as soon as a check fails, with the failed log's
+  relevant lines, the reviews and every unresolved review thread, as JSON
+  lines; exit 0 means green with no open thread. See its `--help`.
+- Merge with a merge commit: `gh pr merge --auto --merge --delete-branch`.
+  `--auto` waits for the six checks the ruleset "main: required CI checks"
+  requires (`test`, `build`, `shell`, `netns`, `cache-protocol`,
+  `sign-off`). Renaming one of those jobs needs the ruleset updated in the
+  same PR, or every PR waits forever. `pr-wait.sh` still shows why a PR is
+  not merging: failed logs and open threads.
+- **Review gate.** A PR touching cost or security code (`internal/scheduler`,
+  `ec2`, `jitserver`, `listener`, `cacheserver`, `jobidentity`, or the egress
+  firewall in `internal/provisioner/egress*.go`) gets an independent review
+  before merge: Copilot's, or a fresh reviewer agent given the diff and not
+  the author's conclusions. Answer every finding (fix, or reply why not).
+  `pr-wait.sh` prints `review_required` while such a PR has no review.
 - **Stacked PRs:** before merging a PR that another PR is based on, retarget the
   child to `main` first (`gh pr edit <child> --base main`). Deleting a base
   branch closes, rather than retargets, the PRs on it.
