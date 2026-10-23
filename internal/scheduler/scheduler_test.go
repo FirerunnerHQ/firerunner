@@ -1415,3 +1415,289 @@ func TestIdleRunnersAndCancelLost(t *testing.T) {
 	close(release)
 	s.Drain()
 }
+
+// jobProv is a provisioner whose runners take a job at once (onBusy, as the
+// guest console marker or GitHub's JobStarted would) and then run until the
+// test ends that job with finish. Each Launch sends its runner name on
+// entered.
+type jobProv struct {
+	entered chan string
+	mu      sync.Mutex
+	done    map[string]chan struct{}
+}
+
+func newJobProv() *jobProv {
+	return &jobProv{entered: make(chan string, 64), done: map[string]chan struct{}{}}
+}
+
+func (p *jobProv) Launch(_ context.Context, name, _ string, _ core.RunnerSpec, onBusy func()) error {
+	ch := make(chan struct{})
+	p.mu.Lock()
+	p.done[name] = ch
+	p.mu.Unlock()
+	onBusy()
+	p.entered <- name
+	<-ch
+	return nil
+}
+
+func (*jobProv) Name() string { return "fake" }
+
+// finish ends the named runner's job; its Launch then returns.
+func (p *jobProv) finish(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	close(p.done[name])
+}
+
+func (p *jobProv) next(t *testing.T) string {
+	t.Helper()
+	select {
+	case name := <-p.entered:
+		return name
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a launch")
+		return ""
+	}
+}
+
+// noMore asserts that nothing has entered Launch. Call it only once every
+// launch that could have happened has been decided, e.g. after Drain.
+func (p *jobProv) noMore(t *testing.T) {
+	t.Helper()
+	select {
+	case name := <-p.entered:
+		t.Fatalf("unexpected launch %s", name)
+	default:
+	}
+}
+
+// TestRunnerExitAtMaxLaunchesForQueuedJob is issue #79: with the tier at Max
+// and jobs queued behind it, a runner finishing its job frees a place, and the
+// queued job must get a runner then, not at the listener's next message.
+func TestRunnerExitAtMaxLaunchesForQueuedJob(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prov := newJobProv()
+	s := New(Options{Max: 2, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 4) // two jobs running, two queued
+	a, b := prov.next(t), prov.next(t)
+
+	prov.finish(a) // no Reconcile follows
+	c := prov.next(t)
+	if got := s.Running(); got != 2 {
+		t.Fatalf("running=%d want 2: the re-plan replaces the exited runner, no more", got)
+	}
+	prov.finish(b)
+	d := prov.next(t)
+
+	cancel()
+	prov.finish(c)
+	prov.finish(d)
+	s.Drain()
+	prov.noMore(t)
+}
+
+// TestRunnerExitWithDemandMetLaunchesNothing: when the runners still live
+// cover the last desired count, an exit launches nothing.
+func TestRunnerExitWithDemandMetLaunchesNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prov := newJobProv()
+	s := New(Options{Max: 4, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 3)
+	a, b, c := prov.next(t), prov.next(t), prov.next(t)
+	s.Reconcile(ctx, 2) // one job completed; its VM has not exited yet
+
+	prov.finish(a)
+	// The re-plan is decided in the critical section that takes the exit out
+	// of running, so once running reads 2 it has launched nothing, or it
+	// would read 3.
+	waitRunning(t, s, 2)
+	prov.noMore(t)
+
+	cancel()
+	prov.finish(b)
+	prov.finish(c)
+	s.Drain()
+	prov.noMore(t)
+}
+
+// TestManyRunnersExitingAtOnceReplaceOnlyWhatIsQueued: concurrent exits each
+// commit against the count the others left, so the tier never goes past Max
+// and launches only for the jobs queued.
+func TestManyRunnersExitingAtOnceReplaceOnlyWhatIsQueued(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prov := newJobProv()
+	s := New(Options{Max: 4, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 6) // four running, two queued
+	first := []string{prov.next(t), prov.next(t), prov.next(t), prov.next(t)}
+	s.Reconcile(ctx, 2) // the four complete: only the two queued remain
+
+	for _, n := range first {
+		go prov.finish(n)
+	}
+	second := []string{prov.next(t), prov.next(t)}
+	waitRunning(t, s, 2) // all four exits settled: two replacements, no more
+	prov.noMore(t)
+
+	cancel()
+	for _, n := range second {
+		prov.finish(n)
+	}
+	s.Drain()
+	prov.noMore(t)
+}
+
+// TestReplanLaunchesAtMostOnePerExit: launches that failed without a job leave
+// the tier below Max with demand unmet (they wait for the next message). One
+// runner exiting frees one place, so its re-plan launches one, not the whole
+// shortfall a stale desired count would ask for.
+func TestReplanLaunchesAtMostOnePerExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	jobs := newJobProv()
+	var attempts atomic.Int32
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		if attempts.Add(1) <= 2 {
+			return errors.New("boot failed") // no job: backs off, no re-plan
+		}
+		return jobs.Launch(vmCtx, name, jit, spec, onBusy)
+	})
+	s := New(Options{Max: 4, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 4)
+	a, b := jobs.next(t), jobs.next(t)
+	waitRunningWithin(t, s, 2, 5*time.Second) // both failed launches backed off and ended
+
+	jobs.finish(a) // live 1, running 1, desired 4: plan alone would launch 3
+	c := jobs.next(t)
+	if got := s.Running(); got != 2 {
+		t.Fatalf("running=%d want 2: one exit, one launch", got)
+	}
+
+	cancel()
+	jobs.finish(b)
+	jobs.finish(c)
+	s.Drain()
+	jobs.noMore(t)
+}
+
+// TestFailedBootWithAJobReplansOnlyAfterBackoff:a launch that fails keeps its
+// place through backoff, so the re-plan its exit triggers is paced by the
+// backoff rather than retrying at once.
+func TestFailedBootWithAJobReplansOnlyAfterBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attempts := make(chan time.Time, 16)
+	prov := provFunc(func(_ context.Context, _, _ string, _ core.RunnerSpec, onBusy func()) error {
+		onBusy() // the guest took the job, then the VM died
+		attempts <- time.Now()
+		return errors.New("vm crashed")
+	})
+	s := New(Options{Max: 1, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 3)
+	var first, second time.Time
+	for i, at := range []*time.Time{&first, &second} {
+		select {
+		case *at = <-attempts:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("attempt %d never came", i+1)
+		}
+	}
+	// A timer never fires early, so this lower bound holds exactly.
+	if gap := second.Sub(first); gap < backoffDelay(1) {
+		t.Fatalf("re-plan after a failed boot came %s later, inside its %s backoff", gap, backoffDelay(1))
+	}
+	cancel()
+	s.Drain()
+}
+
+// TestFailedBootWithoutAJobDoesNotReplan: only a runner that took a job
+// re-plans on exit; a boot that failed before getting one waits for the next
+// message, as before.
+func TestFailedBootWithoutAJobDoesNotReplan(t *testing.T) {
+	var attempts atomic.Int32
+	prov := provFunc(func(context.Context, string, string, core.RunnerSpec, func()) error {
+		attempts.Add(1)
+		return errors.New("boot failed")
+	})
+	s := New(Options{Max: 1, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(context.Background(), 3)
+	waitRunningWithin(t, s, 0, 5*time.Second) // through backoff to the exit
+	s.Drain()
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts=%d want 1", got)
+	}
+}
+
+// TestNoReplanAfterShutdown: once the scheduler's context is cancelled, a
+// busy runner finishing its job launches nothing, whatever was queued.
+func TestNoReplanAfterShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	prov := newJobProv()
+	s := New(Options{Max: 1, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(ctx, 3)
+	a := prov.next(t)
+	cancel()
+	prov.finish(a)
+	// Drain waits for every launch a re-plan could have started: one would
+	// have been added before the exiting goroutine finished.
+	s.Drain()
+	prov.noMore(t)
+}
+
+// TestNoReplanDuringDrain: Drain stops re-plans even while the context is
+// still live, or a tier with queued jobs could never finish draining.
+func TestNoReplanDuringDrain(t *testing.T) {
+	prov := newJobProv()
+	s := New(Options{Max: 1, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+
+	s.Reconcile(context.Background(), 3)
+	a := prov.next(t)
+	drained := make(chan struct{})
+	go func() { s.Drain(); close(drained) }()
+	deadline := time.After(2 * time.Second)
+	for {
+		s.mu.Lock()
+		d := s.draining
+		s.mu.Unlock()
+		if d {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("Drain never began")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	prov.finish(a)
+	select {
+	case <-drained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Drain did not finish: a re-plan launched during it")
+	}
+	prov.noMore(t)
+}
+
+func waitRunningWithin(t *testing.T, s *Scheduler, want int, within time.Duration) {
+	t.Helper()
+	deadline := time.After(within)
+	for {
+		if got := s.Running(); got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("running=%d want %d", s.Running(), want)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}

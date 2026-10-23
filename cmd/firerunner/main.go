@@ -729,9 +729,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	runs := make([]func(context.Context) error, len(listeners))
 	for i := range listeners {
 		lis, sched, tracker := listeners[i], scheds[i], trackers[i]
-		// tierCtx is this tier's own lifetime (see serveTiers): launches and
-		// the warm-pool top-up bind to it, so a tier that stops cancels its
-		// idle runners and stops replenishing, while busy ones finish.
+		// tierCtx is this tier's own lifetime (see serveTiers): launches, the
+		// re-plan after a runner exits and the warm-pool top-up bind to it,
+		// so a tier that stops cancels its idle runners and stops launching,
+		// while busy ones finish.
 		runs[i] = func(tierCtx context.Context) error {
 			onDesired := func(_ context.Context, desired int) int {
 				sched.Reconcile(tierCtx, desired)

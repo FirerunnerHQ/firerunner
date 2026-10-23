@@ -98,6 +98,16 @@ type Scheduler struct {
 	// mu.
 	removeQ       []string
 	removerActive bool
+	// lastDesired and lastCtx are the desired count and context of the latest
+	// Reconcile, kept so a runner that finishes its job can re-run the plan
+	// (see replan). hasDesired is false until the first Reconcile. Guarded by
+	// mu.
+	lastDesired int
+	lastCtx     context.Context
+	hasDesired  bool
+	// draining is set by Drain: from then on nothing launches, so the wait
+	// cannot be extended by a launch it has to wait for in turn. Guarded by mu.
+	draining bool
 }
 
 // vmHandle is the shutdown-relevant state of one in-flight microVM.
@@ -165,13 +175,20 @@ func (s *Scheduler) live() int {
 // Reconcile launches microVMs to meet the desired count, bounded by capacity,
 // and cancels idle VMs when desired drops below the number running. It is safe
 // for concurrent use; each launched runner handles exactly one job.
+//
+// The listener calls it on every message from GitHub. Between messages, a
+// runner that finishes its job re-runs the plan with the desired count given
+// here (see replan), so a job queued at Max starts when a slot frees rather
+// than at the next message.
 func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 	s.mu.Lock()
+	s.lastDesired, s.lastCtx, s.hasDesired = desired, ctx, true
 	reclaimed := s.reclaimQueued(desired)
-	n := plan(desired, s.live(), s.running, s.opts.Max)
-	s.running += n
-	s.pending += n
-	s.opts.Pending.add(n)
+	n := 0
+	if !s.draining {
+		n = plan(desired, s.live(), s.running, s.opts.Max)
+	}
+	s.commit(n)
 	running := s.running
 	stopped := 0
 	startRemover := false
@@ -197,6 +214,60 @@ func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 	if startRemover {
 		go s.removeLoop(ctx)
 	}
+}
+
+// commit adds n launches to running and to the pending counts, before their
+// goroutines start. Callers must hold s.mu.
+func (s *Scheduler) commit(n int) {
+	s.running += n
+	s.pending += n
+	s.opts.Pending.add(n)
+}
+
+// replan re-runs Reconcile's plan with the last desired count after a runner
+// that took a job has exited, and reports how many launches it committed (0 or
+// 1) along with the context to launch them under. GitHub sends a message when
+// a job completes, but the VM that ran it is still live then, so plan counts it
+// as able to serve the jobs queued behind it and launches nothing; the VM goes
+// away seconds later and, without this, nothing looks again until the next
+// message, up to a long poll (~50 s) later. Callers must hold s.mu, in the
+// same critical section that took the exited launch out of running.
+//
+// It launches only what Reconcile would launch for the same count, with the
+// same accounting, and never more than the one place the exit freed. It
+// returns a queued removal to the pool before booting anew, as Reconcile does,
+// and it never scales down: an exit only lowers live, so there is no new
+// excess to cancel.
+//
+// The desired count can be stale by the messages not yet delivered. A runner
+// launched for a job GitHub no longer counts is idle, and the next message
+// (a long poll returns at least every ~50 s) scales it down. That can happen
+// when a queued job is taken by a sibling scale set or cancelled, or when the
+// VM exits before the message reporting its own job's completion arrives. In
+// each case it costs one runner per exit: the cap of one holds however many
+// runners exit at once, since each exit commits under the lock against the
+// count the previous ones left.
+//
+// Only an exit after a job triggers it. A failed boot holds its place in
+// running through backoff and replans, if it had a job, only when that ends,
+// so backoff paces it; an idle VM that exits by itself (a lost runner, a
+// lifetime cap) waits for the next message like before, so a VM that exits at
+// once without a job cannot spin a launch loop. Shutdown (ctx cancelled) and
+// Drain stop it.
+func (s *Scheduler) replan(ctx context.Context) (int, context.Context) {
+	if !s.hasDesired || s.draining || ctx.Err() != nil || s.lastCtx.Err() != nil {
+		return 0, nil
+	}
+	if s.reclaimQueued(s.lastDesired) > 0 {
+		s.opts.Logger.Info("runner exited: kept a runner queued for removal", "desired", s.lastDesired)
+		return 0, nil
+	}
+	n := min(1, plan(s.lastDesired, s.live(), s.running, s.opts.Max))
+	s.commit(n)
+	if n > 0 {
+		s.opts.Logger.Info("runner exited: scaling up", "desired", s.lastDesired, "launching", n, "running", s.running, "max", s.opts.Max)
+	}
+	return n, s.lastCtx
 }
 
 // scaleDown picks idle (non-busy, not already cancelling or deregistering)
@@ -366,13 +437,26 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 			s.running--
 		}
 	}
+	// tookJob is set once the VM has exited if it had been marked busy: its
+	// exit frees a place a queued job may be waiting for (see replan).
+	tookJob := false
 	// This runs before wg.Done above (defers are LIFO), so the WaitGroup counter
-	// stays >=1 while maintainMinimum may Add a replacement — avoiding a
-	// concurrent-Add-during-Drain race.
+	// stays >=1 while replan or maintainMinimum may Add a replacement —
+	// avoiding a concurrent-Add-during-Drain race. replan decides in the same
+	// critical section that frees the place, so a concurrent Reconcile or exit
+	// sees either both or neither.
 	defer func() {
 		s.mu.Lock()
 		finish()
+		n, lctx := 0, context.Context(nil)
+		if tookJob {
+			n, lctx = s.replan(ctx)
+		}
 		s.mu.Unlock()
+		for i := 0; i < n; i++ {
+			s.wg.Add(1)
+			go s.launchOne(lctx, time.Now())
+		}
 		s.maintainMinimum(ctx)
 	}()
 
@@ -455,6 +539,9 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 	// would tie the provisioner's slot lifecycle to this lock. A failed launch
 	// keeps its place in running through backoff so plan bounds the retries.
 	s.mu.Lock()
+	if h := s.active[name]; h != nil {
+		tookJob = h.busy
+	}
 	delete(s.active, name)
 	failed := launchErr != nil && vmCtx.Err() == nil
 	if !failed {
@@ -621,16 +708,17 @@ func (s *Scheduler) maintainMinimum(ctx context.Context) {
 	if s.opts.Min <= 0 || ctx.Err() != nil {
 		return
 	}
+	s.mu.Lock()
 	// The floor is measured against running rather than live on purpose: a
 	// launch sleeping in backoff is the pool's pending replenishment, and
 	// counting it keeps a failing golden from being retried faster than backoff
 	// allows. Demand-driven launches (Reconcile) are the ones that must not
 	// wait on it.
-	s.mu.Lock()
-	n := plan(s.opts.Min, s.running, s.running, s.opts.Max)
-	s.running += n
-	s.pending += n
-	s.opts.Pending.add(n)
+	n := 0
+	if !s.draining {
+		n = plan(s.opts.Min, s.running, s.running, s.opts.Max)
+	}
+	s.commit(n)
 	running := s.running
 	s.mu.Unlock()
 	if n == 0 {
@@ -694,5 +782,12 @@ func (s *Scheduler) Capacity() int {
 	return committed + willBoot + headroom
 }
 
-// Drain blocks until all in-flight microVMs have exited.
-func (s *Scheduler) Drain() { s.wg.Wait() }
+// Drain blocks until all in-flight microVMs have exited. Nothing launches once
+// it has begun: not Reconcile, not the warm-pool top-up, not a re-plan after
+// an exit.
+func (s *Scheduler) Drain() {
+	s.mu.Lock()
+	s.draining = true
+	s.mu.Unlock()
+	s.wg.Wait()
+}
