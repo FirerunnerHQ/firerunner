@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -60,7 +61,9 @@ type ScaleSet struct {
 	// removal delay the next scale-up. The scheduler issues one removal at a
 	// time per tier, so nothing ever waits on this client's mutex.
 	removeClient *scaleset.Client
-	session      session
+	// jitClients generates JIT configs in parallel; see clientPool.
+	jitClients *clientPool
+	session    session
 	// open opens a fresh message session after the current one fails.
 	open       func(context.Context) (session, error)
 	health     *health.Tracker
@@ -126,6 +129,16 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		session: first, health: cfg.Health,
 		scaleSetID: id, created: !reused,
 	}
+	// The registration client is warm (it holds a token): it seeds the pool.
+	s.jitClients = newClientPool(jitParallelism(cfg.MaxRunners), func() (jitClient, error) {
+		c, err := newClient(cfg)
+		if err != nil {
+			return nil, err
+		}
+		c.SetSystemInfo(systemInfo(cfg, id))
+		return c, nil
+	})
+	s.jitClients.seed(client)
 	s.open = func(ctx context.Context) (session, error) {
 		sess, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.Logger)
 		if err != nil {
@@ -213,7 +226,7 @@ func isSessionConflict(err error) bool {
 // JIT returns a JIT source bound to this scale set, satisfying
 // scheduler.JITSource.
 func (s *ScaleSet) JIT() *JITSource {
-	return &JITSource{client: s.client, remover: s.removeClient, scaleSetID: s.scaleSetID, namePrefix: s.cfg.Name}
+	return &JITSource{clients: s.jitClients, remover: s.removeClient, scaleSetID: s.scaleSetID, namePrefix: s.cfg.Name}
 }
 
 // ErrFatal marks a listener error that reconnecting cannot fix: GitHub
@@ -470,7 +483,7 @@ func (a *scaler) HandleJobCompleted(_ context.Context, j *scaleset.JobCompleted)
 
 // JITSource generates just-in-time runner registrations against the scale set.
 type JITSource struct {
-	client     *scaleset.Client
+	clients    *clientPool
 	remover    runnerRemover
 	scaleSetID int
 	namePrefix string
@@ -478,13 +491,91 @@ type JITSource struct {
 
 // Generate implements scheduler.JITSource.
 func (j *JITSource) Generate(ctx context.Context, _ core.RunnerSpec) (name, jitConfig string, err error) {
+	c, err := j.clients.get(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("generate JIT config: %w", err)
+	}
+	defer j.clients.put(c)
 	name = j.namePrefix + "-" + randSuffix()
-	cfg, err := j.client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, j.scaleSetID)
+	cfg, err := c.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, j.scaleSetID)
 	if err != nil {
 		return "", "", fmt.Errorf("generate JIT config: %w", err)
 	}
 	return name, cfg.EncodedJITConfig, nil
 }
+
+// jitClient is the part of *scaleset.Client that Generate uses.
+type jitClient interface {
+	GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
+}
+
+// maxJITClients caps one tier's concurrent JIT requests to GitHub.
+const maxJITClients = 32
+
+// jitParallelism sizes a tier's JIT client pool: one per runner the tier can
+// launch at once, up to maxJITClients.
+func jitParallelism(maxRunners int) int {
+	return min(max(maxRunners, 1), maxJITClients)
+}
+
+// clientPool hands out JIT clients so concurrent launches do not queue on one.
+// A scaleset.Client holds a mutex across every request, so a burst of launches
+// sharing one client generates its configs one after another: 20 queued jobs
+// waited up to ~20 round trips for their runners. The pool grows on demand up
+// to its limit, reusing idle clients (and their cached tokens) first, and
+// beyond that waits for one to free up.
+type clientPool struct {
+	idle    chan jitClient
+	mu      sync.Mutex
+	created int
+	limit   int
+	make    func() (jitClient, error)
+}
+
+func newClientPool(limit int, mk func() (jitClient, error)) *clientPool {
+	return &clientPool{idle: make(chan jitClient, limit), limit: limit, make: mk}
+}
+
+// get returns an idle client, a new one while under the limit, or waits.
+func (p *clientPool) get(ctx context.Context) (jitClient, error) {
+	select {
+	case c := <-p.idle:
+		return c, nil
+	default:
+	}
+	p.mu.Lock()
+	if p.created < p.limit {
+		p.created++
+		p.mu.Unlock()
+		c, err := p.make()
+		if err != nil {
+			p.mu.Lock()
+			p.created--
+			p.mu.Unlock()
+			return nil, err
+		}
+		return c, nil
+	}
+	p.mu.Unlock()
+	select {
+	case c := <-p.idle:
+		return c, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// seed adds an existing client (the warm registration client), counted
+// toward the limit like one the pool made.
+func (p *clientPool) seed(c jitClient) {
+	p.mu.Lock()
+	p.created++
+	p.mu.Unlock()
+	p.put(c)
+}
+
+// put returns a client the pool handed out.
+func (p *clientPool) put(c jitClient) { p.idle <- c }
 
 // runnerRemover is the part of *scaleset.Client that RemoveRunner uses, so the
 // error mapping can be tested without GitHub.
