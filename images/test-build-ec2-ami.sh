@@ -26,8 +26,10 @@ case "$*" in
 	echo "$n" >"$STATE/polls"
 	if [ "$n" -lt 2 ]; then echo running; else cat "$STATE/final" 2>/dev/null || echo stopped; fi
 	;;
+*"ec2 wait instance-exists"*) ;;
+*"ec2 get-console-output"*) cat "$STATE/console" 2>/dev/null || echo "FIRERUNNER-BUILD 2026-01-01T00:00:00Z finished" ;;
 *"ec2 create-image"*) echo ami-0new ;;
-*"ec2 wait image-available"*) ;;
+*"ec2 describe-images"*) cat "$STATE/image-state" 2>/dev/null || echo available ;;
 *"ssm put-parameter"*) ;;
 *"ec2 terminate-instances"*) ;;
 *) echo "unexpected aws call: $*" >&2; exit 1 ;;
@@ -88,6 +90,29 @@ expect "no image" "" not_called "ec2 create-image"
 expect "no publish" "" not_called "ssm put-parameter"
 expect "still terminates" "" called "ec2 terminate-instances --instance-ids i-0build"
 
+# 2b. Provisioning failed: the instance powered off with a FAILED mark. No
+# image is taken of it.
+fresh provision-failed
+echo "FIRERUNNER-BUILD 2026-01-01T00:00:00Z FAILED rc=100" >"$STATE/console"
+build
+expect "fails on a FAILED mark" "$(cat "$STATE/err")" grep -q "provisioning failed" "$STATE/err"
+expect "no image of a failed build" "" not_called "ec2 create-image"
+expect "terminates a failed build" "" called "ec2 terminate-instances --instance-ids i-0build"
+
+# 2c. Stopped without any mark (console lost): not imaged.
+fresh no-mark
+echo "some boot noise" >"$STATE/console"
+build --timeout 2
+expect "fails without a finished mark" "$(cat "$STATE/err")" grep -q "without a 'finished' mark" "$STATE/err"
+expect "no image without a mark" "" not_called "ec2 create-image"
+
+# 2d. The image fails: nothing is published.
+fresh image-failed
+echo failed >"$STATE/image-state"
+build
+expect "fails on a failed image" "$(cat "$STATE/err")" grep -q "ended as failed" "$STATE/err"
+expect "no publish of a failed image" "" not_called "ssm put-parameter"
+
 # 3. Timeout: gives up and terminates.
 fresh timeout
 echo running >"$STATE/final"
@@ -96,7 +121,7 @@ expect "times out" "$(cat "$STATE/err")" grep -q "did not finish" "$STATE/err"
 expect "terminates on timeout" "" called "ec2 terminate-instances --instance-ids i-0build"
 
 # 4. Bad arguments touch no AWS.
-for args in "--arch sparc" "--tag novalue" "--volume-gib big" "--bogus"; do
+for args in "--arch sparc" "--tag novalue" "--tag team=a,b" "--tag k={x}" "--volume-gib big" "--bogus"; do
 	fresh "args-${args// /_}"
 	# shellcheck disable=SC2086 # split the case's words on purpose
 	build $args

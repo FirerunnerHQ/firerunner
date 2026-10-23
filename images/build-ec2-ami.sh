@@ -76,6 +76,8 @@ itype="${itype:-$default_type}"
 [[ "$timeout_s" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
 for t in "${tags[@]+"${tags[@]}"}"; do
 	[[ "$t" == ?*=* ]] || die "--tag wants KEY=VALUE, got '$t'"
+	# The CLI shorthand {Key=K,Value=V} cannot carry these characters.
+	[[ "$t" != *[,\[\]\{\}]* ]] || die "--tag '$t' contains one of , [ ] { }, which the AWS CLI shorthand cannot carry"
 done
 
 if [ -z "$runner_version" ]; then
@@ -152,15 +154,30 @@ instance="$(aws ec2 run-instances \
 log "build instance $instance launched; waiting for it to power off (up to ${timeout_s}s)"
 
 deadline=$(($(date +%s) + timeout_s))
+past_deadline() { [ "$(date +%s)" -ge "$deadline" ]; }
+# A just-launched instance can be briefly unknown to describe calls.
+aws ec2 wait instance-exists --instance-ids "$instance"
 while :; do
 	state="$(aws ec2 describe-instances --instance-ids "$instance" \
-		--query 'Reservations[0].Instances[0].State.Name' --output text)"
+		--query 'Reservations[0].Instances[0].State.Name' --output text)" || state=unknown
 	case "$state" in
 	stopped) break ;;
 	terminated | shutting-down) die "build instance $instance ended as $state" ;;
 	esac
-	[ "$(date +%s)" -lt "$deadline" ] || die "build did not finish within ${timeout_s}s (state $state); its console: aws ec2 get-console-output --instance-id $instance"
+	past_deadline && die "build did not finish within ${timeout_s}s (state $state); its console: aws ec2 get-console-output --instance-id $instance"
 	sleep 15
+done
+
+# provision.sh powers off on failure too: only its "finished" mark on the
+# console says the image is good. Console output can lag the stop.
+while :; do
+	console="$(aws ec2 get-console-output --instance-id "$instance" --latest --query Output --output text 2>/dev/null || true)"
+	if grep -q "FIRERUNNER-BUILD .* FAILED" <<<"$console"; then
+		die "provisioning failed: $(grep -o "FIRERUNNER-BUILD .* FAILED.*" <<<"$console" | head -n 1)"
+	fi
+	grep -q "FIRERUNNER-BUILD .* finished" <<<"$console" && break
+	past_deadline && die "build instance stopped without a 'finished' mark on its console; not imaging it"
+	sleep 10
 done
 
 ami="$(aws ec2 create-image --instance-id "$instance" --name "$name" \
@@ -168,7 +185,17 @@ ami="$(aws ec2 create-image --instance-id "$instance" --name "$name" \
 	--tag-specifications "ResourceType=image,Tags=[$tag_list]" "ResourceType=snapshot,Tags=[$tag_list]" \
 	--query ImageId --output text)"
 log "creating $ami"
-aws ec2 wait image-available --image-ids "$ami"
+# Poll against our own deadline: the CLI waiter gives up after ~10 minutes,
+# which a first snapshot can exceed.
+while :; do
+	img_state="$(aws ec2 describe-images --image-ids "$ami" --query 'Images[0].State' --output text)" || img_state=unknown
+	case "$img_state" in
+	available) break ;;
+	failed | invalid | error) die "image $ami ended as $img_state" ;;
+	esac
+	past_deadline && die "image $ami still $img_state after ${timeout_s}s; it is not published"
+	sleep 15
+done
 aws ssm put-parameter --name "$param" --type String --value "$ami" --overwrite >/dev/null
 log "published $ami to $param"
 

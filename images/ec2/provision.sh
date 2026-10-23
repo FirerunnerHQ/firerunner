@@ -3,8 +3,8 @@
 # runner image, then powers off so build-ec2-ami.sh can snapshot it.
 #
 # It runs once, as root, from the build instance's user-data. build-ec2-ami.sh
-# prepends the settings below and appends the boot script and unit, so this
-# file is never run by hand.
+# prepends the settings and an install_boot_unit function (the boot script and
+# unit), so this file is never run by hand.
 #
 # What the image does at boot (firerunner-ec2-runner.service): fetch the JIT
 # config over the VPC, run one job, power off. Everything here is about making
@@ -21,11 +21,26 @@ set -euxo pipefail
 : "${RUNNER_VERSION:?}" "${RUNNER_ARCH:?}"
 
 mark() { echo "FIRERUNNER-BUILD $(date -u +%FT%TZ) $1" >/dev/console 2>/dev/null || true; }
+# Any failure powers the instance off without the "finished" mark, so the
+# build fails fast instead of waiting out its timeout. build-ec2-ami.sh tells
+# a finished build from a failed one by the mark it finds on the console.
+on_exit() {
+	local rc=$?
+	if [ "$rc" != 0 ]; then
+		mark "FAILED rc=$rc"
+		sync
+		shutdown -h now
+	fi
+}
+trap on_exit EXIT
 mark start
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends \
+# First boot is when apt-daily and unattended-upgrades run and hold the dpkg
+# lock: wait for it instead of failing at once.
+apt_get() { apt-get -o DPkg::Lock::Timeout=600 "$@"; }
+apt_get update
+apt_get install -y --no-install-recommends \
 	docker.io zstd curl jq git ca-certificates
 
 # Docker with the containerd image store, as on GitHub-hosted runners.
@@ -49,7 +64,7 @@ tar xzf runner.tgz
 rm runner.tgz
 ./bin/installdependencies.sh
 
-# Boot unit and script: written by the appended section below.
+# Boot unit and script: install_boot_unit is defined above, by build-ec2-ami.sh.
 install_boot_unit
 
 # A netplan that matches any NIC. cloud-init's 50-cloud-init.yaml matches the
