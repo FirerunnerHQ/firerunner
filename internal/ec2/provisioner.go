@@ -117,17 +117,21 @@ func (p *Provisioner) Name() string { return "ec2" }
 // instance is terminated. Busy detection does not come from here: the listener
 // marks the runner busy from GitHub's JobStarted message, so onBusy is unused.
 func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.RunnerSpec, _ func()) error {
+	entered := time.Now()
 	img, err := p.c.amis.resolve(ctx, p.o.EC2.AMI)
 	if err != nil {
 		return err
 	}
+	resolved := time.Now()
 	inst, err := p.run(ctx, name, img)
 	if err != nil {
 		return err
 	}
 	id := aws.ToString(inst.InstanceId)
 	log := p.log.With("runner", name, "instance", id, "type", inst.InstanceType, "subnet", aws.ToString(inst.SubnetId))
-	log.Info("instance launched")
+	log.Info("instance launched",
+		"ami", resolved.Sub(entered).Round(time.Millisecond),
+		"runInstances", time.Since(resolved).Round(time.Millisecond))
 
 	states, stopWatch := p.c.watch.watch(id)
 	defer stopWatch()

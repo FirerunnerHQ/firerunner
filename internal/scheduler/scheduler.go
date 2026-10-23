@@ -185,7 +185,7 @@ func (s *Scheduler) Reconcile(ctx context.Context, desired int) {
 		s.opts.Logger.Info("scaling up", "desired", desired, "launching", n, "running", running, "max", s.opts.Max)
 		for i := 0; i < n; i++ {
 			s.wg.Add(1)
-			go s.launchOne(ctx)
+			go s.launchOne(ctx, time.Now())
 		}
 		return
 	}
@@ -353,7 +353,9 @@ func (s *Scheduler) settleRemoval(name string, err error) bool {
 	return false
 }
 
-func (s *Scheduler) launchOne(ctx context.Context) {
+// launchOne launches one runner. queuedAt is when the launch was decided, so
+// the log can split the time to a running VM into its phases.
+func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 	defer s.wg.Done()
 	finished := false
 	finish := func() {
@@ -393,7 +395,9 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		return
 	}
 
+	jitStart := time.Now()
 	name, jit, err := s.opts.JIT.Generate(context.WithoutCancel(ctx), s.opts.Spec)
+	jitDur := time.Since(jitStart)
 	if err != nil {
 		s.opts.Logger.Error("generate JIT config", "err", err)
 		// A failed JIT generation is a GitHub API error; without pacing, the
@@ -434,6 +438,11 @@ func (s *Scheduler) launchOne(ctx context.Context) {
 		}
 	}()
 
+	// Phase timing up to the provisioner; it logs its own phases from here.
+	s.opts.Logger.Info("launching runner", "runner", name,
+		"wait", jitStart.Sub(queuedAt).Round(time.Millisecond),
+		"jit", jitDur.Round(time.Millisecond),
+		"sinceDecided", time.Since(queuedAt).Round(time.Millisecond))
 	launchErr := s.opts.Provisioner.Launch(vmCtx, name, jit, s.opts.Spec, func() { s.MarkBusy(name) })
 	// The VM is gone and its slot is back in the pool. Settle the count and
 	// drop the handle in one critical section, so the two never disagree and a
@@ -596,7 +605,7 @@ func (s *Scheduler) maintainMinimum(ctx context.Context) {
 	s.opts.Logger.Info("replenishing warm pool", "min", s.opts.Min, "launching", n, "running", running)
 	for i := 0; i < n; i++ {
 		s.wg.Add(1)
-		go s.launchOne(ctx)
+		go s.launchOne(ctx, time.Now())
 	}
 }
 
