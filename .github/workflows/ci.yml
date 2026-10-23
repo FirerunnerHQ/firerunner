@@ -34,6 +34,8 @@ jobs:
         run: images/test-build-ec2-ami.sh
       - name: Test mutation script
         run: scripts/test-mutate.sh
+      - name: Test stacked-PR merge script
+        run: scripts/test-merge-stack.sh
 
   # The egress firewall against the real kernel's nftables, in throwaway
   # network namespaces: what a guest can and cannot reach in each egress mode.
