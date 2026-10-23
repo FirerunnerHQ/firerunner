@@ -1,9 +1,9 @@
 # firerunner
 
-[![CI](https://github.com/solcreek/firerunner/actions/workflows/ci.yml/badge.svg)](https://github.com/solcreek/firerunner/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/solcreek/firerunner.svg)](https://pkg.go.dev/github.com/solcreek/firerunner)
-[![Go Report Card](https://goreportcard.com/badge/github.com/solcreek/firerunner)](https://goreportcard.com/report/github.com/solcreek/firerunner)
-[![Go version](https://img.shields.io/github/go-mod/go-version/solcreek/firerunner)](go.mod)
+[![CI](https://github.com/FirerunnerHQ/firerunner/actions/workflows/ci.yml/badge.svg)](https://github.com/FirerunnerHQ/firerunner/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/firerunnerhq/firerunner.svg)](https://pkg.go.dev/github.com/firerunnerhq/firerunner)
+[![Go Report Card](https://goreportcard.com/badge/github.com/firerunnerhq/firerunner)](https://goreportcard.com/report/github.com/firerunnerhq/firerunner)
+[![Go version](https://img.shields.io/github/go-mod/go-version/FirerunnerHQ/firerunner)](go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 Ephemeral [Firecracker](https://firecracker-microvm.github.io/) microVM runners
