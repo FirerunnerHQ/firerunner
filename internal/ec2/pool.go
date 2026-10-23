@@ -117,13 +117,15 @@ func (pl *Pool) Target() int {
 	return pl.target
 }
 
-// trim terminates ready instances while ready plus warming exceeds the
-// target. One it cannot end (its spot request would not cancel) goes back
-// to the pool, and the next pass tries again.
+// trim terminates ready instances beyond the target. Warming ones count
+// only once ready: ending ready instances to make room for ones still
+// booting would leave the pool empty while they boot. One it cannot end
+// (its spot request would not cancel) goes back to the pool, and the next
+// pass tries again.
 func (pl *Pool) trim(ctx context.Context) {
 	for ctx.Err() == nil {
 		pl.mu.Lock()
-		if len(pl.ready)+len(pl.warming) <= pl.target || len(pl.ready) == 0 {
+		if len(pl.ready) <= pl.target {
 			pl.mu.Unlock()
 			return
 		}
@@ -271,6 +273,13 @@ func (pl *Pool) fill(ctx context.Context) {
 		return
 	}
 	for range deficit {
+		// The target may have shrunk since the deficit was taken.
+		pl.mu.Lock()
+		short := pl.target - len(pl.ready) - len(pl.warming)
+		pl.mu.Unlock()
+		if short <= 0 {
+			return
+		}
 		inst, err := pl.p.run(ctx, poolName(pl.p.o.Tier), img, forPool)
 		if err != nil {
 			pl.failed(err)

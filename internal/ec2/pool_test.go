@@ -503,3 +503,24 @@ func TestPool_ScheduledPoolStartsEmpty(t *testing.T) {
 	h.p.pool.SetTarget(context.Background(), 1)
 	eventually(t, "one warming", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
 }
+
+func TestPool_ShrinkKeepsReadyWhileOthersWarm(t *testing.T) {
+	// After a busy window: 2 ready, 3 still warming (refills after claims).
+	// Shrinking to 2 must not end the ready ones for the warming ones' sake,
+	// or jobs cold-launch until they finish booting.
+	h := readyPool(t, 2)
+	h.p.pool.SetTarget(context.Background(), 5)
+	eventually(t, "three warming", func() bool { _, w := h.p.pool.Ready(); return w == 3 })
+	h.p.pool.SetTarget(context.Background(), 2)
+	if r, _ := h.p.pool.Ready(); r != 2 {
+		t.Fatalf("ready %d after shrinking to 2 while 3 warm, want the 2 kept", r)
+	}
+	if n := len(h.f.terminatedIDs()); n != 0 {
+		t.Fatalf("terminated %d ready instances", n)
+	}
+	h.stopWarming()
+	eventually(t, "the warmed surplus trimmed", func() bool {
+		r, w := h.p.pool.Ready()
+		return r == 2 && w == 0 && len(h.f.terminatedIDs()) == 3
+	})
+}
