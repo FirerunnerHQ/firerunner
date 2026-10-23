@@ -16,9 +16,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
-	"github.com/solcreek/firerunner/internal/config"
-	"github.com/solcreek/firerunner/internal/core"
-	"github.com/solcreek/firerunner/internal/jitserver"
+	"github.com/firerunnerhq/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/jitserver"
 )
 
 // ErrNoCapacity reports that every instance type in every subnet, in every

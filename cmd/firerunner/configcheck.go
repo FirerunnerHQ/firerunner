@@ -9,7 +9,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/solcreek/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/config"
 )
 
 // checkReport is the result of "firerunner config check". It never carries a

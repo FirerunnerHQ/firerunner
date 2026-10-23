@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/jobidentity"
+	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 )
 
 // SetScope enables multi-repository caching using only host-authenticated records.

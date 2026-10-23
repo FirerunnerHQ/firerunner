@@ -18,9 +18,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/core"
-	"github.com/solcreek/firerunner/internal/provisioner"
-	"github.com/solcreek/firerunner/internal/schedule"
+	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/provisioner"
+	"github.com/firerunnerhq/firerunner/internal/schedule"
 )
 
 // Config is the fully-resolved firerunner configuration.

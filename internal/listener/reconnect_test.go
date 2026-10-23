@@ -14,9 +14,9 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/google/uuid"
 
-	"github.com/solcreek/firerunner/internal/core"
-	"github.com/solcreek/firerunner/internal/health"
-	"github.com/solcreek/firerunner/internal/scheduler"
+	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/scheduler"
 )
 
 // fakeSession is one message session. While failing is set, GetMessage

@@ -42,7 +42,7 @@ Parameters:
       /aws/service/... is not readable).
   ReleaseRepo:
     Type: String
-    Default: solcreek/firerunner
+    Default: FirerunnerHQ/firerunner
     Description: GitHub repository whose releases the control VM installs.
   ZoneName:
     Type: String

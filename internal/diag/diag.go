@@ -21,10 +21,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/cacheserver"
-	"github.com/solcreek/firerunner/internal/config"
-	"github.com/solcreek/firerunner/internal/health"
-	"github.com/solcreek/firerunner/internal/provisioner"
+	"github.com/firerunnerhq/firerunner/internal/cacheserver"
+	"github.com/firerunnerhq/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/provisioner"
 )
 
 // StatusReport is the structured snapshot rendered by "status" (as text or JSON).

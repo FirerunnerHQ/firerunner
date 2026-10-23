@@ -1,4 +1,4 @@
-module github.com/solcreek/firerunner
+module github.com/firerunnerhq/firerunner
 
 go 1.26
 
@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.80.0
 	github.com/aws/smithy-go v1.28.6
 	github.com/golang-jwt/jwt/v4 v4.5.2
+	github.com/google/uuid v1.6.0
 )
 
 require (
@@ -24,7 +25,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.38.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.43.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.5 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 )

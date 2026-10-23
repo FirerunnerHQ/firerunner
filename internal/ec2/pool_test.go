@@ -11,7 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
-	"github.com/solcreek/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/config"
 )
 
 // poolHarness is a harness whose tier keeps a pool of size n.

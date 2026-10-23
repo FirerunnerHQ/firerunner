@@ -19,7 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/core"
 )
 
 // FirecrackerConfig configures the direct-Firecracker provisioner. It

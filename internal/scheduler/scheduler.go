@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/core"
-	"github.com/solcreek/firerunner/internal/provisioner"
+	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/provisioner"
 )
 
 // JITSource generates a just-in-time runner registration for a new microVM.

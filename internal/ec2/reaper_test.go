@@ -9,7 +9,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
-	"github.com/solcreek/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/core"
 )
 
 // put adds an instance to the fake as a previous firerunner left it.

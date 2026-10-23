@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/health"
 )
 
 type fakeScaleSet struct {

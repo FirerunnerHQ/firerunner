@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/config"
 )
 
 // githubAPIBase derives the REST API base URL from the configured org/repo URL,

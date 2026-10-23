@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/config"
 )
 
 func runConfig(t *testing.T, args ...string) (int, string, string) {

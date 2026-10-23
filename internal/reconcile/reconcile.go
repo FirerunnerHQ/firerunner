@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/solcreek/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/health"
 )
 
 // Stats is a scale set's statistics as GitHub reported them.
