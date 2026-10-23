@@ -121,15 +121,9 @@ func diagnose(cmd string, args []string) error {
 // microVMs are pointed at it by firerunner's --cache-url/--cache-port config,
 // which publishes the address into the guest via MMDS.
 func cacheServe(args []string) error {
-	fs := flag.NewFlagSet("cache-server", flag.ContinueOnError)
-	addr := fs.String("addr", "127.0.0.1:8099", "listen address (bind to a guest-facing gateway IP for microVM access; source addresses identify guests; never expose it on a public interface)")
-	dir := fs.String("dir", "/var/lib/firerunner/cache", "cache storage directory")
-	maxSize := fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)")
-	maxEntry := fs.String("max-entry-size", "10GB", "refuse any single cache entry larger than this (e.g. 10GB, 0 for unlimited)")
-	jobsDir := fs.String("jobs-dir", jobidentity.DefaultDir, "private identity directory written by the local daemon")
-	jobsOwner := fs.Int("jobs-owner-uid", os.Getuid(), "UID of the daemon that owns job records (default current UID)")
-	identityWait := fs.Duration("identity-wait", cacheserver.DefaultIdentityWait, "how long a request from a VM whose job identity is still pending waits for it before being denied (0 denies at once)")
-	artifactUpstream := fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs")
+	fs, o := newCacheFlagSet()
+	addr, dir, maxSize, maxEntry := o.addr, o.dir, o.maxSize, o.maxEntry
+	jobsDir, jobsOwner, identityWait, artifactUpstream := o.jobsDir, o.jobsOwner, o.identityWait, o.artifactUpstream
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -199,6 +193,28 @@ func cacheServe(args []string) error {
 	}
 	log.Info("cache-server stopped")
 	return nil
+}
+
+// cacheFlags are the cache-server subcommand's flag values.
+type cacheFlags struct {
+	addr, dir, maxSize, maxEntry, jobsDir, artifactUpstream *string
+	jobsOwner                                               *int
+	identityWait                                            *time.Duration
+}
+
+// newCacheFlagSet registers the cache-server flags.
+func newCacheFlagSet() (*flag.FlagSet, cacheFlags) {
+	fs := flag.NewFlagSet("cache-server", flag.ContinueOnError)
+	return fs, cacheFlags{
+		addr:             fs.String("addr", "127.0.0.1:8099", "listen address (bind to a guest-facing gateway IP for microVM access; source addresses identify guests; never expose it on a public interface)"),
+		dir:              fs.String("dir", "/var/lib/firerunner/cache", "cache storage directory"),
+		maxSize:          fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)"),
+		maxEntry:         fs.String("max-entry-size", "10GB", "refuse any single cache entry larger than this (e.g. 10GB, 0 for unlimited)"),
+		jobsDir:          fs.String("jobs-dir", jobidentity.DefaultDir, "private identity directory written by the local daemon"),
+		jobsOwner:        fs.Int("jobs-owner-uid", os.Getuid(), "UID of the daemon that owns job records (default current UID)"),
+		identityWait:     fs.Duration("identity-wait", cacheserver.DefaultIdentityWait, "how long a request from a VM whose job identity is still pending waits for it before being denied (0 denies at once)"),
+		artifactUpstream: fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs"),
+	}
 }
 
 // parseSize turns a human byte size ("50GB", "512MB", "1TB", or a bare byte

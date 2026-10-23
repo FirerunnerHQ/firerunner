@@ -20,10 +20,11 @@ func (f *fakeEC2) put(tags map[string]string, state types.InstanceStateName, lau
 	i := &fakeInstance{
 		id: fmt.Sprintf("i-%04d", f.next), ip: fmt.Sprintf("10.0.2.%d", f.next),
 		itype: "c7a.large", subnet: "subnet-a", state: state, tags: map[string]string{},
-		spotTags: map[string]string{}, launched: launched,
+		volumeTags: map[string]string{}, spotTags: map[string]string{}, launched: launched,
 	}
 	for k, v := range tags {
 		i.tags[k] = v
+		i.volumeTags[k] = v // firerunner tags volumes like their instances
 	}
 	if spot {
 		i.spot = true
@@ -77,7 +78,7 @@ func job(runner string, extra ...string) map[string]string {
 func TestReaper_StoppedOrphanIsTerminatedWithItsRequestCancelled(t *testing.T) {
 	// A pooled instance a crashed firerunner had claimed: its job ended and
 	// it stopped. Nobody will terminate it but the reaper.
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	id := f.put(job("r1", TagPool, PoolClaimed), types.InstanceStateNameStopped, old, true)
 	g := &githubRunners{}
 	r, _ := reaperFor(f, g, nil)
@@ -90,13 +91,13 @@ func TestReaper_StoppedOrphanIsTerminatedWithItsRequestCancelled(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.cancelled["sir-"+id] || len(f.termBeforeCancel) != 0 {
-		t.Fatalf("spot request cancelled=%v, terminated-before-cancel %v", f.cancelled["sir-"+id], f.termBeforeCancel)
+	if !f.cancelled["sir-"+id] || len(f.termWithOpenRequest) != 0 {
+		t.Fatalf("spot request cancelled=%v, terminated-before-cancel %v", f.cancelled["sir-"+id], f.termWithOpenRequest)
 	}
 }
 
 func TestReaper_RunningOrphanIdleIsDeregisteredAndTerminated(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	id := f.put(job("idle-runner"), types.InstanceStateNameRunning, old, false)
 	g := &githubRunners{}
 	r, _ := reaperFor(f, g, nil)
@@ -109,7 +110,7 @@ func TestReaper_RunningOrphanIdleIsDeregisteredAndTerminated(t *testing.T) {
 func TestReaper_RunningOrphanBusyIsLeftUntilItStops(t *testing.T) {
 	// The chaos case: firerunner killed mid-job and restarted. The job must
 	// finish; the instance is ended by the first sweep after it stops.
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	id := f.put(job("busy-runner", TagPool, PoolClaimed), types.InstanceStateNameRunning, old, true)
 	g := &githubRunners{busy: map[string]bool{"busy-runner": true}}
 	r, _ := reaperFor(f, g, nil)
@@ -125,7 +126,7 @@ func TestReaper_RunningOrphanBusyIsLeftUntilItStops(t *testing.T) {
 }
 
 func TestReaper_LeavesWhatItMustNotTouch(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	live := f.put(job("live"), types.InstanceStateNameRunning, old, false)
 	young := f.put(job("young"), types.InstanceStateNameRunning, time.Now(), false)
 	pooled := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameStopped, old, true)
@@ -145,7 +146,7 @@ func TestReaper_LeavesWhatItMustNotTouch(t *testing.T) {
 }
 
 func TestReaper_PoolInstanceOfATierWithoutAPool(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	id := f.put(job("", TagPool, PoolReady, TagTier, "unpooled"), types.InstanceStateNameStopped, old, true)
 	r, _ := reaperFor(f, &githubRunners{}, nil)
 	r.Sweep(context.Background())
@@ -155,7 +156,7 @@ func TestReaper_PoolInstanceOfATierWithoutAPool(t *testing.T) {
 }
 
 func TestReaper_MaxLifetimeEndsEvenABusyOrphan(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	id := f.put(job("stuck"), types.InstanceStateNameRunning, time.Now().Add(-7*time.Hour), false)
 	g := &githubRunners{busy: map[string]bool{"stuck": true}}
 	r, _ := reaperFor(f, g, nil)
@@ -166,7 +167,7 @@ func TestReaper_MaxLifetimeEndsEvenABusyOrphan(t *testing.T) {
 }
 
 func TestReaper_LookupFailureLeavesTheOrphan(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	id := f.put(job("r"), types.InstanceStateNameRunning, old, false)
 	r, _ := reaperFor(f, &githubRunners{failing: true}, nil)
 	r.Sweep(context.Background())
@@ -176,7 +177,7 @@ func TestReaper_LookupFailureLeavesTheOrphan(t *testing.T) {
 }
 
 func TestReaper_CancelsSpotRequestsWithoutAnInstance(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	gone := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameTerminated, old, true)
 	kept := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameStopped, old, true)
 	r, _ := reaperFor(f, &githubRunners{}, nil)
@@ -192,7 +193,7 @@ func TestReaper_CancelsSpotRequestsWithoutAnInstance(t *testing.T) {
 }
 
 func TestReaper_DryRunChangesNothing(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	stopped := f.put(job("a", TagPool, PoolClaimed), types.InstanceStateNameStopped, old, true)
 	running := f.put(job("b"), types.InstanceStateNameRunning, old, false)
 	gone := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameTerminated, old, true)
@@ -210,10 +211,13 @@ func TestReaper_DryRunChangesNothing(t *testing.T) {
 	if f.cancelled["sir-"+gone] || len(f.terminated) != 0 {
 		t.Fatal("dry run cancelled or terminated")
 	}
+	// The orphan request a dry run leaves open is the state under test, not
+	// one the fake's end-of-test invariants should report: close it here.
+	f.cancelled["sir-"+gone] = true
 }
 
 func TestReaper_NeverTerminatesWithAnOpenRequest(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	id := f.put(job("a", TagPool, PoolClaimed), types.InstanceStateNameStopped, old, true)
 	f.cancelErrs = 1
 	r, _ := reaperFor(f, &githubRunners{}, nil)
@@ -247,7 +251,7 @@ func TestReaper_ClaimedByThisProcessIsLeftAlone(t *testing.T) {
 func TestReaper_YoungAreReportedAndLastIsKept(t *testing.T) {
 	// A pooled instance a job just started has a fresh LaunchTime (AWS
 	// resets it on start): an orphan sweep must wait, and say so.
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	young := f.put(job("r", TagPool, PoolClaimed), types.InstanceStateNameRunning, time.Now(), true)
 	r, _ := reaperFor(f, &githubRunners{busy: map[string]bool{"r": true}}, nil)
 	r.o.Interval = time.Hour
@@ -277,7 +281,7 @@ func TestReaper_YoungAreReportedAndLastIsKept(t *testing.T) {
 func TestReaper_StoppedOrphanIsNotDeregistered(t *testing.T) {
 	// The runner name on a stopped claimed instance may belong to a live
 	// cold launch that fell back after the claim failed: never deregister it.
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	f.put(job("shared-name", TagPool, PoolClaimed), types.InstanceStateNameStopped, old, true)
 	g := &githubRunners{}
 	r, _ := reaperFor(f, g, nil)
@@ -290,7 +294,7 @@ func TestReaper_StoppedOrphanIsNotDeregistered(t *testing.T) {
 func TestReaper_YoungRequestOfAnUnlistedInstanceIsKept(t *testing.T) {
 	// A pool instance launched while the sweep lists: its request is listed,
 	// the instance not yet. The request must not be cancelled.
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	id := f.put(job("", TagPool, PoolWarming, TagTier, "pooled"), types.InstanceStateNamePending, time.Now(), true)
 	f.invisible[id] = true
 	r, _ := reaperFor(f, &githubRunners{}, nil)
@@ -301,7 +305,7 @@ func TestReaper_YoungRequestOfAnUnlistedInstanceIsKept(t *testing.T) {
 }
 
 func TestReaper_RequestOfATrackedInstanceIsKept(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	id := f.put(job("", TagPool, PoolWarming, TagTier, "pooled"), types.InstanceStateNamePending, old, true)
 	f.invisible[id] = true
 	r, c := reaperFor(f, &githubRunners{}, nil)
@@ -313,7 +317,7 @@ func TestReaper_RequestOfATrackedInstanceIsKept(t *testing.T) {
 }
 
 func TestReaper_ReadsEveryPage(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	f.pageSize = 2
 	for i := range 5 {
 		f.put(job(fmt.Sprintf("r%d", i), TagPool, PoolClaimed), types.InstanceStateNameStopped, old, true)

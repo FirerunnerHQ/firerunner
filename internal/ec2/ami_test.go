@@ -8,7 +8,7 @@ import (
 )
 
 func TestAMIResolver_ImageID(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	r := newAMIResolver(f, nil)
 	img, err := r.resolve(context.Background(), "ami-0abc")
 	if err != nil {
@@ -20,7 +20,7 @@ func TestAMIResolver_ImageID(t *testing.T) {
 }
 
 func TestAMIResolver_SSMParameterAndCache(t *testing.T) {
-	f := newFakeEC2()
+	f := newFakeEC2(t)
 	s := &fakeSSM{params: map[string]string{"/firerunner/ami": "ami-0abc"}}
 	r := newAMIResolver(f, s)
 	now := time.Unix(0, 0)
@@ -63,7 +63,7 @@ func TestAMIResolver_Errors(t *testing.T) {
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			r := newAMIResolver(newFakeEC2(), c.ssm)
+			r := newAMIResolver(newFakeEC2(t), c.ssm)
 			_, err := r.resolve(context.Background(), c.ref)
 			if err == nil || !strings.Contains(err.Error(), c.wantIn) {
 				t.Fatalf("err = %v, want it to mention %q", err, c.wantIn)
@@ -72,7 +72,7 @@ func TestAMIResolver_Errors(t *testing.T) {
 	}
 	// A failure is not cached: the next launch retries the lookup.
 	s := &fakeSSM{params: map[string]string{}}
-	r := newAMIResolver(newFakeEC2(), s)
+	r := newAMIResolver(newFakeEC2(t), s)
 	_, _ = r.resolve(context.Background(), "/later")
 	s.params["/later"] = "ami-0abc"
 	if _, err := r.resolve(context.Background(), "/later"); err != nil {

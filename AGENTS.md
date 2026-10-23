@@ -26,7 +26,9 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
 
 - **Sign off every commit** with `git commit -s`. The `dco` workflow rejects a PR
   with any commit lacking a `Signed-off-by` that matches its author email.
-  `make check` checks it locally; to fix a branch, run
+  `make setup` installs a `commit-msg` hook that adds it for you; installing it
+  means you certify the DCO for every commit you make in this clone. `make
+  check` checks it locally; to fix a branch, run
   `git rebase --signoff origin/main`.
 - One topic per commit. Use the subject style `pkg: what changed`, in the
   imperative, with a body that says why. Look at `git log` for the house style.
@@ -38,6 +40,17 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
   branch closes, rather than retargets, the PRs on it.
 - A PR merged into a stack branch, not `main`, does not close its `Closes #N`
   issue. Close it by hand when the stack lands.
+- `scripts/merge-stack.sh PR` does both: it prints the plan (retarget, merge,
+  close), and `--yes` carries it out.
+
+## Agent environment
+
+`.claude/settings.json` runs `scripts/agent-env.sh` at session start. It puts
+`go`, `gh` and `shellcheck` on the Bash tool's PATH when the non-interactive
+shell lacks them (Homebrew on macOS). Outside Claude Code,
+`eval "$(scripts/agent-env.sh)"` does the same. Machine-specific
+settings, such as `AWS_PROFILE` or `AWS_REGION`, belong in the `env` block of
+`.claude/settings.local.json`, which is gitignored. Never commit them.
 
 ## Public repository hygiene
 
@@ -61,6 +74,8 @@ Placeholders such as `subnet-0aaa…` are fine.
 - **Prove a test can fail.** For logic that guards money or security (capacity
   walks, termination, JIT handoff, error classification), break the code on
   purpose once and watch a test fail.
+  `scripts/mutate.sh FILE 'old' 'new'` does it and always restores the file;
+  it ends in `CAUGHT`, `SURVIVED` or `INVALID` (see its header).
 - Shell scripts under `images/` have shell tests (`images/test-*.sh`) that
   stub external commands. Keep them shellcheck-clean.
 
@@ -123,6 +138,7 @@ The usual dev box is macOS with zsh; much of the code and CI is Linux.
 | `internal/health` | per-tier listener state, published for `status`/`doctor` |
 | `internal/diag` | `status` and `doctor` |
 | `images/` | guest images, boot scripts and their tests |
+| `scripts/e2e/` | helpers for end-to-end checks against a real deployment (SSM exec, console, run watch and timing) |
 
 ## Operating a deployment
 

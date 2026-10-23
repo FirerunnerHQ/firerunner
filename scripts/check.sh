@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# check.sh — everything CI's test job checks that this machine can run, in one
-# command, ending in a summary a person or an agent can act on:
+# check.sh — everything CI's test, build and shell jobs check that this machine
+# can run, in one command, ending in a summary a person or an agent can act on:
 #
 #   PASS  gofmt
 #   FAIL  test+coverage   (see the output above)
@@ -11,6 +11,9 @@
 #
 # Usage: scripts/check.sh [--fast]
 #   --fast  skip the race/coverage run (the slowest step) for a quick loop
+#
+# TEST_TIMEOUT (default 4m) is go test -timeout per test binary, here and in
+# make test/cover: a hung test fails instead of stalling the run.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 2
@@ -20,7 +23,7 @@ for arg in "$@"; do
 	case "$arg" in
 	--fast) fast=1 ;;
 	-h | --help)
-		sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*)
@@ -95,7 +98,7 @@ step vet go vet ./...
 step vet-linux env GOOS=linux go vet ./...
 if [ "$fast" = 1 ]; then
 	skip test+coverage "--fast"
-	step test go test ./...
+	step test go test -timeout "${TEST_TIMEOUT:-4m}" ./...
 else
 	step test+coverage make --no-print-directory cover-check
 fi
@@ -106,9 +109,22 @@ else
 fi
 step ec2-boot-script images/test-ec2-run.sh
 step ec2-ami-build images/test-build-ec2-ami.sh
+step mutate-script scripts/test-mutate.sh
+if command -v jq >/dev/null; then
+	step merge-stack scripts/test-merge-stack.sh
+	step e2e-harness scripts/e2e/test-e2e.sh
+else
+	skip merge-stack "jq not installed"
+	skip e2e-harness "jq not installed"
+fi
+step dev-env scripts/test-dev-env.sh
 if command -v shellcheck >/dev/null; then
 	step shellcheck shellcheck images/assets/firerunner-ec2-run.sh images/test-ec2-run.sh \
-		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh scripts/check.sh
+		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh scripts/check.sh \
+		scripts/mutate.sh scripts/test-mutate.sh \
+		scripts/merge-stack.sh scripts/test-merge-stack.sh \
+		scripts/agent-env.sh scripts/setup-dev.sh scripts/test-dev-env.sh .githooks/commit-msg
+	step shellcheck-e2e shellcheck -x scripts/e2e/*.sh
 else
 	skip shellcheck "shellcheck not installed"
 fi

@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -130,18 +131,26 @@ const guestDNAT = `table ip guest_dns {
 // without running servers.
 func (l lab) reachable(t *testing.T, ns, ip string, port int) bool {
 	t.Helper()
+	ok, err := dial(ns, ip, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ok
+}
+
+// dial is reachable without a *testing.T, so probes can run on goroutines.
+func dial(ns, ip string, port int) (bool, error) {
 	cmd := exec.Command("ip", "netns", "exec", ns, "timeout", "2", "bash", "-c",
 		fmt.Sprintf("exec 3<>/dev/tcp/%s/%d", ip, port))
 	out, err := cmd.CombinedOutput()
 	if err == nil || strings.Contains(string(out), "Connection refused") {
-		return true
+		return true, nil
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) && ee.ExitCode() == 124 {
-		return false
+		return false, nil
 	}
-	t.Fatalf("dial %s:%d from %s: %v\n%s", ip, port, ns, err, out)
-	return false
+	return false, fmt.Errorf("dial %s:%d from %s: %v\n%s", ip, port, ns, err, out)
 }
 
 type probe struct {
@@ -151,14 +160,34 @@ type probe struct {
 	want bool
 }
 
+// check dials every probe at once, then reports each as a subtest. A filtered
+// probe waits out its whole timeout, so all of them run concurrently: t.Parallel
+// would cap them at GOMAXPROCS and queue the timeouts in batches.
 func (l lab) check(t *testing.T, probes []probe) {
 	t.Helper()
-	for _, p := range probes {
-		p := p
+	type result struct {
+		got bool
+		err error
+	}
+	results := make([]result, len(probes))
+	var wg sync.WaitGroup
+	for i, p := range probes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := dial(l.guest0, p.ip, p.port)
+			results[i] = result{got, err}
+		}()
+	}
+	wg.Wait()
+	for i, p := range probes {
 		t.Run(p.name, func(t *testing.T) {
-			t.Parallel()
-			if got := l.reachable(t, l.guest0, p.ip, p.port); got != p.want {
-				t.Errorf("guest -> %s:%d reachable = %v, want %v", p.ip, p.port, got, p.want)
+			r := results[i]
+			if r.err != nil {
+				t.Fatal(r.err)
+			}
+			if r.got != p.want {
+				t.Errorf("guest -> %s:%d reachable = %v, want %v", p.ip, p.port, r.got, p.want)
 			}
 		})
 	}

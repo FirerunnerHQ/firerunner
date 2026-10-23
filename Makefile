@@ -6,6 +6,10 @@ PKG := ./...
 COVERPKG := ./internal/config/...,./internal/core/...,./internal/provisioner/...,./internal/scheduler/...,./internal/diag/...,./internal/cacheserver/...,./internal/jobidentity/...,./internal/jitserver/...,./internal/ec2/...,./internal/health/...,./internal/reconcile/...
 COVERPROFILE := cover.out
 COVER_MIN ?= 70
+# Per test binary; a hung test fails with a goroutine dump instead of
+# stalling the run (go's default is 10m). The full race+coverage run takes
+# ~75 s on a 2-core CI runner, the slowest package well under that.
+TEST_TIMEOUT ?= 4m
 
 .PHONY: build
 build:
@@ -17,12 +21,12 @@ vet:
 
 .PHONY: test
 test:
-	go test -race $(PKG)
+	go test -race -timeout $(TEST_TIMEOUT) $(PKG)
 
 # Unit coverage across all packages (cross-package attribution via -coverpkg).
 .PHONY: cover
 cover:
-	go test -race -covermode=atomic -coverpkg=$(COVERPKG) -coverprofile=$(COVERPROFILE) $(PKG)
+	go test -race -timeout $(TEST_TIMEOUT) -covermode=atomic -coverpkg=$(COVERPKG) -coverprofile=$(COVERPROFILE) $(PKG)
 	go tool cover -func=$(COVERPROFILE) | tail -n 1
 
 .PHONY: cover-html
@@ -37,11 +41,16 @@ cover-check: cover
 	awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { exit (t+0 < m+0) }' || \
 		{ echo "coverage $$total% is below minimum $(COVER_MIN)%"; exit 1; }
 
-# Everything CI's test job checks that this machine can run, with a PASS/
-# FAIL/SKIP summary. CHECK_ARGS=--fast skips the slow race/coverage run.
+# Everything CI's test, build and shell jobs check that this machine can run,
+# with a PASS/FAIL/SKIP summary. CHECK_ARGS=--fast skips the slow race/coverage run.
 .PHONY: check
 check:
 	@scripts/check.sh $(CHECK_ARGS)
+
+# One-time setup of a clone: git hooks that sign off every commit (DCO).
+.PHONY: setup
+setup:
+	@scripts/setup-dev.sh
 
 # End-to-end tests require a real KVM host and are gated behind the `e2e` tag.
 .PHONY: e2e
