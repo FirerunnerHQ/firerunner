@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -54,13 +55,32 @@ type Reaper struct {
 	o   ReaperOptions
 	log *slog.Logger
 	now func() time.Time
+
+	mu   sync.Mutex
+	last *ReapReport
+}
+
+// Last returns the latest sweep's report, if any.
+func (r *Reaper) Last() (ReapReport, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.last == nil {
+		return ReapReport{}, false
+	}
+	return *r.last, true
 }
 
 // ReapReport is what one sweep did (or, in dry run, would have done).
 type ReapReport struct {
+	At           time.Time
+	DryRun       bool
 	Instances    []string // terminated
 	SpotRequests []string // cancelled
 	Busy         []string // orphans left running a job
+	// Young are untracked instances inside the grace period (just launched
+	// or started); a later sweep looks at them again.
+	Young []string
+	Err   string
 }
 
 // NewReaper returns a Reaper over the client's account.
@@ -83,9 +103,14 @@ func (r *Reaper) Run(ctx context.Context) {
 	t := time.NewTicker(r.o.Interval)
 	defer t.Stop()
 	for {
-		if _, err := r.Sweep(ctx); err != nil && ctx.Err() == nil {
+		rep, err := r.Sweep(ctx)
+		if err != nil && ctx.Err() == nil {
 			r.log.Warn("reaper sweep", "err", err)
+			rep.Err = err.Error()
 		}
+		r.mu.Lock()
+		r.last = &rep
+		r.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return
@@ -96,7 +121,7 @@ func (r *Reaper) Run(ctx context.Context) {
 
 // Sweep reaps once.
 func (r *Reaper) Sweep(ctx context.Context) (ReapReport, error) {
-	var rep ReapReport
+	rep := ReapReport{At: r.now(), DryRun: r.o.DryRun}
 	out, err := r.c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{Filters: []types.Filter{
 		{Name: aws.String("tag:" + TagOwner), Values: []string{r.o.Owner}},
 		{Name: aws.String("instance-state-name"), Values: []string{"pending", "running", "stopping", "stopped"}},
@@ -127,7 +152,10 @@ func (r *Reaper) Sweep(ctx context.Context) (ReapReport, error) {
 				continue
 			}
 			// A job instance (claimed from a pool, or cold) nobody tracks.
+			// LaunchTime is the latest start, so a pool instance a job just
+			// started is young too.
 			if now.Sub(aws.ToTime(i.LaunchTime)) < r.o.Grace {
+				rep.Young = append(rep.Young, id)
 				continue
 			}
 			switch i.State.Name {
@@ -194,9 +222,11 @@ func (r *Reaper) Sweep(ctx context.Context) (ReapReport, error) {
 		r.log.Info("cancelled a spot request left without an instance", "request", id, "instance", inst)
 		rep.SpotRequests = append(rep.SpotRequests, id)
 	}
+	level := slog.LevelDebug
 	if len(rep.Instances)+len(rep.SpotRequests) > 0 {
-		r.log.Info("reaper sweep", "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "busy", len(rep.Busy))
+		level = slog.LevelInfo
 	}
+	r.log.Log(ctx, level, "reaper sweep", "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "busy", len(rep.Busy), "young", len(rep.Young))
 	return rep, nil
 }
 

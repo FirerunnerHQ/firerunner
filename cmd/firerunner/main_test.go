@@ -178,7 +178,8 @@ func TestServeTiers_AllTiersStoppedShutsDown(t *testing.T) {
 func TestPublishHealth(t *testing.T) {
 	path := filepath.Join(t.TempDir(), health.FileName)
 	a, b := health.NewTracker("a"), health.NewTracker("b")
-	stop := publishHealth(path, []*health.Tracker{a, b}, slog.New(slog.DiscardHandler))
+	reaped := &health.Reaper{At: time.Unix(5, 0).UTC(), Instances: []string{"i-1"}}
+	stop := publishHealth(path, []*health.Tracker{a, b}, func() *health.Reaper { return reaped }, slog.New(slog.DiscardHandler))
 	f, err := health.Read(path)
 	if err != nil || len(f.Tiers) != 2 || f.PID != os.Getpid() {
 		t.Fatalf("initial file = %+v, %v", f, err)
@@ -188,6 +189,9 @@ func TestPublishHealth(t *testing.T) {
 	f, err = health.Read(path)
 	if err != nil || f.Tiers[1].State != health.Failed {
 		t.Fatalf("final file = %+v, %v; want tier b failed", f, err)
+	}
+	if f.Reaper == nil || len(f.Reaper.Instances) != 1 {
+		t.Fatalf("reaper state = %+v, want the latest sweep", f.Reaper)
 	}
 }
 

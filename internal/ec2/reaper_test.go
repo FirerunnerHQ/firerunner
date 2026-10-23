@@ -243,3 +243,33 @@ func TestReaper_ClaimedByThisProcessIsLeftAlone(t *testing.T) {
 		t.Fatalf("reaped a claim this process holds: %v", rep.Instances)
 	}
 }
+
+func TestReaper_YoungAreReportedAndLastIsKept(t *testing.T) {
+	// A pooled instance a job just started has a fresh LaunchTime (AWS
+	// resets it on start): an orphan sweep must wait, and say so.
+	f := newFakeEC2()
+	young := f.put(job("r", TagPool, PoolClaimed), types.InstanceStateNameRunning, time.Now(), true)
+	r, _ := reaperFor(f, &githubRunners{busy: map[string]bool{"r": true}}, nil)
+	r.o.Interval = time.Hour
+	if _, ok := r.Last(); ok {
+		t.Fatal("a report before any sweep")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if rep, ok := r.Last(); ok {
+			if !slices.Equal(rep.Young, []string{young}) || len(rep.Instances) != 0 || rep.At.IsZero() {
+				t.Fatalf("report = %+v", rep)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no report from Run")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+}

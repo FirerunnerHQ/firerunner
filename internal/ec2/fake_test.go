@@ -277,6 +277,7 @@ func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput,
 		if !f.startStaysStopped {
 			i.state = types.InstanceStateNamePending
 		}
+		i.launched = f.now() // as on AWS, LaunchTime is the latest start
 		f.started = append(f.started, id)
 	}
 	return &ec2.StartInstancesOutput{}, nil

@@ -418,13 +418,17 @@ func tierNames(tiers []config.Tier) []string {
 // healthInterval is how often the listener health file is rewritten.
 const healthInterval = 10 * time.Second
 
-// publishHealth writes the trackers' state to path now and every
-// healthInterval until the returned func is called, which writes it once more.
-func publishHealth(path string, trackers []*health.Tracker, log *slog.Logger) func() {
+// publishHealth writes the trackers' state, and the reaper's when reaper is
+// non-nil, to path now and every healthInterval until the returned func is
+// called, which writes it once more.
+func publishHealth(path string, trackers []*health.Tracker, reaper func() *health.Reaper, log *slog.Logger) func() {
 	write := func() {
 		f := health.File{PID: os.Getpid(), WrittenAt: time.Now().UTC()}
 		for _, tr := range trackers {
 			f.Tiers = append(f.Tiers, tr.Snapshot())
+		}
+		if reaper != nil {
+			f.Reaper = reaper()
 		}
 		if err := health.Write(path, f); err != nil {
 			log.Warn("write listener health", "path", path, "err", err)
@@ -639,8 +643,20 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	defer closeAll()
 
+	var reaperState func() *health.Reaper
 	if ec2Client != nil && cfg.EC2Reaper != "off" {
-		go ec2Client.NewReaper(reaperOptions(cfg, owner, tiers, listeners, log)).Run(ctx)
+		reaper := ec2Client.NewReaper(reaperOptions(cfg, owner, tiers, listeners, log))
+		go reaper.Run(ctx)
+		reaperState = func() *health.Reaper {
+			rep, ok := reaper.Last()
+			if !ok {
+				return nil
+			}
+			return &health.Reaper{
+				At: rep.At, DryRun: rep.DryRun, Instances: rep.Instances, SpotRequests: rep.SpotRequests,
+				Busy: rep.Busy, Young: rep.Young, Error: rep.Err,
+			}
+		}
 	}
 
 	log.Info("firerunner starting",
@@ -676,7 +692,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	// Publish each tier's listener health for status and doctor.
 	healthPath := filepath.Join(cfg.Firecracker.WorkDir, health.FileName)
-	stopHealth := publishHealth(healthPath, trackers, log)
+	stopHealth := publishHealth(healthPath, trackers, reaperState, log)
 
 	// Drive every tier's listener concurrently. A listener reconnects its own
 	// session; one that stops on a fatal error leaves the other tiers running.
