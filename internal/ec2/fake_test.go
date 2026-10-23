@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -28,6 +29,8 @@ type fakeInstance struct {
 	userData              string // decoded
 	state                 types.InstanceStateName
 	tags                  map[string]string
+	spotTags              map[string]string // tags on its spot request
+	launched              time.Time
 }
 
 // fakeEC2 is an in-memory EC2. RunInstances fails per type/subnet/market as
@@ -63,7 +66,9 @@ type fakeEC2 struct {
 	startErr          error
 	startStaysStopped bool
 	// tagErr fails CreateTags.
-	tagErr    error
+	tagErr error
+	// clock, when set, is the fake's notion of now (launch times).
+	clock     func() time.Time
 	started   []string
 	cancelled map[string]bool // spot request ID -> cancelled
 	// cancelErrs fails this many CancelSpotInstanceRequests calls first.
@@ -129,10 +134,17 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, _ .
 		b, _ := base64.StdEncoding.DecodeString(aws.ToString(in.UserData))
 		inst.userData = string(b)
 	}
+	inst.launched = f.now()
+	inst.spotTags = map[string]string{}
 	for _, ts := range in.TagSpecifications {
-		if ts.ResourceType == types.ResourceTypeInstance {
+		switch ts.ResourceType {
+		case types.ResourceTypeInstance:
 			for _, t := range ts.Tags {
 				inst.tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+			}
+		case types.ResourceTypeSpotInstancesRequest:
+			for _, t := range ts.Tags {
+				inst.spotTags[aws.ToString(t.Key)] = aws.ToString(t.Value)
 			}
 		}
 	}
@@ -152,6 +164,7 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, _ .
 
 func (f *fakeEC2) view(i *fakeInstance) types.Instance {
 	v := types.Instance{
+		LaunchTime:       aws.Time(i.launched),
 		InstanceId:       aws.String(i.id),
 		PrivateIpAddress: aws.String(i.ip),
 		InstanceType:     types.InstanceType(i.itype),
@@ -191,6 +204,58 @@ func (i *fakeInstance) matches(filters []types.Filter) bool {
 		}
 	}
 	return true
+}
+
+func (f *fakeEC2) now() time.Time {
+	if f.clock != nil {
+		return f.clock()
+	}
+	return time.Now()
+}
+
+func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.DescribeSpotInstanceRequestsInput, _ ...func(*ec2.Options)) (*ec2.DescribeSpotInstanceRequestsOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []types.SpotInstanceRequest
+	for _, id := range f.order {
+		i := f.instances[id]
+		if i.spotReq == "" {
+			continue
+		}
+		state := types.SpotInstanceStateActive
+		switch {
+		case f.cancelled[i.spotReq]:
+			state = types.SpotInstanceStateCancelled
+		case i.state == types.InstanceStateNameStopped:
+			state = types.SpotInstanceStateDisabled
+		}
+		r := types.SpotInstanceRequest{
+			SpotInstanceRequestId: aws.String(i.spotReq),
+			InstanceId:            aws.String(i.id),
+			State:                 state,
+		}
+		for k, v := range i.spotTags {
+			r.Tags = append(r.Tags, types.Tag{Key: aws.String(k), Value: aws.String(v)})
+		}
+		match := true
+		for _, fl := range in.Filters {
+			name := aws.ToString(fl.Name)
+			ok := false
+			for _, want := range fl.Values {
+				switch {
+				case name == "state":
+					ok = ok || string(state) == want
+				case strings.HasPrefix(name, "tag:"):
+					ok = ok || i.spotTags[strings.TrimPrefix(name, "tag:")] == want
+				}
+			}
+			match = match && ok
+		}
+		if match {
+			out = append(out, r)
+		}
+	}
+	return &ec2.DescribeSpotInstanceRequestsOutput{SpotInstanceRequests: out}, nil
 }
 
 func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput, _ ...func(*ec2.Options)) (*ec2.StartInstancesOutput, error) {

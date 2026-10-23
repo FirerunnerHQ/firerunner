@@ -210,8 +210,9 @@ func TestLaunch_PoolStartFailureFallsBackCold(t *testing.T) {
 
 func TestPool_RediscoversAfterRestart(t *testing.T) {
 	// A first firerunner warms a pool and exits; a second, with the same
-	// owner and tier, finds the ready instances instead of launching more,
-	// and terminates the one a crash left claimed.
+	// owner and tier, finds the ready instances instead of launching more.
+	// The one a crash left claimed is not the pool's any more: the reaper
+	// decides its fate, after asking GitHub whether it still runs a job.
 	h := poolHarness(t, 2, config.MarketSpot)
 	cancel := h.runPool(t)
 	eventually(t, "two warming", func() bool { _, w := h.p.pool.Ready(); return w == 2 })
@@ -233,10 +234,9 @@ func TestPool_RediscoversAfterRestart(t *testing.T) {
 	go func() { p2.pool.Run(ctx); close(done) }()
 	defer func() { cancel2(); <-done }()
 
-	eventually(t, "the ready one rediscovered", func() bool { r, _ := p2.pool.Ready(); return r >= 1 })
-	eventually(t, "the claimed leftover terminated", func() bool { return h.f.state(ids[1]) == types.InstanceStateNameShuttingDown })
-	if open := h.f.openSpotRequests(); len(open) != 0 {
-		t.Fatalf("open spot requests behind discarded instances: %v", open)
+	eventually(t, "the ready one rediscovered", func() bool { r, _ := p2.pool.Ready(); return r == 1 })
+	if s := h.f.state(ids[1]); s != types.InstanceStateNameStopped {
+		t.Fatalf("the pool touched a claimed leftover: state %q", s)
 	}
 	// It refills the one it discarded, rather than relaunching both.
 	eventually(t, "one replacement warming", func() bool { _, w := p2.pool.Ready(); return w == 1 })

@@ -115,8 +115,9 @@ func (pl *Pool) filters() []types.Filter {
 }
 
 // discover sorts this tier's pool instances by their tags: ready ones join the
-// pool, warming ones are followed until they stop, and claimed ones, left by a
-// firerunner that died mid-job, are terminated.
+// pool and warming ones are followed until they stop. Claimed ones, left by a
+// firerunner that died mid-claim or mid-job, are the reaper's: it checks with
+// GitHub whether their runner is still running a job before ending them.
 func (pl *Pool) discover(ctx context.Context) error {
 	out, err := pl.p.c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{Filters: pl.filters()})
 	if err != nil {
@@ -126,9 +127,6 @@ func (pl *Pool) discover(ctx context.Context) error {
 		for _, i := range r.Instances {
 			id, state := aws.ToString(i.InstanceId), i.State.Name
 			switch tagValue(i.Tags, TagPool) {
-			case PoolClaimed:
-				pl.log.Info("terminating a pool instance a previous run claimed", "instance", id)
-				pl.discard(ctx, id, aws.ToString(i.SpotInstanceRequestId))
 			case PoolReady, PoolWarming:
 				if state == types.InstanceStateNameStopped {
 					pl.markReady(ctx, i)
@@ -272,6 +270,9 @@ func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 		in := pl.ready[0]
 		pl.ready = pl.ready[1:]
 		pl.mu.Unlock()
+		// From here this process owns the instance: the reaper must leave
+		// it alone even once it is tagged claimed.
+		pl.p.c.track(in.id)
 		err := pl.prepare(ctx, in, runner)
 		switch {
 		case err == nil:
@@ -279,9 +280,11 @@ func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 		case instanceGone(err):
 			pl.log.Warn("pool instance could not be prepared; discarding it", "instance", in.id, "err", err)
 			pl.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
+			pl.p.c.untrack(in.id)
 			continue
 		default:
 			pl.requeue(context.WithoutCancel(ctx), in)
+			pl.p.c.untrack(in.id)
 			return pooled{}, err
 		}
 	}
