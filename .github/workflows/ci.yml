@@ -10,22 +10,76 @@ permissions:
   contents: read
 
 jobs:
+  # The race and coverage run is the critical path; build, vet and the shell
+  # tests run beside it in their own jobs.
+  #
+  # The Go jobs keep their own build cache instead of setup-go's. setup-go keys
+  # one cache on the Go version and go.sum for every job, so whichever job
+  # finishes first saves it (netns, which builds two packages), and the race
+  # build never finds its own output. These keys name the job, because a -race
+  # -coverpkg build shares nothing with a plain one, and hash the sources, so a
+  # change saves a fresh entry and the next run restores the nearest one.
   test:
+    runs-on: ubuntu-latest
+    env:
+      # The restored cache also holds test results: run every test anyway.
+      GOFLAGS: -count=1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        id: go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: false
+      - name: Restore race build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-race-${{ runner.os }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ hashFiles('**/*.go') }}
+          restore-keys: |
+            go-race-${{ runner.os }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
+            go-race-${{ runner.os }}-${{ steps.go.outputs.go-version }}-
+      - name: Test with race detector and coverage gate
+        run: make cover-check
+
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Go
+        id: go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           check-latest: true
+          cache: false
+      - name: Restore build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-build-${{ runner.os }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ hashFiles('**/*.go') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
+            go-build-${{ runner.os }}-${{ steps.go.outputs.go-version }}-
       - name: Build
         run: go build ./...
       - name: Vet
         run: go vet ./...
-      - name: Test with race detector and coverage gate
-        run: make cover-check
+
+  # Shell tests for the image scripts: no Go needed. One step per script.
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test golden docker shim
         run: images/test-docker-shim.sh
       - name: Test EC2 runner boot script
