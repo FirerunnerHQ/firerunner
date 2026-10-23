@@ -26,7 +26,9 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
 
 - **Sign off every commit** with `git commit -s`. The `dco` workflow rejects a PR
   with any commit lacking a `Signed-off-by` that matches its author email.
-  `make check` checks it locally; to fix a branch, run
+  `make setup` installs a `commit-msg` hook that adds it for you; installing it
+  means you certify the DCO for every commit you make in this clone. `make
+  check` checks it locally; to fix a branch, run
   `git rebase --signoff origin/main`.
 - One topic per commit. Use the subject style `pkg: what changed`, in the
   imperative, with a body that says why. Look at `git log` for the house style.
@@ -40,6 +42,15 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
   issue. Close it by hand when the stack lands.
 - `scripts/merge-stack.sh PR` does both: it prints the plan (retarget, merge,
   close), and `--yes` carries it out.
+
+## Agent environment
+
+`.claude/settings.json` runs `scripts/agent-env.sh` at session start. It puts
+`go`, `gh` and `shellcheck` on the Bash tool's PATH when the non-interactive
+shell lacks them (Homebrew on macOS). Outside Claude Code,
+`eval "$(scripts/agent-env.sh)"` does the same. Machine-specific
+settings, such as `AWS_PROFILE` or `AWS_REGION`, belong in the `env` block of
+`.claude/settings.local.json`, which is gitignored. Never commit them.
 
 ## Public repository hygiene
 

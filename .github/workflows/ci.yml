@@ -108,6 +108,8 @@ jobs:
         run: scripts/test-merge-stack.sh
       - name: Test e2e harness
         run: scripts/e2e/test-e2e.sh && shellcheck -x scripts/e2e/*.sh
+      - name: Test dev environment scripts and git hooks
+        run: scripts/test-dev-env.sh
 
   # The egress firewall against the real kernel's nftables, in throwaway
   # network namespaces: what a guest can and cannot reach in each egress mode.

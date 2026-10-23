@@ -1,0 +1,25 @@
+#!/bin/sh
+# commit-msg: sign off every commit, as the dco workflow requires, so a
+# forgotten `git commit -s` cannot block a PR. Installed by `make setup`
+# (git config core.hooksPath .githooks), never automatically. Installing it
+# means you certify the DCO for every commit you make in this clone.
+#
+# Appends "Signed-off-by: <author>" unless that exact trailer is already
+# there, so `git commit -s` does not produce a duplicate, and another
+# person's sign-off does not stop ours being added. An empty message is left
+# alone, so git still aborts the commit.
+set -eu
+
+msg="$1"
+
+# Nothing but whitespace and comments: let git abort the empty commit.
+if [ -z "$(git stripspace --strip-comments <"$msg")" ]; then
+	exit 0
+fi
+
+# The dco check matches the commit's author email, so sign off as the author.
+ident="$(git var GIT_AUTHOR_IDENT)"
+signoff="${ident%>*}>"
+
+git interpret-trailers --in-place --if-exists addIfDifferent \
+	--trailer "Signed-off-by: $signoff" "$msg"

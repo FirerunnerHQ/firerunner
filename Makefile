@@ -47,6 +47,11 @@ cover-check: cover
 check:
 	@scripts/check.sh $(CHECK_ARGS)
 
+# One-time setup of a clone: git hooks that sign off every commit (DCO).
+.PHONY: setup
+setup:
+	@scripts/setup-dev.sh
+
 # End-to-end tests require a real KVM host and are gated behind the `e2e` tag.
 .PHONY: e2e
 e2e:
