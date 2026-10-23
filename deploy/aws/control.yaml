@@ -37,8 +37,9 @@ Parameters:
     Default: /firerunner
     AllowedPattern: "/[A-Za-z0-9/_.-]*[A-Za-z0-9_.-]"
     Description: >-
-      SSM path. The control VM reads <prefix>/control/{version,env,tiers,app-private-key|token}
-      and any runner AMI parameter under <prefix>/.
+      SSM path. The control VM reads <prefix>/control/{version,sha256sums,env,tiers,app-private-key|token}
+      and any runner AMI parameter under <prefix>/ (only there: an ami naming
+      /aws/service/... is not readable).
   ReleaseRepo:
     Type: String
     Default: solcreek/firerunner
@@ -99,9 +100,25 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: [ec2:RunInstances, ec2:CreateTags]
+                Action: ec2:RunInstances
                 Resource: "*"
                 Condition: { StringEquals: { aws:RequestedRegion: !Ref AWS::Region } }
+              # Tags at launch must name this install as owner, and later tags
+              # go only on its own instances and never change the owner: else
+              # tagging would extend the owner-scoped grants below to anything.
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: RunInstances
+                    "aws:RequestTag/firerunner:owner": !Ref Owner
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: "*"
+                Condition:
+                  StringEquals: { "aws:ResourceTag/firerunner:owner": !Ref Owner }
+                  ForAllValues:StringNotEquals: { aws:TagKeys: [firerunner:owner] }
               - Effect: Allow
                 Action:
                   - ec2:DescribeInstances
@@ -115,6 +132,7 @@ Resources:
               - Effect: Allow
                 Action: ec2:CancelSpotInstanceRequests
                 Resource: "*"
+                Condition: { StringEquals: { "aws:ResourceTag/firerunner:owner": !Ref Owner } }
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/*"
@@ -147,7 +165,7 @@ Resources:
           - ResourceType: volume
             Tags: [{ Key: firerunner:control, Value: !Ref AWS::StackName }]
         # Download the release named by <prefix>/control/version, verify it
-        # against its SHA256SUMS, and hand over to its bootstrap script. A
+        # against <prefix>/control/sha256sums, and hand over to its bootstrap script. A
         # failure marks the instance unhealthy, so the group replaces it.
         UserData:
           Fn::Base64: !Sub
@@ -159,7 +177,7 @@ Resources:
                 t=$(curl -fsS -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" http://169.254.169.254/latest/api/token)
                 i=$(curl -fsS -H "X-aws-ec2-metadata-token: $t" http://169.254.169.254/latest/meta-data/instance-id)
                 echo "firerunner user-data failed (line $1); marking $i unhealthy" >&2
-                aws autoscaling set-instance-health --instance-id "$i" --health-status Unhealthy || true
+                aws autoscaling set-instance-health --instance-id "$i" --health-status Unhealthy --no-should-respect-grace-period || true
               }
               trap 'unhealthy $LINENO' ERR
               install -d -m 0700 /etc/firerunner
@@ -175,7 +193,10 @@ Resources:
               version=$(aws ssm get-parameter --name ${ParameterPrefix}/control/version --query Parameter.Value --output text)
               case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) false ;; esac
               d=$(mktemp -d) && cd "$d"
-              for f in SHA256SUMS firerunner_linux_$arch firerunner-control-bootstrap.sh; do
+              # The checksums deploy-control.sh pinned when it deployed this
+              # version, not the release's own: a replaced release asset fails.
+              aws ssm get-parameter --name ${ParameterPrefix}/control/sha256sums --query Parameter.Value --output text > SHA256SUMS
+              for f in firerunner_linux_$arch firerunner-control-bootstrap.sh; do
                 curl -fsSL --retry 5 -o "$f" "https://github.com/${ReleaseRepo}/releases/download/$version/$f"
               done
               grep -E "  (firerunner_linux_$arch|firerunner-control-bootstrap\.sh)$" SHA256SUMS > want

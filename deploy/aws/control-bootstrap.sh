@@ -48,14 +48,24 @@ ip=$(imds local-ipv4)
 
 unhealthy() {
 	log "failed (line $1); marking $instance unhealthy so the group replaces it"
-	aws autoscaling set-instance-health --instance-id "$instance" --health-status Unhealthy || true
+	aws autoscaling set-instance-health --instance-id "$instance" --health-status Unhealthy \
+		--no-should-respect-grace-period || true
 }
 trap 'unhealthy $LINENO' ERR
 
 # param NAME: the parameter's value, decrypted; empty when it does not exist.
+# Any other error (access denied, a KMS key the role cannot use) fails.
 param() {
-	aws ssm get-parameter --name "$FR_PREFIX/control/$1" --with-decryption \
-		--query Parameter.Value --output text 2>/dev/null || true
+	local out
+	if out=$(aws ssm get-parameter --name "$FR_PREFIX/control/$1" --with-decryption \
+		--query Parameter.Value --output text 2>&1); then
+		printf '%s\n' "$out"
+	elif [[ "$out" == *ParameterNotFound* ]]; then
+		return 0
+	else
+		log "read $FR_PREFIX/control/$1: $out"
+		return 1
+	fi
 }
 
 install -d -m 0700 "$etc"
@@ -106,9 +116,11 @@ cat > "$units/firerunner.service" <<EOF
 Description=firerunner control plane
 After=network-online.target
 Wants=network-online.target
-# Five failed starts in ten minutes: give up, and let the group replace the VM.
-StartLimitIntervalSec=10min
-StartLimitBurst=5
+# Ten failed starts in half an hour: give up, and let the group replace the
+# VM. firerunner rides out GitHub and AWS outages without exiting, so only a
+# process that cannot run gets here.
+StartLimitIntervalSec=30min
+StartLimitBurst=10
 OnFailure=firerunner-unhealthy.service
 
 [Service]
@@ -117,7 +129,7 @@ ExecStart=/usr/local/bin/firerunner
 # Exits are restarts: a deleted scale set or a lost session exits to be
 # started fresh.
 Restart=always
-RestartSec=5
+RestartSec=15
 # Jobs run on their own instances and outlive this process; the next control
 # VM's reaper ends what they leave. Do not hold a replacement up for them.
 TimeoutStopSec=60
@@ -139,7 +151,7 @@ Description=mark this control VM unhealthy so its Auto Scaling group replaces it
 [Service]
 Type=oneshot
 Environment=AWS_REGION=$AWS_REGION
-ExecStart=/usr/bin/aws autoscaling set-instance-health --instance-id $instance --health-status Unhealthy
+ExecStart=/usr/bin/aws autoscaling set-instance-health --instance-id $instance --health-status Unhealthy --no-should-respect-grace-period
 EOF
 
 "$systemctl" daemon-reload

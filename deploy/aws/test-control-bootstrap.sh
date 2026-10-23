@@ -32,7 +32,8 @@ ssm)
 	name=""
 	while [ $# -gt 0 ]; do [ "$1" = --name ] && name="$2"; shift; done
 	f="$STATE/ssm/${name#/fr/control/}"
-	[ -f "$f" ] || { echo "ParameterNotFound" >&2; exit 254; }
+	[ ! -f "$STATE/ssm-denied" ] || { echo "An error occurred (AccessDeniedException) when calling the GetParameter operation" >&2; exit 254; }
+	[ -f "$f" ] || { echo "An error occurred (ParameterNotFound) when calling the GetParameter operation" >&2; exit 254; }
 	cat "$f"
 	;;
 *) echo "$*" >> "$STATE/$svc" ;;
@@ -131,8 +132,8 @@ expect "token: env file owner-only" "" \
 failed() {
 	local c="$1"
 	expect "$c: fails" "it succeeded" bash -c '! run'
-	expect "$c: marked unhealthy" "$(cat "$STATE/autoscaling" 2>/dev/null)" \
-		grep -q 'set-instance-health --instance-id i-0123 --health-status Unhealthy' "$STATE/autoscaling"
+	expect "$c: marked unhealthy, now" "$(cat "$STATE/autoscaling" 2>/dev/null)" \
+		grep -q 'set-instance-health --instance-id i-0123 --health-status Unhealthy --no-should-respect-grace-period' "$STATE/autoscaling"
 	expect "$c: name untouched" "" test ! -f "$STATE/route53"
 	expect "$c: nothing started" "" test ! -f "$STATE/systemctl"
 }
@@ -149,6 +150,13 @@ expect "no tiers: says which parameter" "$(cat "$STATE/out")" grep -q 'missing /
 setup
 rm "$STATE/ssm/app-private-key"
 failed "no credential"
+
+# 4b. SSM refuses: not mistaken for a missing parameter.
+setup
+touch "$STATE/ssm-denied"
+failed "ssm denied"
+expect "ssm denied: says why" "$(cat "$STATE/out")" grep -q 'AccessDeniedException' "$STATE/out"
+expect "ssm denied: not reported as missing" "$(cat "$STATE/out")" bash -c "! grep -q missing '$STATE/out'"
 
 # 5. firerunner rejects the config.
 setup
@@ -178,6 +186,7 @@ release() {
 	# shellcheck disable=SC2016 # expands in the stub
 	printf '#!/bin/sh\necho "$1" > "$STATE/bootstrapped"\n' > "$STATE/release/firerunner-control-bootstrap.sh"
 	(cd "$STATE/release" && sha256sum firerunner_linux_* firerunner-control-bootstrap.sh > SHA256SUMS)
+	cp "$STATE/release/SHA256SUMS" "$STATE/ssm/sha256sums" # pinned at deploy
 }
 cat > "$TMP/bin/curl-release" <<'FAKE'
 #!/usr/bin/env bash
@@ -228,15 +237,28 @@ export -f userdata
 	echo tampered >> "$STATE/release/firerunner_linux_$arch"
 	expect "user-data, tampered: fails" "it succeeded" bash -c '! userdata'
 	expect "user-data, tampered: bootstrap never ran" "" test ! -f "$STATE/bootstrapped"
-	expect "user-data, tampered: marked unhealthy" "" grep -q 'set-instance-health --instance-id i-0123' "$STATE/autoscaling"
+	expect "user-data, tampered: marked unhealthy, now" "" grep -q 'set-instance-health --instance-id i-0123 --health-status Unhealthy --no-should-respect-grace-period' "$STATE/autoscaling"
 
 	# 8. SHA256SUMS that does not list the binary is no verification.
 	setup
 	echo v1.2.3 > "$STATE/ssm/version"
 	release "$arch"
-	grep -v firerunner_linux "$STATE/release/SHA256SUMS" > "$STATE/s" && mv "$STATE/s" "$STATE/release/SHA256SUMS"
+	grep -v firerunner_linux "$STATE/ssm/sha256sums" > "$STATE/s" && mv "$STATE/s" "$STATE/ssm/sha256sums"
 	expect "user-data, unlisted: fails" "it succeeded" bash -c '! userdata'
 	expect "user-data, unlisted: bootstrap never ran" "" test ! -f "$STATE/bootstrapped"
+
+	# 9. A release whose assets and SHA256SUMS were both replaced after the
+	# deploy: the pinned checksums still refuse it.
+	setup
+	echo v1.2.3 > "$STATE/ssm/version"
+	release "$arch"
+	echo swapped >> "$STATE/release/firerunner_linux_$arch"
+	(cd "$STATE/release" && sha256sum firerunner_linux_* firerunner-control-bootstrap.sh > SHA256SUMS)
+	expect "user-data, replaced release: fails" "it succeeded" bash -c '! userdata'
+	expect "user-data, replaced release: bootstrap never ran" "" test ! -f "$STATE/bootstrapped"
+	# shellcheck disable=SC2016 # expands in the child
+	expect "user-data, replaced release: never fetched the release's SHA256SUMS" "$(cat "$STATE/downloads" 2>/dev/null)" \
+		bash -c '! grep -q SHA256SUMS "$STATE/downloads"'
 }
 
 if [ "$fails" -gt 0 ]; then
