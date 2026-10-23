@@ -503,7 +503,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			return err
 		}
 		newEC2 = func(t config.Tier) provisioner.Provisioner {
-			return client.Tier(ec2.Options{
+			p := client.Tier(ec2.Options{
 				Tier:        t.Name,
 				Owner:       owner,
 				EC2:         *t.EC2,
@@ -512,6 +512,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				MaxLifetime: cfg.Firecracker.MaxVMLifetime,
 				Logger:      log.With("tier", t.Name),
 			})
+			// A tier's stopped pool fills and refills in the background for
+			// the life of the process; its instances stay stopped on exit and
+			// are found again on the next start.
+			if pool := p.Pool(); pool != nil {
+				go pool.Run(ctx)
+			}
+			return p
 		}
 	}
 	tiers := cfg.EffectiveTiers()
