@@ -123,7 +123,8 @@ if command -v shellcheck >/dev/null; then
 		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh scripts/check.sh \
 		scripts/mutate.sh scripts/test-mutate.sh \
 		scripts/merge-stack.sh scripts/test-merge-stack.sh \
-		scripts/agent-env.sh scripts/setup-dev.sh scripts/test-dev-env.sh .githooks/commit-msg
+		scripts/agent-env.sh scripts/setup-dev.sh scripts/test-dev-env.sh .githooks/commit-msg \
+		scripts/release-build.sh
 	step shellcheck-e2e shellcheck -x scripts/e2e/*.sh
 else
 	skip shellcheck "shellcheck not installed"
