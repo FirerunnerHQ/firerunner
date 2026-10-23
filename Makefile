@@ -41,8 +41,8 @@ cover-check: cover
 	awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { exit (t+0 < m+0) }' || \
 		{ echo "coverage $$total% is below minimum $(COVER_MIN)%"; exit 1; }
 
-# Everything CI's test job checks that this machine can run, with a PASS/
-# FAIL/SKIP summary. CHECK_ARGS=--fast skips the slow race/coverage run.
+# Everything CI's test, build and shell jobs check that this machine can run,
+# with a PASS/FAIL/SKIP summary. CHECK_ARGS=--fast skips the slow race/coverage run.
 .PHONY: check
 check:
 	@scripts/check.sh $(CHECK_ARGS)

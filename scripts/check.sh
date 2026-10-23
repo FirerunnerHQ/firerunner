@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# check.sh — everything CI's test job checks that this machine can run, in one
-# command, ending in a summary a person or an agent can act on:
+# check.sh — everything CI's test, build and shell jobs check that this machine
+# can run, in one command, ending in a summary a person or an agent can act on:
 #
 #   PASS  gofmt
 #   FAIL  test+coverage   (see the output above)
