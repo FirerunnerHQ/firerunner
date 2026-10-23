@@ -84,7 +84,10 @@ type Options struct {
 
 // Provisioner launches one EC2 instance per runner for one tier.
 type Provisioner struct {
-	c    *Client
+	c *Client
+	// pool, when the tier keeps one, supplies pre-warmed instances; Launch
+	// cold-launches when it is empty.
+	pool *Pool
 	o    Options
 	log  *slog.Logger
 	now  func() time.Time
@@ -100,11 +103,19 @@ func (c *Client) Tier(o Options) *Provisioner {
 	if log == nil {
 		log = c.log
 	}
-	return &Provisioner{
+	p := &Provisioner{
 		c: c, o: o, log: log.With("provisioner", "ec2"), now: time.Now, tick: time.Second,
 		termWait: terminateWait, termRetry: terminateRetry,
 	}
+	if o.EC2.Pool > 0 {
+		p.pool = newPool(p, o.EC2.Pool)
+	}
+	return p
 }
+
+// Pool returns the tier's stopped pool, or nil when it keeps none. Its Run
+// must be started for the pool to fill.
+func (p *Provisioner) Pool() *Pool { return p.pool }
 
 // Name implements provisioner.Provisioner.
 func (p *Provisioner) Name() string { return "ec2" }
@@ -117,13 +128,22 @@ func (p *Provisioner) Name() string { return "ec2" }
 // instance is terminated. Busy detection does not come from here: the listener
 // marks the runner busy from GitHub's JobStarted message, so onBusy is unused.
 func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.RunnerSpec, _ func()) error {
+	if p.pool != nil {
+		err := p.launchPooled(ctx, name, jit)
+		if !errors.Is(err, errPoolEmpty) && !errors.Is(err, errPoolStart) {
+			return err
+		}
+		if errors.Is(err, errPoolStart) {
+			p.log.Warn("pool instance unavailable; cold-launching instead", "runner", name, "err", err)
+		}
+	}
 	entered := time.Now()
 	img, err := p.c.amis.resolve(ctx, p.o.EC2.AMI)
 	if err != nil {
 		return err
 	}
 	resolved := time.Now()
-	inst, err := p.run(ctx, name, img)
+	inst, err := p.run(ctx, name, img, forJob)
 	if err != nil {
 		return err
 	}
@@ -148,6 +168,66 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 	return w.run(ctx, ip)
 }
 
+// errPoolStart reports that a claimed pool instance failed to start; the
+// launch falls back to a cold instance.
+var errPoolStart = errors.New("pool instance did not start")
+
+// launchPooled runs the runner on a ready pool instance: claim it, register
+// its config, start it, then wait as for any job instance. It returns
+// errPoolEmpty when no instance is ready.
+func (p *Provisioner) launchPooled(ctx context.Context, name, jit string) error {
+	entered := time.Now()
+	in, err := p.pool.claim(ctx, name)
+	switch {
+	case errors.Is(err, errPoolEmpty), err != nil && ctx.Err() != nil:
+		return err
+	case err != nil:
+		// A pool-wide failure (permissions, throttling): this job cold-
+		// launches; the instance went back to the pool.
+		return fmt.Errorf("%w: claim: %w", errPoolStart, err)
+	}
+	log := p.log.With("runner", name, "instance", in.id, "type", in.itype, "pooled", true)
+	ip, err := netip.ParseAddr(in.ip)
+	if err != nil {
+		p.pool.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
+		return fmt.Errorf("%w: pool instance %s private IP %q: %w", errPoolStart, in.id, in.ip, err)
+	}
+	// Register before the start, so the boot script's first fetch succeeds.
+	if err := p.o.JIT.Register(ip, name, jit); err != nil {
+		p.pool.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
+		return fmt.Errorf("register jit config for %s at %s: %w", in.id, ip, err)
+	}
+	defer p.o.JIT.Revoke(ip)
+	claimed := time.Now()
+	if _, err := p.c.api.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{in.id}}); err != nil {
+		// A stopped spot instance can lack capacity to start again.
+		p.pool.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
+		return fmt.Errorf("%w: start %s: %w", errPoolStart, in.id, err)
+	}
+	started := time.Now()
+	// Now that it runs, release the persistent request: a terminate later
+	// must not bring a replacement. (Cancelling it before the start would
+	// make the start fail.) If this fails, terminate retries it first.
+	spotReq := in.spotReq
+	if spotReq != "" {
+		if err := p.pool.cancelSpot(context.WithoutCancel(ctx), spotReq); err != nil {
+			log.Warn("cancel spot request; retrying before terminate", "request", spotReq, "err", err)
+		} else {
+			spotReq = ""
+		}
+	}
+	log.Info("pool instance started",
+		"claim", claimed.Sub(entered).Round(time.Millisecond),
+		"startInstances", started.Sub(claimed).Round(time.Millisecond))
+
+	states, stopWatch := p.c.watch.watch(in.id)
+	defer stopWatch()
+	// Until it is seen running, a "stopped" state is the instance before
+	// the start took effect, not its job ending.
+	w := &waiter{p: p, id: in.id, log: log, states: states, awaitStart: true, spotReq: spotReq}
+	return w.run(ctx, ip)
+}
+
 // waiter follows one launched instance until it is gone.
 type waiter struct {
 	p      *Provisioner
@@ -158,6 +238,12 @@ type waiter struct {
 	terminating bool
 	termSince   time.Time // first termination request
 	termLast    time.Time // latest termination request
+	// awaitStart is set for a pool instance started from stopped: stop
+	// states are ignored until the instance has been seen running.
+	awaitStart bool
+	// spotReq is a persistent spot request still to cancel before the
+	// instance may be terminated.
+	spotReq string
 }
 
 // run waits for the instance to finish its job, terminating it when ctx is
@@ -182,10 +268,15 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			case types.InstanceStateNameShuttingDown, types.InstanceStateNameTerminated:
 				w.log.Info("instance gone", "state", s)
 				return result
+			case types.InstanceStateNamePending, types.InstanceStateNameRunning:
+				w.awaitStart = false
 			case types.InstanceStateNameStopping, types.InstanceStateNameStopped:
-				// The runner powered off but the instance only stopped, which
-				// a terminate-on-shutdown launch should never do (a pooled
-				// persistent-spot instance would). Finish the job here.
+				if w.awaitStart {
+					continue // the state from before the start
+				}
+				// The runner powered off and the instance stopped: a pool
+				// instance always does, and a job launch should not.
+				// Finish the job here.
 				if !w.terminating {
 					w.terminate(context.WithoutCancel(ctx), "instance stopped")
 				}
@@ -220,6 +311,15 @@ func (w *waiter) terminate(ctx context.Context, reason string) {
 		w.log.Info("terminating instance", "reason", reason)
 	}
 	w.termLast = now
+	if w.spotReq != "" {
+		// An open persistent request would replace the instance after the
+		// terminate; it must be cancelled first.
+		if _, err := w.p.c.api.CancelSpotInstanceRequests(ctx, &ec2.CancelSpotInstanceRequestsInput{SpotInstanceRequestIds: []string{w.spotReq}}); err != nil {
+			w.log.Warn("cancel spot request before terminate", "request", w.spotReq, "err", err)
+			return
+		}
+		w.spotReq = ""
+	}
 	if _, err := w.p.c.api.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{w.id}}); err != nil {
 		w.log.Warn("terminate instance", "err", err)
 	}
@@ -232,10 +332,21 @@ func (w *waiter) abort(ctx context.Context, reason string, cause error) error {
 	return errors.Join(cause, w.run(context.WithoutCancel(ctx), netip.Addr{}))
 }
 
+// launchKind says what an instance is launched for.
+type launchKind int
+
+const (
+	// forJob launches an instance that runs the named runner's job at once.
+	forJob launchKind = iota
+	// forPool launches a pool instance: it boots once with no job, then
+	// stops and waits to be claimed.
+	forPool
+)
+
 // run walks markets × instance types × subnets in the configured order and
 // returns the first instance EC2 accepts. Capacity errors move on to the next
 // combination; any other error ends the walk.
-func (p *Provisioner) run(ctx context.Context, name string, img image) (types.Instance, error) {
+func (p *Provisioner) run(ctx context.Context, name string, img image, kind launchKind) (types.Instance, error) {
 	var markets []string
 	switch p.o.EC2.Market {
 	case config.MarketSpot:
@@ -252,7 +363,7 @@ func (p *Provisioner) run(ctx context.Context, name string, img image) (types.In
 				if err := ctx.Err(); err != nil {
 					return types.Instance{}, err
 				}
-				out, err := p.c.api.RunInstances(ctx, p.input(name, img, market, itype, subnet))
+				out, err := p.c.api.RunInstances(ctx, p.input(name, img, market, itype, subnet, kind))
 				if err == nil {
 					if len(out.Instances) != 1 {
 						return types.Instance{}, fmt.Errorf("RunInstances returned %d instances, want 1", len(out.Instances))
@@ -279,13 +390,18 @@ func isCapacityErr(err error) bool {
 	return false
 }
 
-// input builds the RunInstancesInput for one attempt.
-func (p *Provisioner) input(name string, img image, market, itype, subnet string) *ec2.RunInstancesInput {
+// input builds the RunInstancesInput for one attempt. name is the runner for
+// a job launch, or a unique pool name for a pool launch.
+func (p *Provisioner) input(name string, img image, market, itype, subnet string, kind launchKind) *ec2.RunInstancesInput {
 	tags := []types.Tag{
 		{Key: aws.String(TagTier), Value: aws.String(p.o.Tier)},
-		{Key: aws.String(TagRunner), Value: aws.String(name)},
 		{Key: aws.String(TagOwner), Value: aws.String(p.o.Owner)},
 		{Key: aws.String("Name"), Value: aws.String(name)},
+	}
+	if kind == forPool {
+		tags = append(tags, types.Tag{Key: aws.String(TagPool), Value: aws.String(PoolWarming)})
+	} else {
+		tags = append(tags, types.Tag{Key: aws.String(TagRunner), Value: aws.String(name)})
 	}
 	in := &ec2.RunInstancesInput{
 		ImageId:          aws.String(img.id),
@@ -321,6 +437,22 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 				SpotInstanceType:             types.SpotInstanceTypeOneTime,
 				InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorTerminate,
 			},
+		}
+	}
+	if kind == forPool {
+		// No user-data: the boot script finds no endpoint, warms the disk
+		// and powers off, and the instance stops. It stays stopped until a
+		// job claims it and writes the endpoint in.
+		in.UserData = nil
+		in.InstanceInitiatedShutdownBehavior = types.ShutdownBehaviorStop
+		if market == config.MarketSpot {
+			// Only a persistent request can be stopped and started again,
+			// and it rejects terminate-on-shutdown.
+			in.InstanceInitiatedShutdownBehavior = ""
+			in.InstanceMarketOptions.SpotOptions = &types.SpotMarketOptions{
+				SpotInstanceType:             types.SpotInstanceTypePersistent,
+				InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorStop,
+			}
 		}
 	}
 	if p.o.EC2.RootVolumeGiB > 0 || p.o.EC2.RootVolumeType != "" {

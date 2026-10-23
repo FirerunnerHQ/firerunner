@@ -20,6 +20,12 @@ type API interface {
 	DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
 	TerminateInstances(context.Context, *ec2.TerminateInstancesInput, ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error)
 	DescribeImages(context.Context, *ec2.DescribeImagesInput, ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error)
+	// The stopped pool also starts, re-targets and re-tags instances, and
+	// cancels the persistent spot requests behind them.
+	StartInstances(context.Context, *ec2.StartInstancesInput, ...func(*ec2.Options)) (*ec2.StartInstancesOutput, error)
+	ModifyInstanceAttribute(context.Context, *ec2.ModifyInstanceAttributeInput, ...func(*ec2.Options)) (*ec2.ModifyInstanceAttributeOutput, error)
+	CreateTags(context.Context, *ec2.CreateTagsInput, ...func(*ec2.Options)) (*ec2.CreateTagsOutput, error)
+	CancelSpotInstanceRequests(context.Context, *ec2.CancelSpotInstanceRequestsInput, ...func(*ec2.Options)) (*ec2.CancelSpotInstanceRequestsOutput, error)
 }
 
 // ParamAPI is the subset of the SSM client used to resolve an AMI parameter.
@@ -33,4 +39,14 @@ const (
 	TagTier   = "firerunner:tier"
 	TagRunner = "firerunner:runner"
 	TagOwner  = "firerunner:owner"
+	// TagPool marks a stopped-pool instance: PoolWarming while it boots
+	// once, PoolReady once it has stopped, PoolClaimed when a job took it.
+	TagPool = "firerunner:pool"
+)
+
+// Stopped-pool states, the values of TagPool.
+const (
+	PoolWarming = "warming"
+	PoolReady   = "ready"
+	PoolClaimed = "claimed"
 )

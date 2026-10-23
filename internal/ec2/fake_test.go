@@ -2,6 +2,7 @@ package ec2
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"sync"
@@ -22,6 +23,9 @@ func apiErr(code string) error {
 type fakeInstance struct {
 	id, ip, itype, subnet string
 	spot                  bool
+	spotReq               string // persistent spot request, if any
+	shutdown              types.ShutdownBehavior
+	userData              string // decoded
 	state                 types.InstanceStateName
 	tags                  map[string]string
 }
@@ -53,11 +57,26 @@ type fakeEC2 struct {
 	imageCalls     int
 	// afterRun runs (without the lock held) once an instance is created.
 	afterRun func(id string)
+	// startErr fails StartInstances; started records started IDs.
+	// startStaysStopped leaves a started instance reporting stopped, as a
+	// stale read right after StartInstances can.
+	startErr          error
+	startStaysStopped bool
+	// tagErr fails CreateTags.
+	tagErr    error
+	started   []string
+	cancelled map[string]bool // spot request ID -> cancelled
+	// cancelErrs fails this many CancelSpotInstanceRequests calls first.
+	cancelErrs int
+	// termBeforeCancel records terminates of an instance whose persistent
+	// request was still open: AWS would launch a replacement.
+	termBeforeCancel []string
 }
 
 func newFakeEC2() *fakeEC2 {
 	return &fakeEC2{
 		runErrs:   map[string]error{},
+		cancelled: map[string]bool{},
 		invisible: map[string]bool{},
 		instances: map[string]*fakeInstance{},
 		images:    map[string]string{"ami-0abc": "/dev/sda1"},
@@ -94,13 +113,21 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, _ .
 	}
 	f.next++
 	inst := &fakeInstance{
-		id:     fmt.Sprintf("i-%04d", f.next),
-		ip:     fmt.Sprintf("10.0.1.%d", f.next),
-		itype:  itype,
-		subnet: subnet,
-		spot:   mkt == "spot",
-		state:  types.InstanceStateNamePending,
-		tags:   map[string]string{},
+		id:       fmt.Sprintf("i-%04d", f.next),
+		ip:       fmt.Sprintf("10.0.1.%d", f.next),
+		itype:    itype,
+		subnet:   subnet,
+		spot:     mkt == "spot",
+		shutdown: in.InstanceInitiatedShutdownBehavior,
+		state:    types.InstanceStateNamePending,
+		tags:     map[string]string{},
+	}
+	if mo := in.InstanceMarketOptions; mo != nil && mo.SpotOptions != nil && mo.SpotOptions.SpotInstanceType == types.SpotInstanceTypePersistent {
+		inst.spotReq = fmt.Sprintf("sir-%04d", f.next)
+	}
+	if in.UserData != nil {
+		b, _ := base64.StdEncoding.DecodeString(aws.ToString(in.UserData))
+		inst.userData = string(b)
 	}
 	for _, ts := range in.TagSpecifications {
 		if ts.ResourceType == types.ResourceTypeInstance {
@@ -124,13 +151,150 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, _ .
 }
 
 func (f *fakeEC2) view(i *fakeInstance) types.Instance {
-	return types.Instance{
+	v := types.Instance{
 		InstanceId:       aws.String(i.id),
 		PrivateIpAddress: aws.String(i.ip),
 		InstanceType:     types.InstanceType(i.itype),
 		SubnetId:         aws.String(i.subnet),
 		State:            &types.InstanceState{Name: i.state},
 	}
+	if i.spot {
+		v.InstanceLifecycle = types.InstanceLifecycleTypeSpot
+	}
+	if i.spotReq != "" {
+		v.SpotInstanceRequestId = aws.String(i.spotReq)
+	}
+	for k, val := range i.tags {
+		v.Tags = append(v.Tags, types.Tag{Key: aws.String(k), Value: aws.String(val)})
+	}
+	return v
+}
+
+// matches applies DescribeInstances filters: tag:K, tag-key and
+// instance-state-name.
+func (i *fakeInstance) matches(filters []types.Filter) bool {
+	for _, fl := range filters {
+		name, ok := aws.ToString(fl.Name), false
+		for _, want := range fl.Values {
+			switch {
+			case name == "instance-state-name":
+				ok = ok || string(i.state) == want
+			case name == "tag-key":
+				_, has := i.tags[want]
+				ok = ok || has
+			case strings.HasPrefix(name, "tag:"):
+				ok = ok || i.tags[strings.TrimPrefix(name, "tag:")] == want
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput, _ ...func(*ec2.Options)) (*ec2.StartInstancesOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
+	for _, id := range in.InstanceIds {
+		i, ok := f.instances[id]
+		if !ok || i.state != types.InstanceStateNameStopped {
+			return nil, apiErr("IncorrectInstanceState")
+		}
+		// As on AWS: a stopped spot instance whose request was cancelled
+		// can never be started again.
+		if i.spotReq != "" && f.cancelled[i.spotReq] {
+			return nil, apiErr("IncorrectSpotRequestState")
+		}
+		if !f.startStaysStopped {
+			i.state = types.InstanceStateNamePending
+		}
+		f.started = append(f.started, id)
+	}
+	return &ec2.StartInstancesOutput{}, nil
+}
+
+func (f *fakeEC2) ModifyInstanceAttribute(_ context.Context, in *ec2.ModifyInstanceAttributeInput, _ ...func(*ec2.Options)) (*ec2.ModifyInstanceAttributeOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i, ok := f.instances[aws.ToString(in.InstanceId)]
+	if !ok {
+		return nil, apiErr("InvalidInstanceID.NotFound")
+	}
+	if in.UserData != nil {
+		if i.state != types.InstanceStateNameStopped {
+			return nil, apiErr("IncorrectInstanceState")
+		}
+		// The SDK base64-encodes a blob attribute itself.
+		i.userData = string(in.UserData.Value)
+	}
+	return &ec2.ModifyInstanceAttributeOutput{}, nil
+}
+
+func (f *fakeEC2) CreateTags(_ context.Context, in *ec2.CreateTagsInput, _ ...func(*ec2.Options)) (*ec2.CreateTagsOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.tagErr != nil {
+		return nil, f.tagErr
+	}
+	for _, id := range in.Resources {
+		if i, ok := f.instances[id]; ok {
+			for _, t := range in.Tags {
+				i.tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+			}
+		}
+	}
+	return &ec2.CreateTagsOutput{}, nil
+}
+
+func (f *fakeEC2) CancelSpotInstanceRequests(_ context.Context, in *ec2.CancelSpotInstanceRequestsInput, _ ...func(*ec2.Options)) (*ec2.CancelSpotInstanceRequestsOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cancelErrs > 0 {
+		f.cancelErrs--
+		return nil, apiErr("RequestLimitExceeded")
+	}
+	for _, id := range in.SpotInstanceRequestIds {
+		f.cancelled[id] = true
+	}
+	return &ec2.CancelSpotInstanceRequestsOutput{}, nil
+}
+
+// openSpotRequests lists the persistent spot requests still open behind
+// instances that left the pool (claimed, or discarded): AWS would relaunch
+// those after a terminate. Requests behind instances still pooled are
+// expected to be open.
+func (f *fakeEC2) openSpotRequests() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var open []string
+	for _, i := range f.instances {
+		pooled := (i.tags[TagPool] == PoolReady || i.tags[TagPool] == PoolWarming) &&
+			i.state != types.InstanceStateNameShuttingDown && i.state != types.InstanceStateNameTerminated
+		if i.spotReq != "" && !f.cancelled[i.spotReq] && !pooled {
+			open = append(open, i.spotReq)
+		}
+	}
+	return open
+}
+
+func (f *fakeEC2) instance(id string) fakeInstance {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.instances[id].clone()
+}
+
+// clone copies an instance, tags included, for reading outside the lock.
+func (i *fakeInstance) clone() fakeInstance {
+	c := *i
+	c.tags = make(map[string]string, len(i.tags))
+	for k, v := range i.tags {
+		c.tags[k] = v
+	}
+	return c
 }
 
 func (f *fakeEC2) DescribeInstances(_ context.Context, in *ec2.DescribeInstancesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
@@ -147,6 +311,13 @@ func (f *fakeEC2) DescribeInstances(_ context.Context, in *ec2.DescribeInstances
 		}
 	}
 	var res types.Reservation
+	if len(in.InstanceIds) == 0 {
+		for _, id := range f.order {
+			if i := f.instances[id]; i.matches(in.Filters) {
+				res.Instances = append(res.Instances, f.view(i))
+			}
+		}
+	}
 	for _, id := range in.InstanceIds {
 		if i, ok := f.instances[id]; ok {
 			res.Instances = append(res.Instances, f.view(i))
@@ -163,6 +334,9 @@ func (f *fakeEC2) TerminateInstances(_ context.Context, in *ec2.TerminateInstanc
 		return nil, f.terminateErr
 	}
 	for _, id := range in.InstanceIds {
+		if i, ok := f.instances[id]; ok && i.spotReq != "" && !f.cancelled[i.spotReq] && i.tags[TagPool] == PoolClaimed {
+			f.termBeforeCancel = append(f.termBeforeCancel, id)
+		}
 		f.terminated = append(f.terminated, id)
 		if i, ok := f.instances[id]; ok && i.state != types.InstanceStateNameTerminated {
 			i.state = types.InstanceStateNameShuttingDown
@@ -202,7 +376,7 @@ func (f *fakeEC2) launched() []*fakeInstance {
 	defer f.mu.Unlock()
 	out := make([]*fakeInstance, 0, len(f.order))
 	for _, id := range f.order {
-		c := *f.instances[id]
+		c := f.instances[id].clone()
 		out = append(out, &c)
 	}
 	return out

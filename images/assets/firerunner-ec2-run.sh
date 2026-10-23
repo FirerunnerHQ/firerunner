@@ -26,6 +26,9 @@ POWEROFF="${FIRERUNNER_POWEROFF:-systemctl poweroff}"
 RETRY_SLEEP="${FIRERUNNER_RETRY_SLEEP:-0.2}"
 # Give up on a config that never arrives; firerunner revokes it long before.
 JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
+# Read on a warm-up boot, so the first job does not pay for EBS fetching their
+# blocks from the snapshot.
+WARM_PATHS="${FIRERUNNER_WARM_PATHS:-$RUNNER_DIR /usr/bin/dockerd /usr/bin/containerd /usr/bin/docker /usr/bin/runc}"
 
 log() { echo "firerunner: $*" >&2; }
 
@@ -45,8 +48,12 @@ done
 ud="$(curl -sf -m 2 -H "X-aws-ec2-metadata-token: $tok" "http://$IMDS/latest/user-data" || true)"
 url="$(printf '%s\n' "$ud" | sed -n 's/^FIRERUNNER_JIT_URL=//p' | head -n 1)"
 if [ -z "$url" ]; then
-	# A warm-up or image-build boot: nothing to run.
-	log "no FIRERUNNER_JIT_URL in user-data; powering off"
+	# A pool instance's warm-up boot (or an image build): no job. Read the
+	# files the first job needs, so EBS has their blocks, then power off; the
+	# instance stops until a job claims it.
+	log "no FIRERUNNER_JIT_URL in user-data: warm-up boot; reading the runner's files, then powering off"
+	# shellcheck disable=SC2086 # WARM_PATHS is a list of paths.
+	find $WARM_PATHS -xdev -type f -print0 2>/dev/null | xargs -0 cat >/dev/null 2>&1 || true
 	exit 0
 fi
 

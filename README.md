@@ -332,6 +332,7 @@ See [`examples/tiers-ec2.json`](examples/tiers-ec2.json):
 | `security_groups` | for the instances; they need **no inbound rules** |
 | `market` | `spot`, `on-demand`, or `spot-then-on-demand` (every spot option before any on-demand one) |
 | `root_volume_gib`, `root_volume_type` | optional root EBS override (default: the AMI's size, type `gp3`) |
+| `pool` | how many pre-warmed, stopped instances to keep ready (default 0, every job cold-launches); see below |
 
 `vcpu`, `mem_mib`, `golden` and `toolcache` are Firecracker fields and are
 rejected on an EC2 tier. EC2 tiers do not count against `--max-runners`, which
@@ -362,6 +363,25 @@ firerunner also terminates an instance in these cases:
 
 Instances and volumes are tagged `firerunner:tier`, `firerunner:runner` and
 `firerunner:owner` (this host's name).
+
+**Stopped pool (`"pool": N`).** A cold instance takes about 40 s from launch
+to running its job. A pool keeps N instances booted once and stopped, so a job
+starts one in seconds:
+
+- **Warm.** A pool instance boots with no user-data. Its boot script reads the
+  runner's files, so EBS has fetched their blocks from the snapshot, then powers
+  off. Spot pools use persistent requests that stop on interruption, and are
+  still billed at the spot price. A stopped instance costs only its EBS volume.
+- **Claim.** A job takes a ready instance. firerunner tags it, writes the JIT
+  endpoint into its user-data, and starts it. Then it cancels the spot request,
+  or AWS would replace the instance after terminate. The order matters: AWS
+  will not start a stopped spot instance whose request is already cancelled.
+  When the job ends the instance stops, and firerunner terminates it.
+- **Refill and restart.** The pool refills in the background. Its state lives
+  in the `firerunner:pool` tag, so a restarted firerunner finds its ready
+  instances again and terminates any a crash left mid-claim.
+- **Fallback.** With the pool empty, or if a stopped instance cannot start
+  (spot capacity), the job cold-launches instead.
 
 > **No sweep of leftovers yet.** firerunner follows only the instances it
 > launched in its current process. Instances still running after a crash or
@@ -396,9 +416,12 @@ the runners get no role:
       "Action": ["ec2:DescribeInstances", "ec2:DescribeImages"],
       "Resource": "*" },
     { "Effect": "Allow",
-      "Action": "ec2:TerminateInstances",
+      "Action": ["ec2:TerminateInstances", "ec2:StartInstances", "ec2:ModifyInstanceAttribute"],
       "Resource": "*",
       "Condition": { "StringEquals": { "aws:ResourceTag/firerunner:owner": "<control-vm-hostname>" } } },
+    { "Effect": "Allow",
+      "Action": "ec2:CancelSpotInstanceRequests",
+      "Resource": "*" },
     { "Effect": "Allow",
       "Action": "ssm:GetParameter",
       "Resource": "arn:aws:ssm:*:*:parameter/firerunner/*" }
