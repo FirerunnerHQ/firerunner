@@ -48,7 +48,19 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
 `.claude/settings.json` runs `scripts/agent-env.sh` at session start. It puts
 `go`, `gh` and `shellcheck` on the Bash tool's PATH when the non-interactive
 shell lacks them (Homebrew on macOS). Outside Claude Code,
-`eval "$(scripts/agent-env.sh)"` does the same. Machine-specific
+`eval "$(scripts/agent-env.sh)"` does the same.
+
+The settings also enable the `gopls-lsp` plugin. After an Edit or Write of a
+`.go` file, gopls's compile errors (e.g. `undefined: x [UndeclaredName]`)
+arrive with the agent's next tool call, so most of them no longer need a
+`go vet` round trip; the LSP tool also gives definitions, references and
+call hierarchies. Claude Code starts `gopls` with its own PATH, not the Bash
+tool's, so `gopls` must be on the PATH you launch Claude Code from: `brew
+install gopls`, or `go install golang.org/x/tools/gopls@latest` with
+`~/go/bin` on that PATH. Prefer Edit over a python or sed rewrite for Go
+files, so the diagnostics follow each change.
+
+Machine-specific
 settings, such as `AWS_PROFILE` or `AWS_REGION`, belong in the `env` block of
 `.claude/settings.local.json`, which is gitignored. Never commit them.
 
@@ -111,7 +123,8 @@ The usual dev box is macOS with zsh; much of the code and CI is Linux.
 - **zsh globs.** An unmatched glob aborts the command: `grep -r --include=*.go
   x .` prints "no matches found" and exits 1, which looks like an empty
   result. Quote globs, or use `git grep -n x -- '*.go'` or `rg -g '*.go'`. zsh
-  also does not word-split `$VAR`; use arrays.
+  also does not word-split `$VAR`; use arrays. A word that starts with `=`
+  is a command lookup: `echo ====` fails with "=== not found"; quote it.
 - **Pipes hide failures.** `go test ./... | tail` exits with `tail`'s status;
   a failing test was committed that way. Use `set -o pipefail`, or check
   `${pipestatus[1]}` (zsh) / `${PIPESTATUS[0]}` (bash).
@@ -124,6 +137,11 @@ The usual dev box is macOS with zsh; much of the code and CI is Linux.
 - **Linux-only files** (`_linux.go`, `//go:build linux`) are skipped by a
   darwin build, so a green `go vet` there proves nothing about them: run
   `GOOS=linux go vet ./...` too.
+- **Worktree guard.** A session isolated in a worktree refuses a Bash command
+  it cannot prove stays inside that worktree: an unquoted variable where an
+  option may stand, `cd` to another checkout, or a jq program naming `git`
+  inside a compound `gh` command. Quote literal paths, or write the steps to a
+  script in your scratchpad and run `bash FILE`.
 
 ## Where things are
 
