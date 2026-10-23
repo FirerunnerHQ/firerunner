@@ -36,4 +36,5 @@ jobs:
           pre=()
           case "$GITHUB_REF_NAME" in *-*) pre=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" "${pre[@]}" --verify-tag --generate-notes \
-            dist/firerunner_linux_amd64 dist/firerunner_linux_arm64 dist/SHA256SUMS
+            dist/firerunner_linux_amd64 dist/firerunner_linux_arm64 \
+            dist/firerunner-control-bootstrap.sh dist/SHA256SUMS
