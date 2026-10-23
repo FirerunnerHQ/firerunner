@@ -5,7 +5,7 @@ as one VM in an Auto Scaling group of one:
 
 - **Replacement on failure.** The group replaces a VM that fails EC2's
   checks, one whose boot fails (bad release, missing parameter, rejected
-  config), and one whose firerunner unit fails five times in ten minutes.
+  config), and one whose firerunner unit fails ten times in half an hour.
   The new VM takes over the pool and leftovers, because the owner tag
   (`Owner`) stays the same.
 - **A stable private name.** At boot the VM points `control.<zone>` (a
@@ -19,10 +19,12 @@ credentials are stack parameters and SSM parameters.
 
 ## How a VM boots
 
-1. User-data reads `<prefix>/control/version` (a release tag, e.g.
-   `v0.2.0`). It downloads that release's `SHA256SUMS`, the binary for its
-   architecture and `firerunner-control-bootstrap.sh`, and checks both
-   files against `SHA256SUMS`.
+1. User-data reads `<prefix>/control/version` (a release tag, for example
+   `v0.2.0`). It downloads that release's binary for its architecture and
+   `firerunner-control-bootstrap.sh`, and checks both against
+   `<prefix>/control/sha256sums`. That parameter holds the release's
+   `SHA256SUMS`, which `deploy-control.sh` pinned at deploy time, so an
+   asset replaced afterwards is refused.
 2. [`control-bootstrap.sh`](control-bootstrap.sh) installs the binary and
    writes `/etc/firerunner/` from SSM. Then `firerunner config check` must
    pass, and only then does the name move and the unit start.
@@ -47,7 +49,7 @@ Put the config in SSM, under the prefix (default `/firerunner`):
 | `<prefix>/control/env` | String | non-secret `FR_*` lines: `FR_URL`, `FR_APP_CLIENT_ID`, `FR_APP_INSTALLATION_ID`, tuning flags |
 | `<prefix>/control/tiers` | String | the tier catalog (JSON); `ami` may name `<prefix>/...` parameters |
 | `<prefix>/control/app-private-key` | SecureString | the GitHub App key (or `token`: a PAT) |
-| `<prefix>/control/version` | String | written by `deploy-control.sh` |
+| `<prefix>/control/version`, `sha256sums` | String | written by `deploy-control.sh` |
 
 The bootstrap sets `FR_OWNER`, `FR_JIT_ADDR`, `FR_JIT_HOST`,
 `FR_AWS_REGION`, `FR_TIERS` and `FR_WORKDIR` itself; leave them out of
@@ -57,10 +59,16 @@ The bootstrap sets `FR_OWNER`, `FR_JIT_ADDR`, `FR_JIT_HOST`,
 aws ssm put-parameter --name /firerunner/control/env --type String --value "$(cat env)"
 aws ssm put-parameter --name /firerunner/control/tiers --type String --value "$(cat tiers.json)"
 aws ssm put-parameter --name /firerunner/control/app-private-key --type SecureString --value "$(cat app.pem)"
-aws ssm put-parameter --name /firerunner/control/version --type String --value v0.2.0
 ```
 
-Create the stack. Pick an `Owner` that names this install and **never
+SecureStrings must use the default `aws/ssm` key; the role has no
+`kms:Decrypt` for a key of your own. The role reads parameters only under
+the prefix, so publish the runner AMI there, not as an `/aws/service/...`
+name. Spot tiers in a new account need the EC2 Spot service-linked role;
+create it once with
+`aws iam create-service-linked-role --aws-service-name spot.amazonaws.com`.
+
+Create the stack, then deploy a release (below). Pick an `Owner` that names this install and **never
 change it**: the owner tag is how a replacement VM finds the pool.
 
 ```sh
@@ -70,14 +78,15 @@ aws cloudformation deploy --stack-name firerunner --template-file deploy/aws/con
   RunnerSecurityGroupId=sg-...
 ```
 
-Pass `HostedZoneId=Z...` with `ZoneName=<its name>` to use an existing
+The group's first VM fails its boot, and keeps being replaced, until the
+first `deploy-control.sh` sets a version. Pass `HostedZoneId=Z...` with `ZoneName=<its name>` to use an existing
 private zone. Use `ImageId=/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`
 with an x86 `InstanceType`.
 
 ## Deploy, roll back
 
 ```sh
-deploy/aws/deploy-control.sh firerunner v0.2.1   # waits until v0.2.1 is active
+deploy/aws/deploy-control.sh firerunner v0.2.1   # waits until v0.2.1 has run 60 s, no restarts
 deploy/aws/deploy-control.sh firerunner v0.2.0   # roll back: the same, older
 ```
 
@@ -104,5 +113,9 @@ Use Session Manager, with no SSH and no open ports:
 - The running plane: `journalctl -u firerunner`, and
   `FR_WORKDIR=/var/lib/firerunner firerunner status`.
 
-A config the VM rejects makes the group replace it again and again, about
-every five minutes, until the parameter is fixed. Fix it, then deploy.
+A config the VM rejects makes the group replace it again and again, every
+few minutes, until the parameter is fixed. Fix it, then deploy.
+
+Turn on immutable releases for the release repository. The pinned checksums
+already refuse a replaced asset, but immutability also protects the first
+deploy of a version.

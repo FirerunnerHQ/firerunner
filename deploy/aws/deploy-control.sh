@@ -7,7 +7,7 @@
 # instance refresh: the old VM is terminated first (two would fight over the
 # scale set's session), the new one installs VERSION at boot. Waits for the
 # refresh and for firerunner to be active on the new VM, unless --no-wait.
-# Roll back by deploying the previous version. Needs the AWS CLI with
+# Roll back by deploying the previous version. Needs jq and the AWS CLI with
 # credentials and AWS_REGION (or a profile region) for the stack.
 #
 # Exit codes: 0 deployed, 1 failed (the message says where), 2 usage.
@@ -39,17 +39,32 @@ prefix=$(output ParameterPrefix)
 repo=$(param_value ReleaseRepo)
 if [ -z "$asg" ] || [ "$asg" = None ]; then die "stack $stack has no AutoScalingGroup output"; fi
 
-# Refuse a version the VM could not install, before touching anything.
-sums="https://github.com/$repo/releases/download/$version/SHA256SUMS"
-curl -fsSL -o /dev/null "$sums" || die "no release $version in $repo ($sums)"
+# Refuse a version the VM could not install, before touching anything, and
+# pin its checksums now: every later boot of this version verifies against
+# these, so a release asset replaced afterwards is refused.
+url="https://github.com/$repo/releases/download/$version/SHA256SUMS"
+sums=$(curl -fsSL "$url") || die "no release $version in $repo ($url)"
+grep -qE '  firerunner_linux_(amd64|arm64)$' <<< "$sums" || die "$url lists no firerunner binary"
 
-previous=$(aws ssm get-parameter --name "$prefix/control/version" --query Parameter.Value --output text 2>/dev/null || echo none)
-aws ssm put-parameter --name "$prefix/control/version" --type String --value "$version" --overwrite > /dev/null
-log "$prefix/control/version: $previous -> $version"
+get() { aws ssm get-parameter --name "$prefix/control/$1" --query Parameter.Value --output text 2>/dev/null || echo ""; }
+put() { aws ssm put-parameter --name "$prefix/control/$1" --type String --value "$2" --overwrite > /dev/null; }
+previous=$(get version) previous_sums=$(get sha256sums)
+put sha256sums "$sums"
+put version "$version"
+log "$prefix/control/version: ${previous:-none} -> $version"
 
-refresh=$(aws autoscaling start-instance-refresh --auto-scaling-group-name "$asg" \
+# Restore the previous version if the refresh does not start, so a later
+# health replacement does not upgrade behind the operator's back.
+if ! refresh=$(aws autoscaling start-instance-refresh --auto-scaling-group-name "$asg" \
 	--preferences '{"MinHealthyPercentage":0,"MaxHealthyPercentage":100,"InstanceWarmup":60}' \
-	--query InstanceRefreshId --output text)
+	--query InstanceRefreshId --output text); then
+	if [ -n "$previous" ]; then
+		put version "$previous"
+		put sha256sums "$previous_sums"
+		log "restored $prefix/control/version to $previous"
+	fi
+	die "could not start an instance refresh on $asg (one already running?)"
+fi
 log "instance refresh $refresh started on $asg"
 [ "$wait" = 1 ] || exit 0
 
@@ -68,21 +83,29 @@ instance=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-nam
 	--query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId | [0]' --output text)
 log "new control VM: $instance"
 
-# InService means EC2 is happy, not that firerunner is: ask systemd.
+# InService means EC2 is happy, not that firerunner is. Done when the unit
+# has run this version for a minute without restarting: a crash loop reads
+# "active" between restarts.
+settle="${DEPLOY_SETTLE_SECONDS:-60}"
+# shellcheck disable=SC2016 # expands on the VM
+probe='systemctl is-active firerunner; /usr/local/bin/firerunner version; systemctl show -p NRestarts --value firerunner; echo $(( $(cut -d. -f1 /proc/uptime) - $(systemctl show -p ActiveEnterTimestampMonotonic --value firerunner) / 1000000 ))'
 while :; do
 	cmd=$(aws ssm send-command --instance-ids "$instance" --document-name AWS-RunShellScript \
-		--parameters 'commands=["systemctl is-active firerunner; /usr/local/bin/firerunner version"]' \
+		--parameters "$(jq -cn --arg c "$probe" '{commands: [$c]}')" \
 		--query Command.CommandId --output text 2>/dev/null) || cmd=""
 	if [ -n "$cmd" ]; then
 		sleep 3
 		out=$(aws ssm get-command-invocation --command-id "$cmd" --instance-id "$instance" \
 			--query StandardOutputContent --output text 2>/dev/null || true)
-		if [ "$(head -1 <<< "$out")" = active ]; then
-			running=$(sed -n 2p <<< "$out")
+		{ read -r state; read -r running; read -r restarts; read -r up; } <<< "$out" || true
+		if [ "${state:-}" = active ]; then
 			[ "$running" = "firerunner $version" ] || die "$instance runs $running, not $version"
-			log "firerunner $version active on $instance"
-			exit 0
+			[ "${restarts:-0}" = 0 ] || die "firerunner on $instance restarted $restarts time(s): journalctl -u firerunner"
+			if [ "${up:-0}" -ge "$settle" ]; then
+				log "firerunner $version active on $instance for ${up}s"
+				exit 0
+			fi
 		fi
 	fi
-	waited "firerunner not active on $instance"
+	waited "firerunner not settled on $instance (${state:-no answer})"
 done
