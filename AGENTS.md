@@ -38,6 +38,8 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
   branch closes, rather than retargets, the PRs on it.
 - A PR merged into a stack branch, not `main`, does not close its `Closes #N`
   issue. Close it by hand when the stack lands.
+- `scripts/merge-stack.sh PR` does both: it prints the plan (retarget, merge,
+  close), and `--yes` carries it out.
 
 ## Public repository hygiene
 
