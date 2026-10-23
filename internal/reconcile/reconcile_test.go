@@ -12,11 +12,12 @@ import (
 
 type fakeScaleSet struct {
 	stats    Stats
+	at       time.Time // when the statistics' message arrived
 	ok       bool
 	recycles []string
 }
 
-func (f *fakeScaleSet) Stats() (Stats, time.Time, bool) { return f.stats, time.Unix(1, 0), f.ok }
+func (f *fakeScaleSet) Stats() (Stats, time.Time, bool) { return f.stats, f.at, f.ok }
 func (f *fakeScaleSet) Recycle(reason string)           { f.recycles = append(f.recycles, reason) }
 
 type fakeRunners struct {
@@ -143,15 +144,22 @@ func TestLookupErrorsCancelNothing(t *testing.T) {
 }
 
 func TestOverRegisteredIsReportedAfterGrace(t *testing.T) {
-	ss := &fakeScaleSet{ok: true, stats: Stats{Registered: 5}}
-	rn := &fakeRunners{running: 2}
 	c := newClock()
+	ss := &fakeScaleSet{ok: true, stats: Stats{Registered: 5}, at: c.t}
+	rn := &fakeRunners{running: 2}
 	r, tr := newRec(ss, rn, lookupNone, c)
 	r.Check(context.Background())
 	if tr.Snapshot().Drift != "" {
 		t.Fatalf("reported before the grace: %q", tr.Snapshot().Drift)
 	}
-	c.advance(3 * time.Minute)
+	// No new message for 10 minutes: the stale statistics prove nothing.
+	c.advance(10 * time.Minute)
+	r.Check(context.Background())
+	if tr.Snapshot().Drift != "" {
+		t.Fatalf("reported from stale statistics: %q", tr.Snapshot().Drift)
+	}
+	// A message 3 minutes after the first still shows the gap.
+	ss.at = ss.at.Add(3 * time.Minute)
 	r.Check(context.Background())
 	d := tr.Snapshot().Drift
 	if !strings.Contains(d, "GitHub lists 5 registered runner(s), firerunner tracks 2") {

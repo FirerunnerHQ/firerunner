@@ -59,7 +59,8 @@ type Options struct {
 	// LostEvery paces those lookups (default 1m).
 	LostEvery time.Duration
 	// RegisteredGrace is how long GitHub may list more runners than
-	// firerunner tracks before it is reported (default 3m).
+	// firerunner tracks before it is reported (default 3m), measured
+	// between the messages that report it.
 	RegisteredGrace time.Duration
 	// Tick is how often the reconciler looks (default 10s).
 	Tick   time.Duration
@@ -146,12 +147,16 @@ func (r *Reconciler) Check(ctx context.Context) {
 		r.availableSince = time.Time{}
 	}
 
-	// GitHub lists runners firerunner does not track.
+	// GitHub lists runners firerunner does not track. Statistics arrive only
+	// with messages, so an idle scale set keeps showing the last ones (a
+	// runner that has since deregistered still counted). Only a later message
+	// that still shows the gap confirms it: the grace is measured in message
+	// time, not wall time.
 	if st.Registered > tracked {
 		if r.overRegisteredAt.IsZero() {
-			r.overRegisteredAt = now
+			r.overRegisteredAt = at
 		}
-		if now.Sub(r.overRegisteredAt) >= r.o.RegisteredGrace {
+		if at.Sub(r.overRegisteredAt) >= r.o.RegisteredGrace {
 			drift = append(drift, fmt.Sprintf("GitHub lists %d registered runner(s), firerunner tracks %d", st.Registered, tracked))
 		}
 	} else {
