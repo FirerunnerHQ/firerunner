@@ -1,0 +1,40 @@
+name: release
+
+# A v* tag publishes the Linux binaries and SHA256SUMS as a GitHub Release.
+# The control VM bootstrap (deploy/aws/) installs a release by its tag and
+# verifies the binary against SHA256SUMS. A tag with a hyphen (v0.2.0-rc.1)
+# is published as a prerelease.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: false
+      - name: Test
+        run: go test -timeout 4m ./...
+      - name: Build
+        run: scripts/release-build.sh "$GITHUB_REF_NAME" dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=()
+          case "$GITHUB_REF_NAME" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" "${pre[@]}" --verify-tag --generate-notes \
+            dist/firerunner_linux_amd64 dist/firerunner_linux_arm64 \
+            dist/firerunner-control-bootstrap.sh dist/SHA256SUMS

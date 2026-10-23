@@ -344,7 +344,7 @@ user-data**:
 
 1. firerunner launches the instance with IMDSv2 required (hop limit 1, so
    job containers cannot reach IMDS), **no instance profile**, and user-data
-   holding one line, `FIRERUNNER_JIT_URL=http://<--jit-addr>/jit`.
+   holding one line, `FIRERUNNER_JIT_URL=http://<--jit-host or --jit-addr>/jit`.
 2. It registers the config under the instance's private IP. The instance's
    boot service ([`images/assets/firerunner-ec2-run.sh`](images/assets/firerunner-ec2-run.sh))
    fetches it. The config is served **once**, to that IP only: another
@@ -413,9 +413,19 @@ permissions) fails the launch, and the scheduler backs off.
 
 - `--jit-addr` / `FR_JIT_ADDR` (required with an EC2 tier): the control VM's
   VPC `IP:port`, for example `10.0.0.5:8098`.
+- `--jit-host` / `FR_JIT_HOST`: a private DNS name instances use instead of
+  that IP, for example `control.firerunner.internal`. It keeps one address
+  across control VM replacements; it must resolve to `--jit-addr`'s IP.
 - `--jit-ttl` / `FR_JIT_TTL`: how long a config waits to be fetched.
 - `--aws-region` / `FR_AWS_REGION`: defaults to the SDK's sources, then the
   control VM's own region.
+
+**Running the control VM.** [`deploy/aws/`](deploy/aws/README.md) has a
+CloudFormation template that does this for you:
+
+- an Auto Scaling group of one, which replaces a failed VM;
+- a private DNS name for `--jit-host`;
+- `deploy-control.sh`, which deploys a release in one command.
 
 **Control VM permissions.** Credentials come from the default chain,
 normally the control VM's instance role. It needs no `iam:PassRole`, because

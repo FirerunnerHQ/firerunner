@@ -184,8 +184,8 @@ func remoteIP(r *http.Request) (netip.Addr, error) {
 	return ip.Unmap(), nil
 }
 
-// URL returns the endpoint instances fetch from, given the server's listen
-// address (a concrete VPC IP and port).
+// URL returns the endpoint instances fetch from, given the host:port they
+// reach the server at (its VPC IP, or a private DNS name for it).
 func URL(addr string) string {
 	return (&url.URL{Scheme: "http", Host: addr, Path: Path}).String()
 }
