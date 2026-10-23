@@ -431,3 +431,75 @@ func TestPool_RequeueAfterTaggingClearsTheRunner(t *testing.T) {
 		t.Fatal("a requeued instance is still tracked as in use")
 	}
 }
+
+func TestPool_ShrinkTerminatesReadyBeforeReturning(t *testing.T) {
+	h := readyPool(t, 3)
+	h.p.pool.SetTarget(context.Background(), 1)
+	// No eventually: the instances are gone when SetTarget returns, so a
+	// schedule can shrink the pool before it lowers its hot runners.
+	if r, w := h.p.pool.Ready(); r != 1 || w != 0 {
+		t.Fatalf("ready %d warming %d after shrinking to 1", r, w)
+	}
+	if got := len(h.f.terminatedIDs()); got != 2 {
+		t.Fatalf("terminated %d, want 2", got)
+	}
+	// And it stays at 1: nothing refills what was trimmed.
+	time.Sleep(50 * time.Millisecond)
+	if n := len(h.f.launched()); n != 3 {
+		t.Fatalf("launched %d after the shrink, want the original 3", n)
+	}
+}
+
+func TestPool_GrowFills(t *testing.T) {
+	h := readyPool(t, 1)
+	h.p.pool.SetTarget(context.Background(), 3)
+	eventually(t, "two more warming", func() bool { r, w := h.p.pool.Ready(); return r == 1 && w == 2 })
+	if h.p.pool.Target() != 3 {
+		t.Fatalf("target %d", h.p.pool.Target())
+	}
+}
+
+func TestPool_WarmingAboveTargetEndsOnceReady(t *testing.T) {
+	h := poolHarness(t, 2, config.MarketSpot)
+	h.runPool(t)
+	eventually(t, "warming", func() bool { _, w := h.p.pool.Ready(); return w == 2 })
+	h.p.pool.SetTarget(context.Background(), 0)
+	if n := len(h.f.terminatedIDs()); n != 0 {
+		t.Fatalf("terminated %d warming instances mid-boot", n)
+	}
+	h.stopWarming()
+	eventually(t, "both trimmed once ready", func() bool {
+		r, w := h.p.pool.Ready()
+		return r == 0 && w == 0 && len(h.f.terminatedIDs()) == 2
+	})
+}
+
+func TestPool_ShrinkKeepsAnInstanceWhoseRequestWillNotCancel(t *testing.T) {
+	h := readyPool(t, 2)
+	h.f.mu.Lock()
+	h.f.cancelErrs = 3 // every retry of one discard
+	h.f.mu.Unlock()
+	h.p.pool.SetTarget(context.Background(), 1)
+	if r, _ := h.p.pool.Ready(); r != 2 {
+		t.Fatalf("ready %d: an instance whose request is open must stay pooled", r)
+	}
+	if n := len(h.f.terminatedIDs()); n != 0 {
+		t.Fatalf("terminated %d with its spot request open", n)
+	}
+	eventually(t, "trimmed on a later pass", func() bool { r, _ := h.p.pool.Ready(); return r == 1 })
+}
+
+func TestPool_ScheduledPoolStartsEmpty(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.Pooled = true; o.EC2.Market = config.MarketSpot })
+	if h.p.pool == nil {
+		t.Fatal("a Pooled tier with pool 0 has no pool")
+	}
+	h.p.pool.tick = 5 * time.Millisecond
+	h.runPool(t)
+	time.Sleep(30 * time.Millisecond)
+	if n := len(h.f.launched()); n != 0 {
+		t.Fatalf("launched %d at target 0", n)
+	}
+	h.p.pool.SetTarget(context.Background(), 1)
+	eventually(t, "one warming", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
+}

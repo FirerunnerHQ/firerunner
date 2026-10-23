@@ -103,7 +103,10 @@ type Options struct {
 	// MaxLifetime terminates an instance still alive after this long; 0
 	// disables the backstop.
 	MaxLifetime time.Duration
-	Logger      *slog.Logger
+	// Pooled keeps a pool even while EC2.Pool is 0, for a tier whose
+	// schedule sizes one later (see Pool.SetTarget).
+	Pooled bool
+	Logger *slog.Logger
 }
 
 // Provisioner launches one EC2 instance per runner for one tier.
@@ -131,7 +134,7 @@ func (c *Client) Tier(o Options) *Provisioner {
 		c: c, o: o, log: log.With("provisioner", "ec2"), now: time.Now, tick: time.Second,
 		termWait: terminateWait, termRetry: terminateRetry,
 	}
-	if o.EC2.Pool > 0 {
+	if o.EC2.Pool > 0 || o.Pooled {
 		p.pool = newPool(p, o.EC2.Pool)
 	}
 	return p

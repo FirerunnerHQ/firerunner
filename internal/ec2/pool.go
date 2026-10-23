@@ -66,7 +66,7 @@ var warmMax = 10 * time.Minute
 
 func newPool(p *Provisioner, target int) *Pool {
 	return &Pool{
-		p: p, target: target, log: p.log.With("pool", target), tick: 15 * time.Second, now: time.Now,
+		p: p, target: target, log: p.log.With("component", "pool"), tick: 15 * time.Second, now: time.Now,
 		warming: map[string]time.Time{}, wake: make(chan struct{}, 1),
 	}
 }
@@ -81,6 +81,7 @@ func (pl *Pool) Run(ctx context.Context) {
 	defer t.Stop()
 	for {
 		pl.refresh(ctx)
+		pl.trim(ctx)
 		pl.fill(ctx)
 		select {
 		case <-ctx.Done():
@@ -88,6 +89,54 @@ func (pl *Pool) Run(ctx context.Context) {
 		case <-t.C:
 		case <-pl.wake:
 		}
+	}
+}
+
+// SetTarget resizes the pool. A larger pool fills on the next pass. A
+// smaller one terminates ready instances beyond the target before it
+// returns, so a caller that shrinks the pool and then its hot runners ends
+// stopped instances first; warming instances beyond it are ended once they
+// are ready.
+func (pl *Pool) SetTarget(ctx context.Context, n int) {
+	pl.mu.Lock()
+	old := pl.target
+	pl.target = n
+	pl.mu.Unlock()
+	if n == old {
+		return
+	}
+	pl.log.Info("pool resized", "from", old, "to", n)
+	pl.trim(ctx)
+	pl.poke()
+}
+
+// Target is the size the pool keeps.
+func (pl *Pool) Target() int {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	return pl.target
+}
+
+// trim terminates ready instances while ready plus warming exceeds the
+// target. One it cannot end (its spot request would not cancel) goes back
+// to the pool, and the next pass tries again.
+func (pl *Pool) trim(ctx context.Context) {
+	for ctx.Err() == nil {
+		pl.mu.Lock()
+		if len(pl.ready)+len(pl.warming) <= pl.target || len(pl.ready) == 0 {
+			pl.mu.Unlock()
+			return
+		}
+		in := pl.ready[len(pl.ready)-1]
+		pl.ready = pl.ready[:len(pl.ready)-1]
+		pl.mu.Unlock()
+		if !pl.discard(ctx, in.id, in.spotReq) {
+			pl.mu.Lock()
+			pl.ready = append(pl.ready, in)
+			pl.mu.Unlock()
+			return
+		}
+		pl.log.Info("pool instance terminated: above the target", "instance", in.id)
 	}
 }
 
