@@ -779,17 +779,21 @@ func deviceID(path string) (uint64, bool) {
 }
 
 func authCheck(cfg *config.Config) Check {
+	if cfg.Token == "" {
+		if cfg.AppClientID == "" {
+			return fail("auth", "no --token and no GitHub App credentials")
+		}
+		if cfg.AppInstallID == 0 {
+			return fail("auth", "GitHub App set but --app-installation-id is missing")
+		}
+	}
+	// Startup refuses a configured key that does not parse even beside a
+	// token, so doctor does too.
+	if _, err := cfg.ResolvePrivateKey(); err != nil {
+		return fail("auth", "GitHub App private key: %v", err)
+	}
 	if cfg.Token != "" {
 		return pass("auth", "PAT configured")
-	}
-	if cfg.AppClientID == "" {
-		return fail("auth", "no --token and no GitHub App credentials")
-	}
-	if cfg.AppInstallID == 0 {
-		return fail("auth", "GitHub App set but --app-installation-id is missing")
-	}
-	if _, err := cfg.ResolvePrivateKey(); err != nil {
-		return fail("auth", "GitHub App private key unreadable: %v", err)
 	}
 	return pass("auth", "GitHub App configured (client %s, installation %d)", cfg.AppClientID, cfg.AppInstallID)
 }

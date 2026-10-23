@@ -430,6 +430,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("--mem-mib must be >= 128")
 	case c.Token == "" && c.AppClientID == "":
 		return fmt.Errorf("provide --token or GitHub App credentials")
+	case c.Token == "" && c.AppInstallID == 0:
+		return fmt.Errorf("--app-installation-id is required with --app-client-id (or set --token)")
 	case c.Firecracker.Jailer && (c.Firecracker.JailUID < 1 || c.Firecracker.JailGID < 1):
 		return fmt.Errorf("--jail-uid and --jail-gid (>0) are required when --jailer is set")
 	case len(c.Firecracker.CgroupLimits) > 0 && !c.Firecracker.Jailer:
@@ -666,36 +668,6 @@ func nonEmptyUnique(vals []string) error {
 		seen[v] = true
 	}
 	return nil
-}
-
-// configured value may be either the PEM contents or a path to a PEM file.
-func (c *Config) ResolvePrivateKey() (string, error) {
-	if c.AppPrivateKey == "" {
-		return "", nil
-	}
-	if strings.Contains(c.AppPrivateKey, "PRIVATE KEY") {
-		return c.AppPrivateKey, nil
-	}
-	// Anything without a PEM header is treated as a path to a PEM file. Never
-	// echo the raw value in an error: if the operator pasted key material that
-	// failed the header check above, os.ReadFile's PathError would carry the
-	// key verbatim into doctor --json (the README documents `doctor --json |
-	// jq`) and into journald. Report the failure category instead.
-	if strings.ContainsAny(c.AppPrivateKey, "\n\r") {
-		return "", errors.New(`app private key is neither valid PEM (missing "PRIVATE KEY" header) nor a file path`)
-	}
-	b, err := os.ReadFile(c.AppPrivateKey)
-	if err != nil {
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			return "", errors.New("app private key file does not exist")
-		case errors.Is(err, os.ErrPermission):
-			return "", errors.New("app private key file is not readable (permission denied)")
-		default:
-			return "", errors.New("app private key file could not be read")
-		}
-	}
-	return string(b), nil
 }
 
 // NewLogger builds a slog.Logger from the level and format strings.

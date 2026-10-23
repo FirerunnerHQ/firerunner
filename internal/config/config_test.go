@@ -178,7 +178,7 @@ func TestParse_MalformedEnvFailsClosed(t *testing.T) {
 func TestFromFlags_AppCredsSatisfyAuth(t *testing.T) {
 	args := []string{
 		"--url", "u", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0",
-		"--app-client-id", "Iv1.abc",
+		"--app-client-id", "Iv1.abc", "--app-installation-id", "1",
 	}
 	if _, err := FromFlags(args); err != nil {
 		t.Fatalf("app creds should satisfy auth: %v", err)
@@ -438,36 +438,6 @@ func TestParseLevel(t *testing.T) {
 	}
 	if parseLevel("bogus").String() != "INFO" {
 		t.Fatal("default should be INFO")
-	}
-}
-
-func TestResolvePrivateKey(t *testing.T) {
-	// Inline PEM contents are returned as-is.
-	pem := "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
-	c := &Config{AppPrivateKey: pem}
-	if got, err := c.ResolvePrivateKey(); err != nil || got != pem {
-		t.Fatalf("inline PEM: got %q err %v", got, err)
-	}
-
-	// Empty stays empty.
-	if got, err := (&Config{}).ResolvePrivateKey(); err != nil || got != "" {
-		t.Fatalf("empty: got %q err %v", got, err)
-	}
-
-	// A path is read from disk.
-	dir := t.TempDir()
-	path := dir + "/key.pem"
-	if err := os.WriteFile(path, []byte(pem), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c = &Config{AppPrivateKey: path}
-	if got, err := c.ResolvePrivateKey(); err != nil || got != pem {
-		t.Fatalf("path: got %q err %v", got, err)
-	}
-
-	// A missing path errors.
-	if _, err := (&Config{AppPrivateKey: dir + "/missing.pem"}).ResolvePrivateKey(); err == nil {
-		t.Fatal("expected error for missing key file")
 	}
 }
 

@@ -94,24 +94,6 @@ func TestAppJWT(t *testing.T) {
 	}
 }
 
-func TestParseRSAPrivateKey_PKCS8(t *testing.T) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	der, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
-	if _, err := parseRSAPrivateKey(string(p)); err != nil {
-		t.Fatalf("PKCS8 parse: %v", err)
-	}
-	if _, err := parseRSAPrivateKey("not a pem"); err == nil {
-		t.Error("want error for non-PEM input")
-	}
-}
-
 func TestAuthVerify_PAT(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rate_limit" {

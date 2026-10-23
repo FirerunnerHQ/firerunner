@@ -6,11 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -57,7 +54,7 @@ func authVerify(cfg *config.Config, apiBase string) Check {
 	} else {
 		key, err := cfg.ResolvePrivateKey()
 		if err != nil {
-			return fail("auth-verify", "GitHub App private key unreadable: %v", err)
+			return fail("auth-verify", "GitHub App private key: %v", err)
 		}
 		jwt, err := appJWT(cfg.AppClientID, key, time.Now())
 		if err != nil {
@@ -88,7 +85,7 @@ func authVerify(cfg *config.Config, apiBase string) Check {
 // GitHub App. The issuer is the App's client ID (GitHub also accepts the App
 // ID). Kept stdlib-only: PKCS#1/PKCS#8 PEM parsing + rsa.SignPKCS1v15.
 func appJWT(issuer, pemKey string, now time.Time) (string, error) {
-	key, err := parseRSAPrivateKey(pemKey)
+	key, err := config.ParseAppPrivateKey([]byte(pemKey))
 	if err != nil {
 		return "", err
 	}
@@ -109,25 +106,4 @@ func appJWT(issuer, pemKey string, now time.Time) (string, error) {
 		return "", err
 	}
 	return signingInput + "." + enc(sig), nil
-}
-
-// parseRSAPrivateKey accepts either a PKCS#1 ("RSA PRIVATE KEY") or PKCS#8
-// ("PRIVATE KEY") PEM, as GitHub has issued both formats for App keys.
-func parseRSAPrivateKey(pemKey string) (*rsa.PrivateKey, error) {
-	block, _ := pem.Decode([]byte(pemKey))
-	if block == nil {
-		return nil, errors.New("no PEM block found in private key")
-	}
-	if k, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
-		return k, nil
-	}
-	k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse private key: %w", err)
-	}
-	rk, ok := k.(*rsa.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("private key is %T, want RSA", k)
-	}
-	return rk, nil
 }

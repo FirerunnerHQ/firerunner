@@ -207,6 +207,24 @@ func TestAuthCheck(t *testing.T) {
 	if c := authCheck(&config.Config{AppClientID: "id"}); c.Level != levelFail {
 		t.Errorf("app without installation id: want FAIL, got %s", c.Level)
 	}
+	// An empty key file panicked the daemon once (issue #78); doctor must
+	// report it, naming the flag and the file, as startup does.
+	empty := filepath.Join(t.TempDir(), "app-key.pem")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range []*config.Config{
+		{AppClientID: "id", AppInstallID: 1, AppPrivateKey: empty},
+		{Token: "ghp_x", AppClientID: "id", AppInstallID: 1, AppPrivateKey: empty},
+	} {
+		c := authCheck(cfg)
+		if c.Level != levelFail || !strings.Contains(c.Detail, "--app-private-key "+empty+": file is empty") {
+			t.Errorf("empty key file: got %s %s", c.Level, c.Detail)
+		}
+	}
+	if c := authCheck(&config.Config{AppClientID: "id", AppInstallID: 1}); c.Level != levelFail {
+		t.Errorf("app without key: want FAIL, got %s %s", c.Level, c.Detail)
+	}
 }
 
 // TestDoctor_ReportsFailures checks that Doctor surfaces missing required inputs
