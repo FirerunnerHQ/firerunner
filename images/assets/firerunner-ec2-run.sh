@@ -18,11 +18,22 @@
 # Powering off ends the instance: it is launched with shutdown behaviour
 # "terminate". A pooled persistent-spot instance can only stop, and firerunner
 # terminates it.
+#
+# Once user-data names an endpoint, this boot is for a job and the disk is
+# thrown away after it either way, so it powers off without stopping units
+# (POWEROFF_FAST): the instance is billed until it is shutting down, and with a
+# clean stop of docker, containerd and the rest, 10-12 s passed between the
+# job completing and the instance shutting down. Processes are still
+# killed and the file systems unmounted or remounted read-only. Any other boot
+# (a pool instance's warm-up, an image build, a failure before user-data is
+# read) keeps the clean POWEROFF: that disk may boot again.
 set -eu
 
 IMDS="${FIRERUNNER_IMDS:-169.254.169.254}"
 RUNNER_DIR="${FIRERUNNER_RUNNER_DIR:-/opt/runner}"
 POWEROFF="${FIRERUNNER_POWEROFF:-systemctl poweroff}"
+POWEROFF_FAST="${FIRERUNNER_POWEROFF_FAST:-systemctl poweroff --force}"
+poweroff_cmd="$POWEROFF"
 RETRY_SLEEP="${FIRERUNNER_RETRY_SLEEP:-0.2}"
 # Give up on a config that never arrives; firerunner revokes it long before.
 JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
@@ -34,8 +45,8 @@ log() { echo "firerunner: $*" >&2; }
 
 finish() {
 	sync
-	# shellcheck disable=SC2086 # POWEROFF is a command line.
-	$POWEROFF
+	# shellcheck disable=SC2086 # poweroff_cmd is a command line.
+	$poweroff_cmd
 }
 trap finish EXIT
 
@@ -56,6 +67,8 @@ if [ -z "$url" ]; then
 	find $WARM_PATHS -xdev -type f -print0 2>/dev/null | xargs -0 cat >/dev/null 2>&1 || true
 	exit 0
 fi
+# A job boot from here on: its disk is never booted again.
+poweroff_cmd="$POWEROFF_FAST"
 
 body="$(mktemp)"
 trap 'rm -f "$body"; finish' EXIT
