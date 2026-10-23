@@ -11,6 +11,9 @@
 #
 # Usage: scripts/check.sh [--fast]
 #   --fast  skip the race/coverage run (the slowest step) for a quick loop
+#
+# TEST_TIMEOUT (default 4m) is go test -timeout per test binary, here and in
+# make test/cover: a hung test fails instead of stalling the run.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 2
@@ -20,7 +23,7 @@ for arg in "$@"; do
 	case "$arg" in
 	--fast) fast=1 ;;
 	-h | --help)
-		sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*)
@@ -95,7 +98,7 @@ step vet go vet ./...
 step vet-linux env GOOS=linux go vet ./...
 if [ "$fast" = 1 ]; then
 	skip test+coverage "--fast"
-	step test go test ./...
+	step test go test -timeout "${TEST_TIMEOUT:-4m}" ./...
 else
 	step test+coverage make --no-print-directory cover-check
 fi
