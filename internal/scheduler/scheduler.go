@@ -170,12 +170,16 @@ func plan(desired, live, running, max int) int {
 }
 
 // live returns how many in-flight microVMs can take a job: running minus the
-// launches sleeping in backoff (no VM behind them) and the VMs scaleDown has
-// cancelled (tearing down) or is deregistering. Callers must hold s.mu.
+// launches sleeping in backoff (no VM behind them), the VMs scaleDown has
+// cancelled (tearing down) or is deregistering, and the VMs whose job GitHub
+// reported completed (shutting down; each runs one job). Counting a completed
+// VM made scaleDown see one VM too many when the completion message's desired
+// count still held a queued job, and remove the idle VM booting for it.
+// Callers must hold s.mu.
 func (s *Scheduler) live() int {
 	n := s.running - s.backingOff
 	for _, h := range s.active {
-		if h.cancelled || h.removing {
+		if h.cancelled || h.removing || h.completed {
 			n--
 		}
 	}
@@ -256,8 +260,8 @@ func (s *Scheduler) commit(n int) {
 // replan re-runs Reconcile's plan with the last desired count after a runner
 // whose job completed has exited, and reports how many launches it committed
 // (0 or 1) along with the context to launch them under. GitHub sends a message
-// when a job completes, but the VM that ran it is still live then, so plan
-// counts it as able to serve the jobs queued behind it and launches nothing;
+// when a job completes, but the VM that ran it still holds its place in
+// running then, so at Max plan launches nothing for the jobs queued behind it;
 // the VM goes away seconds later and, without this, nothing looks again until
 // the next message, up to a long poll (~50 s) later. Callers must hold s.mu,
 // in the same critical section that took the exited launch out of running.
