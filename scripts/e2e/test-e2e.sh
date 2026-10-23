@@ -39,6 +39,7 @@ case "$*" in
 *"ssm cancel-command"*) ;;
 *"ec2 get-console-output"*"--latest"*) fake-answer console-latest ;;
 *"ec2 get-console-output"*) fake-answer console ;;
+*"ec2 describe-instances"*) fake-answer describe-instances ;;
 *) echo "unexpected aws call: $*" >&2; exit 1 ;;
 esac
 FAKE
@@ -418,6 +419,140 @@ for args in "wf.yml 0" "wf.yml x" "wf.yml 2 -f novalue" "1" "a b c"; do
 	expect "measure: rejects '$args'" "$(dump)" rc_is 2
 done
 expect "measure: no gh on usage errors" "" not_called "gh "
+
+# --- lifecycle ---------------------------------------------------------------
+
+# The probe sample is describe-instances call 1, at 1000; loop sample k (k >= 2)
+# is call k, taken at 1000 + (k - 2) with the default 1 s interval.
+# insts ID:RUNNER:STATE:LAUNCH...: a describe-instances answer.
+insts() {
+	local items="" q id runner state launch
+	for q in "$@"; do
+		IFS=: read -r id runner state launch <<<"$q"
+		items="$items{\"InstanceId\":\"$id\",\"State\":{\"Name\":\"$state\"},\"LaunchTime\":\"$(iso "$launch" | sed 's/Z$/.000Z/')\",\"Tags\":[{\"Key\":\"Name\",\"Value\":\"$runner\"},{\"Key\":\"firerunner:runner\",\"Value\":\"$runner\"}]},"
+	done
+	echo "{\"Reservations\":[{\"Instances\":[${items%,}]}]}"
+}
+# ljobs CONCLUSION STARTED COMPLETED RUNNER...: one job per runner ("" for none).
+ljobs() {
+	local c="$1" st="$2" co="$3" items="" r
+	shift 3
+	for r in "$@"; do
+		items="$items$(jq -cn --arg c "$c" --arg st "$st" --arg co "$co" --arg r "$r" \
+			'def t: if . == "" then null else (tonumber | todate) end;
+			{id: 1, name: ("job-" + $r), runner_name: (if $r == "" then null else $r end),
+			 status: (if $co != "" then "completed" elif $st != "" then "in_progress" else "queued" end),
+			 conclusion: (if $c == "" then null else $c end), started_at: ($st | t), completed_at: ($co | t)}'),"
+	done
+	echo "{\"jobs\":[${items%,}]}"
+}
+JOBS11="repos/owner/repo/actions/runs/11/jobs?per_page=100"
+line_is() { jqe -s "$1" "$STATE/out"; }
+not_err_has() { ! err_has "$1"; }
+
+fresh life-ok
+answer describe-instances 1 '{"Reservations":[]}'
+answer describe-instances 2 "$(insts i-old:r-1:terminated:500 i-other:r-other:running:1000 i-1:r-1:pending:999)"
+answer describe-instances 3 "$(insts i-old:r-1:terminated:500 i-other:r-other:running:1000 i-1:r-1:running:999)"
+answer describe-instances 12 "$(insts i-old:r-1:terminated:500 i-other:r-other:running:1000 i-1:r-1:shutting-down:999)"
+answer describe-instances 15 "$(insts i-old:r-1:terminated:500 i-other:r-other:terminated:1000 i-1:r-1:terminated:999)"
+answer repos/owner/repo/actions/runs/11 1 "$(mrun 11 in_progress '')"
+answer repos/owner/repo/actions/runs/11 3 "$(mrun 11 completed success)"
+answer "$JOBS11" 1 "$(ljobs '' '' '' '')"
+answer "$JOBS11" 2 "$(ljobs '' 1004 '' r-1)"
+answer "$JOBS11" 3 "$(ljobs success 1004 1009 r-1)"
+run lifecycle.sh --run 11
+expect "lifecycle: exit 0 once the instance is terminated" "$(dump)" rc_is 0
+expect "lifecycle: stops at the first terminated sample" "$(cat "$STATE/clock")" [ "$(cat "$STATE/clock")" = 1013 ]
+expect "lifecycle: dispatches nothing with --run" "" not_called "workflow run"
+expect "lifecycle: matches the job's runner to its instance" "$(cat "$STATE/out")" \
+	line_is '.[0] | .run == 11 and .runner == "r-1" and .instance == "i-1" and .conclusion == "success"'
+expect "lifecycle: timeline" "$(head -n 1 "$STATE/out")" line_is '.[0].t == {launch: 999, pending: 1000, running: 1001,
+	job_start: 1004, job_end: 1009, shutting_down: 1010, stopping: null, stopped: null, terminated: 1013}'
+expect "lifecycle: durations" "$(head -n 1 "$STATE/out")" line_is '.[0].d | .launch_to_running_s == 2 and
+	.running_to_job_start_s == 3 and .job_s == 5 and .job_end_to_shutting_down_s == 1 and
+	.job_end_to_terminated_s == 4 and .shutting_down_to_terminated_s == 3 and .job_end_to_stopped_s == null'
+expect "lifecycle: error bars from the sample gaps" "$(head -n 1 "$STATE/out")" \
+	line_is '.[0] | .interval_s == 1 and .sample_gap_max_s == 1 and .err_s.running == 1 and .err_s.terminated == 1 and .err_s.pending == null'
+expect "lifecycle: summary" "$(tail -n 1 "$STATE/out")" last_json '.summary and .jobs == 1 and .measured == 1 and .failed == 0 and
+	.interval_s == 1 and .d.job_end_to_shutting_down_s == {n: 1, min: 1, p50: 1, max: 1}'
+expect "lifecycle: N < 5 is flagged" "" last_json '.few_samples == true'
+expect "lifecycle: and warned about" "" err_has "warning: only 1 measured job"
+expect "lifecycle: GitHub polled every FR_E2E_POLL, not every sample" "$(calls_of "runs/11/jobs")" [ "$(calls_of "runs/11/jobs")" = 3 ]
+
+fresh life-five
+answer describe-instances 1 '{"Reservations":[]}'
+answer describe-instances 2 "$(insts i-1:r-1:terminated:990 i-2:r-2:terminated:990 i-3:r-3:terminated:990 i-4:r-4:terminated:990 i-5:r-5:stopped:990)"
+answer repos/owner/repo/actions/runs/11 1 "$(mrun 11 completed success)"
+answer "$JOBS11" 1 "$(ljobs success 992 998 r-1 r-2 r-3 r-4 r-5)"
+FR_E2E_INSTANCE_POLL=2 run lifecycle.sh --run 11
+expect "lifecycle five: exit 0" "$(dump)" rc_is 0
+expect "lifecycle five: a line per job" "" [ "$(wc -l <"$STATE/out" | tr -d ' ')" = 6 ]
+expect "lifecycle five: not flagged" "$(tail -n 1 "$STATE/out")" last_json '.few_samples == false and .measured == 5 and .interval_s == 2'
+expect "lifecycle five: no warning" "" not_err_has "warning"
+expect "lifecycle five: a stopped instance counts as ended" "" line_is '.[4].t.stopped == 1000 and .[4].d.job_end_to_stopped_s == 2'
+expect "lifecycle five: first-sample states have no error bar" "" line_is '.[0].err_s.terminated == null'
+
+fresh life-dispatch
+answer dispatch 1 ok
+answer describe-instances 1 '{"Reservations":[]}'
+answer describe-instances 3 "$(insts i-1:r-1:terminated:1000)"
+answer "$LIST" 1 '{"workflow_runs":[]}'
+answer "$LIST" 2 "$(runs_list 99:500 11:1001)"
+answer repos/owner/repo/actions/runs/11 1 "$(mrun 11 completed failure)"
+answer "$JOBS11" 1 "$(ljobs failure 1002 1003 r-1)"
+run lifecycle.sh wf.yml 1 -f tier=cloud
+expect "lifecycle dispatch: a failed job exits 1" "$(dump)" rc_is 1
+expect "lifecycle dispatch: dispatched with inputs" "" called "workflow run wf.yml --repo owner/repo -f tier=cloud"
+expect "lifecycle dispatch: ignores runs from before the dispatch" "" not_called "runs/99"
+expect "lifecycle dispatch: still reports" "" last_json '.failed == 1'
+
+fresh life-unmatched
+answer describe-instances 1 '{"Reservations":[]}'
+answer repos/owner/repo/actions/runs/11 1 "$(mrun 11 completed success)"
+answer "$JOBS11" 1 "$(ljobs success 990 995 r-9)"
+run lifecycle.sh --run 11
+expect "lifecycle unmatched: exit 1" "$(dump)" rc_is 1
+expect "lifecycle unmatched: does not wait for an instance it never saw" "$(cat "$STATE/clock")" [ "$(cat "$STATE/clock")" = 1000 ]
+expect "lifecycle unmatched: names the job" "" err_has "matched job 'job-r-9'"
+expect "lifecycle unmatched: reports it" "" last_json '.unmatched == ["job-r-9"] and .measured == 0'
+
+fresh life-no-shutdown
+answer describe-instances 1 "$(insts i-1:r-1:running:990)"
+answer repos/owner/repo/actions/runs/11 1 "$(mrun 11 completed success)"
+answer "$JOBS11" 1 "$(ljobs success 992 995 r-1)"
+export FR_E2E_SHUTDOWN_DEADLINE=20
+run lifecycle.sh --run 11
+expect "lifecycle: an instance that never ends exits 124" "$(dump)" rc_is 124
+expect "lifecycle: at the shutdown deadline" "$(cat "$STATE/clock")" [ "$(cat "$STATE/clock")" = 1020 ]
+expect "lifecycle: still reports, terminated null" "" line_is '.[0].t.terminated == null and .[0].t.running == 1000'
+
+fresh life-no-start
+answer describe-instances 1 '{"Reservations":[]}'
+answer repos/owner/repo/actions/runs/11 1 "$(mrun 11 queued '')"
+answer "$JOBS11" 1 "$(ljobs '' '' '' '')"
+export FR_E2E_START_DEADLINE=30
+run lifecycle.sh --run 11
+expect "lifecycle: no job started exits 3" "$(dump)" rc_is 3
+expect "lifecycle: at the start deadline" "$(cat "$STATE/clock")" [ "$(cat "$STATE/clock")" = 1030 ]
+expect "lifecycle: GitHub every 5 s while instances every 1 s" "$(calls_of "runs/11/jobs") $(calls_of describe-instances)" \
+	[ "$(calls_of "runs/11/jobs"):$(calls_of describe-instances)" = 7:32 ]
+
+fresh life-no-aws
+answer_err describe-instances "UnauthorizedOperation"
+answer dispatch 1 ok
+run lifecycle.sh wf.yml 2
+expect "lifecycle: a failing first sample exits 2" "$(dump)" rc_is 2
+expect "lifecycle: says why" "" err_has "UnauthorizedOperation"
+expect "lifecycle: before dispatching anything" "" not_called "workflow run"
+
+fresh life-usage
+for args in "wf.yml 0" "--run abc" "--run 11 wf.yml 2" "wf.yml 1 -i 0" "wf.yml 1 -i x" "a b c"; do
+	# shellcheck disable=SC2086 # split the case's words on purpose
+	run lifecycle.sh $args
+	expect "lifecycle: rejects '$args'" "$(dump)" rc_is 2
+done
+expect "lifecycle: no calls on usage errors" "" not_called " "
 
 if [ "$fails" -ne 0 ]; then
 	echo "$fails failure(s)"
