@@ -381,6 +381,18 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			fmt.Fprintf(ltw, "  %s\t%s\t%d\t%s\t%s\n", t.Name, state, t.Reconnects, last, or(truncate(t.LastError, 80), "-"))
 		}
 		ltw.Flush()
+		for _, t := range l.Tiers {
+			if g := t.GitHub; g != nil {
+				fmt.Fprintf(w, "  %s at GitHub: available %d, acquired %d, assigned %d, running %d, registered %d (busy %d, idle %d); firerunner tracks %d\n",
+					t.Name, g.Available, g.Acquired, g.Assigned, g.Running, g.Registered, g.Busy, g.Idle, g.Tracked)
+			}
+			if t.Drift != "" {
+				fmt.Fprintf(w, "  %s DRIFT: %s\n", t.Name, t.Drift)
+			}
+			if t.Recycles > 0 || t.LostRunners > 0 {
+				fmt.Fprintf(w, "  %s repairs: %d session recycle(s), %d lost runner(s) cancelled\n", t.Name, t.Recycles, t.LostRunners)
+			}
+		}
 	}
 
 	fmt.Fprintf(w, "\nmicroVMs: %d active  (firecracker procs=%d, taps=%d, max=%d)\n",
@@ -563,6 +575,10 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 			checks = append(checks, warn(name, "reconnecting since %s ago (%d reconnects so far): %s",
 				humanDuration(now.Sub(t.Since).Truncate(time.Second)), t.Reconnects, truncate(t.LastError, 200)))
 		default:
+			if t.Drift != "" {
+				checks = append(checks, warn(name, "connected, but GitHub and firerunner disagree: %s", truncate(t.Drift, 200)))
+				continue
+			}
 			checks = append(checks, pass(name, "connected, %d reconnects", t.Reconnects))
 		}
 	}

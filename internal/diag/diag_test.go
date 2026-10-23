@@ -643,3 +643,28 @@ func TestTruncate(t *testing.T) {
 		t.Fatalf("truncate short = %q", got)
 	}
 }
+
+func TestStatusAndDoctorShowDrift(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	writeListenerHealth(t, dir, now, health.Tier{
+		Name: "a", State: health.Connected, Since: now,
+		GitHub: &health.GitHubStats{Available: 2, Registered: 5, Tracked: 2, At: now},
+		Drift:  "2 job(s) available but unacquired for 1m5s", Recycles: 1, LostRunners: 3,
+	})
+	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: dir, TapPrefix: "fr", NetBase: 16}}
+	var text bytes.Buffer
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"available 2", "registered 5", "firerunner tracks 2", "DRIFT: 2 job(s) available", "1 session recycle(s), 3 lost runner(s)"} {
+		if !strings.Contains(text.String(), want) {
+			t.Errorf("status missing %q\n%s", want, text.String())
+		}
+	}
+	for _, c := range listenerChecks(cfg.Firecracker, now) {
+		if c.Name == "listener[a]" && c.Level != levelWarn {
+			t.Fatalf("doctor %s for a drifting tier, want WARN", c.Level)
+		}
+	}
+}

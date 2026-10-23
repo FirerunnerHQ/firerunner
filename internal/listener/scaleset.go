@@ -651,6 +651,17 @@ func (p *clientPool) seed(c jitClient) {
 // put returns a client the pool handed out.
 func (p *clientPool) put(c jitClient) { p.idle <- c }
 
+// Exists reports whether GitHub still knows the named runner.
+func (j *JITSource) Exists(ctx context.Context, name string) (bool, error) {
+	opCtx, cancel := context.WithTimeout(ctx, removeOpTimeout)
+	defer cancel()
+	r, err := j.remover.GetRunnerByName(opCtx, name)
+	if err != nil {
+		return false, err
+	}
+	return r != nil, nil
+}
+
 // runnerRemover is the part of *scaleset.Client that RemoveRunner uses, so the
 // error mapping can be tested without GitHub.
 type runnerRemover interface {

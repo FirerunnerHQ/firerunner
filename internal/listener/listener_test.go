@@ -323,3 +323,20 @@ func TestJobIdentityComesFromControlPlane(t *testing.T) {
 		t.Fatalf("got %+v want %+v", got, want)
 	}
 }
+
+func TestJITSourceExists(t *testing.T) {
+	for name, c := range map[string]struct {
+		l          lookup
+		want, fail bool
+	}{
+		"known":     {lookup{ref: &scaleset.RunnerReference{ID: 1}}, true, false},
+		"forgotten": {lookup{}, false, false},
+		"error":     {lookup{err: errors.New("503")}, false, true},
+	} {
+		j := &JITSource{remover: &fakeRemover{lookups: []lookup{c.l}}}
+		got, err := j.Exists(context.Background(), "r")
+		if got != c.want || (err != nil) != c.fail {
+			t.Errorf("%s: Exists = %v, %v", name, got, err)
+		}
+	}
+}
