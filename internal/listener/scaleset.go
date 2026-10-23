@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -63,7 +64,12 @@ type ScaleSet struct {
 	removeClient *scaleset.Client
 	// jitClients generates JIT configs in parallel; see clientPool.
 	jitClients *clientPool
-	session    session
+	// stats holds the latest statistics GitHub sent with a message.
+	stats statsRecorder
+	// mu guards recycle, the cancel func of the current session's context.
+	mu      sync.Mutex
+	recycle context.CancelFunc
+	session session
 	// open opens a fresh message session after the current one fails.
 	open       func(context.Context) (session, error)
 	health     *health.Tracker
@@ -318,11 +324,17 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 
 // runSession listens on one session until it fails or ctx ends.
 func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
-	l, err := sslistener.New(trackedSession{session: sess, health: s.health}, sslistener.Config{
+	// Recycle ends this session (and only this one) to make Run reconnect.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.mu.Lock()
+	s.recycle = cancel
+	s.mu.Unlock()
+	l, err := sslistener.New(trackedSession{session: sess, health: s.health, chaos: chaosExitBeforeAcquire()}, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
-	})
+	}, sslistener.WithMetricsRecorder(&s.stats))
 	if err != nil {
 		return fmt.Errorf("create scaleset listener: %w", err)
 	}
@@ -342,10 +354,72 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 	return l.Run(ctx, a)
 }
 
+// Stats returns the scale set statistics GitHub sent with the latest
+// message, and when they arrived; ok is false before the first.
+func (s *ScaleSet) Stats() (stats scaleset.RunnerScaleSetStatistic, at time.Time, ok bool) {
+	return s.stats.latest()
+}
+
+// Recycle ends the current message session, so Run closes it and opens a new
+// one as after any session failure. A fresh session gets GitHub's current
+// statistics, and possibly re-offers jobs the old one never acquired.
+func (s *ScaleSet) Recycle(reason string) {
+	s.mu.Lock()
+	cancel := s.recycle
+	s.mu.Unlock()
+	if cancel != nil {
+		s.log.Warn("recycling the message session", "reason", reason)
+		cancel()
+	}
+}
+
+// statsRecorder keeps the latest statistics GitHub sent (an
+// sslistener.MetricsRecorder).
+type statsRecorder struct {
+	mu    sync.Mutex
+	stats scaleset.RunnerScaleSetStatistic
+	at    time.Time
+	ok    bool
+}
+
+func (r *statsRecorder) RecordStatistics(st *scaleset.RunnerScaleSetStatistic) {
+	if st == nil {
+		return
+	}
+	r.mu.Lock()
+	r.stats, r.at, r.ok = *st, time.Now(), true
+	r.mu.Unlock()
+}
+func (r *statsRecorder) RecordJobStarted(*scaleset.JobStarted)     {}
+func (r *statsRecorder) RecordJobCompleted(*scaleset.JobCompleted) {}
+func (r *statsRecorder) RecordDesiredRunners(int)                  {}
+
+func (r *statsRecorder) latest() (scaleset.RunnerScaleSetStatistic, time.Time, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stats, r.at, r.ok
+}
+
+// chaosExitBeforeAcquire reports whether FR_CHAOS_EXIT_BEFORE_ACQUIRE is set:
+// a fault-injection switch for testing recovery, never for production. The
+// process then exits in the window the library leaves between deleting a
+// message and acquiring its jobs.
+func chaosExitBeforeAcquire() bool { return os.Getenv("FR_CHAOS_EXIT_BEFORE_ACQUIRE") == "1" }
+
 // trackedSession records each successful GetMessage in the tier's health.
 type trackedSession struct {
 	session
 	health *health.Tracker
+	// chaos exits the process before AcquireJobs (see chaosExitBeforeAcquire).
+	chaos bool
+}
+
+func (t trackedSession) AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error) {
+	if t.chaos {
+		fmt.Fprintf(os.Stderr, "firerunner: FR_CHAOS_EXIT_BEFORE_ACQUIRE: exiting before acquiring %d job(s)\n", len(requestIDs))
+		os.Exit(137)
+	}
+	return t.session.AcquireJobs(ctx, requestIDs)
 }
 
 func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
