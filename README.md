@@ -534,8 +534,11 @@ only**. Never expose that port publicly.
 
 **Verifying a deployment end to end.** These steps create real, billable
 resources. [`scripts/e2e/`](scripts/e2e/README.md) has tested helpers for them:
-remote commands on the control VM, instance consoles, and run watching and
-timing with deadlines.
+a control VM of your own (a stack made from `deploy/aws/control.yaml`), remote
+commands on it, instance consoles, run watching and timing with deadlines, and
+an inventory and cleanup of your own owner's instances. When several people or
+agents share one test account, follow its rules: each has its own `FR_OWNER`
+and tier names, and cleans up only its own owner's resources.
 
 1. Build the runner AMI with `firerunner-ec2-runner.service` enabled, and
    publish its ID to the SSM parameter.

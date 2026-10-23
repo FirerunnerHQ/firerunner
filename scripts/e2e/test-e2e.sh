@@ -695,6 +695,312 @@ envrun "$G"
 expect "e2e.env: the main checkout's own file may set FR_OWNER" "$(dump)" out_has "FR_OWNER=someone-else (set)"
 envrun "$G" --bogus
 expect "env.sh: rejects an unknown argument" "$(dump)" rc_is 2
+: >"$STATE/calls"
+FR_OWNER="bad owner" PATH="$TMP/bin:$PATH" "$HERE/inventory.sh" >"$STATE/out" 2>"$STATE/err" && echo 0 >"$STATE/rc" || echo $? >"$STATE/rc"
+expect "owner: a malformed FR_OWNER exits 2" "$(dump)" rc_is 2
+env -u FR_OWNER PATH="$TMP/bin:$PATH" "$G/scripts/e2e/inventory.sh" --cleanup >"$STATE/out" 2>"$STATE/err" && echo 0 >"$STATE/rc" || echo $? >"$STATE/rc"
+expect "owner: none is derived on main, which sessions share" "$(dump)" rc_is 2
+expect "owner: says to set FR_OWNER" "" err_has "export FR_OWNER="
+expect "owner: and touches nothing" "" not_called "aws "
+
+# --- inventory ---------------------------------------------------------------
+
+# inst ID STATE OWNER [LAUNCHED]: one instance as describe-instances shows it.
+inst() {
+	jq -cn --arg i "$1" --arg s "$2" --arg o "$3" --arg l "${4:-2026-10-23T10:00:00.000Z}" \
+		'{InstanceId: $i, InstanceType: "m7a.large", State: {Name: $s}, LaunchTime: $l,
+		Tags: [{Key: "firerunner:owner", Value: $o}, {Key: "firerunner:tier", Value: "cloud-test"}, {Key: "firerunner:runner", Value: ("runner-" + $i)}]}'
+}
+reservations() { jq -cn --argjson i "[$(
+	IFS=,
+	echo "$*"
+)]" '{Reservations: [{Instances: $i}]}'; }
+inventory_answers() {
+	# The filter leaks another owner's instance: the script must drop it.
+	answer instances 1 "$(reservations "$(inst i-0mine running e2e-test)" "$(inst i-0pool stopped e2e-test)" "$(inst i-0other running e2e-other)")"
+	answer spots 1 '{"SpotInstanceRequests":[{"SpotInstanceRequestId":"sir-1","State":"active","Type":"persistent","InstanceId":"i-0pool","Tags":[{"Key":"firerunner:owner","Value":"e2e-test"}]},{"SpotInstanceRequestId":"sir-x","State":"open","Type":"persistent","Tags":[{"Key":"firerunner:owner","Value":"e2e-other"}]}]}'
+	answer volumes 1 '{"Volumes":[{"VolumeId":"vol-used","State":"in-use","Tags":[{"Key":"firerunner:owner","Value":"e2e-test"}]},{"VolumeId":"vol-free","State":"available","Tags":[{"Key":"firerunner:owner","Value":"e2e-test"}]}]}'
+	answer control-vms 1 '{"Reservations":[]}'
+}
+line_of() { grep -n -- "$1" "$STATE/calls" | head -n 1 | cut -d: -f1; }
+
+fresh inventory-list
+inventory_answers
+run inventory.sh
+expect "inventory: exit 0" "$(dump)" rc_is 0
+expect "inventory: filters on the owner tag" "" called "tag:firerunner:owner,Values=e2e-test"
+expect "inventory: lists only the owner's resources" "$(cat "$STATE/out")" \
+	last_json '.owner == "e2e-test" and ([.instances[].id] == ["i-0mine", "i-0pool"]) and ([.spot_requests[].id] == ["sir-1"]) and ([.volumes[].id] == ["vol-used", "vol-free"])'
+expect "inventory: lists without changing anything" "" not_called "terminate-instances"
+run inventory.sh --owner e2e-other
+expect "inventory: lists another owner" "$(dump)" last_json '[.instances[].id] == ["i-0other"]'
+
+fresh inventory-dry-run
+inventory_answers
+run inventory.sh --cleanup
+expect "cleanup: dry run by default" "$(dump)" last_json '.dry_run == true and .cancel_spot_requests == ["sir-1"] and .terminate_instances == ["i-0mine", "i-0pool"] and .delete_volumes == ["vol-free"]'
+expect "cleanup: dry run cancels nothing" "" not_called "cancel-spot-instance-requests"
+expect "cleanup: dry run terminates nothing" "" not_called "terminate-instances"
+
+fresh inventory-cleanup
+inventory_answers
+run inventory.sh --cleanup --yes
+expect "cleanup: exit 0" "$(dump)" rc_is 0
+expect "cleanup: cancels the owner's spot requests" "" called "cancel-spot-instance-requests --spot-instance-request-ids sir-1$"
+expect "cleanup: terminates the owner's instances" "" called "terminate-instances --instance-ids i-0mine i-0pool$"
+expect "cleanup: cancels before it terminates" "$(cat "$STATE/calls")" \
+	[ "$(line_of cancel-spot)" -lt "$(line_of terminate-instances)" ]
+expect "cleanup: never terminates another owner's instance" "" not_called "i-0other"
+expect "cleanup: never cancels another owner's spot request" "" not_called "sir-x"
+expect "cleanup: deletes only unattached volumes" "" called "delete-volume --volume-id vol-free"
+expect "cleanup: leaves attached volumes to their instance" "" not_called "vol-used"
+expect "cleanup: reports what it did" "" last_json '.dry_run == false'
+
+fresh inventory-cancel-fails
+inventory_answers
+answer cancel-spot-instance-requests 1 "!err UnauthorizedOperation"
+run inventory.sh --cleanup --yes
+expect "cleanup: a failed cancel exits 1" "$(dump)" rc_is 1
+expect "cleanup: and terminates nothing" "" not_called "terminate-instances"
+
+fresh inventory-not-mine
+inventory_answers
+run inventory.sh --owner e2e-other --cleanup --yes
+expect "cleanup: refuses another owner" "$(dump)" rc_is 2
+expect "cleanup: says how to adopt" "" err_has "set FR_OWNER=e2e-other"
+expect "cleanup: no aws call for another owner" "" not_called "aws "
+
+fresh inventory-live-vm
+inventory_answers
+answer control-vms 1 '{"Reservations":[{"Instances":[{"InstanceId":"i-0ctl","State":{"Name":"running"},"Tags":[{"Key":"Name","Value":"st-e2e-test-control"},{"Key":"firerunner:control","Value":"st-e2e-test"}]}]}]}'
+answer owner-st-e2e-test 1 e2e-test
+run inventory.sh --cleanup --yes
+expect "cleanup: refuses while the owner's control VM is live" "$(dump)" rc_is 1
+expect "cleanup: finds its owner through the stack" "" called "describe-stacks --stack-name st-e2e-test"
+expect "cleanup: says to stop it first" "" err_has "control-vm.sh down"
+expect "cleanup: terminates nothing while it is live" "" not_called "terminate-instances"
+
+# --- watch-run consoles ------------------------------------------------------
+
+fresh watch-console-failed-job
+answer "$RUN" 1 "$(runj in_progress '')"
+answer "$JOBS" 1 "$(jq -cn '{jobs: [{name: "a", status: "completed", conclusion: "failure", runner_name: "fr-cloud-1", html_url: "u"}]}')"
+answer runner-instances 1 "$(reservations "$(inst i-0run terminated e2e-test)")"
+answer console-latest 1 "$(printf 'boot\r\nfirerunner-ec2-run: JIT fetch failed\r\n')"
+run watch-run.sh 7
+f="$STATE/artifacts/run-7-i-0run.console"
+expect "watch-run: still exits 1 on a failed job" "$(dump)" rc_is 1
+expect "watch-run: finds the job's runner instance by name" "" called "tag:firerunner:runner,Values=fr-cloud-1"
+expect "watch-run: saves its console" "$(ls "$STATE/artifacts" 2>&1)" grep -q "JIT fetch failed" "$f"
+expect "watch-run: says where" "" err_has "to $f"
+tail -n 1 "$STATE/out" >"$STATE/last"
+# shellcheck disable=SC2016 # a jq program
+expect "watch-run: the JSON names the console file" "" \
+	jqe --arg f "$f" '.consoles == [{instance: "i-0run", runner: "runner-i-0run", file: $f}] and .failed_jobs[0].runner == "fr-cloud-1"' "$STATE/last"
+
+fresh watch-console-no-runner
+answer "$RUN" 1 "$(runj queued '')"
+answer "$JOBS" 1 "$(jobj selftest queued '')"
+answer instances 1 "$(reservations "$(inst i-0old running e2e-test "$(iso 900)")" "$(inst i-0new running e2e-test "$(iso 1010 | sed 's/Z$/+00:00/')")")"
+answer console-latest 1 "no network"
+export FR_E2E_START_DEADLINE=60
+run watch-run.sh 7
+expect "watch-run: no job started still exits 3" "$(dump)" rc_is 3
+expect "watch-run: looks for this session's instances" "" called "tag:firerunner:owner,Values=e2e-test"
+expect "watch-run: saves the consoles launched since the run" "" last_json '[.consoles[].instance] == ["i-0new"]'
+
+fresh watch-console-no-aws
+unset AWS_REGION
+answer "$RUN" 1 "$(runj in_progress '')"
+answer "$JOBS" 1 "$(jq -cn '{jobs: [{name: "a", status: "completed", conclusion: "failure", runner_name: "fr-1", html_url: "u"}]}')"
+run watch-run.sh 7
+expect "watch-run: without AWS it still reports the failure" "$(dump)" rc_is 1
+expect "watch-run: and says it saved no console" "" err_has "not saving consoles"
+expect "watch-run: with an empty consoles list" "" last_json '.consoles == []'
+
+# --- control-vm --------------------------------------------------------------
+
+TEMPLATE_KEYS="$(awk '/^Parameters:/ {p = 1; next} /^[A-Za-z]/ {p = 0} p && /^  [A-Za-z]+:$/ {gsub(/[ :]/, ""); print}' "$HERE/../../deploy/aws/control.yaml" | jq -R . | jq -sc .)"
+# ssm_seed NAME VALUE
+ssm_seed() {
+	mkdir -p "$(dirname "$STATE/ssm$1")"
+	printf '%s\n' "$2" >"$STATE/ssm$1"
+}
+ssm_val() { cat "$STATE/ssm$1"; }
+# base_stack [OWNER]: the shared stack and its parameters.
+base_stack() {
+	jq -cn --arg o "${1:-e2e-shared}" '{Stacks: [{StackName: "st", StackStatus: "UPDATE_COMPLETE",
+		Parameters: [{ParameterKey: "Owner", ParameterValue: $o}, {ParameterKey: "VpcId", ParameterValue: "vpc-0aaa"},
+			{ParameterKey: "SubnetIds", ParameterValue: "subnet-0aaa,subnet-0bbb"}, {ParameterKey: "ParameterPrefix", ParameterValue: "/fr/e2e"},
+			{ParameterKey: "ReleaseRepo", ParameterValue: "acme/fr"}, {ParameterKey: "JitName", ParameterValue: "control"},
+			{ParameterKey: "ZoneName", ParameterValue: "zone.internal"}, {ParameterKey: "HostedZoneId", ParameterValue: ""},
+			{ParameterKey: "Retired", ParameterValue: "x"}],
+		Outputs: [{OutputKey: "ParameterPrefix", OutputValue: "/fr/e2e"}, {OutputKey: "HostedZoneId", OutputValue: "Z0SHARED"},
+			{OutputKey: "JitHost", OutputValue: "control.zone.internal"}]}]}'
+}
+# session_stack STATUS [TAG_OWNER]: this session's stack.
+session_stack() {
+	jq -cn --arg s "$1" --arg t "${2:-e2e-test}" '{Stacks: [{StackName: "st-e2e-test", StackStatus: $s,
+		Tags: [{Key: "firerunner:e2e-session", Value: $t}],
+		Parameters: [{ParameterKey: "Owner", ParameterValue: "e2e-test"}, {ParameterKey: "ParameterPrefix", ParameterValue: "/fr/e2e/sessions/e2e-test"},
+			{ParameterKey: "HostedZoneId", ParameterValue: "Z0SHARED"}],
+		Outputs: [{OutputKey: "ParameterPrefix", OutputValue: "/fr/e2e/sessions/e2e-test"},
+			{OutputKey: "JitHost", OutputValue: "e2e-test.zone.internal"}]}]}'
+}
+NOSTACK="!err An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id st-e2e-test does not exist"
+vm_fresh() {
+	fresh "$1"
+	export FR_E2E_STACK=st
+	answer stack-st 1 "$(base_stack)"
+	answer template-keys 1 "$TEMPLATE_KEYS"
+	ssm_seed /fr/e2e/control/version v1.2.0
+	ssm_seed /fr/e2e/control/sha256sums "aaa  firerunner_linux_arm64"
+	ssm_seed /fr/e2e/control/env "FR_URL=https://example.invalid/org"
+	ssm_seed /fr/e2e/control/app-private-key "SECRET-KEY-TEXT"
+	ssm_seed /fr/e2e/control/tiers '[{"name":"cloud","labels":["cloud-arm"],"provisioner":"ec2","ec2":{"ami":"/fr/e2e/runner-ami"}},{"name":"lit","provisioner":"ec2","ec2":{"ami":"ami-0lit"}}]'
+	ssm_seed /fr/e2e/runner-ami ami-0runner
+	ssm_seed /fr/e2e/sessions/e2e-other/control/version v0.9.0
+	answer asg 1 i-0ctl
+	answer send-command 1 cmd-1
+}
+
+vm_fresh vm-up
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack CREATE_IN_PROGRESS)"
+answer stack-st-e2e-test 4 "$(session_stack CREATE_COMPLETE)"
+answer asg 1 None
+answer asg 2 i-0ctl
+answer invocation 1 "$(inv Success 0 $'activating\n' '')"
+answer invocation 2 "$(inv Success 0 $'active\nfirerunner v1.2.0\n' '')"
+run control-vm.sh up
+S=/fr/e2e/sessions/e2e-test
+expect "up: exit 0 once firerunner is active" "$(dump)" rc_is 0
+expect "up: reports the session" "$(tail -n 1 "$STATE/out")" \
+	last_json '.owner == "e2e-test" and .stack == "st-e2e-test" and .instance == "i-0ctl" and .firerunner == "active" and .version == "v1.2.0" and .jit_host == "e2e-test.zone.internal" and .tiers == ["cloud-test", "lit-test"]'
+expect "up: creates the session's own stack from control.yaml" "" called "create-stack --stack-name st-e2e-test --template-body file://.*deploy/aws/control.yaml"
+expect "up: tags the stack with the session's owner" "" called "Key=firerunner:e2e-session,Value=e2e-test"
+expect "up: the stack's Owner is the session's" "$(cat "$STATE/create-params.json")" \
+	jqe 'map({key: .ParameterKey, value: .ParameterValue}) | from_entries | .Owner == "e2e-test" and .ParameterPrefix == "/fr/e2e/sessions/e2e-test" and .JitName == "e2e-test" and .HostedZoneId == "Z0SHARED" and .ZoneName == "zone.internal" and .VpcId == "vpc-0aaa" and .SubnetIds == "subnet-0aaa,subnet-0bbb"' "$STATE/create-params.json"
+expect "up: passes no parameter the template lacks" "" jqe 'all(.[]; .ParameterKey != "Retired")' "$STATE/create-params.json"
+expect "up: suffixes tier names and labels" "$(ssm_val $S/control/tiers)" \
+	jqe '[.[].name] == ["cloud-test", "lit-test"] and .[0].labels == ["cloud-arm-test"]' "$STATE/ssm$S/control/tiers"
+expect "up: moves AMI parameters under the session prefix" "" \
+	jqe '.[0].ec2.ami == "/fr/e2e/sessions/e2e-test/runner-ami" and .[1].ec2.ami == "ami-0lit"' "$STATE/ssm$S/control/tiers"
+expect "up: copies the AMI parameter" "" [ "$(ssm_val $S/runner-ami)" = ami-0runner ]
+expect "up: copies the app key as a SecureString" "" grep -qx "$S/control/app-private-key SecureString" "$STATE/ssm-types"
+expect "up: never passes the key on a command line" "" not_called SECRET-KEY-TEXT
+expect "up: pins the shared release and its checksums" "" [ "$(ssm_val $S/control/version)/$(ssm_val $S/control/sha256sums)" = "v1.2.0/aaa  firerunner_linux_arm64" ]
+expect "up: needs no download for the shared release" "" not_called "curl "
+expect "up: waits for firerunner to be active" "" [ "$(calls_of get-command-invocation)" = 2 ]
+
+vm_fresh vm-up-exists
+answer stack-st-e2e-test 1 "$(session_stack CREATE_COMPLETE)"
+answer invocation 1 "$(inv Success 0 $'active\nfirerunner v1.2.0\n' '')"
+run control-vm.sh up
+expect "up: an existing stack is only waited for" "$(dump)" rc_is 0
+expect "up: and not created again" "" not_called create-stack
+
+vm_fresh vm-up-version
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack CREATE_COMPLETE)"
+answer invocation 1 "$(inv Success 0 $'active\nfirerunner v2.0.0\n' '')"
+answer curl 1 "bbb  firerunner_linux_amd64"
+run control-vm.sh up --version v2.0.0
+expect "up: --version pins that release's checksums" "$(dump)" called "curl -fsSL https://github.com/acme/fr/releases/download/v2.0.0/SHA256SUMS"
+expect "up: --version is what the VM installs" "" [ "$(ssm_val $S/control/version)" = v2.0.0 ]
+
+vm_fresh vm-up-shared-owner
+answer stack-st 1 "$(base_stack e2e-test)"
+answer stack-st-e2e-test 1 "$NOSTACK"
+run control-vm.sh up
+expect "up: refuses the shared stack's own owner" "$(dump)" rc_is 2
+expect "up: creates nothing then" "" not_called "create-stack"
+
+vm_fresh vm-up-fails
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack ROLLBACK_COMPLETE)"
+answer stack-events 1 $'ControlGroup\tthe group failed'
+run control-vm.sh up
+expect "up: a failed stack exits 1" "$(dump)" rc_is 1
+expect "up: shows why" "" err_has "the group failed"
+expect "up: says how to clean up" "" err_has "control-vm.sh down"
+
+vm_fresh vm-up-deadline
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack CREATE_IN_PROGRESS)"
+export FR_E2E_STACK_DEADLINE=60
+run control-vm.sh up
+expect "up: past FR_E2E_STACK_DEADLINE exits 124" "$(dump)" rc_is 124
+expect "up: at the deadline" "$(cat "$STATE/clock")" [ "$(cat "$STATE/clock")" -le 1065 ]
+
+vm_fresh vm-status
+answer stack-st-e2e-test 1 "$NOSTACK"
+run control-vm.sh status
+expect "status: no stack is not an error" "$(dump)" rc_is 0
+expect "status: says it is absent" "" last_json '.stack_status == "absent" and .instance == null'
+
+vm_fresh vm-no-stack-config
+unset FR_E2E_STACK
+run control-vm.sh up
+expect "control-vm: without FR_E2E_STACK exits 2" "$(dump)" rc_is 2
+run control-vm.sh frobnicate
+expect "control-vm: an unknown command exits 2" "$(dump)" rc_is 2
+
+vm_fresh vm-list
+answer control-vms 1 '{"Reservations":[{"Instances":[
+	{"InstanceId":"i-0b","State":{"Name":"running"},"LaunchTime":"2026-10-23T11:00:00+00:00","Tags":[{"Key":"Name","Value":"st-control"},{"Key":"firerunner:control","Value":"st"}]},
+	{"InstanceId":"i-0a","State":{"Name":"running"},"LaunchTime":"2026-10-23T10:00:00+00:00","Tags":[{"Key":"Name","Value":"st-e2e-x-control"},{"Key":"firerunner:control","Value":"st-e2e-x"},{"Key":"firerunner:e2e-session","Value":"e2e-x"}]},
+	{"InstanceId":"i-0c","State":{"Name":"stopped"},"LaunchTime":"2026-10-23T12:00:00+00:00","Tags":[{"Key":"Name","Value":"hand-made-control"}]}]}]}'
+answer owner-st 1 e2e-shared
+run control-vm.sh list
+expect "list: every live control VM with its owner, oldest first" "$(dump)" \
+	last_json '[.[] | [.instance, .owner]] == [["i-0a", "e2e-x"], ["i-0b", "e2e-shared"], ["i-0c", null]]'
+
+vm_fresh vm-down
+answer stack-st-e2e-test 1 "$(session_stack CREATE_COMPLETE)"
+answer stack-st-e2e-test 2 "$(session_stack DELETE_IN_PROGRESS)"
+answer stack-st-e2e-test 3 "$NOSTACK"
+inventory_answers
+answer rrs 1 '[{"Name":"e2e-test.zone.internal.","Type":"A","TTL":10,"ResourceRecords":[{"Value":"10.0.0.5"}]}]'
+ssm_seed $S/control/tiers '[]'
+ssm_seed $S/control/version v1.2.0
+ssm_seed $S/runner-ami ami-0runner
+run control-vm.sh down
+expect "down: exit 0" "$(dump)" rc_is 0
+expect "down: deletes the session's stack" "" called "delete-stack --stack-name st-e2e-test"
+expect "down: then cleans up the owner's runners" "$(cat "$STATE/calls")" \
+	[ "$(line_of delete-stack)" -lt "$(line_of terminate-instances)" ]
+expect "down: cancels spot requests before terminating" "" \
+	[ "$(line_of cancel-spot)" -lt "$(line_of terminate-instances)" ]
+expect "down: deletes the session's JIT name" "$(cat "$STATE/rr-change.json" 2>&1)" \
+	jqe '.Changes == [{Action: "DELETE", ResourceRecordSet: {Name: "e2e-test.zone.internal.", Type: "A", TTL: 10, ResourceRecords: [{Value: "10.0.0.5"}]}}]' "$STATE/rr-change.json"
+expect "down: deletes the session's parameters" "" test ! -e "$STATE/ssm$S/control/tiers" -a ! -e "$STATE/ssm$S/runner-ami"
+expect "down: keeps the shared parameters" "" [ -e "$STATE/ssm/fr/e2e/control/tiers" ]
+expect "down: keeps other sessions' parameters" "" [ -e "$STATE/ssm/fr/e2e/sessions/e2e-other/control/version" ]
+expect "down: reports" "" last_json '.parameters_deleted == 3 and .jit_name_deleted == true and .cleanup.terminate_instances == ["i-0mine", "i-0pool"]'
+
+vm_fresh vm-down-not-ours
+answer stack-st-e2e-test 1 "$(session_stack CREATE_COMPLETE e2e-someone)"
+run control-vm.sh down
+expect "down: refuses a stack not made for this owner" "$(dump)" rc_is 1
+expect "down: deletes nothing then" "" not_called "delete-stack"
+expect "down: terminates nothing then" "" not_called "terminate-instances"
+
+vm_fresh vm-install
+printf 'binary' >"$STATE/firerunner"
+run control-vm.sh install "$STATE/firerunner"
+expect "install: needs FR_E2E_BUCKET" "$(dump)" rc_is 2
+export FR_E2E_BUCKET=bucket-placeholder
+answer stack-st-e2e-test 1 "$(session_stack CREATE_COMPLETE)"
+answer presign 1 "https://example.invalid/fr?X-Amz-Signature=abc&X-Amz-Expires=900"
+answer invocation 1 "$(inv Success 0 $'active\nfirerunner dev-123\n' '')"
+run control-vm.sh install "$STATE/firerunner"
+expect "install: exit 0 when the new build is active" "$(dump)" rc_is 0
+expect "install: uploads under the owner" "" called "s3 cp $STATE/firerunner s3://bucket-placeholder/e2e/e2e-test/firerunner"
+sent="$(jq -r '.commands[0]' "$STATE/params.json")"
+expect "install: fetches the presigned URL on the VM" "$sent" grep -qF "'https://example.invalid/fr?X-Amz-Signature=abc&X-Amz-Expires=900'" <<<"$sent"
+expect "install: checks the checksum on the VM" "" grep -qF "$(printf binary | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1)  /tmp/firerunner.new" <<<"$sent"
+expect "install: reports the running version" "" last_json '.version == "dev-123" and .firerunner == "active"'
 
 if [ "$fails" -ne 0 ]; then
 	echo "$fails failure(s)"
