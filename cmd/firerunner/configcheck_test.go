@@ -2,11 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/solcreek/firerunner/internal/config"
 )
 
 func runConfig(t *testing.T, args ...string) (int, string, string) {
@@ -111,6 +117,51 @@ func TestConfigCheckMatchesStartup(t *testing.T) {
 		"--app-installation-id", "1", "--app-private-key", "/no/such/key.pem", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0")
 	if code != 1 || !strings.Contains(out, "does not exist") {
 		t.Fatalf("missing app key: exit %d\n%s", code, out)
+	}
+}
+
+// emptyKeyArgs is a daemon config whose App private key file is empty, the
+// input that panicked the daemon in issue #78.
+func emptyKeyArgs(t *testing.T) (args []string, keyPath string) {
+	t.Helper()
+	t.Setenv("FR_MAX_RUNNERS", "4")
+	t.Setenv("FR_TOKEN", "")
+	keyPath = filepath.Join(t.TempDir(), "app-key.pem")
+	if err := os.WriteFile(keyPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return []string{"--url", "https://github.com/o", "--app-client-id", "Iv1", "--app-installation-id", "1",
+		"--app-private-key", keyPath, "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0"}, keyPath
+}
+
+func TestConfigCheckRejectsEmptyAppKey(t *testing.T) {
+	args, keyPath := emptyKeyArgs(t)
+	want := "--app-private-key " + keyPath + ": file is empty"
+
+	code, out, _ := runConfig(t, append([]string{"check"}, args...)...)
+	if code != 1 || !strings.HasPrefix(out, "invalid (daemon): "+want) {
+		t.Fatalf("text: exit %d\n%s", code, out)
+	}
+	code, out, _ = runConfig(t, append([]string{"check", "--json"}, args...)...)
+	var r checkReport
+	if err := json.Unmarshal([]byte(out), &r); err != nil || code != 1 || r.OK || !strings.Contains(r.Error, want) || r.Auth != "" {
+		t.Fatalf("json: exit %d report %+v err %v", code, r, err)
+	}
+}
+
+// TestRunRejectsEmptyAppKey drives the daemon's startup path: an empty key
+// file is an error naming the file, never a panic in the scale set client.
+func TestRunRejectsEmptyAppKey(t *testing.T) {
+	args, keyPath := emptyKeyArgs(t)
+	cfg, err := config.FromFlags(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err = run(ctx, cfg, slog.New(slog.DiscardHandler))
+	if err == nil || !strings.Contains(err.Error(), "--app-private-key "+keyPath+": file is empty") {
+		t.Fatalf("run: %v", err)
 	}
 }
 
