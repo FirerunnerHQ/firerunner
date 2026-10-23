@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,10 +44,25 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
 )
 
-// version is overridable at build time via -ldflags.
+// version is overridable at build time via -ldflags; see buildVersion for
+// builds that do not set it.
 var version = "dev"
 
+// buildVersion returns the -ldflags version when set, else the module
+// version Go recorded (go install ...@v0.2.0 records v0.2.0), else "dev".
+func buildVersion(ldflags string, info *debug.BuildInfo, ok bool) string {
+	if ldflags != "dev" || !ok || info == nil {
+		return ldflags
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	return ldflags
+}
+
 func main() {
+	info, ok := debug.ReadBuildInfo()
+	version = buildVersion(version, info, ok)
 	args := os.Args[1:]
 	if len(args) > 0 {
 		switch args[0] {

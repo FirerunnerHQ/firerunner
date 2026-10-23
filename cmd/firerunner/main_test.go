@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
@@ -302,4 +303,24 @@ func mustSchedule(t *testing.T, js string) *schedule.Schedule {
 		t.Fatal(err)
 	}
 	return &s
+}
+
+func TestBuildVersion(t *testing.T) {
+	installed := &debug.BuildInfo{Main: debug.Module{Path: "github.com/firerunnerhq/firerunner", Version: "v0.1.0-rc.3"}}
+	local := &debug.BuildInfo{Main: debug.Module{Version: "(devel)"}}
+	for _, c := range []struct {
+		name, ldflags string
+		info          *debug.BuildInfo
+		ok            bool
+		want          string
+	}{
+		{"release build", "v0.2.0", installed, true, "v0.2.0"},
+		{"go install", "dev", installed, true, "v0.1.0-rc.3"},
+		{"go build in a checkout", "dev", local, true, "dev"},
+		{"no build info", "dev", nil, false, "dev"},
+	} {
+		if got := buildVersion(c.ldflags, c.info, c.ok); got != c.want {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
 }
