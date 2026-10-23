@@ -540,7 +540,7 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 	auth := authCheck(cfg)
 	checks = append(checks, auth)
 	if auth.Level == levelPass {
-		checks = append(checks, authVerify(cfg, apiBase))
+		checks = append(checks, authVerify(cfg, apiBase)...)
 	}
 
 	// GitHub API reachability (best-effort; WARN offline, never FAIL).
