@@ -496,7 +496,7 @@ func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitse
 			log.Error("jit endpoint stopped", "err", err)
 		}
 	}()
-	log.Info("serving EC2 JIT configs", "addr", cfg.JITAddr)
+	log.Info("serving EC2 JIT configs", "addr", cfg.JITAddr, "url", jitserver.URL(cfg.JITEndpoint()))
 	return jit, func() {
 		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
@@ -590,7 +590,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				Owner:       owner,
 				EC2:         *t.EC2,
 				JIT:         jit,
-				JITURL:      jitserver.URL(cfg.JITAddr),
+				JITURL:      jitserver.URL(cfg.JITEndpoint()),
 				MaxLifetime: cfg.Firecracker.MaxVMLifetime,
 				Logger:      log.With("tier", t.Name),
 			})

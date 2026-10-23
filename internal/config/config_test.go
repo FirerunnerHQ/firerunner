@@ -726,6 +726,33 @@ func TestFromFlags_JITAddr(t *testing.T) {
 	}
 }
 
+func TestFromFlags_JITHost(t *testing.T) {
+	ec2Only := writeTiers(t, `[`+ec2TierJSON+`]`)
+	args := func(extra ...string) []string {
+		return append([]string{"--url", "u", "--token", "t", "--tiers", ec2Only, "--jit-addr", "10.0.0.5:8098"}, extra...)
+	}
+	c, err := FromFlags(args())
+	if err != nil || c.JITEndpoint() != "10.0.0.5:8098" {
+		t.Fatalf("without --jit-host: endpoint %q err %v, want the address", c.JITEndpoint(), err)
+	}
+	c, err = FromFlags(args("--jit-host", "control.firerunner.internal"))
+	if err != nil {
+		t.Fatalf("valid --jit-host: %v", err)
+	}
+	if got := c.JITEndpoint(); got != "control.firerunner.internal:8098" {
+		t.Fatalf("endpoint = %q, want the name with --jit-addr's port", got)
+	}
+	for _, h := range []string{"10.0.0.5", "::1", "control.internal:8098", "http://control", "-bad.internal", "a..b", "under_score.internal"} {
+		if _, err := FromFlags(args("--jit-host", h)); err == nil || !strings.Contains(err.Error(), "--jit-host") {
+			t.Errorf("--jit-host %q: err = %v, want rejected", h, err)
+		}
+	}
+	t.Setenv("FR_JIT_HOST", "control.example.internal")
+	if c, err = FromFlags(args()); err != nil || c.JITHost != "control.example.internal" {
+		t.Fatalf("env fallback: host %q err %v", c.JITHost, err)
+	}
+}
+
 func TestExampleEC2Catalog(t *testing.T) {
 	// The README points at this file; keep it loadable and valid.
 	c, err := FromFlags(append(append(baseArgs(), jitAddr...), "--tiers", "../../examples/tiers-ec2.json", "--max-runners", "8"))
