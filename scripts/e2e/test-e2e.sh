@@ -15,7 +15,9 @@ export REAL_DATE
 
 # Every fake records its call in $STATE/calls. An answer for KEY is read from
 # $STATE/ans/KEY.N, where N is the highest number not above this call's count
-# for KEY; $STATE/ans/KEY.err makes the call fail with that text on stderr.
+# for KEY; $STATE/ans/KEY.err makes every call fail with that text on stderr,
+# and an answer starting with "!err " makes that call fail with the rest.
+# With a second argument, a call with no answer succeeds silently.
 cat >"$TMP/bin/fake-answer" <<'FAKE'
 #!/usr/bin/env bash
 key="$(printf '%s' "$1" | tr -c 'A-Za-z0-9.' '_')"
@@ -24,24 +26,99 @@ echo "$count" >"$STATE/count.$key"
 if [ -f "$STATE/ans/$key.err" ]; then cat "$STATE/ans/$key.err" >&2; exit 1; fi
 n=$count
 while [ "$n" -gt 0 ] && [ ! -f "$STATE/ans/$key.$n" ]; do n=$((n - 1)); done
-[ "$n" -gt 0 ] || { echo "fake: no answer for $1" >&2; exit 1; }
+if [ "$n" -eq 0 ]; then
+	[ -z "${2:-}" ] || exit 0
+	echo "fake: no answer for $1" >&2
+	exit 1
+fi
+case "$(head -n 1 "$STATE/ans/$key.$n")" in
+"!err "*) sed '1s/^!err //' "$STATE/ans/$key.$n" >&2 && exit 254 ;;
+esac
 cat "$STATE/ans/$key.$n"
 FAKE
+# The fake aws answers by key (see fake-answer), except for SSM parameters,
+# which live as files under $STATE/ssm/<name>, their types in $STATE/ssm-types.
 cat >"$TMP/bin/aws" <<'FAKE'
 #!/usr/bin/env bash
 echo "aws $*" >>"$STATE/calls"
-case "$*" in
-*"ssm send-command"*)
+arg() { # arg OPTION ARGS...: the value after OPTION
+	local want="$1" prev=""
+	shift
+	for a in "$@"; do
+		[ "$prev" = "$want" ] && { printf '%s' "$a"; return; }
+		prev="$a"
+	done
+}
+case "$1 $2" in
+"ssm send-command")
 	for a in "$@"; do case "$a" in file://*) cp "${a#file://}" "$STATE/params.json" ;; esac; done
 	fake-answer send-command
 	;;
-*"ssm get-command-invocation"*) fake-answer invocation ;;
-*"ssm cancel-command"*) ;;
-*"ec2 get-console-output"*"--latest"*) fake-answer console-latest ;;
-*"ec2 get-console-output"*) fake-answer console ;;
-*"ec2 describe-instances"*) fake-answer describe-instances ;;
+"ssm get-command-invocation") fake-answer invocation ;;
+"ssm cancel-command") ;;
+"ssm get-parameter")
+	f="$STATE/ssm$(arg --name "$@")"
+	[ -f "$f" ] || { echo "An error occurred (ParameterNotFound) when calling the GetParameter operation" >&2; exit 254; }
+	cat "$f"
+	;;
+"ssm put-parameter")
+	j="$(arg --cli-input-json "$@")"
+	j="${j#file://}"
+	n="$(jq -r .Name "$j")"
+	mkdir -p "$(dirname "$STATE/ssm$n")"
+	jq -r .Value "$j" >"$STATE/ssm$n"
+	echo "$n $(jq -r .Type "$j")" >>"$STATE/ssm-types"
+	;;
+"ssm get-parameters-by-path")
+	p="$(arg --path "$@")"
+	(cd "$STATE/ssm" && find ".$p" -type f 2>/dev/null) | sed 's|^\.||' | jq -R . | jq -sc .
+	;;
+"ssm delete-parameters")
+	on=0
+	for a in "$@"; do
+		case "$a" in --names) on=1 ;; --*) on=0 ;; *) [ "$on" = 0 ] || rm "$STATE/ssm$a" ;; esac
+	done
+	;;
+"ec2 get-console-output")
+	case "$*" in *--latest*) fake-answer console-latest ;; *) fake-answer console ;; esac
+	;;
+"ec2 describe-instances")
+	case "$*" in
+	*"tag:Name,Values=*control*"*) fake-answer control-vms ;;
+	*tag:firerunner:runner,*) fake-answer runner-instances ;;
+	*tag:firerunner:owner,*) fake-answer instances ;;
+	*) fake-answer describe-instances ;; # lifecycle.sh: every firerunner:runner instance
+	esac
+	;;
+"ec2 describe-spot-instance-requests") fake-answer spots ;;
+"ec2 describe-volumes") fake-answer volumes ;;
+"ec2 cancel-spot-instance-requests" | "ec2 terminate-instances" | "ec2 delete-volume") fake-answer "$2" optional ;;
+"cloudformation describe-stacks")
+	case "$*" in
+	*"ParameterKey=='Owner'"*) fake-answer "owner-$(arg --stack-name "$@")" ;;
+	*) fake-answer "stack-$(arg --stack-name "$@")" ;;
+	esac
+	;;
+"cloudformation get-template-summary") fake-answer template-keys ;;
+"cloudformation create-stack")
+	f="$(arg --parameters "$@")"
+	cp "${f#file://}" "$STATE/create-params.json"
+	fake-answer create-stack optional
+	;;
+"cloudformation delete-stack") fake-answer delete-stack optional ;;
+"cloudformation describe-stack-events") fake-answer stack-events ;;
+"autoscaling describe-auto-scaling-groups") fake-answer asg ;;
+"route53 list-resource-record-sets") fake-answer rrs ;;
+"route53 change-resource-record-sets") arg --change-batch "$@" >"$STATE/rr-change.json" ;;
+"s3 cp") fake-answer s3-cp optional ;;
+"s3 presign") fake-answer presign ;;
 *) echo "unexpected aws call: $*" >&2; exit 1 ;;
 esac
+FAKE
+cat >"$TMP/bin/curl" <<'FAKE'
+#!/usr/bin/env bash
+echo "curl $*" >>"$STATE/calls"
+fake-answer curl
 FAKE
 cat >"$TMP/bin/gh" <<'FAKE'
 #!/usr/bin/env bash
@@ -84,7 +161,10 @@ fresh() {
 	echo 1000 >"$STATE/clock"
 	: >"$STATE/calls"
 	export STATE AWS_REGION=test-region-1 FR_E2E_REPO=owner/repo FR_E2E_CONTROL_INSTANCE=i-0control
+	# Never the .claude/e2e.env of the machine running the tests; a fixed owner.
+	export FR_E2E_ENV_FILE=none FR_OWNER=e2e-test FR_E2E_ARTIFACTS="$STATE/artifacts"
 	unset FR_E2E_WORKFLOW FR_E2E_REF FR_E2E_START_DEADLINE FR_E2E_RUN_DEADLINE FR_E2E_EXEC_DEADLINE FR_E2E_POLL AWS_PROFILE
+	unset FR_E2E_STACK FR_E2E_BUCKET FR_E2E_VERSION FR_E2E_TIER_SUFFIX FR_E2E_STACK_DEADLINE
 }
 # answer KEY N TEXT: what call N (and later ones) for KEY returns.
 answer() { printf '%s\n' "$3" >"$STATE/ans/$(printf '%s' "$1" | tr -c 'A-Za-z0-9.' '_').$2"; }
@@ -108,8 +188,11 @@ expect "env.sh: names AWS_REGION" "" grep -q "MISSING  AWS_REGION" "$STATE/out"
 expect "env.sh: names FR_E2E_REPO" "" grep -q "MISSING  FR_E2E_REPO" "$STATE/out"
 
 fresh env-ok
+answer control-vms 1 '{"Reservations":[{"Instances":[{"InstanceId":"i-0other","State":{"Name":"running"},"LaunchTime":"2026-10-23T10:00:00+00:00","Tags":[{"Key":"Name","Value":"st-e2e-other-control"},{"Key":"firerunner:e2e-session","Value":"e2e-other"}]}]}]}'
 PATH="$TMP/bin:$PATH" "$HERE/env.sh" >"$STATE/out" 2>&1 && echo 0 >"$STATE/rc" || echo $? >"$STATE/rc"
 expect "env.sh: exits 0 when configured" "$(cat "$STATE/out")" rc_is 0
+expect "env.sh: shows this session's owner" "" grep -q "FR_OWNER=e2e-test (set)" "$STATE/out"
+expect "env.sh: lists who else uses the environment" "$(cat "$STATE/out")" grep -q "e2e-other i-0other running" "$STATE/out"
 
 fresh no-repo
 unset FR_E2E_REPO
@@ -553,6 +636,65 @@ for args in "wf.yml 0" "--run abc" "--run 11 wf.yml 2" "wf.yml 1 -i 0" "wf.yml 1
 	expect "lifecycle: rejects '$args'" "$(dump)" rc_is 2
 done
 expect "lifecycle: no calls on usage errors" "" not_called " "
+
+# --- configuration files and the owner ---------------------------------------
+
+# A throwaway repository with a worktree, holding a copy of the harness.
+G="$TMP/repo"
+gitq() { GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -c user.name=t -c user.email=t@example.invalid "$@" >/dev/null 2>&1; }
+gitq init -q -b main "$G"
+mkdir -p "$G/scripts/e2e" "$G/.claude"
+cp "$HERE"/*.sh "$G/scripts/e2e/"
+gitq -C "$G" add scripts
+gitq -C "$G" commit -q -m init
+gitq -C "$G" worktree add -q -b feat/x "$G/.claude/worktrees/Feat_X.2"
+W="$G/.claude/worktrees/Feat_X.2"
+mkdir -p "$W/.claude"
+cat >"$G/.claude/e2e.env" <<'EOF'
+# shared by every worktree
+AWS_REGION=main-region
+AWS_PROFILE="main profile"
+export FR_E2E_REPO='o/r'
+FR_E2E_STACK=main-stack
+FR_OWNER=someone-else
+BOGUS=1
+FR_E2E_REF=$HOME
+EOF
+echo "FR_E2E_STACK=wt-stack" >"$W/.claude/e2e.env"
+# envrun DIR ARGS...: run DIR's env.sh with no e2e variables in the
+# environment, except ENVRUN_SET (VAR=VALUE) if set.
+envrun() {
+	local d="$1"
+	shift
+	env -u AWS_REGION -u AWS_PROFILE -u FR_E2E_REPO -u FR_E2E_STACK -u FR_OWNER -u FR_E2E_ENV_FILE -u FR_E2E_REF \
+		${ENVRUN_SET:+"$ENVRUN_SET"} PATH="$TMP/bin:$PATH" "$d/scripts/e2e/env.sh" "$@" >"$STATE/out" 2>"$STATE/err" &&
+		echo 0 >"$STATE/rc" || echo $? >"$STATE/rc"
+}
+
+fresh env-files
+answer control-vms 1 '{"Reservations":[]}'
+envrun "$W"
+out_has() { grep -qF -- "$1" "$STATE/out"; }
+not_out_owner() { ! grep -q FR_OWNER "$STATE/out"; }
+expect "e2e.env: a worktree reads the main checkout's file" "$(dump)" out_has "set      AWS_REGION=main-region"
+expect "e2e.env: its own file wins over the main checkout's" "" out_has "set      FR_E2E_STACK=wt-stack"
+expect "e2e.env: quotes are stripped" "" out_has "set      AWS_PROFILE=main profile"
+expect "e2e.env: export prefix is accepted" "" out_has "set      FR_E2E_REPO=o/r"
+expect "e2e.env: values are literal" "" out_has "set      FR_E2E_REF=\$HOME"
+expect "e2e.env: a worktree ignores the shared file's FR_OWNER" "" out_has "FR_OWNER=e2e-feat-x-2"
+expect "e2e.env: and says so" "" err_has "FR_OWNER is per session"
+expect "e2e.env: other variables are ignored" "" err_has "BOGUS is not"
+expect "e2e.env: tier suffix follows the owner" "" out_has "FR_E2E_TIER_SUFFIX=feat-x-2"
+ENVRUN_SET=AWS_REGION=from-env envrun "$W"
+expect "e2e.env: the environment wins over the file" "$(dump)" out_has "set      AWS_REGION=from-env"
+envrun "$W" --exports
+expect "e2e.env: --exports prints export lines" "$(dump)" grep -qx "export AWS_PROFILE='main profile'" "$STATE/out"
+expect "e2e.env: --exports never exports the owner" "" not_out_owner
+expect "e2e.env: --exports output evaluates" "" [ "$(bash -c ". '$STATE/out'; printf '%s' \"\$AWS_PROFILE|\$FR_E2E_REF\"")" = "main profile|\$HOME" ]
+envrun "$G"
+expect "e2e.env: the main checkout's own file may set FR_OWNER" "$(dump)" out_has "FR_OWNER=someone-else (set)"
+envrun "$G" --bogus
+expect "env.sh: rejects an unknown argument" "$(dump)" rc_is 2
 
 if [ "$fails" -ne 0 ]; then
 	echo "$fails failure(s)"

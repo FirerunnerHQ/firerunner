@@ -30,6 +30,8 @@ check() { # check <name> <command...>
 	shift
 	if "$@"; then pass "$name"; else bad "$name"; fi
 }
+# shellcheck disable=SC2329 # called through check
+not() { ! "$@"; }
 
 # newrepo <dir>: a fresh repository holding a copy of the files under test.
 newrepo() {
@@ -183,6 +185,23 @@ check "agent-env names the tools it could not find" \
 out="$(PATH="$SYS" FR_AGENT_ENV_DIRS="$dirs" "$R/scripts/agent-env.sh")"
 check "agent-env prints exports for eval outside Claude Code" \
 	test "$(PATH="$SYS" bash -c "eval '$out'; go")" = "$TMP/brew/go"
+
+# .claude/e2e.env: exported for the session, through scripts/e2e/env.sh.
+mkdir -p "$R/scripts/e2e" "$R/.claude"
+cp "$ROOT/scripts/e2e/env.sh" "$R/scripts/e2e/"
+printf '%s\n' "AWS_REGION=region-1" "AWS_PROFILE='it''s'" "FR_OWNER=e2e-mine" "NOT_OURS=1" >"$R/.claude/e2e.env"
+: >"$envfile"
+out="$(env -u AWS_REGION -u AWS_PROFILE -u FR_OWNER -u FR_E2E_ENV_FILE PATH="$SYS:$TMP/onpath" \
+	CLAUDE_ENV_FILE="$envfile" FR_AGENT_ENV_DIRS="$dirs" "$R/scripts/agent-env.sh")"
+check "agent-env exports .claude/e2e.env for the session" \
+	test "$(env -u AWS_REGION -u AWS_PROFILE PATH="$SYS" bash -c ". '$envfile'; echo \"\$AWS_REGION|\$AWS_PROFILE\"")" = "region-1|it''s"
+check "agent-env never exports the per-session owner" not grep -q FR_OWNER "$envfile"
+check "agent-env exports only AWS and FR_ variables" not grep -q NOT_OURS "$envfile"
+check "agent-env names what it exported" grep -qxF "# agent-env: from .claude/e2e.env: AWS_REGION AWS_PROFILE" <<<"$out"
+: >"$envfile"
+AWS_REGION=already PATH="$SYS:$TMP/onpath" CLAUDE_ENV_FILE="$envfile" FR_AGENT_ENV_DIRS="$dirs" "$R/scripts/agent-env.sh" >/dev/null
+check "agent-env leaves a variable already set alone" not grep -q AWS_REGION "$envfile"
+rm -r "$R/scripts/e2e" "$R/.claude"
 
 # The real default directory list must not fail on this machine either.
 : >"$envfile"

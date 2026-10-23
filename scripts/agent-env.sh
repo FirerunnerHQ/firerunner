@@ -11,6 +11,13 @@
 # already on PATH is never shadowed; a directory that does not exist is
 # skipped, so on a machine with everything on PATH this does nothing.
 #
+# It also exports the end-to-end configuration in the gitignored
+# .claude/e2e.env (this checkout's, or the main checkout's for a worktree),
+# so that raw aws calls and scripts/e2e see the same AWS_PROFILE, AWS_REGION
+# and FR_E2E_* in every Bash call. scripts/e2e/env.sh reads the file and
+# prints the lines; see scripts/e2e/README.md. Per-session values (FR_OWNER)
+# are never exported: env.sh derives them from the worktree each time.
+#
 # It never changes git config. The sign-off hook is opt-in, because a DCO
 # sign-off is a deliberate certification: until `make setup` has installed it,
 # this prints a one-line reminder.
@@ -62,13 +69,26 @@ for d in ${added[@]+"${added[@]}"}; do
 	lines+=("export PATH=\"\$PATH:$d\"")
 done
 
+e2e_keys=()
+if [ -x scripts/e2e/env.sh ]; then
+	while IFS= read -r l; do
+		case "$l" in export\ *=*)
+			lines+=("$l")
+			l="${l#export }"
+			e2e_keys+=("${l%%=*}")
+			;;
+		esac
+	done < <(scripts/e2e/env.sh --exports 2>/dev/null || true)
+fi
+
 if [ "${#lines[@]}" -gt 0 ]; then
 	if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
 		printf '%s\n' "${lines[@]}" >>"$CLAUDE_ENV_FILE"
 	else
 		printf '%s\n' "${lines[@]}"
 	fi
-	echo "# agent-env: added to PATH: ${added[*]}"
+	[ "${#added[@]}" = 0 ] || echo "# agent-env: added to PATH: ${added[*]}"
+	[ "${#e2e_keys[@]}" = 0 ] || echo "# agent-env: from .claude/e2e.env: ${e2e_keys[*]}"
 fi
 if [ "${#missing[@]}" -gt 0 ]; then
 	echo "# agent-env: not found on PATH or in ${dirs[*]}: ${missing[*]}"
