@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Unit tests for assets/docker-shim.sh. Linux-only (like the shim: it reads
 # /proc/<pid>/comm) and needs bash, coreutils (`timeout`, `sleep`, `env`),
-# grep and diff; no docker daemon is required. A fake docker records its argv, and a copy of `sleep` named
-# Runner.Worker stands in for the runner so /proc/<pid>/comm reads
-# "Runner.Worker".
+# grep and diff; no docker daemon is required. A fake docker records its
+# argv, and a bash script named Runner.Worker stands in for the runner so
+# /proc/<pid>/comm reads "Runner.Worker".
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,9 +24,19 @@ export FIRERUNNER_SHIM_REAL_DOCKER="$TMP/docker"
 export FAKE_DOCKER_ARGV="$TMP/argv"
 export FAKE_DOCKER_ENV="$TMP/env"
 
-# A process whose comm is "Runner.Worker".
-cp "$(command -v sleep)" "$TMP/Runner.Worker"
-"$TMP/Runner.Worker" 300 &
+# A process whose comm is "Runner.Worker": the kernel names a process after
+# the file it executes, so a script of that name will do. Not a renamed copy
+# of `sleep`: a multi-call coreutils (uutils, on newer runner images) refuses
+# to run under a name that is not one of its utilities. The script waits on a
+# child sleep and takes it down when killed.
+cat > "$TMP/Runner.Worker" <<'WORKER'
+#!/bin/bash
+sleep 300 &
+trap 'kill $! 2>/dev/null; exit 0' TERM
+wait
+WORKER
+chmod +x "$TMP/Runner.Worker"
+"$TMP/Runner.Worker" &
 WORKER_PID=$!
 for _ in $(seq 1 50); do
 	[ "$(cat /proc/$WORKER_PID/comm 2>/dev/null)" = "Runner.Worker" ] && break
