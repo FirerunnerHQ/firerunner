@@ -330,7 +330,7 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 	s.mu.Lock()
 	s.recycle = cancel
 	s.mu.Unlock()
-	l, err := sslistener.New(trackedSession{session: sess, health: s.health, chaos: chaosExitBeforeAcquire()}, sslistener.Config{
+	l, err := sslistener.New(trackedSession{session: sess, health: s.health, chaos: chaosExitAfterDelete()}, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
@@ -400,26 +400,29 @@ func (r *statsRecorder) latest() (scaleset.RunnerScaleSetStatistic, time.Time, b
 	return r.stats, r.at, r.ok
 }
 
-// chaosExitBeforeAcquire reports whether FR_CHAOS_EXIT_BEFORE_ACQUIRE is set:
-// a fault-injection switch for testing recovery, never for production. The
-// process then exits in the window the library leaves between deleting a
-// message and acquiring its jobs.
-func chaosExitBeforeAcquire() bool { return os.Getenv("FR_CHAOS_EXIT_BEFORE_ACQUIRE") == "1" }
+// chaosExitAfterDelete reports whether FR_CHAOS_EXIT_AFTER_DELETE is set: a
+// fault-injection switch for testing recovery, never for production. The
+// process then exits right after GitHub accepts a message's deletion, before
+// the message is acted on. actions/scaleset deletes a message first, then
+// acquires its available jobs and applies its statistics, so this is the
+// moment a crash loses the message.
+func chaosExitAfterDelete() bool { return os.Getenv("FR_CHAOS_EXIT_AFTER_DELETE") == "1" }
 
 // trackedSession records each successful GetMessage in the tier's health.
 type trackedSession struct {
 	session
 	health *health.Tracker
-	// chaos exits the process before AcquireJobs (see chaosExitBeforeAcquire).
+	// chaos exits the process after DeleteMessage (see chaosExitAfterDelete).
 	chaos bool
 }
 
-func (t trackedSession) AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error) {
-	if t.chaos {
-		fmt.Fprintf(os.Stderr, "firerunner: FR_CHAOS_EXIT_BEFORE_ACQUIRE: exiting before acquiring %d job(s)\n", len(requestIDs))
+func (t trackedSession) DeleteMessage(ctx context.Context, messageID int) error {
+	err := t.session.DeleteMessage(ctx, messageID)
+	if err == nil && t.chaos {
+		fmt.Fprintf(os.Stderr, "firerunner: FR_CHAOS_EXIT_AFTER_DELETE: exiting after deleting message %d, before acting on it\n", messageID)
 		os.Exit(137)
 	}
-	return t.session.AcquireJobs(ctx, requestIDs)
+	return err
 }
 
 func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {

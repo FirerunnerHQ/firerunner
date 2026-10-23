@@ -481,26 +481,25 @@ func TestRecycleReconnectsAndStatsAreRecorded(t *testing.T) {
 	}
 }
 
-func TestChaosExitBeforeAcquire(t *testing.T) {
-	// The fault switch must exit before AcquireJobs reaches GitHub. Run it in
-	// a child process, since it calls os.Exit.
+func TestChaosExitAfterDelete(t *testing.T) {
+	// The fault switch exits once GitHub accepted the deletion, before the
+	// message is acted on. Run it in a child process, since it calls os.Exit.
 	if os.Getenv("FR_CHAOS_CHILD") == "1" {
 		f := newFakeSession(0, false)
-		ts := trackedSession{session: f, chaos: chaosExitBeforeAcquire()}
-		_, _ = ts.AcquireJobs(context.Background(), []int64{1, 2})
+		ts := trackedSession{session: f, chaos: chaosExitAfterDelete()}
+		_ = ts.DeleteMessage(context.Background(), 42)
 		os.Exit(0) // not reached when chaos is on
 	}
-	cmd := exec.Command(os.Args[0], "-test.run", "^TestChaosExitBeforeAcquire$")
-	cmd.Env = append(os.Environ(), "FR_CHAOS_CHILD=1", "FR_CHAOS_EXIT_BEFORE_ACQUIRE=1")
+	cmd := exec.Command(os.Args[0], "-test.run", "^TestChaosExitAfterDelete$")
+	cmd.Env = append(os.Environ(), "FR_CHAOS_CHILD=1", "FR_CHAOS_EXIT_AFTER_DELETE=1")
 	out, err := cmd.CombinedOutput()
 	var ee *exec.ExitError
-	if !errors.As(err, &ee) || ee.ExitCode() != 137 || !strings.Contains(string(out), "exiting before acquiring 2 job(s)") {
+	if !errors.As(err, &ee) || ee.ExitCode() != 137 || !strings.Contains(string(out), "after deleting message 42") {
 		t.Fatalf("child exit = %v, output:\n%s", err, out)
 	}
-	// Off by default: AcquireJobs passes through.
+	// Off by default: DeleteMessage passes through.
 	f := newFakeSession(0, false)
-	ids, err := trackedSession{session: f, chaos: false}.AcquireJobs(context.Background(), []int64{7})
-	if err != nil || len(ids) != 1 || ids[0] != 7 {
-		t.Fatalf("AcquireJobs = %v, %v", ids, err)
+	if err := (trackedSession{session: f}).DeleteMessage(context.Background(), 1); err != nil {
+		t.Fatal(err)
 	}
 }
