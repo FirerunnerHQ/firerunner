@@ -210,20 +210,28 @@ func FromFlags(args []string) (*Config, error) {
 	return c, nil
 }
 
-// Parse loads configuration exactly like FromFlags but without enforcing
-// required-field validation, so diagnostic subcommands (status, doctor) can
-// inspect and report on a partial or misconfigured deployment instead of
-// refusing to start.
-func Parse(args []string) (*Config, error) {
+// flagVals holds the flag values Parse turns into Config fields after parsing.
+type flagVals struct {
+	labels, jailerCgroup, egress, dnsServers string
+	metaRefresh                              time.Duration
+}
+
+// FlagSet returns the daemon's flags, registered exactly as Parse registers
+// them, with their defaults read from the current environment. It configures
+// nothing: it lists the flags, for help output and for tests that walk them.
+func FlagSet() *flag.FlagSet {
+	return newFlagSet(&Config{}, &flagVals{}, &envReader{})
+}
+
+// newFlagSet registers every daemon flag, writing into c and v. Typed FR_*
+// values that do not parse are collected in er.
+func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs := flag.NewFlagSet("firerunner", flag.ContinueOnError)
-	c := &Config{}
-	var labels string
-	er := &envReader{}
 
 	fs.StringVar(&c.URL, "url", env("FR_URL", ""), "GitHub org or repo URL to register the scale set (required)")
 	fs.StringVar(&c.ScaleSetName, "name", env("FR_NAME", "firerunner"), "scale set name; also the runs-on label")
 	fs.StringVar(&c.RunnerGroup, "runner-group", env("FR_RUNNER_GROUP", "default"), "runner group name")
-	fs.StringVar(&labels, "labels", env("FR_LABELS", ""), "extra comma-separated runs-on labels")
+	fs.StringVar(&v.labels, "labels", env("FR_LABELS", ""), "extra comma-separated runs-on labels")
 	fs.IntVar(&c.MaxRunners, "max-runners", er.int("FR_MAX_RUNNERS", 4), "max concurrent microVMs")
 	fs.IntVar(&c.MinRunners, "min-runners", er.int("FR_MIN_RUNNERS", 0), "warm pool size: microVMs kept pre-booted and registered so jobs start without a cold boot (0 = on-demand; higher = faster pickup, more idle RAM)")
 
@@ -256,8 +264,7 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.Firecracker.ChrootBase, "chroot-base", env("FR_CHROOT_BASE", "/srv/jailer"), "jailer chroot base dir")
 	fs.IntVar(&c.Firecracker.JailUID, "jail-uid", er.int("FR_JAIL_UID", 0), "uid the jailer drops Firecracker to (required with --jailer)")
 	fs.IntVar(&c.Firecracker.JailGID, "jail-gid", er.int("FR_JAIL_GID", 0), "gid the jailer drops Firecracker to (required with --jailer)")
-	var jailerCgroup string
-	fs.StringVar(&jailerCgroup, "jailer-cgroup", env("FR_JAILER_CGROUP", ""), "semicolon-separated cgroup v2 limits applied to each microVM via the jailer, each <file>=<value> (e.g. \"memory.max=2147483648;cpu.max=200000;pids.max=512\"); requires --jailer")
+	fs.StringVar(&v.jailerCgroup, "jailer-cgroup", env("FR_JAILER_CGROUP", ""), "semicolon-separated cgroup v2 limits applied to each microVM via the jailer, each <file>=<value> (e.g. \"memory.max=2147483648;cpu.max=200000;pids.max=512\"); requires --jailer")
 	fs.BoolVar(&c.Firecracker.NetNS, "netns", er.boolean("FR_NETNS", false), "run each microVM in its own network namespace (tap lives in the netns, veth uplink to the host); strongest network isolation, requires --jailer")
 	fs.StringVar(&c.Firecracker.ToolCacheImage, "toolcache", env("FR_TOOLCACHE", ""), "path to a read-only ext4 image (labelled \"hostedtoolcache\", mirroring GitHub's tool-cache layout) attached to every microVM so setup-* actions hit a pre-seeded cache instead of downloading; opt-in accelerator, jobs fall back to downloading when unset")
 	fs.StringVar(&c.CacheJobsDir, "cache-jobs-dir", env("FR_CACHE_JOBS_DIR", "/run/firerunner/jobs"), "private job identity directory shared with the local cache server; unique per daemon")
@@ -270,14 +277,22 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.AWSRegion, "aws-region", env("FR_AWS_REGION", ""), "AWS region for ec2 tiers; defaults to AWS_REGION/shared config, then the control VM's own region from IMDS")
 	fs.DurationVar(&c.JITTTL, "jit-ttl", er.duration("FR_JIT_TTL", 5*time.Minute), "how long an EC2 instance's JIT config waits to be fetched before it expires")
 
-	var egress, dnsServers string
-	var metaRefresh time.Duration
-	fs.StringVar(&egress, "egress", env("FR_EGRESS", "api,actions,git,dns,packages,ntp"), "comma-separated egress allowlist: GitHub /meta categories (api,actions,git,packages) plus dns,ntp; or 'open' for no allowlist")
-	fs.StringVar(&dnsServers, "dns-servers", env("FR_DNS_SERVERS", "1.1.1.1,8.8.8.8"), "comma-separated resolver IPs guests may reach")
-	fs.DurationVar(&metaRefresh, "meta-refresh", er.duration("FR_META_REFRESH", 24*time.Hour), "how often to refresh GitHub /meta ranges (0 disables)")
+	fs.StringVar(&v.egress, "egress", env("FR_EGRESS", "api,actions,git,dns,packages,ntp"), "comma-separated egress allowlist: GitHub /meta categories (api,actions,git,packages) plus dns,ntp; or 'open' for no allowlist")
+	fs.StringVar(&v.dnsServers, "dns-servers", env("FR_DNS_SERVERS", "1.1.1.1,8.8.8.8"), "comma-separated resolver IPs guests may reach")
+	fs.DurationVar(&v.metaRefresh, "meta-refresh", er.duration("FR_META_REFRESH", 24*time.Hour), "how often to refresh GitHub /meta ranges (0 disables)")
 
 	fs.StringVar(&c.LogLevel, "log-level", env("FR_LOG_LEVEL", "info"), "log level: debug, info, warn, error")
 	fs.StringVar(&c.LogFormat, "log-format", env("FR_LOG_FORMAT", "text"), "log format: text or json")
+	return fs
+}
+
+// Parse loads configuration exactly like FromFlags but without enforcing
+// required-field validation, so diagnostic subcommands (status, doctor) can
+// inspect and report on a partial or misconfigured deployment instead of
+// refusing to start.
+func Parse(args []string) (*Config, error) {
+	c, v, er := &Config{}, &flagVals{}, &envReader{}
+	fs := newFlagSet(c, v, er)
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -293,14 +308,14 @@ func Parse(args []string) (*Config, error) {
 	if err := er.err(); err != nil {
 		return nil, err
 	}
-	if labels != "" {
-		for _, l := range strings.Split(labels, ",") {
+	if v.labels != "" {
+		for _, l := range strings.Split(v.labels, ",") {
 			if l = strings.TrimSpace(l); l != "" {
 				c.Labels = append(c.Labels, l)
 			}
 		}
 	}
-	c.Firecracker.CgroupLimits = splitSemi(jailerCgroup)
+	c.Firecracker.CgroupLimits = splitSemi(v.jailerCgroup)
 	// The provisioner's per-VM network pool is bounded by the runner capacity.
 	// With a tier catalog this is the slot budget shared across all tiers.
 	c.Firecracker.MaxVMs = c.MaxRunners
@@ -312,9 +327,9 @@ func Parse(args []string) (*Config, error) {
 		c.Tiers = tiers
 	}
 	c.Firecracker.Egress = provisioner.EgressConfig{
-		Categories:      splitCSV(egress),
-		DNSServers:      splitCSV(dnsServers),
-		RefreshInterval: metaRefresh,
+		Categories:      splitCSV(v.egress),
+		DNSServers:      splitCSV(v.dnsServers),
+		RefreshInterval: v.metaRefresh,
 	}
 	return c, nil
 }
