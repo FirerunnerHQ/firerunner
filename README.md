@@ -482,6 +482,32 @@ read-only credential check), and API reachability (against the derived API base,
 so GitHub Enterprise Server works too) — and prints one `PASS`/`WARN`/`FAIL`
 line each. It exits non-zero when any check fails, so it can gate a deploy.
 
+**Reconciling with GitHub.** Every message from GitHub carries the scale set's
+statistics: available, acquired, assigned, running, registered, busy and idle
+counts. A reconciler per tier compares them with firerunner's own runners.
+`status` shows both side by side, and `doctor` warns while they disagree.
+
+- **Jobs available but never acquired for 60 s:** the message session is
+  recycled, at most every 5 minutes, so a fresh one reports, and can re-offer,
+  them.
+- **A runner idle for 2 minutes that GitHub no longer knows:** it is cancelled,
+  which frees its slot and its instance.
+- **GitHub lists more runners than firerunner tracks**, confirmed by a later
+  message: this is reported only. The instances behind them carry
+  `firerunner:owner` tags.
+
+GitHub keeps a job's assignment to the scale set until a runner takes it, not
+in the message. So a firerunner that dies mid-message loses nothing: on
+restart, the new session's statistics (`totalAssignedJobs`) bring the job back.
+This was verified on EC2: firerunner was killed right after deleting the job's
+message, the job waited queued, and it ran after the restart. In that setup
+GitHub never sent `JobAvailable` messages (0 in 33 jobs); it assigns jobs to a
+JIT scale set directly.
+
+`FR_CHAOS_EXIT_AFTER_DELETE=1` makes the daemon exit right after deleting a
+message, before acting on it. It is a fault-injection switch for recovery tests
+only; never set it in production.
+
 **Checking a configuration offline.** `firerunner config check` validates the
 flags and `FR_*` environment exactly as startup does, without contacting GitHub
 or AWS. Add `--catalog FILE` to validate one tier catalog on its own. That needs

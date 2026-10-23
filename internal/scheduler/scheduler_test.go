@@ -1365,3 +1365,53 @@ func (b *safeBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.b.String()
 }
+
+func TestIdleRunnersAndCancelLost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelled := make(chan string, 4)
+	release := make(chan struct{}) // ends a busy runner's job; shutdown leaves busy runners alone
+	prov := provFunc(func(ctx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		select {
+		case <-ctx.Done():
+			cancelled <- name
+		case <-release:
+		}
+		return nil
+	})
+	s := New(Options{Max: 2, Provisioner: prov, JIT: &slowJIT{}, Logger: testLogger()})
+	s.Reconcile(ctx, 2)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(s.IdleRunners(0)) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("runners never tracked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := s.IdleRunners(time.Hour); len(got) != 0 {
+		t.Fatalf("IdleRunners(1h) = %v, want none that old", got)
+	}
+	idle := s.IdleRunners(0)
+	s.MarkBusy(idle[0])
+	if got := s.IdleRunners(0); len(got) != 1 || got[0] != idle[1] {
+		t.Fatalf("IdleRunners after MarkBusy = %v, want only %s", got, idle[1])
+	}
+	if s.CancelLost(idle[0]) {
+		t.Fatal("cancelled a busy runner")
+	}
+	if !s.CancelLost(idle[1]) {
+		t.Fatal("did not cancel the lost idle runner")
+	}
+	if s.CancelLost(idle[1]) {
+		t.Fatal("cancelled the same runner twice")
+	}
+	if got := <-cancelled; got != idle[1] {
+		t.Fatalf("cancelled %s, want %s", got, idle[1])
+	}
+	if got := s.IdleRunners(0); len(got) != 0 {
+		t.Fatalf("IdleRunners after CancelLost = %v", got)
+	}
+	cancel()
+	close(release)
+	s.Drain()
+}

@@ -104,6 +104,8 @@ type Scheduler struct {
 type vmHandle struct {
 	cancel context.CancelFunc
 	busy   bool
+	// since is when the runner was handed to the provisioner.
+	since time.Time
 	// cancelled guards against a scale-down (or shutdown) cancelling the same
 	// idle VM twice across rapid Reconcile calls before its launch goroutine has
 	// removed it from the registry.
@@ -534,7 +536,7 @@ func backoffDelay(failures int) time.Duration {
 // is still idle, cancel it. It starts life idle (busy=false).
 func (s *Scheduler) track(name string, cancel context.CancelFunc) {
 	s.mu.Lock()
-	s.active[name] = &vmHandle{cancel: cancel}
+	s.active[name] = &vmHandle{cancel: cancel, since: time.Now()}
 	s.mu.Unlock()
 }
 
@@ -555,6 +557,38 @@ func (s *Scheduler) MarkBusy(name string) {
 		h.busy = true
 	}
 	s.mu.Unlock()
+}
+
+// IdleRunners returns the runners launched more than olderThan ago that have
+// not taken a job and are not being removed: the ones a reconciler checks
+// against GitHub.
+func (s *Scheduler) IdleRunners(olderThan time.Duration) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	cutoff := time.Now().Add(-olderThan)
+	for name, h := range s.active {
+		if !h.busy && !h.cancelled && !h.removing && h.since.Before(cutoff) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// CancelLost cancels an idle runner GitHub no longer knows: it can never get
+// a job, and would hold its slot (and its instance) until its lifetime ends.
+// A busy runner is left alone. It reports whether it cancelled.
+func (s *Scheduler) CancelLost(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h := s.active[name]
+	if h == nil || h.busy || h.cancelled || h.removing {
+		return false
+	}
+	h.cancelled = true
+	h.cancel()
+	s.opts.Logger.Warn("cancelling a runner GitHub no longer lists", "runner", name)
+	return true
 }
 
 // cancelIfIdle cancels the named microVM's context only if no job has been

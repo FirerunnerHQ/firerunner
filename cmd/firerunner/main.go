@@ -38,6 +38,7 @@ import (
 	"github.com/solcreek/firerunner/internal/jobidentity"
 	"github.com/solcreek/firerunner/internal/listener"
 	"github.com/solcreek/firerunner/internal/provisioner"
+	"github.com/solcreek/firerunner/internal/reconcile"
 	"github.com/solcreek/firerunner/internal/scheduler"
 )
 
@@ -349,6 +350,20 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 	return nil
 }
 
+// statsSource adapts a listener to the reconciler.
+type statsSource struct{ lis *listener.ScaleSet }
+
+func (s statsSource) Stats() (reconcile.Stats, time.Time, bool) {
+	st, at, ok := s.lis.Stats()
+	return reconcile.Stats{
+		Available: st.TotalAvailableJobs, Acquired: st.TotalAcquiredJobs, Assigned: st.TotalAssignedJobs,
+		Running: st.TotalRunningJobs, Registered: st.TotalRegisteredRunners, Busy: st.TotalBusyRunners,
+		Idle: st.TotalIdleRunners,
+	}, at, ok
+}
+
+func (s statsSource) Recycle(reason string) bool { return s.lis.Recycle(reason) }
+
 // tierPending returns the pending-launch counter a tier's scheduler shares.
 // Firecracker tiers share one, because their launches draw on the same host
 // slots. An EC2 tier draws on no host slots, so it gets nil (a private
@@ -630,7 +645,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	runs := make([]func(context.Context) error, len(listeners))
 	for i := range listeners {
-		lis, sched := listeners[i], scheds[i]
+		lis, sched, tracker := listeners[i], scheds[i], trackers[i]
 		// tierCtx is this tier's own lifetime (see serveTiers): launches and
 		// the warm-pool top-up bind to it, so a tier that stops cancels its
 		// idle runners and stops replenishing, while busy ones finish.
@@ -641,6 +656,12 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			}
 			onBusy := func(name string) { sched.MarkBusy(name) }
 			capacity := func() int { return sched.Capacity() }
+			// The reconciler compares GitHub's statistics with this tier's
+			// runners for as long as the tier serves.
+			jit := lis.JIT()
+			go reconcile.New(statsSource{lis}, sched, jit.Exists, reconcile.Options{
+				Health: tracker, Logger: log.With("tier", tiers[i].Name, "component", "reconcile"),
+			}).Run(tierCtx)
 			return lis.Run(tierCtx, onDesired, onBusy, capacity)
 		}
 	}

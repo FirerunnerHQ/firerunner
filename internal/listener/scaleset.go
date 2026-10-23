@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -63,7 +64,13 @@ type ScaleSet struct {
 	removeClient *scaleset.Client
 	// jitClients generates JIT configs in parallel; see clientPool.
 	jitClients *clientPool
-	session    session
+	// stats holds the latest statistics GitHub sent with a message.
+	stats statsRecorder
+	// mu guards recycle, the cancel func of the live session's context; nil
+	// when no session is live.
+	mu      sync.Mutex
+	recycle context.CancelCauseFunc
+	session session
 	// open opens a fresh message session after the current one fails.
 	open       func(context.Context) (session, error)
 	health     *health.Tracker
@@ -274,6 +281,19 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		_ = sess.Close(closeCtx)
 		cancel()
+		if errors.Is(err, errRecycled) {
+			// Asked for, not a failure: reopen at once, with no backoff and
+			// nothing recorded against the listener's health. Only if the
+			// reopen fails does the usual reconnect path take over.
+			if sess, err = s.open(ctx); err == nil {
+				s.session = sess
+				s.log.Info("listener session recycled")
+				continue
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
 		for {
 			wait := jitter(backoff)
 			s.log.Warn("listener session ended; reconnecting", "err", err, "backoff", wait)
@@ -318,11 +338,22 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 
 // runSession listens on one session until it fails or ctx ends.
 func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
-	l, err := sslistener.New(trackedSession{session: sess, health: s.health}, sslistener.Config{
+	// Recycle ends this session (and only this one) to make Run reopen it.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	s.mu.Lock()
+	s.recycle = cancel
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.recycle = nil
+		s.mu.Unlock()
+	}()
+	l, err := sslistener.New(trackedSession{session: sess, health: s.health, log: s.log, chaos: chaosExitAfterDelete()}, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
-	})
+	}, sslistener.WithMetricsRecorder(&s.stats))
 	if err != nil {
 		return fmt.Errorf("create scaleset listener: %w", err)
 	}
@@ -339,19 +370,101 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		a.setCapacity = l.SetMaxRunners
 		a.advertiseCapacity()
 	}
-	return l.Run(ctx, a)
+	err = l.Run(ctx, a)
+	if errors.Is(context.Cause(ctx), errRecycled) {
+		return errRecycled
+	}
+	return err
 }
 
-// trackedSession records each successful GetMessage in the tier's health.
+// errRecycled ends a session that Recycle asked to replace.
+var errRecycled = errors.New("session recycled")
+
+// Stats returns the scale set statistics GitHub sent with the latest
+// message, and when they arrived; ok is false before the first.
+func (s *ScaleSet) Stats() (stats scaleset.RunnerScaleSetStatistic, at time.Time, ok bool) {
+	return s.stats.latest()
+}
+
+// Recycle ends the current message session, so Run closes it and opens a new
+// one at once. A fresh session gets GitHub's current statistics, and possibly
+// re-offers jobs the old one never acquired. It reports whether a live session
+// was there to recycle; there is none before the first or while reconnecting.
+func (s *ScaleSet) Recycle(reason string) bool {
+	s.mu.Lock()
+	cancel := s.recycle
+	s.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	s.log.Warn("recycling the message session", "reason", reason)
+	cancel(errRecycled)
+	return true
+}
+
+// statsRecorder keeps the latest statistics GitHub sent (an
+// sslistener.MetricsRecorder).
+type statsRecorder struct {
+	mu    sync.Mutex
+	stats scaleset.RunnerScaleSetStatistic
+	at    time.Time
+	ok    bool
+}
+
+func (r *statsRecorder) RecordStatistics(st *scaleset.RunnerScaleSetStatistic) {
+	if st == nil {
+		return
+	}
+	r.mu.Lock()
+	r.stats, r.at, r.ok = *st, time.Now(), true
+	r.mu.Unlock()
+}
+func (r *statsRecorder) RecordJobStarted(*scaleset.JobStarted)     {}
+func (r *statsRecorder) RecordJobCompleted(*scaleset.JobCompleted) {}
+func (r *statsRecorder) RecordDesiredRunners(int)                  {}
+
+func (r *statsRecorder) latest() (scaleset.RunnerScaleSetStatistic, time.Time, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stats, r.at, r.ok
+}
+
+// chaosExitAfterDelete reports whether FR_CHAOS_EXIT_AFTER_DELETE is set: a
+// fault-injection switch for testing recovery, never for production. The
+// process then exits right after GitHub accepts a message's deletion, before
+// the message is acted on. actions/scaleset deletes a message first, then
+// acquires its available jobs and applies its statistics, so this is the
+// moment a crash loses the message.
+func chaosExitAfterDelete() bool { return os.Getenv("FR_CHAOS_EXIT_AFTER_DELETE") == "1" }
+
+// trackedSession records each successful GetMessage in the tier's health, and
+// logs at debug level what each message carries.
 type trackedSession struct {
 	session
 	health *health.Tracker
+	log    *slog.Logger
+	// chaos exits the process after DeleteMessage (see chaosExitAfterDelete).
+	chaos bool
+}
+
+func (t trackedSession) DeleteMessage(ctx context.Context, messageID int) error {
+	err := t.session.DeleteMessage(ctx, messageID)
+	if err == nil && t.chaos {
+		fmt.Fprintf(os.Stderr, "firerunner: FR_CHAOS_EXIT_AFTER_DELETE: exiting after deleting message %d, before acting on it\n", messageID)
+		os.Exit(137)
+	}
+	return err
 }
 
 func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
 	m, err := t.session.GetMessage(ctx, lastMessageID, maxCapacity)
 	if err == nil && t.health != nil {
 		t.health.MessageOK()
+	}
+	if err == nil && m != nil && t.log != nil {
+		t.log.Debug("message", "id", m.MessageID,
+			"jobAvailable", len(m.JobAvailableMessages), "jobAssigned", len(m.JobAssignedMessages),
+			"jobStarted", len(m.JobStartedMessages), "jobCompleted", len(m.JobCompletedMessages))
 	}
 	return m, err
 }
@@ -576,6 +689,17 @@ func (p *clientPool) seed(c jitClient) {
 
 // put returns a client the pool handed out.
 func (p *clientPool) put(c jitClient) { p.idle <- c }
+
+// Exists reports whether GitHub still knows the named runner.
+func (j *JITSource) Exists(ctx context.Context, name string) (bool, error) {
+	opCtx, cancel := context.WithTimeout(ctx, removeOpTimeout)
+	defer cancel()
+	r, err := j.remover.GetRunnerByName(opCtx, name)
+	if err != nil {
+		return false, err
+	}
+	return r != nil, nil
+}
 
 // runnerRemover is the part of *scaleset.Client that RemoveRunner uses, so the
 // error mapping can be tested without GitHub.

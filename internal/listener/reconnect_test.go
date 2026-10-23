@@ -3,6 +3,9 @@ package listener
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -439,5 +442,77 @@ func TestTrackedSessionRecordsMessages(t *testing.T) {
 	_, _ = ts.GetMessage(context.Background(), 0, 1)
 	if !tr.Snapshot().LastMessage.Equal(before) {
 		t.Fatal("a failed GetMessage counted as a message")
+	}
+}
+
+func TestRecycleReconnectsAndStatsAreRecorded(t *testing.T) {
+	fastReconnect(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr := health.NewTracker("a")
+	first := newFakeSession(0, false)
+	next := newFakeSession(2, false)
+	o := &opener{results: []openResult{{sess: next}}}
+	ss := testScaleSet("a", first, o, tr)
+	tier := startTier(ctx, ss, 4)
+
+	if _, _, ok := ss.Stats(); ok {
+		t.Fatal("stats reported before any message")
+	}
+	first.msgs <- &scaleset.RunnerScaleSetMessage{MessageID: 1, Statistics: &scaleset.RunnerScaleSetStatistic{
+		TotalAvailableJobs: 3, TotalAssignedJobs: 1, TotalRegisteredRunners: 5,
+	}}
+	eventually(t, "the message's statistics recorded", func() bool {
+		st, at, ok := ss.Stats()
+		return ok && st.TotalAvailableJobs == 3 && st.TotalRegisteredRunners == 5 && !at.IsZero()
+	})
+
+	if !ss.Recycle("test") {
+		t.Fatal("Recycle reported no live session")
+	}
+	eventually(t, "a new session after the recycle", func() bool { return o.opened() == 1 && next.gets.Load() > 0 })
+	if !first.closed.Load() {
+		t.Fatal("the recycled session was not closed")
+	}
+	// A recycle is not a failure: no reconnect, no error, no backoff.
+	if h := tr.Snapshot(); h.State != health.Connected || h.Reconnects != 0 || h.LastError != "" {
+		t.Fatalf("health after a recycle = %+v", h)
+	}
+	// The new session's statistics drive demand as after any reconnect.
+	eventually(t, "launches from the new session", func() bool { l, _ := tier.prov.counts(); return l == 2 })
+	select {
+	case err := <-tier.done:
+		t.Fatalf("Run returned %v after a recycle", err)
+	default:
+	}
+}
+
+func TestChaosExitAfterDelete(t *testing.T) {
+	// The fault switch exits once GitHub accepted the deletion, before the
+	// message is acted on. Run it in a child process, since it calls os.Exit.
+	if os.Getenv("FR_CHAOS_CHILD") == "1" {
+		f := newFakeSession(0, false)
+		ts := trackedSession{session: f, chaos: chaosExitAfterDelete()}
+		_ = ts.DeleteMessage(context.Background(), 42)
+		os.Exit(0) // not reached when chaos is on
+	}
+	cmd := exec.Command(os.Args[0], "-test.run", "^TestChaosExitAfterDelete$")
+	cmd.Env = append(os.Environ(), "FR_CHAOS_CHILD=1", "FR_CHAOS_EXIT_AFTER_DELETE=1")
+	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 137 || !strings.Contains(string(out), "after deleting message 42") {
+		t.Fatalf("child exit = %v, output:\n%s", err, out)
+	}
+	// Off by default: DeleteMessage passes through.
+	f := newFakeSession(0, false)
+	if err := (trackedSession{session: f}).DeleteMessage(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecycleWithoutALiveSession(t *testing.T) {
+	ss := testScaleSet("a", newFakeSession(0, false), &opener{}, nil)
+	if ss.Recycle("before Run") {
+		t.Fatal("Recycle reported success with no session running")
 	}
 }

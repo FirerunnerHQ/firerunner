@@ -39,6 +39,32 @@ type Tier struct {
 	LastMessage time.Time `json:"last_message,omitzero"`
 	LastError   string    `json:"last_error,omitempty"`
 	Since       time.Time `json:"since"`
+
+	// GitHub is the scale set's statistics from the latest message, with
+	// firerunner's own count of runners for comparison.
+	GitHub *GitHubStats `json:"github,omitempty"`
+	// Drift describes any current disagreement between GitHub and
+	// firerunner; empty when they agree.
+	Drift string `json:"drift,omitempty"`
+	// Recycles counts sessions the reconciler recycled to recover jobs.
+	Recycles int `json:"recycles,omitempty"`
+	// LostRunners counts runners cancelled because GitHub no longer listed
+	// them.
+	LostRunners int `json:"lost_runners,omitempty"`
+}
+
+// GitHubStats is a scale set's statistics as GitHub reported them.
+type GitHubStats struct {
+	Available  int       `json:"available"`
+	Acquired   int       `json:"acquired"`
+	Assigned   int       `json:"assigned"`
+	Running    int       `json:"running"`
+	Registered int       `json:"registered"`
+	Busy       int       `json:"busy"`
+	Idle       int       `json:"idle"`
+	At         time.Time `json:"at"`
+	// Tracked is how many runners firerunner itself has live.
+	Tracked int `json:"tracked"`
 }
 
 // Tracker records one tier's health. It is safe for concurrent use.
@@ -99,11 +125,44 @@ func (tr *Tracker) Failed(err error) {
 	tr.set(Failed)
 }
 
+// GitHubStats records the latest statistics and firerunner's own count.
+func (tr *Tracker) GitHubStats(st GitHubStats) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.t.GitHub = &st
+}
+
+// SetDrift records the current drift description; empty clears it.
+func (tr *Tracker) SetDrift(d string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.t.Drift = d
+}
+
+// Recycled counts a session recycled by the reconciler.
+func (tr *Tracker) Recycled() {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.t.Recycles++
+}
+
+// LostRunner counts a runner cancelled because GitHub no longer listed it.
+func (tr *Tracker) LostRunner() {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.t.LostRunners++
+}
+
 // Snapshot returns the current health.
 func (tr *Tracker) Snapshot() Tier {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	return tr.t
+	t := tr.t
+	if t.GitHub != nil {
+		g := *t.GitHub
+		t.GitHub = &g
+	}
+	return t
 }
 
 func errString(err error) string {
