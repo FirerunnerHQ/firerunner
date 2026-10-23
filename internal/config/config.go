@@ -276,7 +276,7 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.AWSRegion, "aws-region", env("FR_AWS_REGION", ""), "AWS region for ec2 tiers; defaults to AWS_REGION/shared config, then the control VM's own region from IMDS")
 	fs.DurationVar(&c.JITTTL, "jit-ttl", er.duration("FR_JIT_TTL", 5*time.Minute), "how long an EC2 instance's JIT config waits to be fetched before it expires")
 	fs.StringVar(&c.Owner, "owner", env("FR_OWNER", ""), "name of this install: tagged as firerunner:owner on every instance it launches, so its pool and reaper find them again. Defaults to the host name; set a stable value when the control VM can be replaced")
-	fs.StringVar(&c.EC2Reaper, "ec2-reaper", env("FR_EC2_REAPER", "on"), "clean up EC2 instances and spot requests this install left behind (after a crash or restart): on, dry-run (log only), or off")
+	fs.StringVar(&c.EC2Reaper, "ec2-reaper", env("FR_EC2_REAPER", "on"), "clean up EC2 instances and spot requests this install left behind (after a crash or restart, including pool instances left mid-claim): on, dry-run (log only), or off (nothing cleans them up)")
 
 	var egress, dnsServers string
 	var metaRefresh time.Duration

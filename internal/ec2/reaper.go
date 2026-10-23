@@ -122,92 +122,53 @@ func (r *Reaper) Run(ctx context.Context) {
 // Sweep reaps once.
 func (r *Reaper) Sweep(ctx context.Context) (ReapReport, error) {
 	rep := ReapReport{At: r.now(), DryRun: r.o.DryRun}
-	out, err := r.c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{Filters: []types.Filter{
-		{Name: aws.String("tag:" + TagOwner), Values: []string{r.o.Owner}},
-		{Name: aws.String("instance-state-name"), Values: []string{"pending", "running", "stopping", "stopped"}},
-	}})
-	if err != nil {
-		return rep, err
-	}
-	now := r.now()
-	alive := map[string]bool{}
-	for _, res := range out.Reservations {
-		for _, i := range res.Instances {
-			id := aws.ToString(i.InstanceId)
-			alive[id] = true
-			if r.c.isLive(id) {
-				continue
-			}
-			tier, runner, pool := tagValue(i.Tags, TagTier), tagValue(i.Tags, TagRunner), tagValue(i.Tags, TagPool)
-			spotReq := aws.ToString(i.SpotInstanceRequestId)
-			log := r.log.With("instance", id, "tier", tier, "runner", runner, "state", i.State.Name)
-
-			if pool == PoolReady || pool == PoolWarming {
-				if r.o.PooledTiers[tier] {
-					continue // the pool's own
-				}
-				if r.reap(ctx, log, "pool instance of a tier that keeps no pool", id, spotReq) {
-					rep.Instances = append(rep.Instances, id)
-				}
-				continue
-			}
-			// A job instance (claimed from a pool, or cold) nobody tracks.
-			// LaunchTime is the latest start, so a pool instance a job just
-			// started is young too.
-			if now.Sub(aws.ToTime(i.LaunchTime)) < r.o.Grace {
-				rep.Young = append(rep.Young, id)
-				continue
-			}
-			switch i.State.Name {
-			case types.InstanceStateNameStopped, types.InstanceStateNameStopping:
-				// Its runner ran (or failed) and powered off.
-				r.deregister(ctx, log, tier, runner)
-				if r.reap(ctx, log, "used instance left stopped", id, spotReq) {
-					rep.Instances = append(rep.Instances, id)
-				}
-			default:
-				if r.o.MaxLifetime > 0 && now.Sub(aws.ToTime(i.LaunchTime)) >= r.o.MaxLifetime {
-					if r.reap(ctx, log, "orphan past the max lifetime", id, spotReq) {
-						rep.Instances = append(rep.Instances, id)
-					}
-					continue
-				}
-				if runner == "" {
-					continue // nothing to ask GitHub; MaxLifetime ends it
-				}
-				if r.o.DryRun {
-					log.Info("would deregister this orphan's runner and, unless it is busy, terminate it")
-					rep.Instances = append(rep.Instances, id)
-					continue
-				}
-				err := r.o.Remove(ctx, tier, runner)
-				switch {
-				case errors.Is(err, core.ErrRunnerBusy):
-					log.Info("orphan is running a job; leaving it to finish")
-					rep.Busy = append(rep.Busy, id)
-				case err != nil:
-					log.Warn("could not deregister the orphan's runner; trying next sweep", "err", err)
-				default:
-					if r.reap(ctx, log, "orphan whose runner had no job", id, spotReq) {
-						rep.Instances = append(rep.Instances, id)
-					}
-				}
-			}
-		}
-	}
-
-	// Persistent spot requests whose instance is gone would launch an
-	// untracked replacement.
-	sir, err := r.c.api.DescribeSpotInstanceRequests(ctx, &ec2.DescribeSpotInstanceRequestsInput{Filters: []types.Filter{
+	// Requests first, instances second: every instance a listed request
+	// names then already exists when the instances are listed, so a request
+	// is never judged against a list taken before its instance launched.
+	var requests []types.SpotInstanceRequest
+	sp := ec2.NewDescribeSpotInstanceRequestsPaginator(r.c.api, &ec2.DescribeSpotInstanceRequestsInput{Filters: []types.Filter{
 		{Name: aws.String("tag:" + TagOwner), Values: []string{r.o.Owner}},
 		{Name: aws.String("state"), Values: []string{"open", "active", "disabled"}},
 	}})
-	if err != nil {
-		return rep, err
+	for sp.HasMorePages() {
+		page, err := sp.NextPage(ctx)
+		if err != nil {
+			return rep, err
+		}
+		requests = append(requests, page.SpotInstanceRequests...)
 	}
-	for _, s := range sir.SpotInstanceRequests {
+	var instances []types.Instance
+	ip := ec2.NewDescribeInstancesPaginator(r.c.api, &ec2.DescribeInstancesInput{Filters: []types.Filter{
+		{Name: aws.String("tag:" + TagOwner), Values: []string{r.o.Owner}},
+		{Name: aws.String("instance-state-name"), Values: []string{"pending", "running", "stopping", "stopped"}},
+	}})
+	for ip.HasMorePages() {
+		page, err := ip.NextPage(ctx)
+		if err != nil {
+			return rep, err
+		}
+		for _, res := range page.Reservations {
+			instances = append(instances, res.Instances...)
+		}
+	}
+	now := r.now()
+	alive := map[string]bool{}
+	for _, i := range instances {
+		alive[aws.ToString(i.InstanceId)] = true
+	}
+	for _, i := range instances {
+		r.judge(ctx, i, now, &rep)
+	}
+
+	// Persistent spot requests whose instance is gone would launch an
+	// untracked replacement. A request this young may still be filling, and
+	// one whose instance this process tracks is in use.
+	for _, s := range requests {
 		id, inst := aws.ToString(s.SpotInstanceRequestId), aws.ToString(s.InstanceId)
-		if inst != "" && alive[inst] {
+		if inst != "" && (alive[inst] || r.c.isLive(inst)) {
+			continue
+		}
+		if now.Sub(aws.ToTime(s.CreateTime)) < r.o.Grace {
 			continue
 		}
 		if r.o.DryRun {
@@ -230,14 +191,68 @@ func (r *Reaper) Sweep(ctx context.Context) (ReapReport, error) {
 	return rep, nil
 }
 
-// deregister removes a finished instance's runner registration, best effort:
-// an ephemeral runner normally removes itself.
-func (r *Reaper) deregister(ctx context.Context, log *slog.Logger, tier, runner string) {
-	if runner == "" || r.o.DryRun || r.o.Remove == nil {
+// judge decides one of this install's instances: leave it, or reap it.
+func (r *Reaper) judge(ctx context.Context, i types.Instance, now time.Time, rep *ReapReport) {
+	id := aws.ToString(i.InstanceId)
+	if r.c.isLive(id) {
 		return
 	}
-	if err := r.o.Remove(ctx, tier, runner); err != nil && !errors.Is(err, core.ErrRunnerBusy) {
-		log.Debug("deregister runner of a stopped instance", "err", err)
+	tier, runner, pool := tagValue(i.Tags, TagTier), tagValue(i.Tags, TagRunner), tagValue(i.Tags, TagPool)
+	spotReq := aws.ToString(i.SpotInstanceRequestId)
+	log := r.log.With("instance", id, "tier", tier, "runner", runner, "state", i.State.Name)
+
+	if pool == PoolReady || pool == PoolWarming {
+		if r.o.PooledTiers[tier] {
+			return // the pool's own
+		}
+		if r.reap(ctx, log, "pool instance of a tier that keeps no pool", id, spotReq) {
+			rep.Instances = append(rep.Instances, id)
+		}
+		return
+	}
+	// A job instance (claimed from a pool, or cold) nobody tracks.
+	// LaunchTime is the latest start, so a pool instance a job just
+	// started is young too.
+	if now.Sub(aws.ToTime(i.LaunchTime)) < r.o.Grace {
+		rep.Young = append(rep.Young, id)
+		return
+	}
+	switch i.State.Name {
+	case types.InstanceStateNameStopped, types.InstanceStateNameStopping:
+		// Its runner ran (or failed) and powered off, so its
+		// ephemeral registration is already gone. The runner name is
+		// not deregistered: a launch that fell back to a cold
+		// instance may be using the same name right now.
+		if r.reap(ctx, log, "used instance left stopped", id, spotReq) {
+			rep.Instances = append(rep.Instances, id)
+		}
+	default:
+		if r.o.MaxLifetime > 0 && now.Sub(aws.ToTime(i.LaunchTime)) >= r.o.MaxLifetime {
+			if r.reap(ctx, log, "orphan past the max lifetime", id, spotReq) {
+				rep.Instances = append(rep.Instances, id)
+			}
+			return
+		}
+		if runner == "" {
+			return // nothing to ask GitHub; MaxLifetime ends it
+		}
+		if r.o.DryRun {
+			log.Info("would deregister this orphan's runner and, unless it is busy, terminate it")
+			rep.Instances = append(rep.Instances, id)
+			return
+		}
+		err := r.o.Remove(ctx, tier, runner)
+		switch {
+		case errors.Is(err, core.ErrRunnerBusy):
+			log.Info("orphan is running a job; leaving it to finish")
+			rep.Busy = append(rep.Busy, id)
+		case err != nil:
+			log.Warn("could not deregister the orphan's runner; trying next sweep", "err", err)
+		default:
+			if r.reap(ctx, log, "orphan whose runner had no job", id, spotReq) {
+				rep.Instances = append(rep.Instances, id)
+			}
+		}
 	}
 }
 

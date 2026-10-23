@@ -68,7 +68,11 @@ type fakeEC2 struct {
 	// tagErr fails CreateTags.
 	tagErr error
 	// clock, when set, is the fake's notion of now (launch times).
-	clock     func() time.Time
+	clock func() time.Time
+	// modifyErr fails ModifyInstanceAttribute.
+	modifyErr error
+	// pageSize, when > 0, splits filtered listings into pages.
+	pageSize  int
 	started   []string
 	cancelled map[string]bool // spot request ID -> cancelled
 	// cancelErrs fails this many CancelSpotInstanceRequests calls first.
@@ -233,6 +237,7 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 			SpotInstanceRequestId: aws.String(i.spotReq),
 			InstanceId:            aws.String(i.id),
 			State:                 state,
+			CreateTime:            aws.Time(i.launched),
 		}
 		for k, v := range i.spotTags {
 			r.Tags = append(r.Tags, types.Tag{Key: aws.String(k), Value: aws.String(v)})
@@ -255,7 +260,8 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 			out = append(out, r)
 		}
 	}
-	return &ec2.DescribeSpotInstanceRequestsOutput{SpotInstanceRequests: out}, nil
+	out, next := page(out, in.NextToken, f.pageSize)
+	return &ec2.DescribeSpotInstanceRequestsOutput{SpotInstanceRequests: out, NextToken: next}, nil
 }
 
 func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput, _ ...func(*ec2.Options)) (*ec2.StartInstancesOutput, error) {
@@ -286,6 +292,9 @@ func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput,
 func (f *fakeEC2) ModifyInstanceAttribute(_ context.Context, in *ec2.ModifyInstanceAttributeInput, _ ...func(*ec2.Options)) (*ec2.ModifyInstanceAttributeOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.modifyErr != nil {
+		return nil, f.modifyErr
+	}
 	i, ok := f.instances[aws.ToString(in.InstanceId)]
 	if !ok {
 		return nil, apiErr("InvalidInstanceID.NotFound")
@@ -377,19 +386,39 @@ func (f *fakeEC2) DescribeInstances(_ context.Context, in *ec2.DescribeInstances
 		}
 	}
 	var res types.Reservation
+	var next *string
 	if len(in.InstanceIds) == 0 {
+		var all []types.Instance
 		for _, id := range f.order {
-			if i := f.instances[id]; i.matches(in.Filters) {
-				res.Instances = append(res.Instances, f.view(i))
+			// An invisible instance is too new to show in a listing yet.
+			if i := f.instances[id]; i.matches(in.Filters) && !f.invisible[id] {
+				all = append(all, f.view(i))
 			}
 		}
+		res.Instances, next = page(all, in.NextToken, f.pageSize)
 	}
 	for _, id := range in.InstanceIds {
 		if i, ok := f.instances[id]; ok {
 			res.Instances = append(res.Instances, f.view(i))
 		}
 	}
-	return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{res}}, nil
+	return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{res}, NextToken: next}, nil
+}
+
+// page returns one page of items from token (an index), and the next token.
+func page[T any](items []T, token *string, size int) ([]T, *string) {
+	if size <= 0 {
+		return items, nil
+	}
+	start := 0
+	if token != nil {
+		fmt.Sscan(*token, &start)
+	}
+	end := min(start+size, len(items))
+	if end >= len(items) {
+		return items[start:end], nil
+	}
+	return items[start:end], aws.String(fmt.Sprint(end))
 }
 
 func (f *fakeEC2) TerminateInstances(_ context.Context, in *ec2.TerminateInstancesInput, _ ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error) {

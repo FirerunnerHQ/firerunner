@@ -279,3 +279,14 @@ func TestReaperOptions(t *testing.T) {
 		t.Fatal("removing a runner of an unconfigured tier must fail, not succeed")
 	}
 }
+
+func TestPooledTiers(t *testing.T) {
+	got := pooledTiers([]config.Tier{
+		{Name: "fc"},
+		{Name: "cold", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{}},
+		{Name: "pooled", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{Pool: 2}},
+	})
+	if len(got) != 1 || !got["pooled"] {
+		t.Fatalf("pooledTiers = %v, want only the tier with a pool", got)
+	}
+}

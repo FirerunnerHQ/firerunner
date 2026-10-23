@@ -353,19 +353,15 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 // reaperOptions configures the EC2 reaper for this install: which tiers keep
 // a pool, how to deregister each tier's runners, and the lifetime backstop.
 func reaperOptions(cfg *config.Config, owner string, tiers []config.Tier, listeners []*listener.ScaleSet, log *slog.Logger) ec2.ReaperOptions {
-	pooled := map[string]bool{}
 	removers := map[string]*listener.JITSource{}
 	for i, t := range tiers {
 		if t.IsEC2() {
 			removers[t.Name] = listeners[i].JIT()
-			if t.EC2.Pool > 0 {
-				pooled[t.Name] = true
-			}
 		}
 	}
 	return ec2.ReaperOptions{
 		Owner:       owner,
-		PooledTiers: pooled,
+		PooledTiers: pooledTiers(tiers),
 		Remove: func(ctx context.Context, tier, runner string) error {
 			jit, ok := removers[tier]
 			if !ok {
@@ -379,6 +375,18 @@ func reaperOptions(cfg *config.Config, owner string, tiers []config.Tier, listen
 		DryRun:      cfg.EC2Reaper == "dry-run",
 		Logger:      log,
 	}
+}
+
+// pooledTiers names the EC2 tiers that keep a stopped pool: the reaper leaves
+// their ready and warming instances to the pool.
+func pooledTiers(tiers []config.Tier) map[string]bool {
+	pooled := map[string]bool{}
+	for _, t := range tiers {
+		if t.IsEC2() && t.EC2.Pool > 0 {
+			pooled[t.Name] = true
+		}
+	}
+	return pooled
 }
 
 // statsSource adapts a listener to the reconciler.

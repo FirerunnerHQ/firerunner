@@ -400,7 +400,8 @@ running process tracks, and anything younger than 2 minutes.
 Everything is found by the `firerunner:owner` tag, which defaults to the host
 name. **Set `--owner` (`FR_OWNER`) to a stable name when the control VM can be
 replaced**, so a new host takes over its predecessor's pool and leftovers.
-Use `--ec2-reaper dry-run` to only log what it would do, or `off` to disable it.
+Use `--ec2-reaper dry-run` to only log what it would do. With `off`, nothing
+cleans up after a crash: not even pool instances left mid-claim.
 No instance is terminated while its spot request may still be open.
 
 When a type has no capacity in a subnet, firerunner tries the next subnet, then

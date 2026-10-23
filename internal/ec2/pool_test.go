@@ -407,3 +407,27 @@ func TestPool_StuckWarmingIsDiscardedAndRefilled(t *testing.T) {
 	}
 	eventually(t, "a replacement warming", func() bool { return len(h.f.launched()) == 2 })
 }
+
+func TestPool_RequeueAfterTaggingClearsTheRunner(t *testing.T) {
+	// The claim tagged the instance, then failed pool-wide (throttling on
+	// the user-data write): it goes back ready, no longer naming the runner
+	// the job now cold-launches as.
+	h := readyPool(t, 1)
+	id := h.f.launched()[0].id
+	h.f.mu.Lock()
+	h.f.modifyErr = apiErr("RequestLimitExceeded")
+	h.f.mu.Unlock()
+	if _, err := h.p.pool.claim(context.Background(), "runner-x"); err == nil {
+		t.Fatal("claim succeeded")
+	}
+	in := h.f.instance(id)
+	if in.tags[TagPool] != PoolReady || in.tags[TagRunner] != "" {
+		t.Fatalf("tags after a failed claim = %v, want ready and no runner", in.tags)
+	}
+	if r, _ := h.p.pool.Ready(); r != 1 {
+		t.Fatalf("ready = %d, want the instance back", r)
+	}
+	if h.p.c.isLive(id) {
+		t.Fatal("a requeued instance is still tracked as in use")
+	}
+}

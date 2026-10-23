@@ -273,3 +273,61 @@ func TestReaper_YoungAreReportedAndLastIsKept(t *testing.T) {
 	cancel()
 	<-done
 }
+
+func TestReaper_StoppedOrphanIsNotDeregistered(t *testing.T) {
+	// The runner name on a stopped claimed instance may belong to a live
+	// cold launch that fell back after the claim failed: never deregister it.
+	f := newFakeEC2()
+	f.put(job("shared-name", TagPool, PoolClaimed), types.InstanceStateNameStopped, old, true)
+	g := &githubRunners{}
+	r, _ := reaperFor(f, g, nil)
+	r.Sweep(context.Background())
+	if len(g.removed) != 0 {
+		t.Fatalf("deregistered %v for a stopped instance", g.removed)
+	}
+}
+
+func TestReaper_YoungRequestOfAnUnlistedInstanceIsKept(t *testing.T) {
+	// A pool instance launched while the sweep lists: its request is listed,
+	// the instance not yet. The request must not be cancelled.
+	f := newFakeEC2()
+	id := f.put(job("", TagPool, PoolWarming, TagTier, "pooled"), types.InstanceStateNamePending, time.Now(), true)
+	f.invisible[id] = true
+	r, _ := reaperFor(f, &githubRunners{}, nil)
+	rep, _ := r.Sweep(context.Background())
+	if len(rep.SpotRequests) != 0 {
+		t.Fatalf("cancelled %v: a young request whose instance was not listed yet", rep.SpotRequests)
+	}
+}
+
+func TestReaper_RequestOfATrackedInstanceIsKept(t *testing.T) {
+	f := newFakeEC2()
+	id := f.put(job("", TagPool, PoolWarming, TagTier, "pooled"), types.InstanceStateNamePending, old, true)
+	f.invisible[id] = true
+	r, c := reaperFor(f, &githubRunners{}, nil)
+	c.track(id)
+	rep, _ := r.Sweep(context.Background())
+	if len(rep.SpotRequests) != 0 {
+		t.Fatalf("cancelled %v: the request of an instance this process tracks", rep.SpotRequests)
+	}
+}
+
+func TestReaper_ReadsEveryPage(t *testing.T) {
+	f := newFakeEC2()
+	f.pageSize = 2
+	for i := range 5 {
+		f.put(job(fmt.Sprintf("r%d", i), TagPool, PoolClaimed), types.InstanceStateNameStopped, old, true)
+	}
+	gone := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameTerminated, old, true)
+	r, _ := reaperFor(f, &githubRunners{}, nil)
+	rep, err := r.Sweep(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Instances) != 5 {
+		t.Fatalf("reaped %d of 5 stopped orphans across pages", len(rep.Instances))
+	}
+	if !slices.Contains(rep.SpotRequests, "sir-"+gone) {
+		t.Fatalf("missed the orphan request on a later page: %v", rep.SpotRequests)
+	}
+}
