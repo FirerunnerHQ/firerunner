@@ -389,6 +389,14 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			if t.Drift != "" {
 				fmt.Fprintf(w, "  %s DRIFT: %s\n", t.Name, t.Drift)
 			}
+			if sz := t.Sizes; sz != nil {
+				window := "base sizes (outside every window)"
+				if sz.Window != "" {
+					window = "window " + sz.Window
+				}
+				fmt.Fprintf(w, "  %s schedule: %s: %d hot runner(s), pool %d, since %s\n",
+					t.Name, window, sz.Min, sz.Pool, sz.Since.UTC().Format(time.RFC3339))
+			}
 			if t.Recycles > 0 || t.LostRunners > 0 {
 				fmt.Fprintf(w, "  %s repairs: %d session recycle(s), %d lost runner(s) cancelled\n", t.Name, t.Recycles, t.LostRunners)
 			}

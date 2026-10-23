@@ -704,3 +704,32 @@ func TestStatusShowsTheReaper(t *testing.T) {
 		t.Fatalf("status:\n%s", text.String())
 	}
 }
+
+func TestStatusShowsScheduledSizes(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	since := time.Date(2026, 10, 19, 22, 0, 0, 0, time.UTC)
+	writeListenerHealth(t, dir, now,
+		health.Tier{Name: "in", State: health.Connected, Since: now,
+			Sizes: &health.Sizes{Min: 2, Pool: 12, Window: "mon-fri 06:00-13:00", Since: since}},
+		health.Tier{Name: "out", State: health.Connected, Since: now,
+			Sizes: &health.Sizes{Min: 0, Pool: 2, Since: since}},
+		health.Tier{Name: "plain", State: health.Connected, Since: now})
+	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: dir, TapPrefix: "fr", NetBase: 16}}
+	var text bytes.Buffer
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	out := text.String()
+	for _, want := range []string{
+		"in schedule: window mon-fri 06:00-13:00: 2 hot runner(s), pool 12, since 2026-10-19T22:00:00Z",
+		"out schedule: base sizes (outside every window): 0 hot runner(s), pool 2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status missing %q\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "plain schedule") {
+		t.Errorf("an unscheduled tier shows a schedule\n%s", out)
+	}
+}
