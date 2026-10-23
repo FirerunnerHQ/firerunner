@@ -266,12 +266,12 @@ var (
 // session's statistics re-drive the desired count. Run ends only on an error
 // retrying cannot fix: rejected credentials (ErrFatal, which stops this tier
 // alone) or a deleted scale set (ErrRestart, which restarts the daemon).
-func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
+func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc, onCompleted CompletedFunc, capacity CapacityFunc) error {
 	sess := s.session
 	backoff := reconnectMin
 	for {
 		started := time.Now()
-		err := s.runSession(ctx, sess, onDesired, onBusy, capacity)
+		err := s.runSession(ctx, sess, onDesired, onBusy, onCompleted, capacity)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -337,7 +337,7 @@ func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFu
 }
 
 // runSession listens on one session until it fails or ctx ends.
-func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired DesiredFunc, onBusy BusyFunc, capacity CapacityFunc) error {
+func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired DesiredFunc, onBusy BusyFunc, onCompleted CompletedFunc, capacity CapacityFunc) error {
 	// Recycle ends this session (and only this one) to make Run reopen it.
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -361,6 +361,7 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		onDesired:    onDesired,
 		onJobStarted: s.cfg.OnJobStarted,
 		onBusy:       onBusy,
+		onCompleted:  onCompleted,
 		minRunners:   s.cfg.MinRunners,
 		maxRunners:   s.cfg.MaxRunners,
 		log:          s.log,
@@ -521,8 +522,10 @@ func (s *ScaleSet) Close(ctx context.Context) error {
 }
 
 // scaler adapts GitHub's scale-set callbacks onto firerunner's DesiredFunc.
-// Because every microVM is ephemeral and self-terminating, job start/completion
-// mark the VM busy for shutdown drain and dispatch trusted identity resolution.
+// Because every microVM is ephemeral and self-terminating, job start marks the
+// VM busy for shutdown drain and dispatches trusted identity resolution, and
+// job completion tells the scheduler the VM's exit may re-plan for the jobs
+// queued behind it.
 // JobStarted is a second, independent busy signal alongside the guest console
 // marker the provisioner watches: the console marker fires the instant the guest
 // dequeues a job (the primary, earliest source), while the scale-set protocol's
@@ -539,6 +542,7 @@ type scaler struct {
 	onJobStarted func(context.Context, jobidentity.Job)
 	onDesired    DesiredFunc
 	onBusy       BusyFunc
+	onCompleted  CompletedFunc
 	capacity     CapacityFunc
 	setCapacity  func(int)
 	minRunners   int
@@ -591,6 +595,9 @@ func (a *scaler) HandleJobStarted(ctx context.Context, j *scaleset.JobStarted) e
 
 func (a *scaler) HandleJobCompleted(_ context.Context, j *scaleset.JobCompleted) error {
 	a.log.Info("job completed", "runner", j.RunnerName, "result", j.Result)
+	if a.onCompleted != nil && j.RunnerName != "" {
+		a.onCompleted(j.RunnerName)
+	}
 	return nil
 }
 
