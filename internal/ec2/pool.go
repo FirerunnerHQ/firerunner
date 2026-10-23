@@ -44,7 +44,7 @@ type Pool struct {
 
 	mu       sync.Mutex
 	ready    []pooled
-	warming  map[string]bool
+	warming  map[string]time.Time // instance -> when it was launched
 	wake     chan struct{}
 	failures int
 	retryAt  time.Time
@@ -58,10 +58,15 @@ type pooled struct {
 // poolRetryMax caps the backoff between failed warm launches.
 const poolRetryMax = 5 * time.Minute
 
+// warmMax bounds a warm-up boot. An instance still not stopped after it never
+// will be (a wrong image, a boot script that cannot finish): it is discarded,
+// so it stops billing and its place in the pool is refilled.
+var warmMax = 10 * time.Minute
+
 func newPool(p *Provisioner, target int) *Pool {
 	return &Pool{
 		p: p, target: target, log: p.log.With("pool", target), tick: 15 * time.Second, now: time.Now,
-		warming: map[string]bool{}, wake: make(chan struct{}, 1),
+		warming: map[string]time.Time{}, wake: make(chan struct{}, 1),
 	}
 }
 
@@ -129,7 +134,7 @@ func (pl *Pool) discover(ctx context.Context) error {
 					pl.markReady(ctx, i)
 				} else {
 					pl.mu.Lock()
-					pl.warming[id] = true
+					pl.warming[id] = aws.ToTime(i.LaunchTime)
 					pl.mu.Unlock()
 				}
 			}
@@ -140,7 +145,8 @@ func (pl *Pool) discover(ctx context.Context) error {
 	return nil
 }
 
-// refresh moves warming instances that have stopped into the pool.
+// refresh moves warming instances that have stopped into the pool, and
+// discards ones that have warmed longer than warmMax.
 func (pl *Pool) refresh(ctx context.Context) {
 	pl.mu.Lock()
 	ids := make([]string, 0, len(pl.warming))
@@ -167,6 +173,19 @@ func (pl *Pool) refresh(ctx context.Context) {
 				pl.mu.Lock()
 				delete(pl.warming, aws.ToString(i.InstanceId))
 				pl.mu.Unlock()
+			default:
+				id := aws.ToString(i.InstanceId)
+				pl.mu.Lock()
+				since, ok := pl.warming[id]
+				pl.mu.Unlock()
+				if ok && !since.IsZero() && pl.now().Sub(since) > warmMax {
+					pl.log.Warn("pool instance did not finish warming; discarding it", "instance", id, "warming", pl.now().Sub(since).Round(time.Second))
+					if pl.discard(ctx, id, aws.ToString(i.SpotInstanceRequestId)) {
+						pl.mu.Lock()
+						delete(pl.warming, id)
+						pl.mu.Unlock()
+					}
+				}
 			}
 		}
 	}
@@ -212,7 +231,7 @@ func (pl *Pool) fill(ctx context.Context) {
 		id := aws.ToString(inst.InstanceId)
 		pl.log.Info("warming pool instance", "instance", id, "type", inst.InstanceType)
 		pl.mu.Lock()
-		pl.warming[id] = true
+		pl.warming[id] = pl.now()
 		pl.failures = 0
 		pl.mu.Unlock()
 	}
@@ -232,11 +251,19 @@ var errPoolEmpty = errors.New("no ready pool instance")
 
 // claim takes a ready instance for the runner and prepares it to start: it is
 // tagged claimed and the JIT endpoint is written into its user-data. Its spot
-// request stays open until it has started (see cancelSpot). An instance that
-// cannot be prepared is terminated and the next one is tried.
+// request stays open until it has started (see cancelSpot).
+//
+// Only an error about that one instance (it is no longer stopped, or gone)
+// discards it and tries the next. Anything else (ctx cancelled, missing
+// permissions, throttling) would fail for every instance alike, so the
+// instance goes back to the pool and the error is returned: emptying the pool
+// on such an error would re-warm it for every job.
 func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 	defer pl.poke() // refill behind the claim
 	for {
+		if err := ctx.Err(); err != nil {
+			return pooled{}, err
+		}
 		pl.mu.Lock()
 		if len(pl.ready) == 0 {
 			pl.mu.Unlock()
@@ -245,13 +272,36 @@ func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 		in := pl.ready[0]
 		pl.ready = pl.ready[1:]
 		pl.mu.Unlock()
-		if err := pl.prepare(ctx, in, runner); err != nil {
+		err := pl.prepare(ctx, in, runner)
+		switch {
+		case err == nil:
+			return in, nil
+		case instanceGone(err):
 			pl.log.Warn("pool instance could not be prepared; discarding it", "instance", in.id, "err", err)
 			pl.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
 			continue
+		default:
+			pl.requeue(context.WithoutCancel(ctx), in)
+			return pooled{}, err
 		}
-		return in, nil
 	}
+}
+
+// instanceGone reports an error about one instance's own state, which no
+// other pool instance shares.
+func instanceGone(err error) bool {
+	return isCode(err, "IncorrectInstanceState") || isCode(err, errNotFound)
+}
+
+// requeue returns an unused instance to the pool, retagging it ready if the
+// claim had tagged it.
+func (pl *Pool) requeue(ctx context.Context, in pooled) {
+	if err := pl.tag(ctx, in.id, TagPool, PoolReady); err != nil {
+		pl.log.Warn("retag pool instance ready", "instance", in.id, "err", err)
+	}
+	pl.mu.Lock()
+	pl.ready = append([]pooled{in}, pl.ready...)
+	pl.mu.Unlock()
 }
 
 func (pl *Pool) prepare(ctx context.Context, in pooled, runner string) error {
@@ -283,17 +333,32 @@ func (pl *Pool) cancelSpot(ctx context.Context, req string) error {
 	return err
 }
 
-// discard cancels an instance's spot request, if any, then terminates it.
-func (pl *Pool) discard(ctx context.Context, id, spotReq string) {
+// discard cancels an instance's spot request, if any, then terminates it, and
+// reports whether it did. It never terminates while the request may still be
+// open, since AWS would launch an untracked replacement: on a failed cancel
+// the instance is left (tagged as it is) for the next sweep or rediscovery.
+func (pl *Pool) discard(ctx context.Context, id, spotReq string) bool {
 	api := pl.p.c.api
 	if spotReq != "" {
-		if _, err := api.CancelSpotInstanceRequests(ctx, &ec2.CancelSpotInstanceRequestsInput{SpotInstanceRequestIds: []string{spotReq}}); err != nil {
-			pl.log.Warn("cancel spot request", "request", spotReq, "err", err)
+		var err error
+		for attempt := range 3 {
+			if err = pl.cancelSpot(ctx, spotReq); err == nil {
+				break
+			}
+			if attempt < 2 {
+				time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+			}
+		}
+		if err != nil {
+			pl.log.Warn("cancel spot request; leaving the instance for the next sweep", "request", spotReq, "instance", id, "err", err)
+			return false
 		}
 	}
 	if _, err := api.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{id}}); err != nil {
 		pl.log.Warn("terminate pool instance", "instance", id, "err", err)
+		return false
 	}
+	return true
 }
 
 func (pl *Pool) tag(ctx context.Context, id, key, value string) error {

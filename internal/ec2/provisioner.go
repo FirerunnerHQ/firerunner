@@ -134,7 +134,7 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 			return err
 		}
 		if errors.Is(err, errPoolStart) {
-			p.log.Warn("pool instance did not start; cold-launching instead", "runner", name, "err", err)
+			p.log.Warn("pool instance unavailable; cold-launching instead", "runner", name, "err", err)
 		}
 	}
 	entered := time.Now()
@@ -178,18 +178,23 @@ var errPoolStart = errors.New("pool instance did not start")
 func (p *Provisioner) launchPooled(ctx context.Context, name, jit string) error {
 	entered := time.Now()
 	in, err := p.pool.claim(ctx, name)
-	if err != nil {
+	switch {
+	case errors.Is(err, errPoolEmpty), err != nil && ctx.Err() != nil:
 		return err
+	case err != nil:
+		// A pool-wide failure (permissions, throttling): this job cold-
+		// launches; the instance went back to the pool.
+		return fmt.Errorf("%w: claim: %w", errPoolStart, err)
 	}
 	log := p.log.With("runner", name, "instance", in.id, "type", in.itype, "pooled", true)
 	ip, err := netip.ParseAddr(in.ip)
 	if err != nil {
-		p.pool.discard(context.WithoutCancel(ctx), in.id, "")
+		p.pool.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
 		return fmt.Errorf("%w: pool instance %s private IP %q: %w", errPoolStart, in.id, in.ip, err)
 	}
 	// Register before the start, so the boot script's first fetch succeeds.
 	if err := p.o.JIT.Register(ip, name, jit); err != nil {
-		p.pool.discard(context.WithoutCancel(ctx), in.id, "")
+		p.pool.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
 		return fmt.Errorf("register jit config for %s at %s: %w", in.id, ip, err)
 	}
 	defer p.o.JIT.Revoke(ip)

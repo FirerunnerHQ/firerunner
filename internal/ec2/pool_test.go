@@ -101,17 +101,15 @@ func TestLaunch_ClaimsFromPool(t *testing.T) {
 		return len(h.f.started) == 1
 	})
 	in := h.f.instance(pooledID)
-	// Claimed: tagged, its spot request cancelled before the start, and
-	// told where to fetch its config.
+	// Claimed: tagged, told where to fetch its config, started, and then its
+	// spot request cancelled.
 	if in.tags[TagPool] != PoolClaimed || in.tags[TagRunner] != "runner-1" {
 		t.Fatalf("claimed tags = %v", in.tags)
 	}
 	if !strings.HasPrefix(in.userData, "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit") {
 		t.Fatalf("claimed user-data = %q", in.userData)
 	}
-	if open := h.f.openSpotRequests(); len(open) != 0 {
-		t.Fatalf("spot requests still open after the claim: %v", open)
-	}
+	eventually(t, "the spot request cancelled after the start", func() bool { return len(h.f.openSpotRequests()) == 0 })
 	// The config was registered before the start, so the first fetch works.
 	if code, body := h.fetch(in.ip); code != http.StatusOK || body != testJIT {
 		t.Fatalf("fetch = %d %q", code, body)
@@ -146,12 +144,11 @@ func TestLaunch_IgnoresStoppedBeforeTheStart(t *testing.T) {
 	eventually(t, "a ready instance", func() bool { r, _ := h.p.pool.Ready(); return r == 1 })
 	id := h.f.launched()[0].id
 	h.f.mu.Lock()
-	h.f.startErr = nil
+	h.f.startStaysStopped = true // describe keeps reporting stopped after the start
 	h.f.mu.Unlock()
 	errc := h.launch(context.Background())
 	eventually(t, "the start", func() bool { h.f.mu.Lock(); defer h.f.mu.Unlock(); return len(h.f.started) == 1 })
-	h.f.setState(id, types.InstanceStateNameStopped) // a stale read before the start shows
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(30 * time.Millisecond) // several polls of the stale "stopped"
 	if ids := h.f.terminatedIDs(); len(ids) != 0 {
 		t.Fatalf("terminated %v on a stale stopped state", ids)
 	}
@@ -237,9 +234,7 @@ func TestPool_RediscoversAfterRestart(t *testing.T) {
 	defer func() { cancel2(); <-done }()
 
 	eventually(t, "the ready one rediscovered", func() bool { r, _ := p2.pool.Ready(); return r >= 1 })
-	if s := h.f.state(ids[1]); s != types.InstanceStateNameShuttingDown {
-		t.Fatalf("claimed leftover state %q, want terminated", s)
-	}
+	eventually(t, "the claimed leftover terminated", func() bool { return h.f.state(ids[1]) == types.InstanceStateNameShuttingDown })
 	if open := h.f.openSpotRequests(); len(open) != 0 {
 		t.Fatalf("open spot requests behind discarded instances: %v", open)
 	}
@@ -316,4 +311,99 @@ func TestLaunch_SpotCancelRetriedBeforeTerminate(t *testing.T) {
 	if !h.f.cancelled[h.f.instances[id].spotReq] {
 		t.Fatal("the spot request was never cancelled")
 	}
+}
+
+// readyPool returns a harness whose pool holds n ready instances.
+func readyPool(t *testing.T, n int) *harness {
+	t.Helper()
+	h := poolHarness(t, n, config.MarketSpot)
+	h.runPool(t)
+	eventually(t, "warming", func() bool { _, w := h.p.pool.Ready(); return w == n })
+	h.stopWarming()
+	eventually(t, "ready", func() bool { r, _ := h.p.pool.Ready(); return r == n })
+	return h
+}
+
+func TestPool_PoolWideClaimErrorKeepsThePool(t *testing.T) {
+	// Missing permissions or throttling would fail for every instance: the
+	// pool must not be emptied (and re-warmed) for each job. The job cold-
+	// launches; the instance stays in the pool.
+	h := readyPool(t, 2)
+	h.f.mu.Lock()
+	h.f.tagErr = apiErr("UnauthorizedOperation")
+	h.f.mu.Unlock()
+	errc := h.launch(context.Background())
+	var cold *fakeInstance
+	eventually(t, "a cold launch", func() bool {
+		for _, i := range h.f.launched() {
+			if i.tags[TagRunner] == "runner-1" && i.tags[TagPool] == "" {
+				cold = i
+				return true
+			}
+		}
+		return false
+	})
+	if r, _ := h.p.pool.Ready(); r != 2 {
+		t.Fatalf("ready = %d after a pool-wide error, want both kept", r)
+	}
+	if ids := h.f.terminatedIDs(); len(ids) != 0 {
+		t.Fatalf("terminated %v", ids)
+	}
+	h.f.mu.Lock()
+	h.f.tagErr = nil
+	h.f.mu.Unlock()
+	eventually(t, "the cold instance registered", func() bool { return h.jit.Pending(netip.MustParseAddr(cold.ip)) })
+	h.f.setState(cold.id, types.InstanceStateNameTerminated)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPool_ClaimWithCancelledContextKeepsThePool(t *testing.T) {
+	h := readyPool(t, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := h.p.pool.claim(ctx, "runner-x"); err == nil {
+		t.Fatal("claim with a cancelled context succeeded")
+	}
+	if r, _ := h.p.pool.Ready(); r != 2 {
+		t.Fatalf("ready = %d after a cancelled claim, want 2", r)
+	}
+	if ids := h.f.terminatedIDs(); len(ids) != 0 {
+		t.Fatalf("terminated %v on a cancelled claim", ids)
+	}
+}
+
+func TestPool_DiscardNeverTerminatesWithAnOpenRequest(t *testing.T) {
+	h := readyPool(t, 1)
+	in := h.f.launched()[0]
+	h.f.mu.Lock()
+	h.f.cancelErrs = 3 // every retry fails
+	h.f.mu.Unlock()
+	if h.p.pool.discard(context.Background(), in.id, in.spotReq) {
+		t.Fatal("discard reported success with the spot request still open")
+	}
+	if ids := h.f.terminatedIDs(); len(ids) != 0 {
+		t.Fatalf("terminated %v with its request open", ids)
+	}
+	// A later attempt, once cancelling works, terminates it.
+	if !h.p.pool.discard(context.Background(), in.id, in.spotReq) {
+		t.Fatal("discard failed once cancelling works")
+	}
+}
+
+func TestPool_StuckWarmingIsDiscardedAndRefilled(t *testing.T) {
+	old := warmMax
+	warmMax = 30 * time.Millisecond
+	t.Cleanup(func() { warmMax = old })
+	h := poolHarness(t, 1, config.MarketSpot)
+	h.runPool(t)
+	eventually(t, "warming", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
+	stuck := h.f.launched()[0].id
+	h.f.setState(stuck, types.InstanceStateNameRunning) // its warm-up never powers off
+	eventually(t, "the stuck instance discarded", func() bool { return h.f.state(stuck) == types.InstanceStateNameShuttingDown })
+	if open := h.f.openSpotRequests(); len(open) != 0 {
+		t.Fatalf("spot requests left open: %v", open)
+	}
+	eventually(t, "a replacement warming", func() bool { return len(h.f.launched()) == 2 })
 }

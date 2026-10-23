@@ -58,7 +58,12 @@ type fakeEC2 struct {
 	// afterRun runs (without the lock held) once an instance is created.
 	afterRun func(id string)
 	// startErr fails StartInstances; started records started IDs.
-	startErr  error
+	// startStaysStopped leaves a started instance reporting stopped, as a
+	// stale read right after StartInstances can.
+	startErr          error
+	startStaysStopped bool
+	// tagErr fails CreateTags.
+	tagErr    error
 	started   []string
 	cancelled map[string]bool // spot request ID -> cancelled
 	// cancelErrs fails this many CancelSpotInstanceRequests calls first.
@@ -204,7 +209,9 @@ func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput,
 		if i.spotReq != "" && f.cancelled[i.spotReq] {
 			return nil, apiErr("IncorrectSpotRequestState")
 		}
-		i.state = types.InstanceStateNamePending
+		if !f.startStaysStopped {
+			i.state = types.InstanceStateNamePending
+		}
 		f.started = append(f.started, id)
 	}
 	return &ec2.StartInstancesOutput{}, nil
@@ -230,6 +237,9 @@ func (f *fakeEC2) ModifyInstanceAttribute(_ context.Context, in *ec2.ModifyInsta
 func (f *fakeEC2) CreateTags(_ context.Context, in *ec2.CreateTagsInput, _ ...func(*ec2.Options)) (*ec2.CreateTagsOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.tagErr != nil {
+		return nil, f.tagErr
+	}
 	for _, id := range in.Resources {
 		if i, ok := f.instances[id]; ok {
 			for _, t := range in.Tags {
