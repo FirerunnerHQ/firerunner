@@ -64,6 +64,52 @@ Placeholders such as `subnet-0aaa…` are fine.
 - Shell scripts under `images/` have shell tests (`images/test-*.sh`) that
   stub external commands. Keep them shellcheck-clean.
 
+## Known pitfalls
+
+- **`scaleset.Client` serialises every call.** In `actions/scaleset` v0.4.0 its
+  `mu` is held across the whole HTTP request and is not context-aware, so a
+  context deadline does not bound a call while another goroutine holds the
+  client. Give each concurrent use its own client: `internal/listener` keeps
+  separate ones for message sessions, runner removal and a pool for JIT
+  generation. Do not add a second user to an existing client.
+- **Persistent spot requests: cancel after the start.** A stopped instance
+  whose persistent request was cancelled can never start again
+  (`IncorrectSpotRequestState`), and terminating one whose request is still
+  open makes AWS launch a replacement. So the stopped pool starts, then
+  cancels, then may terminate (`internal/ec2/provisioner.go`). Persistent
+  requests also reject terminate-on-shutdown; one-time spot accepts it. The
+  fake in `internal/ec2/fake_test.go` encodes these rules (`StartInstances`,
+  `termBeforeCancel`); if you learn a new AWS rule, add it there first.
+- **Changing a flag's or option's meaning:** sweep `README.md`,
+  `config.example.env`, `deploy/` and code comments in the same commit, e.g.
+  `git grep -n -e '--max-runners' -e FR_MAX_RUNNERS`. Stale mentions found one
+  per review round cost one PR five rounds.
+- **Secrets are never flag defaults.** The flag package prints defaults in
+  `-h` and on every parse error. `internal/config` registers `--token` and
+  `--app-private-key` with an empty default and reads `FR_TOKEN` /
+  `FR_APP_PRIVATE_KEY` after parsing; follow that for any new credential.
+
+## Shell and test hygiene for agents
+
+The usual dev box is macOS with zsh; much of the code and CI is Linux.
+
+- **zsh globs.** An unmatched glob aborts the command: `grep -r --include=*.go
+  x .` prints "no matches found" and exits 1, which looks like an empty
+  result. Quote globs, or use `git grep -n x -- '*.go'` or `rg -g '*.go'`. zsh
+  also does not word-split `$VAR`; use arrays.
+- **Pipes hide failures.** `go test ./... | tail` exits with `tail`'s status;
+  a failing test was committed that way. Use `set -o pipefail`, or check
+  `${pipestatus[1]}` (zsh) / `${PIPESTATUS[0]}` (bash).
+- **Always pass `-timeout`** (e.g. `go test -timeout 120s ./internal/ec2/...`).
+  The default is 10 minutes, longer than an agent's tool call limit, so a hang
+  is reported as a tool timeout rather than a goroutine dump.
+- **BSD userland.** macOS has no `timeout`, and `sed -i` needs `''`. The
+  shell tests under `images/` run on both macOS and Linux in `make check`, so
+  keep them portable.
+- **Linux-only files** (`_linux.go`, `//go:build linux`) are skipped by a
+  darwin build, so a green `go vet` there proves nothing about them: run
+  `GOOS=linux go vet ./...` too.
+
 ## Where things are
 
 | path | what |
