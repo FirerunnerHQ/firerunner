@@ -37,7 +37,7 @@ waited() { [ "$(date +%s)" -lt "$deadline" ] || die "timed out: $1"; sleep "$pol
 asg=$(output AutoScalingGroup)
 prefix=$(output ParameterPrefix)
 repo=$(param_value ReleaseRepo)
-[ -n "$asg" ] && [ "$asg" != None ] || die "stack $stack has no AutoScalingGroup output"
+if [ -z "$asg" ] || [ "$asg" = None ]; then die "stack $stack has no AutoScalingGroup output"; fi
 
 # Refuse a version the VM could not install, before touching anything.
 sums="https://github.com/$repo/releases/download/$version/SHA256SUMS"
