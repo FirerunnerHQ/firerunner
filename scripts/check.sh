@@ -123,6 +123,16 @@ step dev-env scripts/test-dev-env.sh
 step check-remote scripts/test-check-remote.sh
 step control-bootstrap deploy/cloudformation/test-control-bootstrap.sh
 step deploy-control deploy/cloudformation/test-deploy-control.sh
+# cfn-lint: installed, or run through uvx/pipx at the version CI pins.
+if command -v cfn-lint >/dev/null; then
+	step cfn-lint cfn-lint deploy/cloudformation/*.yaml
+elif command -v uvx >/dev/null; then
+	step cfn-lint uvx --from cfn-lint==1.58.0 cfn-lint deploy/cloudformation/*.yaml
+elif command -v pipx >/dev/null; then
+	step cfn-lint pipx run cfn-lint==1.58.0 deploy/cloudformation/*.yaml
+else
+	skip cfn-lint "neither cfn-lint, uvx nor pipx installed"
+fi
 if command -v shellcheck >/dev/null; then
 	step shellcheck shellcheck images/assets/firerunner-ec2-run.sh images/test-ec2-run.sh \
 		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh scripts/check.sh \
