@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -180,8 +181,18 @@ func TestLaunch_RunInstancesInput(t *testing.T) {
 					t.Errorf("%s tags = %v", ts.ResourceType, got)
 				}
 			}
-			if len(in.TagSpecifications) != 2 {
-				t.Errorf("tag specs = %d, want instance and volume", len(in.TagSpecifications))
+			// Instance and volume always; a spot request too, so a role
+			// scoped to the owner tag may cancel it.
+			want := []types.ResourceType{types.ResourceTypeInstance, types.ResourceTypeVolume}
+			if mkt == config.MarketSpot {
+				want = append(want, types.ResourceTypeSpotInstancesRequest)
+			}
+			var gotTypes []types.ResourceType
+			for _, ts := range in.TagSpecifications {
+				gotTypes = append(gotTypes, ts.ResourceType)
+			}
+			if fmt.Sprint(gotTypes) != fmt.Sprint(want) {
+				t.Errorf("tagged %v, want %v", gotTypes, want)
 			}
 			if tok := aws.ToString(in.ClientToken); tok == "" || len(tok) > 64 {
 				t.Errorf("ClientToken = %q, want 1-64 chars", tok)
