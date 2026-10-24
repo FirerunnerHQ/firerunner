@@ -163,6 +163,7 @@ fresh() {
 	export STATE AWS_REGION=test-region-1 FR_E2E_REPO=owner/repo FR_E2E_CONTROL_INSTANCE=i-0control
 	# Never the .claude/e2e.env of the machine running the tests; a fixed owner.
 	export FR_E2E_ENV_FILE=none FR_OWNER=e2e-test FR_E2E_ARTIFACTS="$STATE/artifacts"
+	export AWS_CONFIG_FILE="$STATE/aws-config" AWS_SHARED_CREDENTIALS_FILE="$STATE/aws-credentials"
 	unset FR_E2E_WORKFLOW FR_E2E_REF FR_E2E_START_DEADLINE FR_E2E_RUN_DEADLINE FR_E2E_EXEC_DEADLINE FR_E2E_POLL AWS_PROFILE
 	unset FR_E2E_STACK FR_E2E_BUCKET FR_E2E_VERSION FR_E2E_TIER_SUFFIX FR_E2E_STACK_DEADLINE
 }
@@ -673,18 +674,35 @@ envrun() {
 
 fresh env-files
 answer control-vms 1 '{"Reservations":[]}'
+echo "[main profile]" >"$AWS_SHARED_CREDENTIALS_FILE"
 envrun "$W"
 out_has() { grep -qF -- "$1" "$STATE/out"; }
+out_re() { grep -qE -- "$1" "$STATE/out"; }
+owner_of() { sed -n 's/^owner    FR_OWNER=//p' "$STATE/out"; }
 not_out_owner() { ! grep -q FR_OWNER "$STATE/out"; }
 expect "e2e.env: a worktree reads the main checkout's file" "$(dump)" out_has "set      AWS_REGION=main-region"
 expect "e2e.env: its own file wins over the main checkout's" "" out_has "set      FR_E2E_STACK=wt-stack"
-expect "e2e.env: quotes are stripped" "" out_has "set      AWS_PROFILE=main profile"
+expect "e2e.env: quotes are stripped" "" out_has "set      AWS_PROFILE=main profile (in $AWS_SHARED_CREDENTIALS_FILE)"
 expect "e2e.env: export prefix is accepted" "" out_has "set      FR_E2E_REPO=o/r"
 expect "e2e.env: values are literal" "" out_has "set      FR_E2E_REF=\$HOME"
-expect "e2e.env: a worktree ignores the shared file's FR_OWNER" "" out_has "FR_OWNER=e2e-feat-x-2"
+expect "e2e.env: a worktree ignores the shared file's FR_OWNER" "$(owner_of)" out_re "^owner    FR_OWNER=e2e-feat-x-2-[0-9a-f]{6}$"
 expect "e2e.env: and says so" "" err_has "FR_OWNER is per session"
 expect "e2e.env: other variables are ignored" "" err_has "BOGUS is not"
-expect "e2e.env: tier suffix follows the owner" "" out_has "FR_E2E_TIER_SUFFIX=feat-x-2"
+expect "e2e.env: tier suffix follows the owner" "" out_has "FR_E2E_TIER_SUFFIX=$(owner_of | sed 's/^e2e-//')"
+first="$(owner_of)"
+envrun "$W"
+expect "owner: the same worktree always derives the same owner" "$first / $(owner_of)" [ "$(owner_of)" = "$first" ]
+# Two worktrees whose names agree in the first 20 characters, the slug's length.
+for t in issue-100-agent-harness-a issue-100-agent-harness-b; do
+	gitq -C "$G" worktree add -q -b "$t" "$G/.claude/worktrees/$t"
+done
+envrun "$G/.claude/worktrees/issue-100-agent-harness-a"
+own_a="$(owner_of)"
+envrun "$G/.claude/worktrees/issue-100-agent-harness-b"
+own_b="$(owner_of)"
+expect "owner: worktrees with a common prefix get different owners" "$own_a / $own_b" \
+	test -n "$own_a" -a "$own_a" != "$own_b"
+expect "owner: a derived owner fits in 40 characters" "$own_a" [ "${#own_a}" -le 40 ]
 ENVRUN_SET=AWS_REGION=from-env envrun "$W"
 expect "e2e.env: the environment wins over the file" "$(dump)" out_has "set      AWS_REGION=from-env"
 envrun "$W" --exports
@@ -692,7 +710,18 @@ expect "e2e.env: --exports prints export lines" "$(dump)" grep -qx "export AWS_P
 expect "e2e.env: --exports never exports the owner" "" not_out_owner
 expect "e2e.env: --exports output evaluates" "" [ "$(bash -c ". '$STATE/out'; printf '%s' \"\$AWS_PROFILE|\$FR_E2E_REF\"")" = "main profile|\$HOME" ]
 envrun "$G"
-expect "e2e.env: the main checkout's own file may set FR_OWNER" "$(dump)" out_has "FR_OWNER=someone-else (set)"
+expect "e2e.env: the main checkout's file never sets FR_OWNER, even for itself" "$(dump)" out_has "MISSING  FR_OWNER"
+expect "e2e.env: and says so" "" err_has "FR_OWNER is per session"
+: >"$AWS_SHARED_CREDENTIALS_FILE"
+ENVRUN_SET=AWS_PROFILE=e2e envrun "$G"
+expect "env.sh: a profile in neither AWS file is missing" "$(dump)" \
+	out_has "MISSING  AWS_PROFILE=e2e: no [e2e] in $AWS_SHARED_CREDENTIALS_FILE, no [profile e2e] in $AWS_CONFIG_FILE"
+echo "[profile e2e]" >"$AWS_CONFIG_FILE"
+ENVRUN_SET=AWS_PROFILE=e2e envrun "$G"
+expect "env.sh: finds a profile in the config file" "$(dump)" out_has "set      AWS_PROFILE=e2e (in $AWS_CONFIG_FILE)"
+printf '[x]\n[e2e]\n' >"$AWS_SHARED_CREDENTIALS_FILE"
+ENVRUN_SET=AWS_PROFILE=e2e envrun "$G"
+expect "env.sh: finds a profile in the credentials file" "$(dump)" out_has "set      AWS_PROFILE=e2e (in $AWS_SHARED_CREDENTIALS_FILE)"
 envrun "$G" --bogus
 expect "env.sh: rejects an unknown argument" "$(dump)" rc_is 2
 : >"$STATE/calls"
@@ -779,6 +808,17 @@ expect "cleanup: refuses while the owner's control VM is live" "$(dump)" rc_is 1
 expect "cleanup: finds its owner through the stack" "" called "describe-stacks --stack-name st-e2e-test"
 expect "cleanup: says to stop it first" "" err_has "control-vm.sh down"
 expect "cleanup: terminates nothing while it is live" "" not_called "terminate-instances"
+
+fresh inventory-owner-unknown
+inventory_answers
+answer control-vms 1 '{"Reservations":[{"Instances":[{"InstanceId":"i-0ctl","State":{"Name":"running"},"Tags":[{"Key":"Name","Value":"st-x-control"},{"Key":"firerunner:control","Value":"st-x"}]}]}]}'
+answer owner-st-x 1 "!err AccessDenied"
+run inventory.sh --cleanup --yes
+expect "cleanup: a control VM whose owner cannot be read stops it" "$(dump)" rc_is 1
+expect "cleanup: terminates nothing then" "" not_called "terminate-instances"
+expect "cleanup: cancels nothing then" "" not_called "cancel-spot-instance-requests"
+run inventory.sh
+expect "inventory: listing still works without the owner" "$(dump)" last_json '.control_vms == []'
 
 # --- watch-run consoles ------------------------------------------------------
 
@@ -893,6 +933,19 @@ expect "up: pins the shared release and its checksums" "" [ "$(ssm_val $S/contro
 expect "up: needs no download for the shared release" "" not_called "curl "
 expect "up: waits for firerunner to be active" "" [ "$(calls_of get-command-invocation)" = 2 ]
 
+vm_fresh vm-up-not-ours
+answer stack-st-e2e-test 1 "$(session_stack CREATE_COMPLETE e2e-someone)"
+run control-vm.sh up
+expect "up: refuses an existing stack made for another owner" "$(dump)" rc_is 1
+expect "up: and does not wait on it" "" not_called "send-command"
+
+vm_fresh vm-up-uppercase
+export FR_OWNER=e2e-Test
+run control-vm.sh up
+expect "up: refuses an owner with capitals" "$(dump)" rc_is 2
+expect "up: says it must be lower case" "" err_has "lower case"
+expect "up: no aws call for it" "" not_called "aws "
+
 vm_fresh vm-up-exists
 answer stack-st-e2e-test 1 "$(session_stack CREATE_COMPLETE)"
 answer invocation 1 "$(inv Success 0 $'active\nfirerunner v1.2.0\n' '')"
@@ -906,7 +959,7 @@ answer stack-st-e2e-test 2 "$(session_stack CREATE_COMPLETE)"
 answer invocation 1 "$(inv Success 0 $'active\nfirerunner v2.0.0\n' '')"
 answer curl 1 "bbb  firerunner_linux_amd64"
 run control-vm.sh up --version v2.0.0
-expect "up: --version pins that release's checksums" "$(dump)" called "curl -fsSL https://github.com/acme/fr/releases/download/v2.0.0/SHA256SUMS"
+expect "up: --version pins that release's checksums" "$(dump)" called "curl -fsSL --max-time 60 https://github.com/acme/fr/releases/download/v2.0.0/SHA256SUMS"
 expect "up: --version is what the VM installs" "" [ "$(ssm_val $S/control/version)" = v2.0.0 ]
 
 vm_fresh vm-up-shared-owner
@@ -978,6 +1031,15 @@ expect "down: deletes the session's parameters" "" test ! -e "$STATE/ssm$S/contr
 expect "down: keeps the shared parameters" "" [ -e "$STATE/ssm/fr/e2e/control/tiers" ]
 expect "down: keeps other sessions' parameters" "" [ -e "$STATE/ssm/fr/e2e/sessions/e2e-other/control/version" ]
 expect "down: reports" "" last_json '.parameters_deleted == 3 and .jit_name_deleted == true and .cleanup.terminate_instances == ["i-0mine", "i-0pool"]'
+
+vm_fresh vm-down-shared-owner
+answer stack-st 1 "$(base_stack e2e-test)"
+answer stack-st-e2e-test 1 "$NOSTACK"
+inventory_answers
+run control-vm.sh down
+expect "down: refuses the shared stack's own owner" "$(dump)" rc_is 2
+expect "down: cleans up nothing then" "" not_called "terminate-instances"
+expect "down: deletes no stack then" "" not_called "delete-stack"
 
 vm_fresh vm-down-not-ours
 answer stack-st-e2e-test 1 "$(session_stack CREATE_COMPLETE e2e-someone)"

@@ -82,7 +82,7 @@ if [ "$cmd" = list ]; then
 	exit 0
 fi
 e2e_require FR_E2E_STACK
-e2e_check_name FR_E2E_STACK "$FR_E2E_STACK"
+e2e_check_name FR_E2E_STACK "$FR_E2E_STACK" any-case
 owner="$(e2e_owner)"
 base="$FR_E2E_STACK"
 stack="$base-$owner"
@@ -164,13 +164,28 @@ report() {
 	}'
 }
 
+# mine_or_die: refuse the stack in $s unless control-vm.sh made it for this
+# owner. Another session whose owner collides must never wait on, install
+# into or delete this one.
+mine_or_die() {
+	[ "$(tag "$s" firerunner:e2e-session)" = "$owner" ] ||
+		e2e_die 1 "refusing: stack $stack was not made by control-vm.sh for $owner (no firerunner:e2e-session=$owner tag); export another FR_OWNER"
+}
+
+# not_shared_owner STACK_JSON: refuse when FR_OWNER is the shared stack's own
+# owner, whose pool and leftovers belong to the shared install.
+not_shared_owner() {
+	[ "$(param "$1" Owner)" != "$owner" ] ||
+		e2e_die 2 "FR_OWNER=$owner is the shared stack's own owner; choose one for this session"
+}
+
 # --- up ----------------------------------------------------------------------
 
 seed_and_create() {
 	local b base_prefix prefix zone_id jit zone repo base_version sums env key token tiers suffix keys a
 	b="$(stack_json "$base")"
 	[ -n "$b" ] || e2e_die 2 "FR_E2E_STACK=$base: no such stack"
-	[ "$(param "$b" Owner)" != "$owner" ] || e2e_die 2 "FR_OWNER=$owner is the shared stack's own owner; choose one for this session"
+	not_shared_owner "$b"
 	base_prefix="$(output "$b" ParameterPrefix)"
 	zone_id="$(output "$b" HostedZoneId)"
 	jit="$(output "$b" JitHost)"
@@ -187,7 +202,7 @@ seed_and_create() {
 		sums="$(ssm_get "$base_prefix/control/sha256sums")"
 	else
 		e2e_need_cmd curl
-		sums="$(curl -fsSL "https://github.com/$repo/releases/download/$version/SHA256SUMS")" ||
+		sums="$(curl -fsSL --max-time 60 "https://github.com/$repo/releases/download/$version/SHA256SUMS")" ||
 			e2e_die 2 "no release $version in $repo"
 	fi
 	grep -qE '  firerunner_linux_(amd64|arm64)$' <<<"$sums" || e2e_die 1 "the checksums of $version list no firerunner binary"
@@ -251,6 +266,7 @@ cmd_up() {
 	local st i fr=""
 	s="$(stack_json "$stack")"
 	if [ -n "$s" ]; then
+		mine_or_die
 		e2e_log "stack $stack exists ($(jq -r .StackStatus <<<"$s")); waiting for it"
 	else
 		seed_and_create
@@ -326,6 +342,7 @@ cmd_install() {
 	e2e_require FR_E2E_BUCKET
 	s="$(stack_json "$stack")"
 	[ -n "$s" ] || e2e_die 1 "no stack $stack: run scripts/e2e/control-vm.sh up first"
+	mine_or_die
 	i="$(instance)"
 	[ -n "$i" ] || e2e_die 1 "stack $stack has no in-service VM yet"
 	obj="s3://$FR_E2E_BUCKET/e2e/$owner/firerunner"
@@ -358,10 +375,11 @@ systemctl is-active firerunner || true
 
 cmd_down() {
 	local prefix="" zone_id="" jit="" st b cleanup rc=0 names n=0 rrs dns=false
+	b="$(stack_json "$base")"
+	[ -z "$b" ] || not_shared_owner "$b"
 	s="$(stack_json "$stack")"
 	if [ -n "$s" ]; then
-		[ "$(tag "$s" firerunner:e2e-session)" = "$owner" ] ||
-			e2e_die 1 "refusing: stack $stack was not made by control-vm.sh for $owner (no firerunner:e2e-session=$owner tag)"
+		mine_or_die
 		prefix="$(param "$s" ParameterPrefix)"
 		zone_id="$(param "$s" HostedZoneId)"
 		jit="$(output "$s" JitHost)"
@@ -381,7 +399,6 @@ cmd_down() {
 		e2e_log "stack $stack deleted"
 	else
 		e2e_log "no stack $stack; cleaning up what $owner may have left"
-		b="$(stack_json "$base")"
 		[ -z "$b" ] || prefix="$(output "$b" ParameterPrefix)/sessions/$owner"
 		[ -z "$b" ] || zone_id="$(output "$b" HostedZoneId)"
 		[ -z "$b" ] || { jit="$(output "$b" JitHost)" && jit="$owner.${jit#*.}"; }

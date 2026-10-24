@@ -39,9 +39,12 @@ earlier. So:
 1. **Your own owner.** Every session runs its control VM with its own
    `FR_OWNER`. firerunner tags every instance, volume and spot request it
    creates `firerunner:owner=<FR_OWNER>`, and its reaper (`--ec2-reaper`)
-   touches only its own owner's. `env.sh` derives one per worktree
-   (`e2e-<worktree name>`, or `e2e-<branch>` outside a worktree; never from
-   `main`). Set `FR_OWNER` to reuse an older owner and adopt its pool.
+   touches only its own owner's. `env.sh` derives one per worktree:
+   `e2e-<worktree name>-<hash>`, or `e2e-<branch>-<hash>` outside a worktree,
+   never from `main`. The hash covers the worktree's full path, or the branch,
+   and the host. So two worktrees whose names share a prefix, or one branch on
+   two machines, never share an owner. Owners are lower case. Set `FR_OWNER`
+   to reuse an older owner and adopt its pool.
 2. **Your own tier names.** A tier's name is its scale set's name. Two control
    VMs on one name share one scale set and take each other's jobs.
    `control-vm.sh up` suffixes every tier name and label with
@@ -49,7 +52,9 @@ earlier. So:
    `runs-on`.
 3. **Clean up only your own owner's resources.** Prefer the reaper. Otherwise
    use `control-vm.sh down` or `inventory.sh --cleanup`, which refuse any owner
-   but yours, and refuse while that owner's control VM is live. Never
+   but yours, and refuse while that owner's control VM is live, or while a
+   control VM's owner cannot be read. Both refuse the shared stack's own
+   owner, and refuse a session stack that another owner made. Never
    terminate an instance or cancel a spot request by hand unless you have
    checked its `firerunner:owner` tag.
 4. **Look before you touch.** `scripts/e2e/env.sh` and
@@ -80,8 +85,9 @@ any shell. Order of precedence: the environment, `$FR_E2E_ENV_FILE`, this
 checkout's `.claude/e2e.env`, then the main checkout's, which serves every
 agent worktree under `.claude/worktrees/`. Only `AWS_PROFILE`, `AWS_REGION`
 and `FR_*` lines count, and their values are literal, with no expansion. The
-main checkout's file may not set `FR_OWNER` or `FR_E2E_TIER_SUFFIX` for a
-worktree: those are per session. In Claude Code, the SessionStart hook
+main checkout's file never sets `FR_OWNER` or `FR_E2E_TIER_SUFFIX`, not even
+for the main checkout: those are per session. Export them, or put them in a
+worktree's own file. In Claude Code, the SessionStart hook
 (`scripts/agent-env.sh`) also exports the file's values. So raw `aws` calls
 get the same `AWS_PROFILE` and `AWS_REGION` without an export in every Bash
 call. After you edit the file, start a new session, or run
@@ -130,7 +136,9 @@ changed by these scripts.
 Three separate credentials are involved, and none of them lives in this
 repository:
 
-- **AWS:** a profile or role in the deployment's account. Reading needs
+- **AWS:** a profile or role in the deployment's account. A profile can live in
+  `~/.aws/credentials` (`[name]`) or `~/.aws/config` (`[profile name]`);
+  `env.sh` says which file holds `AWS_PROFILE`, or that neither does. Reading needs
   `ec2:Describe*`, `ec2:GetConsoleOutput`, `ssm:SendCommand`,
   `ssm:GetCommandInvocation`, `ssm:CancelCommand` and
   `cloudformation:DescribeStacks`. `control-vm.sh` needs, in addition, rights

@@ -17,7 +17,8 @@
 # from this worktree. To clean up a pool you adopted, set FR_OWNER to its
 # owner. It refuses while a control VM of that owner is live, since its
 # firerunner would replace what is removed: stop it first
-# (control-vm.sh down). It is a dry run unless --yes, and in this order:
+# (control-vm.sh down). It also refuses when the owner of any live control
+# VM's stack cannot be read: that VM might be this owner's. It is a dry run unless --yes, and in this order:
 #   1. cancel the spot requests (a terminated instance whose persistent
 #      request is still open is replaced by AWS);
 #   2. terminate the instances;
@@ -40,7 +41,7 @@ while [ $# -gt 0 ]; do
 	--cleanup) cleanup=1 ;;
 	--yes) yes=1 ;;
 	-h | --help)
-		sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*) e2e_die 2 "unknown argument: $1 (see --help)" ;;
@@ -75,7 +76,10 @@ spots="$(aws ec2 describe-spot-instance-requests --output json --filters "$tag" 
 volumes="$(aws ec2 describe-volumes --output json --filters "$tag" |
 	jq -c --arg o "$owner" "[.Volumes[] | select($mine_only) | {id: .VolumeId, state: .State}]")" ||
 	e2e_die 1 "describe-volumes failed"
-vms="$(e2e_control_vms)" || e2e_die 1 "could not list the control VMs"
+# For cleanup, a control VM whose owner cannot be read counts against it.
+strict=""
+[ "$cleanup" = 0 ] || strict=--strict
+vms="$(e2e_control_vms $strict)" || e2e_die 1 "could not list the control VMs and their owners; nothing cleaned up"
 vms="$(jq -c --arg o "$owner" '[.[] | select(.owner == $o)]' <<<"$vms")"
 
 if [ "$cleanup" = 0 ]; then
