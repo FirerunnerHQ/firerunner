@@ -468,6 +468,12 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 				InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorTerminate,
 			},
 		}
+		// Every spot request carries the owner tag, so a role scoped to it
+		// (the control VM's, the reaper's) may cancel it, and the reaper
+		// can find one left without its instance.
+		in.TagSpecifications = append(in.TagSpecifications, types.TagSpecification{
+			ResourceType: types.ResourceTypeSpotInstancesRequest, Tags: tags,
+		})
 	}
 	if kind == forPool {
 		// No user-data: the boot script finds no endpoint, warms the disk
@@ -477,16 +483,12 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 		in.InstanceInitiatedShutdownBehavior = types.ShutdownBehaviorStop
 		if market == config.MarketSpot {
 			// Only a persistent request can be stopped and started again,
-			// and it rejects terminate-on-shutdown. The request is tagged
-			// too, so the reaper can find one left without its instance.
+			// and it rejects terminate-on-shutdown.
 			in.InstanceInitiatedShutdownBehavior = ""
 			in.InstanceMarketOptions.SpotOptions = &types.SpotMarketOptions{
 				SpotInstanceType:             types.SpotInstanceTypePersistent,
 				InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorStop,
 			}
-			in.TagSpecifications = append(in.TagSpecifications, types.TagSpecification{
-				ResourceType: types.ResourceTypeSpotInstancesRequest, Tags: tags,
-			})
 		}
 	}
 	if p.o.EC2.RootVolumeGiB > 0 || p.o.EC2.RootVolumeType != "" {

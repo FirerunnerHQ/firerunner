@@ -106,6 +106,8 @@ jobs:
         run: |
           deploy/cloudformation/test-control-bootstrap.sh
           deploy/cloudformation/test-deploy-control.sh
+          python3 -I deploy/cloudformation/test-reaper.py
+          python3 -I deploy/cloudformation/test-policies.py
           shellcheck deploy/cloudformation/*.sh scripts/release-build.sh
       - name: Lint CloudFormation templates
         run: pipx run cfn-lint==1.58.0 deploy/cloudformation/*.yaml
