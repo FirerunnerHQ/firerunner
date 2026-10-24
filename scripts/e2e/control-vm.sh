@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # control-vm.sh — this session's own control VM, as a stack made from
-# deploy/aws/control.yaml.
+# deploy/cloudformation/control.yaml.
 #
 # Usage:
 #   scripts/e2e/control-vm.sh up [--version V] [--tiers FILE]
@@ -47,7 +47,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/e2e/env.sh
 . "$HERE/env.sh"
-TEMPLATE="$HERE/../../deploy/aws/control.yaml"
+TEMPLATE="$HERE/../../deploy/cloudformation/control.yaml"
 
 usage() {
 	sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
@@ -192,7 +192,7 @@ seed_and_create() {
 	zone="${jit#*.}"
 	repo="$(param "$b" ReleaseRepo)"
 	[ -n "$base_prefix" ] && [ -n "$zone_id" ] && [ -n "$jit" ] ||
-		e2e_die 2 "$base lacks the ParameterPrefix, HostedZoneId or JitHost output: is it a deploy/aws/control.yaml stack?"
+		e2e_die 2 "$base lacks the ParameterPrefix, HostedZoneId or JitHost output: is it a deploy/cloudformation/control.yaml stack?"
 	prefix="$base_prefix/sessions/$owner"
 
 	base_version="$(ssm_get "$base_prefix/control/version")"

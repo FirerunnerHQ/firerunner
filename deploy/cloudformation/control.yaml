@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   firerunner control plane: one control VM in an Auto Scaling group of one,
   replaced on failure, reachable by runners at a stable private DNS name.
-  See deploy/aws/README.md.
+  See deploy/cloudformation/README.md.
 
 Parameters:
   Owner:

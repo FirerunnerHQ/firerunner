@@ -16,7 +16,7 @@ commands as root on an instance. `inventory.sh --cleanup --yes` and
 | script | does |
 |---|---|
 | `env.sh` | shared configuration; run it directly to see what is set, your owner, and who else is using the environment |
-| `control-vm.sh up\|status\|install FILE\|down\|list` | your own control VM: a stack made from [`deploy/aws/control.yaml`](../../deploy/aws/control.yaml) |
+| `control-vm.sh up\|status\|install FILE\|down\|list` | your own control VM: a stack made from [`deploy/cloudformation/control.yaml`](../../deploy/cloudformation/control.yaml) |
 | `inventory.sh [--owner O] [--cleanup [--yes]]` | an owner's instances, spot requests and volumes; cleanup of your own |
 | `remote-exec.sh [INSTANCE] -- CMD…` | runs a command through SSM, prints its output, exits with its status |
 | `console.sh [INSTANCE] [-n LINES]` | prints the tail of an instance's serial console |
@@ -63,7 +63,7 @@ earlier. So:
    assuming it is abandoned.
 
 A session's own stack scopes its VM's role to its owner (see
-[`deploy/aws/control.yaml`](../../deploy/aws/control.yaml)), so even a
+[`deploy/cloudformation/control.yaml`](../../deploy/cloudformation/control.yaml)), so even a
 misconfigured firerunner cannot terminate another owner's instances.
 
 ## Configuration
@@ -76,7 +76,7 @@ lines. No default names an account, a host or a repository:
 AWS_REGION=…              # region of the control VMs and the runners
 AWS_PROFILE=…             # optional; otherwise the default credential chain
 FR_E2E_REPO=OWNER/REPO    # where the e2e workflows run
-FR_E2E_STACK=…            # the shared deploy/aws/control.yaml stack (control-vm.sh)
+FR_E2E_STACK=…            # the shared deploy/cloudformation/control.yaml stack (control-vm.sh)
 FR_E2E_BUCKET=…           # optional: for control-vm.sh install
 ```
 
@@ -110,7 +110,7 @@ job to start), `FR_E2E_RUN_DEADLINE` (1800 s for a run to finish),
 ## Your control VM
 
 `control-vm.sh up` creates the stack `FR_E2E_STACK-FR_OWNER` from
-`deploy/aws/control.yaml`. It has the shared stack's network and instance
+`deploy/cloudformation/control.yaml`. It has the shared stack's network and instance
 parameters, `Owner=FR_OWNER`, and the JIT name `<FR_OWNER>.<shared zone>`.
 Its configuration lives under `<shared prefix>/sessions/<FR_OWNER>/`: the
 shared `env` and app key, the shared tier catalog (or `--tiers FILE`) with
@@ -128,7 +128,7 @@ name and the session's parameters. The runner scale sets stay registered on
 GitHub; the next `up` with the same owner reuses them.
 
 The shared stack itself, made and deployed as
-[`deploy/aws/README.md`](../../deploy/aws/README.md) describes, is never
+[`deploy/cloudformation/README.md`](../../deploy/cloudformation/README.md) describes, is never
 changed by these scripts.
 
 ## Credentials

@@ -1,7 +1,7 @@
 name: release
 
 # A v* tag publishes the Linux binaries and SHA256SUMS as a GitHub Release.
-# The control VM bootstrap (deploy/aws/) installs a release by its tag and
+# The control VM bootstrap (deploy/cloudformation/) installs a release by its tag and
 # verifies the binary against SHA256SUMS. A tag with a hyphen (v0.2.0-rc.1)
 # is published as a prerelease.
 on:

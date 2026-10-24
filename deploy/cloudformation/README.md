@@ -1,4 +1,18 @@
-# Control plane on AWS
+# Runner infrastructure on AWS
+
+The CloudFormation templates for running firerunner's EC2 tiers. They are
+the single source for this infrastructure, whether you launch them yourself
+or deploy them from other tooling:
+
+| template | creates | needs |
+|---|---|---|
+| [`network.yaml`](network.yaml) | a VPC with public subnets in 2–3 zones, and the runners' security group (no inbound) | — (or bring your own VPC) |
+| [`control.yaml`](control.yaml) | the control plane: an Auto Scaling group of one VM, its role, its security group, a private DNS zone | a VPC, subnets, the runners' group |
+
+Both take parameters only. Their outputs feed the next template, or
+Terraform or StackSets.
+
+## Control plane
 
 [`control.yaml`](control.yaml) runs firerunner's control plane for EC2 tiers
 as one VM in an Auto Scaling group of one:
@@ -35,9 +49,16 @@ credentials are stack parameters and SSM parameters.
 
 You need:
 
-- A VPC whose subnets have egress to GitHub. DNS support and DNS hostnames
-  must be on, for the private zone.
-- The runners' security group.
+- A VPC whose subnets have egress to GitHub, with DNS support and DNS
+  hostnames on (for the private zone), and the runners' security group.
+  `network.yaml` makes both:
+
+  ```sh
+  aws cloudformation deploy --stack-name firerunner-network \
+    --template-file deploy/cloudformation/network.yaml
+  aws cloudformation describe-stacks --stack-name firerunner-network \
+    --query 'Stacks[0].Outputs'   # VpcId, SubnetIds, RunnerSecurityGroupId
+  ```
 - A runner AMI published to an SSM parameter under the prefix
   (see [`images/`](../../images/)).
 - A release of firerunner: a `v*` tag publishes one.
@@ -72,7 +93,7 @@ Create the stack, then deploy a release (below). Pick an `Owner` that names this
 change it**: the owner tag is how a replacement VM finds the pool.
 
 ```sh
-aws cloudformation deploy --stack-name firerunner --template-file deploy/aws/control.yaml \
+aws cloudformation deploy --stack-name firerunner --template-file deploy/cloudformation/control.yaml \
   --capabilities CAPABILITY_IAM --parameter-overrides \
   Owner=acme-prod VpcId=vpc-... SubnetIds=subnet-a,subnet-b \
   RunnerSecurityGroupId=sg-...
@@ -86,8 +107,8 @@ with an x86 `InstanceType`.
 ## Deploy, roll back
 
 ```sh
-deploy/aws/deploy-control.sh firerunner v0.2.1   # waits until v0.2.1 has run 60 s, no restarts
-deploy/aws/deploy-control.sh firerunner v0.2.0   # roll back: the same, older
+deploy/cloudformation/deploy-control.sh firerunner v0.2.1   # waits until v0.2.1 has run 60 s, no restarts
+deploy/cloudformation/deploy-control.sh firerunner v0.2.0   # roll back: the same, older
 ```
 
 The refresh terminates the old VM before launching the new one: two
