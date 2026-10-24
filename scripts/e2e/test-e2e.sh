@@ -897,7 +897,7 @@ vm_fresh() {
 	ssm_seed /fr/e2e/control/sha256sums "aaa  firerunner_linux_arm64"
 	ssm_seed /fr/e2e/control/env "FR_URL=https://example.invalid/org"
 	ssm_seed /fr/e2e/control/app-private-key "SECRET-KEY-TEXT"
-	ssm_seed /fr/e2e/control/tiers '[{"name":"cloud","labels":["cloud-arm"],"provisioner":"ec2","ec2":{"ami":"/fr/e2e/runner-ami"}},{"name":"lit","provisioner":"ec2","ec2":{"ami":"ami-0lit"}}]'
+	ssm_seed /fr/e2e/control/tiers '[{"name":"cloud","labels":["cloud-arm"],"provisioner":"ec2","min":1,"max":4,"ec2":{"ami":"/fr/e2e/runner-ami","pool":3},"schedule":{"timezone":"UTC","windows":[{"days":"daily","hours":"00:00-01:00","pool":1}]}},{"name":"lit","provisioner":"ec2","ec2":{"ami":"ami-0lit"}}]'
 	ssm_seed /fr/e2e/runner-ami ami-0runner
 	ssm_seed /fr/e2e/sessions/e2e-other/control/version v0.9.0
 	answer asg 1 i-0ctl
@@ -927,11 +927,23 @@ expect "up: suffixes tier names and labels" "$(ssm_val $S/control/tiers)" \
 expect "up: moves AMI parameters under the session prefix" "" \
 	jqe '.[0].ec2.ami == "/fr/e2e/sessions/e2e-test/runner-ami" and .[1].ec2.ami == "ami-0lit"' "$STATE/ssm$S/control/tiers"
 expect "up: copies the AMI parameter" "" [ "$(ssm_val $S/runner-ami)" = ami-0runner ]
+expect "up: drops the shared catalog's pool, schedule and min" "" \
+	jqe '.[0].min == 0 and .[0].max == 4 and (.[0] | has("schedule") | not) and (.[0].ec2 | has("pool") | not) and .[1].min == 0' "$STATE/ssm$S/control/tiers"
 expect "up: copies the app key as a SecureString" "" grep -qx "$S/control/app-private-key SecureString" "$STATE/ssm-types"
 expect "up: never passes the key on a command line" "" not_called SECRET-KEY-TEXT
 expect "up: pins the shared release and its checksums" "" [ "$(ssm_val $S/control/version)/$(ssm_val $S/control/sha256sums)" = "v1.2.0/aaa  firerunner_linux_arm64" ]
 expect "up: needs no download for the shared release" "" not_called "curl "
 expect "up: waits for firerunner to be active" "" [ "$(calls_of get-command-invocation)" = 2 ]
+
+vm_fresh vm-up-tiers-file
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack CREATE_COMPLETE)"
+answer invocation 1 "$(inv Success 0 $'active\nfirerunner v1.2.0\n' '')"
+printf '%s' '[{"name":"warm","provisioner":"ec2","min":1,"ec2":{"ami":"ami-0w","pool":2}}]' >"$STATE/tiers.json"
+run control-vm.sh up --tiers "$STATE/tiers.json"
+expect "up: --tiers exit 0" "$(dump)" rc_is 0
+expect "up: --tiers keeps the file's pool and min" "" \
+	jqe '.[0].name == "warm-test" and .[0].min == 1 and .[0].ec2.pool == 2' "$STATE/ssm$S/control/tiers"
 
 vm_fresh vm-up-not-ours
 answer stack-st-e2e-test 1 "$(session_stack CREATE_COMPLETE e2e-someone)"

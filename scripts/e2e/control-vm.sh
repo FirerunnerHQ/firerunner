@@ -26,6 +26,10 @@
 #            firerunner is active on the VM. If the stack exists, it only
 #            waits. Runs on the session's tiers use `runs-on: <tier name>`
 #            from the JSON's tiers.
+#            The shared catalog loses its idle capacity on the way: no
+#            ec2.pool, no schedule, min 0, so a session bills only for the
+#            jobs it runs. To test a pool or hot runners, pass --tiers FILE,
+#            which is taken as written.
 #   status   the stack, its VM, whether firerunner is active there, and the
 #            session's tier names.
 #   install  replaces the VM's firerunner binary with FILE (a linux build for
@@ -218,6 +222,9 @@ seed_and_create() {
 		tiers="$(cat "$tiers_file")"
 	else
 		tiers="$(ssm_get "$base_prefix/control/tiers")"
+		# Stopped pool instances bill for their disks, hot runners for
+		# their time, for as long as the session lives: opt in with --tiers.
+		tiers="$(jq -c 'if type == "array" then map(.min = 0 | del(.schedule) | if .ec2 then del(.ec2.pool) else . end) else . end' <<<"$tiers" 2>/dev/null)" || tiers=""
 	fi
 	jq -e 'type == "array" and length > 0 and all(.[]; .name | type == "string")' <<<"$tiers" >/dev/null 2>&1 ||
 		e2e_die 2 "the tier catalog is not a JSON array of named tiers"
