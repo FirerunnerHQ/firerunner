@@ -121,8 +121,8 @@ else
 fi
 step dev-env scripts/test-dev-env.sh
 step check-remote scripts/test-check-remote.sh
-step control-bootstrap deploy/aws/test-control-bootstrap.sh
-step deploy-control deploy/aws/test-deploy-control.sh
+step control-bootstrap deploy/cloudformation/test-control-bootstrap.sh
+step deploy-control deploy/cloudformation/test-deploy-control.sh
 if command -v shellcheck >/dev/null; then
 	step shellcheck shellcheck images/assets/firerunner-ec2-run.sh images/test-ec2-run.sh \
 		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh scripts/check.sh \
@@ -131,7 +131,7 @@ if command -v shellcheck >/dev/null; then
 		scripts/pr-wait.sh scripts/test-pr-wait.sh \
 		scripts/check-remote.sh scripts/test-check-remote.sh \
 		scripts/agent-env.sh scripts/setup-dev.sh scripts/test-dev-env.sh .githooks/commit-msg \
-		scripts/release-build.sh deploy/aws/*.sh
+		scripts/release-build.sh deploy/cloudformation/*.sh
 	step shellcheck-e2e shellcheck -x scripts/e2e/*.sh
 else
 	skip shellcheck "shellcheck not installed"

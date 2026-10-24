@@ -21,7 +21,7 @@
 #   FR_E2E_TIER_SUFFIX      optional: appended to tier names, which are scale
 #                           set names (default: FR_OWNER without "e2e-")
 #   FR_E2E_STACK            control-vm: the shared stack made from
-#                           deploy/aws/control.yaml that session stacks copy
+#                           deploy/cloudformation/control.yaml that session stacks copy
 #   FR_E2E_BUCKET           control-vm install: S3 bucket for a dev binary
 #   FR_E2E_VERSION          control-vm up: release to run (default: the shared
 #                           stack's version)

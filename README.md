@@ -490,7 +490,7 @@ permissions) fails the launch, and the scheduler backs off.
 - `--aws-region` / `FR_AWS_REGION`: defaults to the SDK's sources, then the
   control VM's own region.
 
-**Running the control VM.** [`deploy/aws/`](deploy/aws/README.md) has a
+**Running the control VM.** [`deploy/cloudformation/`](deploy/cloudformation/README.md) has a
 CloudFormation template that does this for you:
 
 - an Auto Scaling group of one, which replaces a failed VM;
@@ -534,7 +534,7 @@ only**. Never expose that port publicly.
 
 **Verifying a deployment end to end.** These steps create real, billable
 resources. [`scripts/e2e/`](scripts/e2e/README.md) has tested helpers for them:
-a control VM of your own (a stack made from `deploy/aws/control.yaml`), remote
+a control VM of your own (a stack made from `deploy/cloudformation/control.yaml`), remote
 commands on it, instance consoles, run watching and timing with deadlines, and
 an inventory and cleanup of your own owner's instances. When several people or
 agents share one test account, follow its rules: each has its own `FR_OWNER`

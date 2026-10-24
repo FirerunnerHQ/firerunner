@@ -860,7 +860,7 @@ expect "watch-run: with an empty consoles list" "" last_json '.consoles == []'
 
 # --- control-vm --------------------------------------------------------------
 
-TEMPLATE_KEYS="$(awk '/^Parameters:/ {p = 1; next} /^[A-Za-z]/ {p = 0} p && /^  [A-Za-z]+:$/ {gsub(/[ :]/, ""); print}' "$HERE/../../deploy/aws/control.yaml" | jq -R . | jq -sc .)"
+TEMPLATE_KEYS="$(awk '/^Parameters:/ {p = 1; next} /^[A-Za-z]/ {p = 0} p && /^  [A-Za-z]+:$/ {gsub(/[ :]/, ""); print}' "$HERE/../../deploy/cloudformation/control.yaml" | jq -R . | jq -sc .)"
 # ssm_seed NAME VALUE
 ssm_seed() {
 	mkdir -p "$(dirname "$STATE/ssm$1")"
@@ -917,7 +917,7 @@ S=/fr/e2e/sessions/e2e-test
 expect "up: exit 0 once firerunner is active" "$(dump)" rc_is 0
 expect "up: reports the session" "$(tail -n 1 "$STATE/out")" \
 	last_json '.owner == "e2e-test" and .stack == "st-e2e-test" and .instance == "i-0ctl" and .firerunner == "active" and .version == "v1.2.0" and .jit_host == "e2e-test.zone.internal" and .tiers == ["cloud-test", "lit-test"]'
-expect "up: creates the session's own stack from control.yaml" "" called "create-stack --stack-name st-e2e-test --template-body file://.*deploy/aws/control.yaml"
+expect "up: creates the session's own stack from control.yaml" "" called "create-stack --stack-name st-e2e-test --template-body file://.*deploy/cloudformation/control.yaml"
 expect "up: tags the stack with the session's owner" "" called "Key=firerunner:e2e-session,Value=e2e-test"
 expect "up: the stack's Owner is the session's" "$(cat "$STATE/create-params.json")" \
 	jqe 'map({key: .ParameterKey, value: .ParameterValue}) | from_entries | .Owner == "e2e-test" and .ParameterPrefix == "/fr/e2e/sessions/e2e-test" and .JitName == "e2e-test" and .HostedZoneId == "Z0SHARED" and .ZoneName == "zone.internal" and .VpcId == "vpc-0aaa" and .SubnetIds == "subnet-0aaa,subnet-0bbb"' "$STATE/create-params.json"

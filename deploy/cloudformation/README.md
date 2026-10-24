@@ -72,7 +72,7 @@ Create the stack, then deploy a release (below). Pick an `Owner` that names this
 change it**: the owner tag is how a replacement VM finds the pool.
 
 ```sh
-aws cloudformation deploy --stack-name firerunner --template-file deploy/aws/control.yaml \
+aws cloudformation deploy --stack-name firerunner --template-file deploy/cloudformation/control.yaml \
   --capabilities CAPABILITY_IAM --parameter-overrides \
   Owner=acme-prod VpcId=vpc-... SubnetIds=subnet-a,subnet-b \
   RunnerSecurityGroupId=sg-...
@@ -86,8 +86,8 @@ with an x86 `InstanceType`.
 ## Deploy, roll back
 
 ```sh
-deploy/aws/deploy-control.sh firerunner v0.2.1   # waits until v0.2.1 has run 60 s, no restarts
-deploy/aws/deploy-control.sh firerunner v0.2.0   # roll back: the same, older
+deploy/cloudformation/deploy-control.sh firerunner v0.2.1   # waits until v0.2.1 has run 60 s, no restarts
+deploy/cloudformation/deploy-control.sh firerunner v0.2.0   # roll back: the same, older
 ```
 
 The refresh terminates the old VM before launching the new one: two
