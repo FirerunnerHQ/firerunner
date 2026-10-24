@@ -80,9 +80,12 @@ install gopls`, or `go install golang.org/x/tools/gopls@latest` with
 `~/go/bin` on that PATH. Prefer Edit over a python or sed rewrite for Go
 files, so the diagnostics follow each change.
 
-Machine-specific
-settings, such as `AWS_PROFILE` or `AWS_REGION`, belong in the `env` block of
-`.claude/settings.local.json`, which is gitignored. Never commit them.
+Machine-specific end-to-end settings, such as `AWS_PROFILE` or `AWS_REGION`,
+belong in the main checkout's `.claude/e2e.env`, which is gitignored and also
+serves its worktrees. Never commit them. Before any e2e run against AWS, read
+[`scripts/e2e/README.md`](scripts/e2e/README.md): the test account is shared,
+so you use your own `FR_OWNER` and tier names and clean up only your own
+owner's resources.
 
 ## Public repository hygiene
 
@@ -177,7 +180,7 @@ The usual dev box is macOS with zsh; much of the code and CI is Linux.
 | `internal/health` | per-tier listener state, published for `status`/`doctor` |
 | `internal/diag` | `status` and `doctor` |
 | `images/` | guest images, boot scripts and their tests |
-| `scripts/e2e/` | helpers for end-to-end checks against a real deployment (SSM exec, console, run watch and timing) |
+| `scripts/e2e/` | helpers for end-to-end checks against a real deployment (your own control VM, owner inventory and cleanup, SSM exec, console, run watch and timing) |
 
 ## Operating a deployment
 

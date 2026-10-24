@@ -15,6 +15,7 @@ cover.out
 
 # Claude Code: per-machine settings and agent worktrees
 /.claude/settings.local.json
+/.claude/e2e.env
 /.claude/worktrees/
 
 # Protocol test dependencies
