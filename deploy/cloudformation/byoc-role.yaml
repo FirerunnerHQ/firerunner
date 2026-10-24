@@ -11,12 +11,24 @@ Parameters:
     Type: String
     AllowedPattern: "[0-9]{12}"
     Description: The AWS account the control plane runs in.
+  TrustedRoleName:
+    Type: String
+    Default: ""
+    AllowedPattern: "[A-Za-z0-9+=,.@_/-]*"
+    Description: The role in that account allowed to assume this one; empty trusts any principal there that also has the external ID.
   ExternalId:
     Type: String
     NoEcho: true
     MinLength: 16
-    AllowedPattern: "[A-Za-z0-9+=,.@:/-]+"
-    Description: The secret the control plane presents when it assumes this role (from your firerunner account page).
+    MaxLength: 1224
+    AllowedPattern: "[A-Za-z0-9_+=,.@:/-]+"
+    Description: >-
+      The identifier the control plane presents when it assumes this role, unique to
+      your install (from your firerunner account page). It guards against the confused
+      deputy; it is not a secret (the role's trust policy shows it).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The runners' VPC; launches may use only its subnets and security groups.
   Owner:
     Type: String
     AllowedPattern: "[A-Za-z0-9][A-Za-z0-9._-]{0,62}"
@@ -26,6 +38,9 @@ Parameters:
     Default: /firerunner
     AllowedPattern: "/[A-Za-z0-9/_.-]*[A-Za-z0-9_.-]"
     Description: SSM path the control plane may read runner AMI parameters under.
+
+Conditions:
+  OneRole: !Not [!Equals [!Ref TrustedRoleName, ""]]
 
 Resources:
   Role:
@@ -39,17 +54,39 @@ Resources:
           - Effect: Allow
             Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${TrustedAccountId}:root" }
             Action: sts:AssumeRole
-            Condition: { StringEquals: { sts:ExternalId: !Ref ExternalId } }
+            Condition: !If
+              - OneRole
+              - StringEquals: { sts:ExternalId: !Ref ExternalId }
+                ArnEquals: { aws:PrincipalArn: !Sub "arn:${AWS::Partition}:iam::${TrustedAccountId}:role/${TrustedRoleName}" }
+              - StringEquals: { sts:ExternalId: !Ref ExternalId }
       Policies:
         - PolicyName: firerunner-runner-compute
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # runner-compute:begin (identical in byoc-role.yaml; test-policies.py checks)
+              # runner-compute:begin (identical in control.yaml; test-policies.py checks)
+              # Launches: the instance and its volumes must carry this owner's
+              # tag, and the network it joins must be this VPC; images and
+              # spot requests come with the launch.
               - Effect: Allow
                 Action: ec2:RunInstances
-                Resource: "*"
-                Condition: { StringEquals: { aws:RequestedRegion: !Ref AWS::Region } }
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                Condition: { StringEquals: { "aws:RequestTag/firerunner:owner": !Ref Owner } }
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                Condition:
+                  ArnEquals: { ec2:Vpc: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${VpcId}" }
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
               # Tags at launch must name this install as owner, and later tags
               # go only on its own instances and never change the owner: else
               # tagging would extend the owner-scoped grants below to anything.

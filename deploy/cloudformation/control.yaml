@@ -100,10 +100,28 @@ Resources:
             Version: "2012-10-17"
             Statement:
               # runner-compute:begin (identical in byoc-role.yaml; test-policies.py checks)
+              # Launches: the instance and its volumes must carry this owner's
+              # tag, and the network it joins must be this VPC; images and
+              # spot requests come with the launch.
               - Effect: Allow
                 Action: ec2:RunInstances
-                Resource: "*"
-                Condition: { StringEquals: { aws:RequestedRegion: !Ref AWS::Region } }
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                Condition: { StringEquals: { "aws:RequestTag/firerunner:owner": !Ref Owner } }
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                Condition:
+                  ArnEquals: { ec2:Vpc: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${VpcId}" }
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
               # Tags at launch must name this install as owner, and later tags
               # go only on its own instances and never change the owner: else
               # tagging would extend the owner-scoped grants below to anything.

@@ -22,3 +22,13 @@ a, b = block("control.yaml"), block("byoc-role.yaml")
 if a != b:
     sys.exit("FAIL the runner-compute policy differs between control.yaml and byoc-role.yaml")
 print("ok   runner-compute policy identical in control.yaml and byoc-role.yaml")
+
+# The cross-account role grants nothing beyond that block.
+byoc = open(os.path.join(HERE, "byoc-role.yaml")).read()
+before = byoc[:byoc.find("# runner-compute:begin")]
+after = byoc[byoc.find("# runner-compute:end"):]
+if before.count("- Effect: Allow") != 1 or "- Effect" in after:  # the one before is the trust policy
+    sys.exit("FAIL byoc-role.yaml has statements outside the runner-compute block")
+if byoc.count("PolicyName:") != 1 or "ManagedPolicyArns" in byoc:
+    sys.exit("FAIL byoc-role.yaml grants more than its one runner-compute policy")
+print("ok   byoc-role.yaml grants only the runner-compute policy")
