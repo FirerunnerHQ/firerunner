@@ -258,14 +258,15 @@ func TestPool_WarmFailureBacksOff(t *testing.T) {
 	}
 }
 
-func TestPool_ClaimDiscardsAnUnpreparableInstance(t *testing.T) {
+func TestPool_ClaimRewarmsAReadyInstanceStartedAgain(t *testing.T) {
 	h := poolHarness(t, 2, config.MarketSpot)
 	h.runPool(t)
 	eventually(t, "two warming", func() bool { _, w := h.p.pool.Ready(); return w == 2 })
 	h.stopWarming()
 	eventually(t, "two ready", func() bool { r, _ := h.p.pool.Ready(); return r == 2 })
-	// The next instance the pool would hand out has been started by someone
-	// else: its user data can no longer be modified.
+	// The next instance the pool would hand out has been started again (a
+	// persistent spot request restarts it after an interruption): its
+	// user-data cannot be set while it runs.
 	h.p.pool.mu.Lock()
 	first := h.p.pool.ready[0].id
 	h.p.pool.mu.Unlock()
@@ -274,11 +275,54 @@ func TestPool_ClaimDiscardsAnUnpreparableInstance(t *testing.T) {
 	if err != nil || in.id == first {
 		t.Fatalf("claim = %+v, %v; want the second instance", in, err)
 	}
-	if ids := h.f.terminatedIDs(); len(ids) != 1 || ids[0] != first {
-		t.Fatalf("terminated %v, want the unpreparable instance", ids)
+	if ids := h.f.terminatedIDs(); len(ids) != 0 {
+		t.Fatalf("terminated %v: an instance warming up again must be kept", ids)
 	}
-	if _, err := h.p.pool.claim(context.Background(), "runner-y"); !errors.Is(err, errPoolEmpty) {
-		t.Fatalf("claim on an empty pool = %v", err)
+	if got := h.f.instance(first).tags[TagPool]; got != PoolWarming {
+		t.Fatalf("restarted instance tagged %q, want warming", got)
+	}
+	// It powers off after warming, as a new one does, and is ready again.
+	h.f.setState(first, types.InstanceStateNameStopped)
+	eventually(t, "ready again", func() bool {
+		h.p.pool.mu.Lock()
+		defer h.p.pool.mu.Unlock()
+		for _, in := range h.p.pool.ready {
+			if in.id == first {
+				return h.f.instance(first).tags[TagPool] == PoolReady
+			}
+		}
+		return false
+	})
+}
+
+func TestPool_ClaimDiscardsAVanishedInstance(t *testing.T) {
+	// An instance EC2 no longer knows is discarded; the claim tries the next.
+	h := readyPool(t, 2)
+	h.f.mu.Lock()
+	h.f.modifyErr = apiErr(errNotFound)
+	h.f.mu.Unlock()
+	if _, err := h.p.pool.claim(context.Background(), "runner-x"); !errors.Is(err, errPoolEmpty) {
+		t.Fatalf("claim = %v, want the pool emptied of unknown instances", err)
+	}
+	if n := len(h.f.terminatedIDs()); n != 2 {
+		t.Fatalf("discarded %d, want both", n)
+	}
+}
+
+func TestPool_ReadyCheckRewarmsAndDrops(t *testing.T) {
+	h := readyPool(t, 3)
+	h.p.pool.mu.Lock()
+	restarted, gone := h.p.pool.ready[0].id, h.p.pool.ready[1].id
+	h.p.pool.mu.Unlock()
+	h.f.setState(restarted, types.InstanceStateNameRunning)
+	h.f.setState(gone, types.InstanceStateNameTerminated)
+	// No claim: the periodic check finds both.
+	eventually(t, "one ready, one warming", func() bool {
+		r, w := h.p.pool.Ready()
+		return r == 1 && w >= 1
+	})
+	if got := h.f.instance(restarted).tags[TagPool]; got != PoolWarming {
+		t.Fatalf("restarted instance tagged %q, want warming", got)
 	}
 }
 

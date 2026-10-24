@@ -56,6 +56,10 @@ type pooled struct {
 	id, ip, spotReq, itype string
 }
 
+// readyCheckEvery is how many passes (one per tick, 15 s) go between checks
+// that ready instances are still stopped.
+const readyCheckEvery = 20
+
 // poolRetryMax caps the backoff between failed warm launches.
 const poolRetryMax = 5 * time.Minute
 
@@ -79,7 +83,10 @@ func (pl *Pool) Run(ctx context.Context) {
 	}
 	t := time.NewTicker(pl.tick)
 	defer t.Stop()
-	for {
+	for pass := 0; ; pass++ {
+		if pass%readyCheckEvery == 0 {
+			pl.checkReady(ctx)
+		}
 		pl.refresh(ctx)
 		pl.trim(ctx)
 		pl.fill(ctx)
@@ -336,6 +343,15 @@ func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 		switch {
 		case err == nil:
 			return in, nil
+		case isCode(err, "IncorrectInstanceState"):
+			// Not stopped: something started it again (a persistent spot
+			// request restarts its instance once capacity returns after an
+			// interruption). It warms and powers off like a new one, so
+			// follow it as warming instead of discarding it.
+			pl.log.Info("ready pool instance is not stopped; following it as warming", "instance", in.id)
+			pl.rewarm(context.WithoutCancel(ctx), in.id)
+			pl.p.c.untrack(in.id)
+			continue
 		case instanceGone(err):
 			pl.log.Warn("pool instance could not be prepared; discarding it", "instance", in.id, "err", err)
 			pl.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
@@ -347,6 +363,89 @@ func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 			return pooled{}, err
 		}
 	}
+}
+
+// rewarm moves an instance back to warming: tagged so (and no longer naming
+// a runner), and followed by refresh until it stops again, ends, or
+// overstays warmMax. It is followed even if the retag fails.
+func (pl *Pool) rewarm(ctx context.Context, id string) {
+	if _, err := pl.p.c.api.CreateTags(ctx, &ec2.CreateTagsInput{
+		Resources: []string{id},
+		Tags: []types.Tag{
+			{Key: aws.String(TagPool), Value: aws.String(PoolWarming)},
+			{Key: aws.String(TagRunner), Value: aws.String("")},
+		},
+	}); err != nil {
+		pl.log.Warn("retag pool instance warming", "instance", id, "err", err)
+	}
+	pl.mu.Lock()
+	pl.warming[id] = pl.now()
+	pl.mu.Unlock()
+}
+
+// checkReady makes sure the ready instances are still stopped. One started
+// again (see claim) goes back to warming; one gone is dropped.
+func (pl *Pool) checkReady(ctx context.Context) {
+	pl.mu.Lock()
+	ids := make([]string, 0, len(pl.ready))
+	for _, in := range pl.ready {
+		ids = append(ids, in.id)
+	}
+	pl.mu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+	out, err := pl.p.c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: ids})
+	if err != nil {
+		if !isCode(err, errNotFound) {
+			pl.log.Warn("describe ready pool instances", "err", err)
+		}
+		return
+	}
+	state := map[string]types.InstanceStateName{}
+	for _, r := range out.Reservations {
+		for _, i := range r.Instances {
+			state[aws.ToString(i.InstanceId)] = i.State.Name
+		}
+	}
+	for _, id := range ids {
+		st, seen := state[id]
+		if !seen || st == types.InstanceStateNameStopped {
+			continue
+		}
+		in, ok := pl.takeReady(id)
+		if !ok {
+			continue // claimed meanwhile
+		}
+		switch st {
+		case types.InstanceStateNameShuttingDown, types.InstanceStateNameTerminated:
+			// Ended from outside. Its persistent request would launch an
+			// untracked replacement: cancel it.
+			pl.log.Warn("ready pool instance is gone; dropping it", "instance", id, "state", st)
+			if in.spotReq != "" {
+				if err := pl.cancelSpot(ctx, in.spotReq); err != nil {
+					pl.log.Warn("cancel the gone instance's spot request; the reaper retries", "request", in.spotReq, "err", err)
+				}
+			}
+		default:
+			pl.log.Info("ready pool instance is not stopped; following it as warming", "instance", id, "state", st)
+			pl.rewarm(ctx, id)
+		}
+	}
+}
+
+// takeReady removes an instance from the ready list and returns it, if it
+// was there.
+func (pl *Pool) takeReady(id string) (pooled, bool) {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	for i, in := range pl.ready {
+		if in.id == id {
+			pl.ready = append(pl.ready[:i], pl.ready[i+1:]...)
+			return in, true
+		}
+	}
+	return pooled{}, false
 }
 
 // instanceGone reports an error about one instance's own state, which no
