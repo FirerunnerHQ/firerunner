@@ -8,6 +8,8 @@ or deploy them from other tooling:
 |---|---|---|
 | [`network.yaml`](network.yaml) | a VPC with public subnets in 2–3 zones, and the runners' security group (no inbound) | — (or bring your own VPC) |
 | [`control.yaml`](control.yaml) | the control plane: an Auto Scaling group of one VM, its role, its security group, a private DNS zone | a VPC, subnets, the runners' group |
+| [`reaper.yaml`](reaper.yaml) (optional) | a scheduled Lambda that ends the install's instances running past a limit | the install's `Owner` |
+| [`byoc-role.yaml`](byoc-role.yaml) (bring your own cloud) | a role a control plane in another account assumes, with an external ID, to run runners here | that account's ID, an external ID, `Owner` |
 
 Both take parameters only. Their outputs feed the next template, or
 Terraform or StackSets.
@@ -140,3 +142,41 @@ few minutes, until the parameter is fixed. Fix it, then deploy.
 Turn on immutable releases for the release repository. The pinned checksums
 already refuse a replaced asset, but immutability also protects the first
 deploy of a version.
+
+## Reaper safety net (optional)
+
+firerunner's own reaper runs on the control VM and checks with GitHub before
+it ends anything. [`reaper.yaml`](reaper.yaml) is a backstop for when the
+control VM is not there.
+
+- **What it does.** A Lambda runs every `EveryMinutes` (default 15). It ends
+  the install's running instances (by `Owner`) whose latest start is older
+  than `MaxAgeMinutes` (default 720).
+- **It cancels the spot request first.** If that fails, it keeps the
+  instance rather than leave a request open.
+- **Stopped pool instances are left alone.**
+- **It cannot ask GitHub whether a job is running.** Set the limit above
+  your longest job.
+- **`DryRun=true`** only logs what it would end.
+- **Clean deletion.** The stack creates the function's log group itself, so
+  deleting the stack deletes the logs too.
+
+## Bring your own cloud: the cross-account role
+
+[`byoc-role.yaml`](byoc-role.yaml) lets a firerunner control plane in
+another AWS account, such as a hosted one, run runners in this account.
+
+- **What it grants.** Exactly the runner-compute permissions of
+  `control.yaml`'s role:
+  - launch instances, but only tagged with this `Owner`;
+  - start, re-tag, modify and terminate only instances with that tag;
+  - cancel only that tag's spot requests;
+  - read AMI parameters under the prefix.
+
+  [`test-policies.py`](test-policies.py) keeps the two copies identical.
+- **Assuming it.** The trusted account must present the external ID. The
+  role has no other access to the account.
+- **Not yet supported.** Runners fetch their JIT config from an endpoint
+  inside their VPC, identified by private IP. A control plane outside the
+  VPC therefore also needs a JIT endpoint inside it, which this role does
+  not provide yet.

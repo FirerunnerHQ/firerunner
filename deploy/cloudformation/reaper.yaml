@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  firerunner reaper safety net (optional): a scheduled Lambda that ends an
+  install's instances running longer than a limit, in case firerunner itself
+  is not there to (control VM down, a bug). It knows nothing of GitHub, so it
+  also ends a job that runs past the limit: set it above your longest job.
+  See deploy/cloudformation/README.md.
+
+Parameters:
+  Owner:
+    Type: String
+    AllowedPattern: "[A-Za-z0-9][A-Za-z0-9._-]{0,62}"
+    Description: The install's firerunner:owner tag (control.yaml's Owner). Nothing else is touched.
+  MaxAgeMinutes:
+    Type: Number
+    MinValue: 30
+    Default: 720
+    Description: End a running instance this long after its (latest) start.
+  EveryMinutes:
+    Type: Number
+    MinValue: 5
+    Default: 15
+    Description: How often to sweep.
+  DryRun:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Only log what would be ended.
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: firerunner-reaper
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Effect: Allow
+                Action: [ec2:TerminateInstances, ec2:CancelSpotInstanceRequests]
+                Resource: "*"
+                Condition: { StringEquals: { "aws:ResourceTag/firerunner:owner": !Ref Owner } }
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt LogGroup.Arn
+
+  # Created here, not by Lambda on first run, so deleting the stack deletes
+  # the logs too.
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-reaper"
+      RetentionInDays: 14
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-reaper"
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 120
+      Role: !GetAtt Role.Arn
+      Environment:
+        Variables: { OWNER: !Ref Owner, MAX_AGE_MINUTES: !Ref MaxAgeMinutes, DRY_RUN: !Ref DryRun }
+      Code:
+        ZipFile: |
+          import datetime, json, os
+          import boto3
+
+          OWNER = os.environ["OWNER"]
+          MAX_AGE = datetime.timedelta(minutes=int(os.environ["MAX_AGE_MINUTES"]))
+          DRY_RUN = os.environ.get("DRY_RUN") == "true"
+
+
+          def handler(event, context, ec2=None, now=None):
+              ec2 = ec2 or boto3.client("ec2")
+              now = now or datetime.datetime.now(datetime.timezone.utc)
+              out = {"ended": [], "would_end": [], "kept_open_request": [], "dry_run": DRY_RUN}
+              pages = ec2.get_paginator("describe_instances").paginate(Filters=[
+                  {"Name": "tag:firerunner:owner", "Values": [OWNER]},
+                  # Stopped pool instances are firerunner's to keep.
+                  {"Name": "instance-state-name", "Values": ["pending", "running"]},
+              ])
+              for page in pages:
+                  for res in page["Reservations"]:
+                      for i in res["Instances"]:
+                          if now - i["LaunchTime"] < MAX_AGE:
+                              continue
+                          iid = i["InstanceId"]
+                          if DRY_RUN:
+                              out["would_end"].append(iid)
+                              continue
+                          # Never terminate with the spot request open: AWS
+                          # would launch an untracked replacement.
+                          req = i.get("SpotInstanceRequestId")
+                          if req:
+                              try:
+                                  ec2.cancel_spot_instance_requests(SpotInstanceRequestIds=[req])
+                              except Exception as e:
+                                  print(json.dumps({"instance": iid, "cancel_error": str(e)}))
+                                  out["kept_open_request"].append(iid)
+                                  continue
+                          ec2.terminate_instances(InstanceIds=[iid])
+                          out["ended"].append(iid)
+              print(json.dumps(out))
+              return out
+
+  Schedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Sub "rate(${EveryMinutes} minutes)"
+      Targets: [{ Id: reaper, Arn: !GetAtt Function.Arn }]
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Schedule.Arn
+
+Outputs:
+  FunctionName:
+    Value: !Ref Function

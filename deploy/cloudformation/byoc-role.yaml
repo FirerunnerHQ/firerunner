@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  firerunner cross-account role for bring-your-own-cloud: lets a firerunner
+  control plane in another AWS account (a hosted one) launch and end runner
+  instances in this account, with exactly the compute permissions of
+  control.yaml's role, scoped to one owner tag. Assuming it requires the
+  external ID. See deploy/cloudformation/README.md.
+
+Parameters:
+  TrustedAccountId:
+    Type: String
+    AllowedPattern: "[0-9]{12}"
+    Description: The AWS account the control plane runs in.
+  ExternalId:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    AllowedPattern: "[A-Za-z0-9+=,.@:/-]+"
+    Description: The secret the control plane presents when it assumes this role (from your firerunner account page).
+  Owner:
+    Type: String
+    AllowedPattern: "[A-Za-z0-9][A-Za-z0-9._-]{0,62}"
+    Description: The install's firerunner:owner tag; the role touches only instances carrying it.
+  ParameterPrefix:
+    Type: String
+    Default: /firerunner
+    AllowedPattern: "/[A-Za-z0-9/_.-]*[A-Za-z0-9_.-]"
+    Description: SSM path the control plane may read runner AMI parameters under.
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub "firerunner control plane in ${TrustedAccountId}, owner ${Owner}"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${TrustedAccountId}:root" }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { sts:ExternalId: !Ref ExternalId } }
+      Policies:
+        - PolicyName: firerunner-runner-compute
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # runner-compute:begin (identical in byoc-role.yaml; test-policies.py checks)
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource: "*"
+                Condition: { StringEquals: { aws:RequestedRegion: !Ref AWS::Region } }
+              # Tags at launch must name this install as owner, and later tags
+              # go only on its own instances and never change the owner: else
+              # tagging would extend the owner-scoped grants below to anything.
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: RunInstances
+                    "aws:RequestTag/firerunner:owner": !Ref Owner
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: "*"
+                Condition:
+                  StringEquals: { "aws:ResourceTag/firerunner:owner": !Ref Owner }
+                  ForAllValues:StringNotEquals: { aws:TagKeys: [firerunner:owner] }
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeImages
+                  - ec2:DescribeSpotInstanceRequests
+                Resource: "*"
+              - Effect: Allow
+                Action: [ec2:TerminateInstances, ec2:StartInstances, ec2:ModifyInstanceAttribute]
+                Resource: "*"
+                Condition: { StringEquals: { "aws:ResourceTag/firerunner:owner": !Ref Owner } }
+              - Effect: Allow
+                Action: ec2:CancelSpotInstanceRequests
+                Resource: "*"
+                Condition: { StringEquals: { "aws:ResourceTag/firerunner:owner": !Ref Owner } }
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/*"
+              # runner-compute:end
+
+Outputs:
+  RoleArn:
+    Description: Give this to the control plane, with the external ID.
+    Value: !GetAtt Role.Arn
