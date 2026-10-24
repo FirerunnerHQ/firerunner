@@ -2,28 +2,38 @@
 # pr-wait.sh — wait for a PR's checks, then report checks, failed logs and
 # review state in one go, so nobody polls `gh pr checks` by hand.
 #
-# Usage: scripts/pr-wait.sh PR [--deadline S] [--repo OWNER/REPO]
+# Usage: scripts/pr-wait.sh PR [--deadline S] [--sha SHA] [--repo OWNER/REPO]
 #   PR          number, URL or branch, as gh accepts
 #   --deadline  give up after S seconds (default 1800)
+#   --sha       wait for this head commit (say, `git rev-parse HEAD` after a
+#               push) while GitHub still shows the PR at an older one
 #   --repo      default: the repository of the current directory
 #
-# It polls until every check on the PR's head commit has finished, or stops
-# early as soon as a required check fails (any check, when none is required).
-# Then it prints JSON lines on stdout, one object each, keyed by "type":
+# It looks only at the check runs of the PR's current head commit, read again
+# on every poll, so a push made just before never counts the previous head's
+# checks; a head with no check run yet is pending. The required checks come
+# from the base branch's rulesets, so one that has not started yet (say,
+# sign-off from a separate workflow) is waited for, not missed. It polls until
+# every check on the head has finished and every required check has run, or
+# stops early as soon as a required check fails (any check, when none is
+# required). Then it prints JSON lines on stdout, one object each, keyed by
+# "type":
 #   check            name, workflow, conclusion, duration_s, url
 #   failed_log       the failed job's log, trimmed to the lines that matter
 #   review           review decision and the reviews (author, state)
 #   thread           one per unresolved review thread: path, line, author, body
 #   review_required  the diff touches cost or security paths and nobody but
 #                    the author has reviewed it (AGENTS.md, review gate)
-#   summary          the verdict, last
+#   summary          the verdict, the head commit and any required check that
+#                    never reported on it (missing_required), last
 # Exit status: 0 all checks passed and no thread is unresolved, 1 a check
 # failed or a thread is unresolved, 2 usage or PR not found, 124 the deadline
 # passed. Progress goes to stderr. Needs gh (authenticated) and jq.
 # Tuning: FR_PR_WAIT_POLL (10 s between polls), FR_PR_WAIT_LOG_LINES (60).
 set -euo pipefail
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+# usage: the header above, without the comment markers.
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 log() { echo "pr-wait: $*" >&2; }
 die() {
 	log "$2"
@@ -33,7 +43,7 @@ die() {
 # Paths whose changes need an independent review before merge (AGENTS.md).
 GATED_PATHS='^internal/(scheduler|ec2|jitserver|listener|cacheserver|jobidentity)/|^internal/provisioner/egress'
 
-pr="" deadline=1800 repo_args=()
+pr="" deadline=1800 want="" repo_args=()
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-h | --help)
@@ -43,6 +53,11 @@ while [ $# -gt 0 ]; do
 	--deadline)
 		[ $# -ge 2 ] || die 2 "--deadline needs a value"
 		deadline="$2"
+		shift
+		;;
+	--sha)
+		[ $# -ge 2 ] || die 2 "--sha needs a value"
+		want="$2"
 		shift
 		;;
 	--repo)
@@ -67,6 +82,7 @@ log_lines="${FR_PR_WAIT_LOG_LINES:-60}"
 for v in "$deadline" "$poll" "$log_lines"; do
 	case "$v" in '' | *[!0-9]*) die 2 "not a number of seconds or lines: '$v'" ;; esac
 done
+case "$want" in *[!0-9a-f]*) die 2 "--sha needs a full hex commit id, not '$want'" ;; esac
 command -v gh >/dev/null || die 2 "gh not found"
 command -v jq >/dev/null || die 2 "jq not found"
 
@@ -76,35 +92,75 @@ trap 'rm -f "$err"' EXIT
 # ${repo_args[@]+...} keeps bash 3.2 from calling an empty array unbound.
 ghr() { gh "$@" ${repo_args[@]+"${repo_args[@]}"}; }
 
-info="$(ghr pr view "$pr" --json number,url,author,files 2>"$err")" ||
+info="$(ghr pr view "$pr" --json number,url,author,files,headRefOid,baseRefName 2>"$err")" ||
 	die 2 "PR $pr not found: $(cat "$err")"
 number="$(jq -r .number <<<"$info")"
 url="$(jq -r .url <<<"$info")"
 author="$(jq -r '.author.login // ""' <<<"$info")"
+head="$(jq -r '.headRefOid // ""' <<<"$info")"
+base="$(jq -r '.baseRefName // ""' <<<"$info")"
 # https://github.com/OWNER/REPO/pull/N
 owner="$(cut -d/ -f4 <<<"$url")"
 name="$(cut -d/ -f5 <<<"$url")"
+api="repos/$owner/$name"
 
 now() { date +%s; }
 give_up=$(($(now) + deadline))
-checks='[]' seen="" verdict=""
+checks='[]' seen="" verdict="" missing=""
 
-# required_names: the names of the PR's required checks, one per line; empty
-# when the repository requires none.
-required_names() {
-	ghr pr checks "$number" --required --json name --jq '.[].name' 2>/dev/null || true
-}
+# required: the contexts the base branch's rulesets require, one per line;
+# empty when none is required. `gh pr checks --required` is no substitute: it
+# lists only the required checks that have already started.
+required=""
+if r="$(gh api "$api/rules/branches/$(jq -rn --arg b "$base" '$b | @uri')" \
+	--jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | unique | .[]' 2>"$err")"; then
+	required="$r"
+else
+	log "required checks of $base unknown, waiting for every reported check: $(cat "$err")"
+fi
+[ -z "$required" ] || log "required on $base: $(tr '\n' ' ' <<<"$required")"
 
+# A check run (REST) in the shape the report uses; the bucket as gh names it.
+# The workflow name is filled in at the end.
+# shellcheck disable=SC2016 # jq, not shell
+to_checks='[.[] | {name, workflow: null,
+	bucket: (if .status != "completed" then "pending"
+		elif .conclusion == "success" or .conclusion == "neutral" then "pass"
+		elif .conclusion == "skipped" then "skipping"
+		elif .conclusion == "cancelled" then "cancel"
+		else "fail" end),
+	state: ((.conclusion // .status // "") | ascii_upcase),
+	link: (.details_url // .html_url // ""),
+	startedAt: (.started_at // ""), completedAt: (.completed_at // "")}]'
+
+first=1
 while :; do
-	# gh pr checks exits 8 while checks are pending and 1 when one failed, even
-	# with --json; only the JSON on stdout matters here.
-	out="$(ghr pr checks "$number" --json name,workflow,bucket,state,link,startedAt,completedAt 2>"$err" || true)"
-	if jq -e 'type == "array"' >/dev/null 2>&1 <<<"$out"; then
-		checks="$out"
-	elif grep -q "no checks reported" "$err"; then
+	# Read the head again on every poll but the first: a push while waiting
+	# moves it, and only its checks count.
+	if [ "$first" = 0 ]; then
+		if h="$(ghr pr view "$number" --json headRefOid --jq .headRefOid 2>"$err")" && [ -n "$h" ]; then
+			if [ "$h" != "$head" ]; then
+				log "head moved to $h"
+				head="$h" checks='[]' seen=""
+			fi
+		else
+			log "gh pr view: $(cat "$err")"
+		fi
+	fi
+	first=0
+
+	if [ -n "$want" ] && [ "$head" != "$want" ]; then
+		log "waiting for head $want; the PR is at $head"
 		checks='[]'
+		missing="$required"
 	else
-		log "gh pr checks: $(cat "$err")"
+		# The latest run of each check on this commit, and nothing else.
+		if out="$(gh api --paginate "$api/commits/$head/check-runs?per_page=100" --jq '.check_runs[]' 2>"$err")"; then
+			checks="$(jq -s "$to_checks" <<<"$out")"
+		else
+			log "check runs of $head: $(cat "$err")"
+		fi
+		missing="$(jq -r --arg r "$required" '($r | split("\n") | map(select(. != ""))) - [.[].name] | .[]' <<<"$checks")"
 	fi
 
 	while IFS= read -r line; do
@@ -117,27 +173,38 @@ while :; do
 	pending="$(jq '[.[] | select(.bucket == "pending")] | length' <<<"$checks")"
 	total="$(jq length <<<"$checks")"
 	if [ -n "$failed" ]; then
-		required="$(required_names)"
 		if [ -z "$required" ] || grep -qxF -f <(printf '%s\n' "$required") <<<"$failed"; then
 			verdict=check_failed
 			break
 		fi
 	fi
-	if [ "$total" -gt 0 ] && [ "$pending" = 0 ]; then
+	if [ "$total" -gt 0 ] && [ "$pending" = 0 ] && [ -z "$missing" ]; then
 		if [ -n "$failed" ]; then verdict=check_failed; else verdict=success; fi
 		break
 	fi
 	if [ "$(now)" -ge "$give_up" ]; then
-		if [ "$total" = 0 ]; then
-			log "no check reported on PR #$number within ${deadline}s"
+		if [ -n "$want" ] && [ "$head" != "$want" ]; then
+			log "PR #$number never reached head $want within ${deadline}s"
+		elif [ "$total" = 0 ]; then
+			log "no check reported on $head of PR #$number within ${deadline}s"
 		else
 			log "$pending check(s) still pending after ${deadline}s"
 		fi
+		[ -z "$missing" ] || log "required check(s) never reported on $head: $(tr '\n' ' ' <<<"$missing")"
 		verdict=deadline
 		break
 	fi
 	sleep "$poll"
 done
+
+# The workflow of each check, by its Actions run id.
+if wf="$(gh api "$api/actions/runs?head_sha=$head&per_page=100" \
+	--jq '[.workflow_runs[] | {key: (.id | tostring), value: .name}] | from_entries' 2>"$err")" &&
+	jq -e 'type == "object"' >/dev/null 2>&1 <<<"$wf"; then
+	checks="$(jq -c --argjson w "$wf" 'map(.workflow = ((first(.link | capture("/actions/runs/(?<r>[0-9]+)/") | .r) // null) as $r | if $r then $w[$r] else null end))' <<<"$checks")"
+else
+	log "workflow names unavailable: $(cat "$err")"
+fi
 
 jq -c '.[] | {type: "check", name, workflow, conclusion: .bucket, state,
 	duration_s: (if (.startedAt // "") != "" and (.completedAt // "") != "" and (.completedAt | startswith("0001")) == false
@@ -228,7 +295,9 @@ fi
 
 if [ "$verdict" = success ] && [ "$unresolved" -gt 0 ]; then verdict=unresolved_threads; fi
 jq -cn --argjson n "$number" --arg u "$url" --arg v "$verdict" --argjson c "$checks" \
-	--argjson t "$unresolved" --argjson rr "$review_required" '{type: "summary", pr: $n, url: $u, verdict: $v,
+	--argjson t "$unresolved" --argjson rr "$review_required" --arg h "$head" --arg m "$missing" \
+	'{type: "summary", pr: $n, url: $u, verdict: $v, head: $h,
+	missing_required: ($m | split("\n") | map(select(. != ""))),
 	checks: {total: ($c | length), pass: ([$c[] | select(.bucket == "pass")] | length),
 		fail: ([$c[] | select(.bucket == "fail" or .bucket == "cancel")] | length),
 		pending: ([$c[] | select(.bucket == "pending")] | length)},

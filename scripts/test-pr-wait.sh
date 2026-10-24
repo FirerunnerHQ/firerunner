@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Tests for scripts/pr-wait.sh against a fake gh. Needs bash and jq; no
-# network. The fake serves the PR from $STATE/view.json, one checks snapshot
-# per `gh pr checks` call ($STATE/checks-1.json, -2, …; the last repeats),
-# failed logs from $STATE/log-JOB.txt and GraphQL from $STATE/graphql.json,
-# and records every call in $STATE/calls.
+# network. The fake serves the PR from $STATE/view.json, its head commit from
+# line k of $STATE/heads on the k-th `gh pr view` (the last repeats; without
+# the file, view.json's), one check-run snapshot per check-runs call on commit
+# SHA ($STATE/runs-SHA-1.json, -2, …; the last repeats; none: no runs), the
+# base branch's rules from $STATE/rules.json ([] without it; an error with
+# $STATE/rules.err), workflow runs from $STATE/workflows.json, failed logs
+# from $STATE/log-JOB.txt and GraphQL from $STATE/graphql.json. It counts
+# check-runs calls in $STATE/polls and records every call in $STATE/calls.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,39 +20,49 @@ cat >"$TMP/bin/gh" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$STATE/calls"
-jqf="" required=0 job="" args=()
+jqf="" job="" args=()
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--jq) jqf="$2"; shift ;;
-	--required) required=1 ;;
 	--job) job="$2"; shift ;;
 	--json|--repo|-F|-f) shift ;;
+	--paginate|--log-failed) ;;
 	*) args+=("$1") ;;
 	esac
 	shift
 done
 set -- "${args[@]}"
-case "$1 $2" in
+# next <counter>: bump $STATE/<counter> and print it.
+next() {
+	local n=$(($(cat "$STATE/$1" 2>/dev/null || echo 0) + 1))
+	echo "$n" >"$STATE/$1"
+	echo "$n"
+}
+case "$1 ${2:-}" in
 "pr view")
 	[ -f "$STATE/view.json" ] || { echo "no pull requests found for branch \"$3\"" >&2; exit 1; }
 	json="$(cat "$STATE/view.json")"
-	;;
-"pr checks")
-	if [ "$required" = 1 ]; then
-		[ -f "$STATE/required.json" ] || { echo "no required checks reported on the 'b' branch" >&2; exit 1; }
-		json="$(cat "$STATE/required.json")"
-	else
-		n=$(($(cat "$STATE/polls" 2>/dev/null || echo 0) + 1))
-		echo "$n" >"$STATE/polls"
-		while [ "$n" -gt 1 ] && [ ! -f "$STATE/checks-$n.json" ]; do n=$((n - 1)); done
-		[ -f "$STATE/checks-$n.json" ] || { echo "no checks reported on the 'b' branch" >&2; exit 1; }
-		json="$(cat "$STATE/checks-$n.json")"
-		echo "$json"
-		# Like gh: 1 when a check failed, 8 while any is pending.
-		if jq -e 'any(.[]; .bucket == "fail")' >/dev/null <<<"$json"; then exit 1; fi
-		if jq -e 'any(.[]; .bucket == "pending")' >/dev/null <<<"$json"; then exit 8; fi
-		exit 0
+	k="$(next views)"
+	if [ -f "$STATE/heads" ]; then
+		h="$(sed -n "${k}p" "$STATE/heads")"
+		[ -n "$h" ] || h="$(tail -n 1 "$STATE/heads")"
+		json="$(jq --arg h "$h" '.headRefOid = $h' <<<"$json")"
 	fi
+	;;
+"api repos/o/r/commits/"*)
+	sha="$(cut -d/ -f5 <<<"$2")"
+	next polls >/dev/null
+	[ ! -f "$STATE/runs-$sha.err" ] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
+	n="$(next "polls-$sha")"
+	while [ "$n" -gt 1 ] && [ ! -f "$STATE/runs-$sha-$n.json" ]; do n=$((n - 1)); done
+	if [ -f "$STATE/runs-$sha-$n.json" ]; then json="$(cat "$STATE/runs-$sha-$n.json")"; else json='{"total_count": 0, "check_runs": []}'; fi
+	;;
+"api repos/o/r/rules/branches/"*)
+	[ ! -f "$STATE/rules.err" ] || { echo "HTTP 403: Resource not accessible" >&2; exit 1; }
+	json="$(cat "$STATE/rules.json" 2>/dev/null || echo '[]')"
+	;;
+"api repos/o/r/actions/runs"*)
+	json="$(cat "$STATE/workflows.json" 2>/dev/null || echo '{"workflow_runs": []}')"
 	;;
 "run view")
 	cat "$STATE/log-$job.txt"
@@ -60,6 +74,19 @@ esac
 if [ -n "$jqf" ]; then jq -r "$jqf" <<<"$json"; else echo "$json"; fi
 FAKE
 chmod +x "$TMP/bin/gh"
+# A clock that ticks once per call when $STATE/clock holds its start, so a
+# deadline falls on a known poll; the real date otherwise.
+cat >"$TMP/bin/date" <<'FAKE'
+#!/bin/sh
+if [ -f "${STATE:-}/clock" ]; then
+	t="$(cat "$STATE/clock")"
+	echo $((t + 1)) >"$STATE/clock"
+	echo "$t"
+else
+	exec /bin/date "$@"
+fi
+FAKE
+chmod +x "$TMP/bin/date"
 export PATH="$TMP/bin:$PATH"
 export FR_PR_WAIT_POLL=0
 
@@ -76,24 +103,42 @@ check() { # check <name> <command...>
 }
 
 URL=https://github.com/o/r/actions/runs
-# c <name> <bucket> [job]: one check, as gh pr checks --json prints it.
+H1=a1a1a1 # the PR's head, unless a test moves it
+H2=b2b2b2
+# c <name> <bucket> [job]: one check run, as the REST API returns it.
 c() {
-	local done=2026-10-23T10:00:42Z
-	[ "$2" != pending ] || done=0001-01-01T00:00:00Z
-	jq -cn --arg n "$1" --arg b "$2" --arg d "$done" --arg u "$URL/100/job/${3:-1}" \
-		'{name: $n, workflow: "ci", bucket: $b, state: ($b | ascii_upcase),
-		  startedAt: "2026-10-23T10:00:00Z", completedAt: $d, link: $u}'
+	local done=2026-10-23T10:00:42Z status=completed conclusion
+	case "$2" in
+	pass) conclusion=success ;;
+	fail) conclusion=failure ;;
+	cancel) conclusion=cancelled ;;
+	skip) conclusion=skipped ;;
+	pending) status=in_progress conclusion="" done="" ;;
+	esac
+	jq -cn --arg n "$1" --arg s "$status" --arg k "$conclusion" --arg d "$done" --arg u "$URL/100/job/${3:-1}" \
+		'{name: $n, status: $s, conclusion: (if $k == "" then null else $k end),
+		  started_at: "2026-10-23T10:00:00Z", completed_at: (if $d == "" then null else $d end),
+		  details_url: $u, html_url: $u}'
 }
-# snap <k> <check...>: what the k-th gh pr checks call returns.
-snap() {
-	local k="$1"
-	shift
-	printf '%s\n' "$@" | jq -s . >"$STATE/checks-$k.json"
+# snap_at <sha> <k> <check...>: what the k-th check-runs call on sha returns.
+snap_at() {
+	local sha="$1" k="$2"
+	shift 2
+	printf '%s\n' "$@" | jq -s '{total_count: length, check_runs: .}' >"$STATE/runs-$sha-$k.json"
 }
-# view <files...>: the PR, by alice, changing these files.
+# snap <k> <check...>: the same, on the default head.
+snap() { snap_at "$H1" "$@"; }
+# rules <context...>: the base branch requires these checks.
+rules() {
+	printf '%s\n' "$@" | jq -Rn '[{type: "pull_request", parameters: {}},
+		{type: "required_status_checks", parameters: {required_status_checks: [inputs | {context: ., integration_id: 1}]}}]' \
+		>"$STATE/rules.json"
+}
+# view <files...>: the PR, by alice, at head $H1 on main, changing these files.
 view() {
-	printf '%s\n' "$@" | jq -Rn '{number: 5, url: "https://github.com/o/r/pull/5",
-		author: {login: "alice"}, files: [inputs | select(. != "") | {path: .}]}' >"$STATE/view.json"
+	printf '%s\n' "$@" | jq -Rn --arg h "$H1" '{number: 5, url: "https://github.com/o/r/pull/5",
+		author: {login: "alice"}, headRefOid: $h, baseRefName: "main",
+		files: [inputs | select(. != "") | {path: .}]}' >"$STATE/view.json"
 }
 # reviews <json-reviews> <json-threads>
 reviews() {
@@ -122,8 +167,11 @@ summary() { of_type summary | jq -r "$1"; }
 setup pass
 snap 1 "$(c test pending)" "$(c build pass)"
 snap 2 "$(c test pass)" "$(c build pass)"
+echo '{"workflow_runs": [{"id": 100, "name": "ci"}, {"id": 7, "name": "dco"}]}' >"$STATE/workflows.json"
 run_it 5
 check "pass: exits 0" test "$rc" = 0
+check "pass: names each check's workflow" test "$(of_type check | jq -r .workflow | sort -u)" = ci
+check "pass: summary names the head" test "$(summary .head)" = "$H1"
 check "pass: polls until no check is pending" test "$(cat "$STATE/polls")" = 2
 check "pass: one check line per check, with duration" \
 	test "$(of_type check | jq -r '"\(.name) \(.conclusion) \(.duration_s)"')" = "test pass 42
@@ -177,7 +225,7 @@ check "failfast: still reports reviews" test -n "$(of_type review)"
 # --- a failure of a check that is not required does not stop the wait -------
 
 setup optional
-echo '[{"name":"build"}]' >"$STATE/required.json"
+rules build
 snap 1 "$(c lint fail 9)" "$(c build pending)"
 snap 2 "$(c lint fail 9)" "$(c build pass)"
 echo "--- FAIL: TestLint" >"$STATE/log-9.txt"
@@ -190,7 +238,7 @@ check "optional: log without step markers is kept" \
 # --- a required failure stops it ---------------------------------------------
 
 setup required
-echo '[{"name":"build"}]' >"$STATE/required.json"
+rules build
 snap 1 "$(c lint pending)" "$(c build fail 3)"
 : >"$STATE/log-3.txt"
 # lint stays pending: without the fail-fast, this would run into the deadline.
@@ -250,6 +298,91 @@ snap 1 "$(c test pass)"
 view internal/config/config.go internal/ec2x/a.go
 run_it 5
 check "gate: other paths need no review" test "$(summary .review_required)" = false
+
+# --- only the current head counts --------------------------------------------
+
+# Just after a push: the old head is green, the new one has no run yet.
+setup stale
+view README.md
+echo "$H2" >"$STATE/heads"
+snap_at "$H1" 1 "$(c test pass)" "$(c build pass)"
+snap_at "$H2" 2 "$(c test pending)" "$(c build pending)"
+snap_at "$H2" 3 "$(c test pass)" "$(c build pass)"
+run_it 5
+check "stale: a head without check runs is pending, not green" test "$(cat "$STATE/polls")" = 3
+check "stale: then succeeds on the new head" test "$rc:$(summary .head)" = "0:$H2"
+check "stale: never reads the old head's checks" test -z "$(grep "commits/$H1" "$STATE/calls" || true)"
+
+# A push while waiting: the old head's checks stop counting.
+setup moved
+printf '%s\n' "$H1" "$H1" "$H2" >"$STATE/heads"
+snap_at "$H1" 1 "$(c test pending)"
+snap_at "$H2" 1 "$(c test pending)"
+snap_at "$H2" 2 "$(c test pass)"
+run_it 5
+check "moved: follows the head to the new commit" test "$rc:$(summary .head)" = "0:$H2"
+check "moved: says so" grep -q "head moved to $H2" <<<"$errout"
+check "moved: reports the new head's checks only" test "$(of_type check | jq -r .conclusion)" = pass
+
+# The new head's checks cannot be read: the old head's are not reported.
+# The clock reads 0 for the deadline, then 1 and 2 after polls 1 and 2: the
+# deadline of 2 falls on poll 2, the first on the new head.
+setup moved-error
+rules sign-off
+printf '%s\n' "$H1" "$H2" >"$STATE/heads"
+snap_at "$H1" 1 "$(c test pass)"
+touch "$STATE/runs-$H2.err"
+echo 0 >"$STATE/clock"
+run_it 5 --deadline 2
+check "moved-error: ends in the deadline" test "$rc:$(summary .head)" = "124:$H2"
+check "moved-error: drops the old head's checks" test "$(summary .checks.total)" = 0
+check "moved-error: logs the error" grep -q 'Bad Gateway' <<<"$errout"
+
+# GitHub still shows the old head; --sha names the one just pushed.
+setup sha
+printf '%s\n' "$H1" "$H1" "$H2" >"$STATE/heads"
+snap_at "$H1" 1 "$(c test pass)"
+snap_at "$H2" 1 "$(c test pass)"
+run_it 5 --sha "$H2"
+check "sha: does not accept the old head's green checks" test "$rc:$(summary .head)" = "0:$H2"
+check "sha: never reads the old head's checks" test -z "$(grep "commits/$H1" "$STATE/calls" || true)"
+setup sha-never
+snap 1 "$(c test pass)"
+run_it 5 --sha "$H2" --deadline 0
+check "sha: a head that never arrives ends in the deadline" test "$rc:$(summary .verdict)" = 124:deadline
+check "sha: and names it" grep -q "never reached head $H2" <<<"$errout"
+run_it 5 --sha HEAD
+check "sha: a ref name is a usage error" test "$rc" = 2
+
+# --- required checks that have not started yet -------------------------------
+
+# CI is done before the separate dco workflow registers sign-off.
+setup late-required
+rules test sign-off
+snap 1 "$(c test pass)" "$(c build pass)"
+snap 2 "$(c test pass)" "$(c build pass)" "$(c sign-off pending 7)"
+snap 3 "$(c test pass)" "$(c build pass)" "$(c sign-off pass 7)"
+run_it 5
+check "late-required: waits for a required check not yet reported" test "$(cat "$STATE/polls")" = 3
+check "late-required: then succeeds" test "$rc:$(summary .verdict)" = 0:success
+check "late-required: reads the rules of the base branch" grep -q '^api repos/o/r/rules/branches/main ' "$STATE/calls"
+check "late-required: never asks gh pr checks" test -z "$(grep '^pr checks' "$STATE/calls" || true)"
+check "late-required: none missing in the end" test "$(summary '.missing_required | length')" = 0
+
+setup never-required
+rules test sign-off
+snap 1 "$(c test pass)"
+run_it 5 --deadline 0
+check "never-required: ends in the deadline" test "$rc:$(summary .verdict)" = 124:deadline
+check "never-required: names the missing check" grep -q 'never reported on .*: sign-off' <<<"$errout"
+check "never-required: and lists it in the summary" test "$(summary '.missing_required | join(",")')" = sign-off
+
+setup rules-error
+touch "$STATE/rules.err"
+snap 1 "$(c test pass)"
+run_it 5
+check "rules-error: falls back to every reported check" test "$rc" = 0
+check "rules-error: says the required checks are unknown" grep -q 'required checks of main unknown' <<<"$errout"
 
 # --- deadline, usage, --repo -------------------------------------------------
 
