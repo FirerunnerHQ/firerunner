@@ -178,14 +178,18 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 	path := PathCold
 	if p.pool != nil {
 		use, release := true, func() {}
-		// The policy is asked only while the pool has an instance to keep.
-		if ready, _ := p.pool.Ready(); ready > 0 && p.o.UsePool != nil {
-			use, release = p.o.UsePool()
+		if p.o.UsePool != nil {
+			// With a policy, a pool with nothing ready is not waited on:
+			// the launch goes cold without spending a claim, and one that
+			// refills meanwhile stays kept.
+			if ready, _ := p.pool.Ready(); ready == 0 {
+				use = false
+			} else if use, release = p.o.UsePool(); !use {
+				path = PathKept
+				p.log.Info("no pending job needs the pool; cold-launching", "runner", name)
+			}
 		}
-		if !use {
-			path = PathKept
-			p.log.Info("no pending job needs the pool; cold-launching", "runner", name)
-		} else {
+		if use {
 			started := false
 			err := p.launchPooled(ctx, name, jit, func() { started = true; p.launched(PathPool) })
 			if !started {
