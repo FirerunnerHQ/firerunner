@@ -694,6 +694,21 @@ func (p *clientPool) seed(c jitClient) {
 // put returns a client the pool handed out.
 func (p *clientPool) put(c jitClient) { p.idle <- c }
 
+// NamePrefix is how every runner name this source generates begins.
+func (j *JITSource) NamePrefix() string { return j.namePrefix + "-" }
+
+// Owns reports whether the named runner is registered in this scale set: a
+// runner of the same name prefix may belong to another install's scale set.
+func (j *JITSource) Owns(ctx context.Context, name string) (bool, error) {
+	opCtx, cancel := context.WithTimeout(ctx, removeOpTimeout)
+	defer cancel()
+	r, err := j.remover.GetRunnerByName(opCtx, name)
+	if err != nil {
+		return false, err
+	}
+	return r != nil && r.RunnerScaleSetID == j.scaleSetID, nil
+}
+
 // Exists reports whether GitHub still knows the named runner.
 func (j *JITSource) Exists(ctx context.Context, name string) (bool, error) {
 	opCtx, cancel := context.WithTimeout(ctx, removeOpTimeout)
