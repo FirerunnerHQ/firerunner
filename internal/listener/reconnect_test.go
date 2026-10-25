@@ -465,7 +465,10 @@ func TestTrackedSessionKeepsPendingJobs(t *testing.T) {
 	if p == nil || p.Jobs != 2 || p.Kept != 1 || p.ByEvent["push"] != 1 {
 		t.Fatalf("pending = %+v", p)
 	}
-	if !jobs.ClaimPool() || jobs.ClaimPool() {
+	if ok, _ := jobs.ClaimPool(); !ok {
+		t.Fatal("the pull_request job did not let a launch take the pool")
+	}
+	if ok, _ := jobs.ClaimPool(); ok {
 		t.Fatal("want one pool claim, for the pull_request job")
 	}
 	f.msgs <- &scaleset.RunnerScaleSetMessage{
@@ -476,6 +479,22 @@ func TestTrackedSessionKeepsPendingJobs(t *testing.T) {
 	}
 	if p := tr.Snapshot().Pending; p != nil {
 		t.Fatalf("pending after start and completion = %+v, want none", p)
+	}
+}
+
+func TestTrackedSessionCountsJobsAssignedBeforeIt(t *testing.T) {
+	jobs := assigned.New(&assigned.Policy{Events: []string{"pull_request"}})
+	ts := trackedSession{session: newFakeSession(2, false), pending: jobs}
+	if st := ts.Session().Statistics; st == nil || st.TotalAssignedJobs != 2 {
+		t.Fatalf("session statistics = %+v", st)
+	}
+	for i := range 2 {
+		if ok, _ := jobs.ClaimPool(); !ok {
+			t.Fatalf("claim %d: a job assigned before the session may not take the pool", i)
+		}
+	}
+	if ok, _ := jobs.ClaimPool(); ok {
+		t.Fatal("more pool claims than jobs")
 	}
 }
 

@@ -468,6 +468,16 @@ func (t trackedSession) DeleteMessage(ctx context.Context, messageID int) error 
 	return err
 }
 
+// Session tells the assigned jobs how many jobs the new session starts with,
+// before the library sizes the tier from that count.
+func (t trackedSession) Session() scaleset.RunnerScaleSetSession {
+	sess := t.session.Session()
+	if sess.Statistics != nil {
+		t.pending.Session(sess.Statistics.TotalAssignedJobs)
+	}
+	return sess
+}
+
 func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
 	m, err := t.session.GetMessage(ctx, lastMessageID, maxCapacity)
 	if err == nil && t.health != nil {
