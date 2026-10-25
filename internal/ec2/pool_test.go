@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -157,6 +158,62 @@ func TestLaunch_IgnoresStoppedBeforeTheStart(t *testing.T) {
 	h.f.setState(id, types.InstanceStateNameStopped)
 	if err := waitErr(t, errc); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLaunch_PoolKeptForPendingJobs(t *testing.T) {
+	var mu sync.Mutex
+	usePool := false
+	var paths []string
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Pool = 1
+		o.EC2.Market = config.MarketOnDemand
+		o.UsePool = func() bool { mu.Lock(); defer mu.Unlock(); return usePool }
+		o.Launched = func(p string) { mu.Lock(); defer mu.Unlock(); paths = append(paths, p) }
+	})
+	h.p.pool.tick = 5 * time.Millisecond
+	h.runPool(t)
+	eventually(t, "a warming instance", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
+	h.stopWarming()
+	eventually(t, "a ready instance", func() bool { r, _ := h.p.pool.Ready(); return r == 1 })
+	pooledID := h.f.launched()[0].id
+
+	// No pending job the policy names: cold-launch, and keep the pool.
+	errc := h.launch(context.Background())
+	var cold *fakeInstance
+	eventually(t, "a cold instance", func() bool {
+		for _, i := range h.f.launched() {
+			if i.tags[TagRunner] == "runner-1" && i.tags[TagPool] == "" {
+				cold = i
+				return true
+			}
+		}
+		return false
+	})
+	if r, _ := h.p.pool.Ready(); r != 1 {
+		t.Fatalf("pool ready = %d after a kept launch, want 1", r)
+	}
+	h.f.setState(cold.id, types.InstanceStateNameTerminated)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+
+	// A pending job the policy names: the launch takes the pool.
+	mu.Lock()
+	usePool = true
+	mu.Unlock()
+	errc = h.launch(context.Background())
+	eventually(t, "the pooled instance to start", func() bool { h.f.mu.Lock(); defer h.f.mu.Unlock(); return len(h.f.started) == 1 })
+	h.f.setState(pooledID, types.InstanceStateNameRunning)
+	time.Sleep(20 * time.Millisecond)
+	h.f.setState(pooledID, types.InstanceStateNameStopped)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(paths, ",") != PathKept+","+PathPool {
+		t.Fatalf("paths = %v, want [kept pool]", paths)
 	}
 }
 
