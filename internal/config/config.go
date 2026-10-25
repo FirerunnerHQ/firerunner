@@ -194,6 +194,18 @@ type EC2Tier struct {
 	// persistent requests and are still billed at the spot price. 0 disables
 	// the pool, and every job cold-launches.
 	Pool int `json:"pool,omitempty"`
+	// PoolFor keeps the pool for the jobs that need a fast start: a launch
+	// takes a pool instance only for a pending job it matches, and others
+	// cold-launch. Unset, every launch takes the pool while it has one.
+	PoolFor *PoolFor `json:"pool_for,omitempty"`
+}
+
+// PoolFor matches pending jobs by event (e.g. "pull_request") or by job
+// display name (e.g. a required check). It shapes supply only: GitHub gives a
+// queued job to any idle runner, so it cannot pin a job to a pool instance.
+type PoolFor struct {
+	Events []string `json:"events,omitempty"`
+	Jobs   []string `json:"jobs,omitempty"`
 }
 
 // AMIFromSSM reports whether AMI names an SSM parameter rather than an image ID.
@@ -745,6 +757,24 @@ func validateEC2Tier(t Tier) error {
 		return fmt.Errorf("tier %q: ec2.root_volume_gib must be >= 0", t.Name)
 	case e.Pool < 0:
 		return fmt.Errorf("tier %q: ec2.pool must be >= 0", t.Name)
+	}
+	if f := e.PoolFor; f != nil {
+		switch {
+		case len(f.Events) == 0 && len(f.Jobs) == 0:
+			return fmt.Errorf("tier %q: ec2.pool_for needs events or jobs", t.Name)
+		case t.MaxPool() == 0:
+			return fmt.Errorf("tier %q: ec2.pool_for needs a pool (ec2.pool or a schedule window's pool)", t.Name)
+		}
+		for _, l := range []struct {
+			name string
+			vals []string
+		}{{"events", f.Events}, {"jobs", f.Jobs}} {
+			if len(l.vals) > 0 {
+				if err := nonEmptyUnique(l.vals); err != nil {
+					return fmt.Errorf("tier %q: ec2.pool_for.%s: %w", t.Name, l.name, err)
+				}
+			}
+		}
 	}
 	// io1/io2 need a provisioned IOPS value, which the tier does not carry.
 	switch e.VolumeType() {
