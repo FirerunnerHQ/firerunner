@@ -10,11 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -396,6 +398,17 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				}
 				fmt.Fprintf(w, "  %s schedule: %s: %d hot runner(s), pool %d, since %s\n",
 					t.Name, window, sz.Min, sz.Pool, sz.Since.UTC().Format(time.RFC3339))
+			}
+			if pj := t.Pending; pj != nil {
+				fmt.Fprintf(w, "  %s assigned, not started: %d job(s) (%s)", t.Name, pj.Jobs, countList(pj.ByEvent))
+				if pj.Kept > 0 {
+					fmt.Fprintf(w, "; %d the pool is kept for", pj.Kept)
+				}
+				fmt.Fprintln(w)
+			}
+			if len(t.Launches) > 0 {
+				fmt.Fprintf(w, "  %s launches: %d from the pool, %d cold, %d cold to keep the pool\n",
+					t.Name, t.Launches["pool"], t.Launches["cold"], t.Launches["kept"])
 			}
 			if t.OfflineWouldRemove > 0 {
 				fmt.Fprintf(w, "  %s runner sweep (dry run): would remove %d offline runner(s)\n", t.Name, t.OfflineWouldRemove)
@@ -1172,4 +1185,17 @@ func isPID(name string) bool {
 		}
 	}
 	return true
+}
+
+// countList renders counts by name, sorted by name: "pull_request 2, push 1".
+func countList(m map[string]int) string {
+	parts := make([]string, 0, len(m))
+	for _, k := range slices.Sorted(maps.Keys(m)) {
+		name := k
+		if name == "" {
+			name = "unknown"
+		}
+		parts = append(parts, fmt.Sprintf("%s %d", name, m[k]))
+	}
+	return strings.Join(parts, ", ")
 }
