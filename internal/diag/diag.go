@@ -407,7 +407,7 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				fmt.Fprintln(w)
 			}
 			if len(t.Launches) > 0 {
-				fmt.Fprintf(w, "  %s launches: %d from the pool, %d cold, %d cold to keep the pool\n",
+				fmt.Fprintf(w, "  %s launches: %d from the pool, %d cold, %d cold with the pool kept\n",
 					t.Name, t.Launches["pool"], t.Launches["cold"], t.Launches["kept"])
 			}
 			if t.OfflineWouldRemove > 0 {
