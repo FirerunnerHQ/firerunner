@@ -725,6 +725,15 @@ func (s *Scheduler) IdleRunners(olderThan time.Duration) []string {
 	return out
 }
 
+// Tracks reports whether the named runner is one of this scheduler's live
+// launches. A name is generated (and registered at GitHub) shortly before
+// its launch is tracked, so callers must allow for that window.
+func (s *Scheduler) Tracks(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active[name] != nil
+}
+
 // CancelLost cancels an idle runner GitHub no longer knows: it can never get
 // a job, and would hold its slot (and its instance) until its lifetime ends.
 // A busy runner is left alone. It reports whether it cancelled.
