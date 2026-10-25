@@ -38,6 +38,10 @@ func (h *harness) stopWarming() {
 	}
 }
 
+// runningHold is how long a test leaves an instance running before it stops:
+// long enough for the 5 ms state poll to see it under -race and coverage.
+const runningHold = 200 * time.Millisecond
+
 func (h *harness) runPool(t *testing.T) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -117,7 +121,7 @@ func TestLaunch_ClaimsFromPool(t *testing.T) {
 	}
 	// The instance runs its job, powers off and stops; Launch terminates it.
 	h.f.setState(pooledID, types.InstanceStateNameRunning)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(runningHold)
 	h.f.setState(pooledID, types.InstanceStateNameStopped)
 	if err := waitErr(t, errc); err != nil {
 		t.Fatalf("Launch = %v", err)
@@ -154,7 +158,7 @@ func TestLaunch_IgnoresStoppedBeforeTheStart(t *testing.T) {
 		t.Fatalf("terminated %v on a stale stopped state", ids)
 	}
 	h.f.setState(id, types.InstanceStateNameRunning)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(runningHold)
 	h.f.setState(id, types.InstanceStateNameStopped)
 	if err := waitErr(t, errc); err != nil {
 		t.Fatal(err)
@@ -213,7 +217,7 @@ func TestLaunch_PoolKeptForPendingJobs(t *testing.T) {
 	errc = h.launch(context.Background())
 	eventually(t, "the pooled instance to start", func() bool { h.f.mu.Lock(); defer h.f.mu.Unlock(); return len(h.f.started) == 1 })
 	h.f.setState(pooledID, types.InstanceStateNameRunning)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(runningHold)
 	h.f.setState(pooledID, types.InstanceStateNameStopped)
 	if err := waitErr(t, errc); err != nil {
 		t.Fatal(err)
@@ -470,7 +474,7 @@ func TestLaunch_SpotCancelRetriedBeforeTerminate(t *testing.T) {
 	errc := h.launch(context.Background())
 	eventually(t, "the start", func() bool { h.f.mu.Lock(); defer h.f.mu.Unlock(); return len(h.f.started) == 1 })
 	h.f.setState(id, types.InstanceStateNameRunning)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(runningHold)
 	h.f.setState(id, types.InstanceStateNameStopped) // the job ends
 	if err := waitErr(t, errc); err != nil {
 		t.Fatal(err)
