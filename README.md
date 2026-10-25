@@ -426,6 +426,33 @@ starts one in seconds:
 - **Fallback.** With the pool empty, or if a stopped instance cannot start
   (spot capacity), the job cold-launches instead.
 
+**Keeping the pool for the jobs that need it (`"pool_for"`).** By default
+every launch takes a pool instance while there is one. With `pool_for`, a
+launch takes one only for a pending job that matches; other demand
+cold-launches and leaves the pool alone:
+
+```json
+"ec2": {"pool": 2, "pool_for": {"events": ["pull_request"], "jobs": ["required-check"]}, "...": "..."}
+```
+
+- **What matches.** A job matches by event (`pull_request`, `push`,
+  `schedule`, …) or by its display name, such as a required check.
+- **Where the jobs come from.** On a JIT scale set GitHub announces every
+  job with a `JobAssigned` message before a runner picks it up. firerunner
+  keeps those jobs until they start or complete. Each matching job lets one
+  launch take the pool, earliest queued first. Jobs assigned before a
+  restart or reconnect have no message to read; each of those may take the
+  pool once, so a pull request waiting through a deploy still starts fast.
+  While the pool has nothing ready, launches go cold without asking.
+- **Supply, not placement.** GitHub gives a queued job to whichever idle
+  runner of the scale set asks first, so a pool instance started for a pull
+  request can still run a push job queued before it. The policy decides only
+  which launches spend the pool; it cannot pin a job to an instance.
+- **Visibility.** Each assignment is logged (`job assigned`, with the event
+  and GitHub's own queue-to-assign delay). `status` shows the jobs assigned
+  but not started, by event, and how many launches took the pool, went cold,
+  or went cold although the pool had an instance ready.
+
 **Sizing by schedule (`"schedule"`).** A tier can keep more hot runners
 (`min`) and a bigger stopped pool at busy times. It works on any tier;
 `pool` needs an EC2 tier.

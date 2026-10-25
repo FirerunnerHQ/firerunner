@@ -610,6 +610,18 @@ func TestFromFlags_EC2WarmPoolOutsideSlotBudget(t *testing.T) {
 	}
 }
 
+func TestFromFlags_EC2PoolFor(t *testing.T) {
+	p := writeTiers(t, `[`+strings.Replace(ec2TierJSON, `"root_volume_gib":40`,
+		`"root_volume_gib":40,"pool":2,"pool_for":{"events":["pull_request"],"jobs":["required"]}`, 1)+`]`)
+	c, err := FromFlags(append(append(baseArgs(), jitAddr...), "--tiers", p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := c.EffectiveTiers()[0].EC2.PoolFor; f == nil || f.Events[0] != "pull_request" || f.Jobs[0] != "required" {
+		t.Fatalf("pool_for = %+v", f)
+	}
+}
+
 func TestFromFlags_EC2TierErrors(t *testing.T) {
 	// Each case replaces one fragment of the valid ec2TierJSON.
 	cases := map[string][2]string{
@@ -633,6 +645,10 @@ func TestFromFlags_EC2TierErrors(t *testing.T) {
 		"negative pool":        {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":-1`},
 		"bad volume type":      {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"st1"`},
 		"io2 needs iops":       {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"io2"`},
+		"pool_for no pool":     {`"root_volume_gib":40`, `"root_volume_gib":40,"pool_for":{"events":["pull_request"]}}`},
+		"pool_for empty":       {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":2,"pool_for":{}`},
+		"pool_for dup event":   {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":2,"pool_for":{"events":["push","push"]}`},
+		"pool_for blank job":   {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":2,"pool_for":{"jobs":[""]}`},
 		"zero max":             {`"max":20`, `"max":0`},
 		"min over max":         {`"min":1`, `"min":30`},
 	}

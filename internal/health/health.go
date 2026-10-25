@@ -6,6 +6,7 @@ package health
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
@@ -60,6 +61,19 @@ type Tier struct {
 	// Sizes are the hot runners and pool size the tier's schedule set last;
 	// nil for a tier without a schedule.
 	Sizes *Sizes `json:"sizes,omitempty"`
+	// Pending is the jobs GitHub assigned that have not started, when any.
+	Pending *Pending `json:"pending,omitempty"`
+	// Launches counts EC2 launches by path: "pool", "cold", or "kept" (a
+	// cold launch that left the pool for jobs ec2.pool_for names).
+	Launches map[string]int `json:"launches,omitempty"`
+}
+
+// Pending is a tier's assigned-but-not-started jobs.
+type Pending struct {
+	Jobs    int            `json:"jobs"`
+	ByEvent map[string]int `json:"by_event,omitempty"`
+	// Kept is how many ec2.pool_for keeps the pool for.
+	Kept int `json:"kept,omitempty"`
 }
 
 // Sizes are a scheduled tier's current sizes and the window that set them
@@ -164,6 +178,26 @@ func (tr *Tracker) SetSizes(sz Sizes) {
 	tr.t.Sizes = &sz
 }
 
+// SetPending records the pending jobs; nil or empty clears them.
+func (tr *Tracker) SetPending(p *Pending) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if p != nil && p.Jobs == 0 {
+		p = nil
+	}
+	tr.t.Pending = p
+}
+
+// Launched counts an EC2 launch by path.
+func (tr *Tracker) Launched(path string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.t.Launches == nil {
+		tr.t.Launches = map[string]int{}
+	}
+	tr.t.Launches[path]++
+}
+
 // OfflineRemoved counts an untracked offline runner removed.
 func (tr *Tracker) OfflineRemoved() {
 	tr.mu.Lock()
@@ -201,6 +235,12 @@ func (tr *Tracker) Snapshot() Tier {
 		g := *t.GitHub
 		t.GitHub = &g
 	}
+	if t.Pending != nil {
+		p := *t.Pending
+		p.ByEvent = maps.Clone(p.ByEvent)
+		t.Pending = &p
+	}
+	t.Launches = maps.Clone(t.Launches)
 	return t
 }
 

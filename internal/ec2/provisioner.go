@@ -106,8 +106,28 @@ type Options struct {
 	// Pooled keeps a pool even while EC2.Pool is 0, for a tier whose
 	// schedule sizes one later (see Pool.SetTarget).
 	Pooled bool
-	Logger *slog.Logger
+	// UsePool, when set, decides per launch whether it may take a pool
+	// instance; false cold-launches and leaves the pool for the jobs
+	// ec2.pool_for names. release is called when the launch did not start
+	// a pool instance after all. Nil lets every launch take the pool.
+	UsePool func() (ok bool, release func())
+	// Launched, when set, is told each launch's path (PathPool, PathCold or
+	// PathKept).
+	Launched func(path string)
+	Logger   *slog.Logger
 }
+
+// Launch paths, as Options.Launched reports them.
+const (
+	// PathPool started a stopped pool instance.
+	PathPool = "pool"
+	// PathCold launched a new instance: the tier keeps no pool, the pool was
+	// empty, or its instance would not start.
+	PathCold = "cold"
+	// PathKept launched a new instance although the pool had one ready,
+	// leaving it for the jobs ec2.pool_for names.
+	PathKept = "kept"
+)
 
 // Provisioner launches one EC2 instance per runner for one tier.
 type Provisioner struct {
@@ -155,13 +175,32 @@ func (p *Provisioner) Name() string { return "ec2" }
 // instance is terminated. Busy detection does not come from here: the listener
 // marks the runner busy from GitHub's JobStarted message, so onBusy is unused.
 func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.RunnerSpec, _ func()) error {
+	path := PathCold
 	if p.pool != nil {
-		err := p.launchPooled(ctx, name, jit)
-		if !errors.Is(err, errPoolEmpty) && !errors.Is(err, errPoolStart) {
-			return err
+		use, release := true, func() {}
+		if p.o.UsePool != nil {
+			// With a policy, a pool with nothing ready is not waited on:
+			// the launch goes cold without spending a claim, and one that
+			// refills meanwhile stays kept.
+			if ready, _ := p.pool.Ready(); ready == 0 {
+				use = false
+			} else if use, release = p.o.UsePool(); !use {
+				path = PathKept
+				p.log.Info("no pending job needs the pool; cold-launching", "runner", name)
+			}
 		}
-		if errors.Is(err, errPoolStart) {
-			p.log.Warn("pool instance unavailable; cold-launching instead", "runner", name, "err", err)
+		if use {
+			started := false
+			err := p.launchPooled(ctx, name, jit, func() { started = true; p.launched(PathPool) })
+			if !started {
+				release() // the claim was not spent
+			}
+			if !errors.Is(err, errPoolEmpty) && !errors.Is(err, errPoolStart) {
+				return err
+			}
+			if errors.Is(err, errPoolStart) {
+				p.log.Warn("pool instance unavailable; cold-launching instead", "runner", name, "err", err)
+			}
 		}
 	}
 	entered := time.Now()
@@ -174,6 +213,7 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 	if err != nil {
 		return err
 	}
+	p.launched(path)
 	id := aws.ToString(inst.InstanceId)
 	p.c.track(id)
 	defer p.c.untrack(id)
@@ -197,6 +237,12 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 	return w.run(ctx, ip)
 }
 
+func (p *Provisioner) launched(path string) {
+	if p.o.Launched != nil {
+		p.o.Launched(path)
+	}
+}
+
 // errPoolStart reports that a claimed pool instance failed to start; the
 // launch falls back to a cold instance.
 var errPoolStart = errors.New("pool instance did not start")
@@ -204,7 +250,7 @@ var errPoolStart = errors.New("pool instance did not start")
 // launchPooled runs the runner on a ready pool instance: claim it, register
 // its config, start it, then wait as for any job instance. It returns
 // errPoolEmpty when no instance is ready.
-func (p *Provisioner) launchPooled(ctx context.Context, name, jit string) error {
+func (p *Provisioner) launchPooled(ctx context.Context, name, jit string, onStart func()) error {
 	entered := time.Now()
 	in, err := p.pool.claim(ctx, name)
 	switch {
@@ -234,6 +280,7 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string) error 
 		p.pool.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
 		return fmt.Errorf("%w: start %s: %w", errPoolStart, in.id, err)
 	}
+	onStart()
 	started := time.Now()
 	// Now that it runs, release the persistent request: a terminate later
 	// must not bring a replacement. (Cancelling it before the start would

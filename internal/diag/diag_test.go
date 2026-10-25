@@ -714,7 +714,9 @@ func TestStatusShowsScheduledSizes(t *testing.T) {
 			Sizes: &health.Sizes{Min: 2, Pool: 12, Window: "mon-fri 06:00-13:00", Since: since}},
 		health.Tier{Name: "out", State: health.Connected, Since: now,
 			Sizes: &health.Sizes{Min: 0, Pool: 2, Since: since}},
-		health.Tier{Name: "plain", State: health.Connected, Since: now})
+		health.Tier{Name: "plain", State: health.Connected, Since: now,
+			Pending:  &health.Pending{Jobs: 3, ByEvent: map[string]int{"push": 1, "pull_request": 2}, Kept: 2},
+			Launches: map[string]int{"pool": 4, "kept": 1}})
 	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: dir, TapPrefix: "fr", NetBase: 16}}
 	var text bytes.Buffer
 	if err := Status(cfg, "test", &text, false); err != nil {
@@ -722,6 +724,8 @@ func TestStatusShowsScheduledSizes(t *testing.T) {
 	}
 	out := text.String()
 	for _, want := range []string{
+		"plain assigned, not started: 3 job(s) (pull_request 2, push 1); 2 the pool is kept for",
+		"plain launches: 4 from the pool, 0 cold, 1 cold with the pool kept",
 		"in schedule: window mon-fri 06:00-13:00: 2 hot runner(s), pool 12, since 2026-10-19T22:00:00Z",
 		"out schedule: base sizes (outside every window): 0 hot runner(s), pool 2",
 	} {

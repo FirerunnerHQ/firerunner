@@ -3,6 +3,7 @@ package listener
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/google/uuid"
 
+	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
@@ -443,6 +445,56 @@ func TestTrackedSessionRecordsMessages(t *testing.T) {
 	_, _ = ts.GetMessage(context.Background(), 0, 1)
 	if !tr.Snapshot().LastMessage.Equal(before) {
 		t.Fatal("a failed GetMessage counted as a message")
+	}
+}
+
+func TestTrackedSessionKeepsPendingJobs(t *testing.T) {
+	tr := health.NewTracker("a")
+	f := newFakeSession(0, false)
+	jobs := assigned.New(&assigned.Policy{Events: []string{"pull_request"}})
+	ts := trackedSession{session: f, health: tr, pending: jobs, log: slog.New(slog.DiscardHandler)}
+	b := func(req int64, event string) scaleset.JobMessageBase {
+		return scaleset.JobMessageBase{RunnerRequestID: req, EventName: event}
+	}
+	f.msgs <- &scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{
+		{JobMessageBase: b(1, "push")}, {JobMessageBase: b(2, "pull_request")}}}
+	if _, err := ts.GetMessage(context.Background(), 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	p := tr.Snapshot().Pending
+	if p == nil || p.Jobs != 2 || p.Kept != 1 || p.ByEvent["push"] != 1 {
+		t.Fatalf("pending = %+v", p)
+	}
+	if ok, _ := jobs.ClaimPool(); !ok {
+		t.Fatal("the pull_request job did not let a launch take the pool")
+	}
+	if ok, _ := jobs.ClaimPool(); ok {
+		t.Fatal("want one pool claim, for the pull_request job")
+	}
+	f.msgs <- &scaleset.RunnerScaleSetMessage{
+		JobStartedMessages:   []*scaleset.JobStarted{{JobMessageBase: b(1, "push")}},
+		JobCompletedMessages: []*scaleset.JobCompleted{{JobMessageBase: b(2, "pull_request")}}}
+	if _, err := ts.GetMessage(context.Background(), 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if p := tr.Snapshot().Pending; p != nil {
+		t.Fatalf("pending after start and completion = %+v, want none", p)
+	}
+}
+
+func TestTrackedSessionCountsJobsAssignedBeforeIt(t *testing.T) {
+	jobs := assigned.New(&assigned.Policy{Events: []string{"pull_request"}})
+	ts := trackedSession{session: newFakeSession(2, false), pending: jobs}
+	if st := ts.Session().Statistics; st == nil || st.TotalAssignedJobs != 2 {
+		t.Fatalf("session statistics = %+v", st)
+	}
+	for i := range 2 {
+		if ok, _ := jobs.ClaimPool(); !ok {
+			t.Fatalf("claim %d: a job assigned before the session may not take the pool", i)
+		}
+	}
+	if ok, _ := jobs.ClaimPool(); ok {
+		t.Fatal("more pool claims than jobs")
 	}
 }
 

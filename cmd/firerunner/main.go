@@ -30,6 +30,7 @@ import (
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 
+	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/cacheserver"
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/diag"
@@ -411,6 +412,15 @@ func reaperOptions(cfg *config.Config, owner string, tiers []config.Tier, listen
 	}
 }
 
+// poolPolicy is the tier's ec2.pool_for as an assigned-jobs policy; nil, every
+// launch may take the pool.
+func poolPolicy(t config.Tier) *assigned.Policy {
+	if t.EC2 == nil || t.EC2.PoolFor == nil {
+		return nil
+	}
+	return &assigned.Policy{Events: t.EC2.PoolFor.Events, Jobs: t.EC2.PoolFor.Jobs}
+}
+
 // scheduleTarget is what a tier's schedule resizes: its stopped pool, if it
 // keeps one, then the hot runners the scheduler keeps beside GitHub's jobs.
 func scheduleTarget(sched *scheduler.Scheduler, prov provisioner.Provisioner, tracker *health.Tracker) schedule.Target {
@@ -651,6 +661,18 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if cfg.UsesFirecracker() {
 		fc = provisioner.NewFirecracker(cfg.Firecracker, log)
 	}
+	tiers := cfg.EffectiveTiers()
+	// A tier's provisioner and listener share its health and the jobs
+	// assigned to it: the listener records both, and an EC2 provisioner
+	// reports its launch paths and asks whether a launch may take the pool.
+	trackers := make([]*health.Tracker, len(tiers))
+	tierHealth := map[string]*health.Tracker{}
+	tierJobs := map[string]*assigned.Jobs{}
+	for i, t := range tiers {
+		trackers[i] = health.NewTracker(t.Name)
+		tierHealth[t.Name] = trackers[i]
+		tierJobs[t.Name] = assigned.New(poolPolicy(t))
+	}
 	var (
 		newEC2    func(config.Tier) provisioner.Provisioner
 		ec2Client *ec2.Client
@@ -681,6 +703,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				JIT:         jit,
 				JITURL:      jitserver.URL(cfg.JITEndpoint()),
 				MaxLifetime: cfg.Firecracker.MaxVMLifetime,
+				UsePool:     tierJobs[t.Name].ClaimPool,
+				Launched:    tierHealth[t.Name].Launched,
 				Logger:      log.With("tier", t.Name),
 			})
 			// A tier's stopped pool fills and refills in the background for
@@ -692,7 +716,6 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			return p
 		}
 	}
-	tiers := cfg.EffectiveTiers()
 	provs := make([]provisioner.Provisioner, len(tiers))
 	for i, t := range tiers {
 		var shared provisioner.Provisioner
@@ -711,7 +734,6 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	var (
 		listeners []*listener.ScaleSet
 		scheds    []*scheduler.Scheduler
-		trackers  []*health.Tracker
 		pending   scheduler.PendingLaunches
 	)
 	closeAll := func() {
@@ -721,12 +743,12 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	for i, t := range tiers {
 		tlog := log.With("tier", t.Name)
-		tracker := health.NewTracker(t.Name)
-		trackers = append(trackers, tracker)
+		tracker := trackers[i]
 		lis, err := listener.New(ctx, listener.Config{
 			URL:          cfg.URL,
 			OnJobStarted: onJobStarted,
 			Health:       tracker,
+			Pending:      tierJobs[t.Name],
 			Name:         t.Name,
 			RunnerGroup:  cfg.RunnerGroup,
 			Labels:       t.Labels,

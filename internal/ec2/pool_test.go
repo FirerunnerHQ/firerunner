@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +37,10 @@ func (h *harness) stopWarming() {
 		}
 	}
 }
+
+// runningHold is how long a test leaves an instance running before it stops:
+// long enough for the 5 ms state poll to see it under -race and coverage.
+const runningHold = 200 * time.Millisecond
 
 func (h *harness) runPool(t *testing.T) context.CancelFunc {
 	t.Helper()
@@ -116,7 +121,7 @@ func TestLaunch_ClaimsFromPool(t *testing.T) {
 	}
 	// The instance runs its job, powers off and stops; Launch terminates it.
 	h.f.setState(pooledID, types.InstanceStateNameRunning)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(runningHold)
 	h.f.setState(pooledID, types.InstanceStateNameStopped)
 	if err := waitErr(t, errc); err != nil {
 		t.Fatalf("Launch = %v", err)
@@ -153,10 +158,137 @@ func TestLaunch_IgnoresStoppedBeforeTheStart(t *testing.T) {
 		t.Fatalf("terminated %v on a stale stopped state", ids)
 	}
 	h.f.setState(id, types.InstanceStateNameRunning)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(runningHold)
 	h.f.setState(id, types.InstanceStateNameStopped)
 	if err := waitErr(t, errc); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLaunch_PoolKeptForPendingJobs(t *testing.T) {
+	var mu sync.Mutex
+	usePool := false
+	var paths []string
+	claims, released := 0, 0
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Pool = 1
+		o.EC2.Market = config.MarketOnDemand
+		o.UsePool = func() (bool, func()) {
+			mu.Lock()
+			defer mu.Unlock()
+			if usePool {
+				claims++
+			}
+			return usePool, func() { mu.Lock(); defer mu.Unlock(); released++ }
+		}
+		o.Launched = func(p string) { mu.Lock(); defer mu.Unlock(); paths = append(paths, p) }
+	})
+	h.p.pool.tick = 5 * time.Millisecond
+	h.runPool(t)
+	eventually(t, "a warming instance", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
+	h.stopWarming()
+	eventually(t, "a ready instance", func() bool { r, _ := h.p.pool.Ready(); return r == 1 })
+	pooledID := h.f.launched()[0].id
+
+	// No pending job the policy names: cold-launch, and keep the pool.
+	errc := h.launch(context.Background())
+	var cold *fakeInstance
+	eventually(t, "a cold instance", func() bool {
+		for _, i := range h.f.launched() {
+			if i.tags[TagRunner] == "runner-1" && i.tags[TagPool] == "" {
+				cold = i
+				return true
+			}
+		}
+		return false
+	})
+	if r, _ := h.p.pool.Ready(); r != 1 {
+		t.Fatalf("pool ready = %d after a kept launch, want 1", r)
+	}
+	h.f.setState(cold.id, types.InstanceStateNameTerminated)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+
+	// A pending job the policy names: the launch takes the pool.
+	mu.Lock()
+	usePool = true
+	mu.Unlock()
+	errc = h.launch(context.Background())
+	eventually(t, "the pooled instance to start", func() bool { h.f.mu.Lock(); defer h.f.mu.Unlock(); return len(h.f.started) == 1 })
+	h.f.setState(pooledID, types.InstanceStateNameRunning)
+	time.Sleep(runningHold)
+	h.f.setState(pooledID, types.InstanceStateNameStopped)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(paths, ",") != PathKept+","+PathPool {
+		t.Fatalf("paths = %v, want [kept pool]", paths)
+	}
+	if claims != 1 || released != 0 {
+		t.Fatalf("claims %d released %d, want one claim spent", claims, released)
+	}
+}
+
+func TestLaunch_ClaimReleasedWhenThePoolInstanceWillNotStart(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	released := 0
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Pool = 1
+		o.EC2.Market = config.MarketOnDemand
+		o.UsePool = func() (bool, func()) { return true, func() { mu.Lock(); defer mu.Unlock(); released++ } }
+		o.Launched = func(p string) { mu.Lock(); defer mu.Unlock(); paths = append(paths, p) }
+	})
+	h.p.pool.tick = 5 * time.Millisecond
+	h.runPool(t)
+	eventually(t, "a warming instance", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
+	h.stopWarming()
+	eventually(t, "a ready instance", func() bool { r, _ := h.p.pool.Ready(); return r == 1 })
+	h.f.mu.Lock()
+	h.f.startErr = errors.New("InsufficientInstanceCapacity")
+	h.f.mu.Unlock()
+	errc := h.launch(context.Background())
+	var cold *fakeInstance
+	eventually(t, "a cold instance", func() bool {
+		for _, i := range h.f.launched() {
+			if i.tags[TagRunner] == "runner-1" && i.tags[TagPool] == "" {
+				cold = i
+				return true
+			}
+		}
+		return false
+	})
+	h.f.setState(cold.id, types.InstanceStateNameTerminated)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if released != 1 || strings.Join(paths, ",") != PathCold {
+		t.Fatalf("released %d paths %v, want the claim released and one cold launch", released, paths)
+	}
+}
+
+func TestLaunch_EmptyPoolSkipsThePolicy(t *testing.T) {
+	asked := false
+	var paths []string
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Pool = 1
+		o.EC2.Market = config.MarketOnDemand
+		o.UsePool = func() (bool, func()) { asked = true; return false, func() {} }
+		o.Launched = func(p string) { paths = append(paths, p) }
+	})
+	errc := h.launch(context.Background()) // the pool is not running: nothing ready
+	inst := h.instance(t)
+	h.f.setState(inst.id, types.InstanceStateNameTerminated)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+	if asked || strings.Join(paths, ",") != PathCold {
+		t.Fatalf("asked %v paths %v, want a plain cold launch", asked, paths)
 	}
 }
 
@@ -342,7 +474,7 @@ func TestLaunch_SpotCancelRetriedBeforeTerminate(t *testing.T) {
 	errc := h.launch(context.Background())
 	eventually(t, "the start", func() bool { h.f.mu.Lock(); defer h.f.mu.Unlock(); return len(h.f.started) == 1 })
 	h.f.setState(id, types.InstanceStateNameRunning)
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(runningHold)
 	h.f.setState(id, types.InstanceStateNameStopped) // the job ends
 	if err := waitErr(t, errc); err != nil {
 		t.Fatal(err)
