@@ -165,10 +165,18 @@ func TestLaunch_PoolKeptForPendingJobs(t *testing.T) {
 	var mu sync.Mutex
 	usePool := false
 	var paths []string
+	claims, released := 0, 0
 	h := newHarness(t, func(o *Options) {
 		o.EC2.Pool = 1
 		o.EC2.Market = config.MarketOnDemand
-		o.UsePool = func() bool { mu.Lock(); defer mu.Unlock(); return usePool }
+		o.UsePool = func() (bool, func()) {
+			mu.Lock()
+			defer mu.Unlock()
+			if usePool {
+				claims++
+			}
+			return usePool, func() { mu.Lock(); defer mu.Unlock(); released++ }
+		}
 		o.Launched = func(p string) { mu.Lock(); defer mu.Unlock(); paths = append(paths, p) }
 	})
 	h.p.pool.tick = 5 * time.Millisecond
@@ -214,6 +222,69 @@ func TestLaunch_PoolKeptForPendingJobs(t *testing.T) {
 	defer mu.Unlock()
 	if strings.Join(paths, ",") != PathKept+","+PathPool {
 		t.Fatalf("paths = %v, want [kept pool]", paths)
+	}
+	if claims != 1 || released != 0 {
+		t.Fatalf("claims %d released %d, want one claim spent", claims, released)
+	}
+}
+
+func TestLaunch_ClaimReleasedWhenThePoolInstanceWillNotStart(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	released := 0
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Pool = 1
+		o.EC2.Market = config.MarketOnDemand
+		o.UsePool = func() (bool, func()) { return true, func() { mu.Lock(); defer mu.Unlock(); released++ } }
+		o.Launched = func(p string) { mu.Lock(); defer mu.Unlock(); paths = append(paths, p) }
+	})
+	h.p.pool.tick = 5 * time.Millisecond
+	h.runPool(t)
+	eventually(t, "a warming instance", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
+	h.stopWarming()
+	eventually(t, "a ready instance", func() bool { r, _ := h.p.pool.Ready(); return r == 1 })
+	h.f.mu.Lock()
+	h.f.startErr = errors.New("InsufficientInstanceCapacity")
+	h.f.mu.Unlock()
+	errc := h.launch(context.Background())
+	var cold *fakeInstance
+	eventually(t, "a cold instance", func() bool {
+		for _, i := range h.f.launched() {
+			if i.tags[TagRunner] == "runner-1" && i.tags[TagPool] == "" {
+				cold = i
+				return true
+			}
+		}
+		return false
+	})
+	h.f.setState(cold.id, types.InstanceStateNameTerminated)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if released != 1 || strings.Join(paths, ",") != PathCold {
+		t.Fatalf("released %d paths %v, want the claim released and one cold launch", released, paths)
+	}
+}
+
+func TestLaunch_EmptyPoolSkipsThePolicy(t *testing.T) {
+	asked := false
+	var paths []string
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Pool = 1
+		o.EC2.Market = config.MarketOnDemand
+		o.UsePool = func() (bool, func()) { asked = true; return false, func() {} }
+		o.Launched = func(p string) { paths = append(paths, p) }
+	})
+	errc := h.launch(context.Background()) // the pool is not running: nothing ready
+	inst := h.instance(t)
+	h.f.setState(inst.id, types.InstanceStateNameTerminated)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+	if asked || strings.Join(paths, ",") != PathCold {
+		t.Fatalf("asked %v paths %v, want a plain cold launch", asked, paths)
 	}
 }
 

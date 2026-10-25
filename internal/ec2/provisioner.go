@@ -108,8 +108,9 @@ type Options struct {
 	Pooled bool
 	// UsePool, when set, decides per launch whether it may take a pool
 	// instance; false cold-launches and leaves the pool for the jobs
-	// ec2.pool_for names. Nil lets every launch take the pool.
-	UsePool func() bool
+	// ec2.pool_for names. release is called when the launch did not start
+	// a pool instance after all. Nil lets every launch take the pool.
+	UsePool func() (ok bool, release func())
 	// Launched, when set, is told each launch's path (PathPool, PathCold or
 	// PathKept).
 	Launched func(path string)
@@ -123,7 +124,7 @@ const (
 	// PathCold launched a new instance: the tier keeps no pool, the pool was
 	// empty, or its instance would not start.
 	PathCold = "cold"
-	// PathKept launched a new instance although the pool may have had one,
+	// PathKept launched a new instance although the pool had one ready,
 	// leaving it for the jobs ec2.pool_for names.
 	PathKept = "kept"
 )
@@ -175,21 +176,29 @@ func (p *Provisioner) Name() string { return "ec2" }
 // marks the runner busy from GitHub's JobStarted message, so onBusy is unused.
 func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.RunnerSpec, _ func()) error {
 	path := PathCold
-	switch {
-	case p.pool == nil:
-	case p.o.UsePool != nil && !p.o.UsePool():
-		path = PathKept
-		p.log.Info("no pending job needs the pool; cold-launching", "runner", name)
-	default:
-		err := p.launchPooled(ctx, name, jit)
-		if !errors.Is(err, errPoolEmpty) && !errors.Is(err, errPoolStart) {
-			return err
+	if p.pool != nil {
+		use, release := true, func() {}
+		// The policy is asked only while the pool has an instance to keep.
+		if ready, _ := p.pool.Ready(); ready > 0 && p.o.UsePool != nil {
+			use, release = p.o.UsePool()
 		}
-		if errors.Is(err, errPoolStart) {
-			p.log.Warn("pool instance unavailable; cold-launching instead", "runner", name, "err", err)
+		if !use {
+			path = PathKept
+			p.log.Info("no pending job needs the pool; cold-launching", "runner", name)
+		} else {
+			started := false
+			err := p.launchPooled(ctx, name, jit, func() { started = true; p.launched(PathPool) })
+			if !started {
+				release() // the claim was not spent
+			}
+			if !errors.Is(err, errPoolEmpty) && !errors.Is(err, errPoolStart) {
+				return err
+			}
+			if errors.Is(err, errPoolStart) {
+				p.log.Warn("pool instance unavailable; cold-launching instead", "runner", name, "err", err)
+			}
 		}
 	}
-	p.launched(path)
 	entered := time.Now()
 	img, err := p.c.amis.resolve(ctx, p.o.EC2.AMI)
 	if err != nil {
@@ -200,6 +209,7 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 	if err != nil {
 		return err
 	}
+	p.launched(path)
 	id := aws.ToString(inst.InstanceId)
 	p.c.track(id)
 	defer p.c.untrack(id)
@@ -236,7 +246,7 @@ var errPoolStart = errors.New("pool instance did not start")
 // launchPooled runs the runner on a ready pool instance: claim it, register
 // its config, start it, then wait as for any job instance. It returns
 // errPoolEmpty when no instance is ready.
-func (p *Provisioner) launchPooled(ctx context.Context, name, jit string) error {
+func (p *Provisioner) launchPooled(ctx context.Context, name, jit string, onStart func()) error {
 	entered := time.Now()
 	in, err := p.pool.claim(ctx, name)
 	switch {
@@ -266,7 +276,7 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string) error 
 		p.pool.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
 		return fmt.Errorf("%w: start %s: %w", errPoolStart, in.id, err)
 	}
-	p.launched(PathPool)
+	onStart()
 	started := time.Now()
 	// Now that it runs, release the persistent request: a terminate later
 	// must not bring a replacement. (Cancelling it before the start would
