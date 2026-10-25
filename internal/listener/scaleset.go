@@ -15,6 +15,7 @@ import (
 	"github.com/actions/scaleset"
 	sslistener "github.com/actions/scaleset/listener"
 
+	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
@@ -42,7 +43,10 @@ type Config struct {
 	CommitSHA string
 
 	OnJobStarted func(context.Context, jobidentity.Job)
-	Logger       *slog.Logger
+	// Pending, if set, keeps the tier's assigned-but-not-started jobs, read
+	// from each message before the library acts on it.
+	Pending *assigned.Jobs
+	Logger  *slog.Logger
 	// Health, if set, records the tier's connection state.
 	Health *health.Tracker
 }
@@ -355,7 +359,7 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		s.recycle = nil
 		s.mu.Unlock()
 	}()
-	l, err := sslistener.New(trackedSession{session: sess, health: s.health, log: s.log, chaos: chaosExitAfterDelete()}, sslistener.Config{
+	l, err := sslistener.New(trackedSession{session: sess, health: s.health, pending: s.cfg.Pending, log: s.log, chaos: chaosExitAfterDelete()}, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
@@ -443,12 +447,14 @@ func (r *statsRecorder) latest() (scaleset.RunnerScaleSetStatistic, time.Time, b
 // moment a crash loses the message.
 func chaosExitAfterDelete() bool { return os.Getenv("FR_CHAOS_EXIT_AFTER_DELETE") == "1" }
 
-// trackedSession records each successful GetMessage in the tier's health, and
-// logs at debug level what each message carries.
+// trackedSession records each successful GetMessage in the tier's health,
+// logs what each message carries, and keeps its job assignments in pending:
+// the library parses JobAssigned but never passes it to the Scaler.
 type trackedSession struct {
 	session
-	health *health.Tracker
-	log    *slog.Logger
+	health  *health.Tracker
+	pending *assigned.Jobs
+	log     *slog.Logger
 	// chaos exits the process after DeleteMessage (see chaosExitAfterDelete).
 	chaos bool
 }
@@ -471,8 +477,27 @@ func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapaci
 		t.log.Debug("message", "id", m.MessageID,
 			"jobAvailable", len(m.JobAvailableMessages), "jobAssigned", len(m.JobAssignedMessages),
 			"jobStarted", len(m.JobStartedMessages), "jobCompleted", len(m.JobCompletedMessages))
+		for _, a := range m.JobAssignedMessages {
+			if a != nil {
+				t.log.Info("job assigned", "repository", a.OwnerName+"/"+a.RepositoryName, "job", a.JobDisplayName,
+					"event", a.EventName, "runnerRequestId", a.RunnerRequestID, "githubDelay", githubDelay(a.JobMessageBase))
+			}
+		}
+	}
+	if err == nil && t.pending.Message(m) && t.health != nil {
+		mix := t.pending.Mix()
+		t.health.SetPending(&health.Pending{Jobs: mix.Jobs, ByEvent: mix.ByEvent, Kept: mix.Kept})
 	}
 	return m, err
+}
+
+// githubDelay is how long GitHub took to assign a job to the scale set after
+// queueing it; 0 when either time is missing.
+func githubDelay(b scaleset.JobMessageBase) time.Duration {
+	if b.QueueTime.IsZero() || b.ScaleSetAssignTime.IsZero() {
+		return 0
+	}
+	return b.ScaleSetAssignTime.Sub(b.QueueTime).Round(time.Millisecond)
 }
 
 // isFatal reports whether a session error is one retrying cannot fix: GitHub

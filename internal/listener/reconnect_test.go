@@ -3,6 +3,7 @@ package listener
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/google/uuid"
 
+	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
@@ -443,6 +445,37 @@ func TestTrackedSessionRecordsMessages(t *testing.T) {
 	_, _ = ts.GetMessage(context.Background(), 0, 1)
 	if !tr.Snapshot().LastMessage.Equal(before) {
 		t.Fatal("a failed GetMessage counted as a message")
+	}
+}
+
+func TestTrackedSessionKeepsPendingJobs(t *testing.T) {
+	tr := health.NewTracker("a")
+	f := newFakeSession(0, false)
+	jobs := assigned.New(&assigned.Policy{Events: []string{"pull_request"}})
+	ts := trackedSession{session: f, health: tr, pending: jobs, log: slog.New(slog.DiscardHandler)}
+	b := func(req int64, event string) scaleset.JobMessageBase {
+		return scaleset.JobMessageBase{RunnerRequestID: req, EventName: event}
+	}
+	f.msgs <- &scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{
+		{JobMessageBase: b(1, "push")}, {JobMessageBase: b(2, "pull_request")}}}
+	if _, err := ts.GetMessage(context.Background(), 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	p := tr.Snapshot().Pending
+	if p == nil || p.Jobs != 2 || p.Kept != 1 || p.ByEvent["push"] != 1 {
+		t.Fatalf("pending = %+v", p)
+	}
+	if !jobs.ClaimPool() || jobs.ClaimPool() {
+		t.Fatal("want one pool claim, for the pull_request job")
+	}
+	f.msgs <- &scaleset.RunnerScaleSetMessage{
+		JobStartedMessages:   []*scaleset.JobStarted{{JobMessageBase: b(1, "push")}},
+		JobCompletedMessages: []*scaleset.JobCompleted{{JobMessageBase: b(2, "pull_request")}}}
+	if _, err := ts.GetMessage(context.Background(), 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if p := tr.Snapshot().Pending; p != nil {
+		t.Fatalf("pending after start and completion = %+v, want none", p)
 	}
 }
 
