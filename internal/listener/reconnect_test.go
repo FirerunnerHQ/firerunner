@@ -517,3 +517,15 @@ func TestRecycleWithoutALiveSession(t *testing.T) {
 		t.Fatal("Recycle reported success with no session running")
 	}
 }
+
+func TestCloseKeepsACreatedScaleSetWhenAsked(t *testing.T) {
+	// A nil client: Close must not reach it.
+	sess := &fakeSession{}
+	s := &ScaleSet{cfg: Config{KeepOnClose: true}, log: testLogger(), session: sess, scaleSetID: 4, created: true}
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !sess.closed.Load() {
+		t.Fatal("the message session was not closed")
+	}
+}

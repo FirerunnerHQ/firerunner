@@ -27,6 +27,11 @@ type Config struct {
 	RunnerGroup string
 	Labels      []string
 	MaxRunners  int
+	// KeepOnClose leaves a scale set this process created registered when
+	// it closes. A long-lived install (a stable --owner, a control VM that
+	// is replaced) keeps one scale set across restarts: deleting it on
+	// every graceful stop would make each deploy recreate it.
+	KeepOnClose bool
 
 	// Auth: a personal access token, or a GitHub App (preferred, per GitHub).
 	Token string
@@ -49,8 +54,9 @@ type session interface {
 	Close(ctx context.Context) error
 }
 
-// ScaleSet is the production Listener. Constructing it registers an ephemeral
-// runner scale set with GitHub; Close deregisters it.
+// ScaleSet is the production Listener. Constructing it registers a runner
+// scale set with GitHub, or reuses one of the same name; Close deregisters
+// one it created, unless Config.KeepOnClose.
 type ScaleSet struct {
 	cfg    Config
 	log    *slog.Logger
@@ -511,6 +517,10 @@ func (s *ScaleSet) Close(ctx context.Context) error {
 	_ = s.session.Close(ctx)
 	if !s.created {
 		s.log.Info("leaving reused runner scale set registered", "scaleSetID", s.scaleSetID)
+		return nil
+	}
+	if s.cfg.KeepOnClose {
+		s.log.Info("leaving runner scale set registered for the next start", "scaleSetID", s.scaleSetID)
 		return nil
 	}
 	if err := s.client.DeleteRunnerScaleSet(ctx, s.scaleSetID); err != nil {

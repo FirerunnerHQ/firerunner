@@ -731,10 +731,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			RunnerGroup:  cfg.RunnerGroup,
 			Labels:       t.Labels,
 			MaxRunners:   t.Max,
-			Token:        cfg.Token,
-			App:          app,
-			Version:      version,
-			Logger:       tlog,
+			// A named install outlives its process: keep its scale set
+			// across restarts and control VM replacements.
+			KeepOnClose: cfg.Owner != "",
+			Token:       cfg.Token,
+			App:         app,
+			Version:     version,
+			Logger:      tlog,
 		}, owner)
 		if err != nil {
 			closeAll()
