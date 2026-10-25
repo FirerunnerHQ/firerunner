@@ -67,6 +67,9 @@ type Config struct {
 	// EC2Reaper is "on", "dry-run" or "off": whether instances and spot
 	// requests this install left behind are cleaned up.
 	EC2Reaper string
+	// RunnerSweep is "on", "dry-run" or "off": whether offline runners this
+	// install does not track are removed from its scale sets.
+	RunnerSweep string
 	// Owner names this install: the firerunner:owner tag on everything it
 	// launches, and its scale-set session owner. Empty means the host name.
 	Owner string
@@ -329,6 +332,7 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.StringVar(&c.JITHost, "jit-host", env("FR_JIT_HOST", ""), "DNS name EC2 runner instances use for the JIT endpoint instead of --jit-addr's IP (e.g. control.firerunner.internal), so a replaced control VM keeps one address; it must resolve to --jit-addr's IP inside the VPC. The port is --jit-addr's")
 	fs.DurationVar(&c.JITTTL, "jit-ttl", er.duration("FR_JIT_TTL", 5*time.Minute), "how long an EC2 instance's JIT config waits to be fetched before it expires")
 	fs.StringVar(&c.Owner, "owner", env("FR_OWNER", ""), "name of this install: tagged as firerunner:owner on every instance it launches, so its pool and reaper find them again. Defaults to the host name; set a stable value when the control VM can be replaced")
+	fs.StringVar(&c.RunnerSweep, "runner-sweep", env("FR_RUNNER_SWEEP", "on"), "every 5 minutes, remove offline runners in this install's scale sets that it does not track (left by a launch that died before connecting, or by an earlier process), once two sweeps in a row find them: on, dry-run (log only), or off")
 	fs.StringVar(&c.EC2Reaper, "ec2-reaper", env("FR_EC2_REAPER", "on"), "clean up EC2 instances and spot requests this install left behind (after a crash or restart, including pool instances left mid-claim): on, dry-run (log only), or off (nothing cleans them up)")
 
 	fs.StringVar(&v.egress, "egress", env("FR_EGRESS", "api,actions,git,dns,packages,ntp"), "comma-separated egress allowlist: GitHub /meta categories (api,actions,git,packages) plus dns,ntp; or 'open' for no allowlist")
@@ -499,6 +503,11 @@ func (c *Config) validate() error {
 	case "on", "dry-run", "off":
 	default:
 		return fmt.Errorf("--ec2-reaper %q must be on, dry-run or off", c.EC2Reaper)
+	}
+	switch c.RunnerSweep {
+	case "on", "dry-run", "off":
+	default:
+		return fmt.Errorf("--runner-sweep %q must be on, dry-run or off", c.RunnerSweep)
 	}
 	if o := c.Owner; o != "" && (len(o) > 128 || strings.HasPrefix(strings.ToLower(o), "aws:") || strings.TrimSpace(o) != o) {
 		return fmt.Errorf("--owner %q must be at most 128 characters, not start with aws:, and have no surrounding spaces", o)

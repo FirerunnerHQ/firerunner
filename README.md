@@ -467,6 +467,14 @@ running process tracks, and anything younger than 2 minutes.
 - **A pool instance of a tier that no longer keeps a pool:** terminated.
 - **A persistent spot request whose instance is gone:** cancelled.
 
+- **An offline runner the install does not track** (`--runner-sweep`, every
+  tier, EC2 or not): left in the scale set by a launch that died before its
+  runner connected, or by an earlier process. It is removed once two sweeps
+  in a row, 5 minutes apart, find it offline, idle and untracked, and GitHub
+  confirms it belongs to this scale set. `--runner-sweep dry-run` only logs;
+  `off` disables it. The listing uses an installation token that can only
+  read runners.
+
 Everything is found by the `firerunner:owner` tag, which defaults to the host
 name. **Set `--owner` (`FR_OWNER`) to a stable name when the control VM can be
 replaced**, so a new host takes over its predecessor's pool and leftovers.

@@ -34,6 +34,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/diag"
 	"github.com/firerunnerhq/firerunner/internal/ec2"
+	"github.com/firerunnerhq/firerunner/internal/ghrunners"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jitserver"
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
@@ -438,6 +439,42 @@ func pooledTiers(tiers []config.Tier) map[string]bool {
 	return pooled
 }
 
+// offlineRunners lists a tier's offline, idle runners for the reconciler:
+// those named for its scale set that GitHub confirms belong to it.
+type offlineRunners struct {
+	list interface {
+		Runners(context.Context) ([]ghrunners.Runner, error)
+	}
+	jit interface {
+		NamePrefix() string
+		Owns(ctx context.Context, name string) (bool, error)
+		RemoveRunner(ctx context.Context, name string) error
+	}
+}
+
+func (o offlineRunners) Offline(ctx context.Context) ([]string, error) {
+	rs, err := o.list.Runners(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, r := range rs {
+		if r.Status != "offline" || r.Busy || !strings.HasPrefix(r.Name, o.jit.NamePrefix()) {
+			continue
+		}
+		// Another install's scale set may use the same name prefix.
+		if ok, err := o.jit.Owns(ctx, r.Name); err != nil || !ok {
+			continue
+		}
+		names = append(names, r.Name)
+	}
+	return names, nil
+}
+
+func (o offlineRunners) Remove(ctx context.Context, name string) error {
+	return o.jit.RemoveRunner(ctx, name)
+}
+
 // statsSource adapts a listener to the reconciler.
 type statsSource struct{ lis *listener.ScaleSet }
 
@@ -575,6 +612,15 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		ClientID:       cfg.AppClientID,
 		InstallationID: cfg.AppInstallID,
 		PrivateKey:     privateKey,
+	}
+
+	// The REST runner list behind --runner-sweep, shared by every tier.
+	var runnerList *ghrunners.Client
+	if cfg.RunnerSweep != "off" {
+		if runnerList, err = ghrunners.New(cfg.URL, cfg.Token, app); err != nil {
+			log.Warn("runner sweep disabled", "err", err)
+			runnerList = nil
+		}
 	}
 
 	// Each tier is its own GitHub scale set; developers pick one with
@@ -781,9 +827,14 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			// The reconciler compares GitHub's statistics with this tier's
 			// runners for as long as the tier serves.
 			jit := lis.JIT()
-			go reconcile.New(statsSource{lis}, sched, jit.Exists, reconcile.Options{
+			ropts := reconcile.Options{
 				Health: tracker, Logger: log.With("tier", tiers[i].Name, "component", "reconcile"),
-			}).Run(tierCtx)
+			}
+			if runnerList != nil {
+				ropts.Offline = offlineRunners{list: runnerList, jit: jit}
+				ropts.OfflineDryRun = cfg.RunnerSweep == "dry-run"
+			}
+			go reconcile.New(statsSource{lis}, sched, jit.Exists, ropts).Run(tierCtx)
 			if tiers[i].Schedule != nil {
 				go schedule.Follow(tierCtx, tiers[i].SizesAt, scheduleTarget(sched, prov, tracker),
 					30*time.Second, nil, log.With("tier", tiers[i].Name, "component", "schedule"))
