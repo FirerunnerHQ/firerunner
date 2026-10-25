@@ -59,7 +59,8 @@ type ScaleSet struct {
 	// non-context-aware mutex across every call, so sharing client would let a
 	// slow JIT generation stall a scale-down past its deadline, and a slow
 	// removal delay the next scale-up. The scheduler issues one removal at a
-	// time per tier, so nothing ever waits on this client's mutex.
+	// time per tier; the reconciler's lost-runner lookups and offline-runner
+	// removals (rare: one per leaked runner) are its only other callers.
 	removeClient *scaleset.Client
 	// jitClients generates JIT configs in parallel; see clientPool.
 	jitClients *clientPool

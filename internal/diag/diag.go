@@ -397,6 +397,9 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				fmt.Fprintf(w, "  %s schedule: %s: %d hot runner(s), pool %d, since %s\n",
 					t.Name, window, sz.Min, sz.Pool, sz.Since.UTC().Format(time.RFC3339))
 			}
+			if t.OfflineWouldRemove > 0 {
+				fmt.Fprintf(w, "  %s runner sweep (dry run): would remove %d offline runner(s)\n", t.Name, t.OfflineWouldRemove)
+			}
 			if t.Recycles > 0 || t.LostRunners > 0 || t.OfflineRemoved > 0 {
 				fmt.Fprintf(w, "  %s repairs: %d session recycle(s), %d lost runner(s) cancelled, %d offline runner(s) removed\n", t.Name, t.Recycles, t.LostRunners, t.OfflineRemoved)
 			}

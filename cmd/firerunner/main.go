@@ -439,8 +439,8 @@ func pooledTiers(tiers []config.Tier) map[string]bool {
 	return pooled
 }
 
-// offlineRunners lists a tier's offline, idle runners for the reconciler:
-// those named for its scale set that GitHub confirms belong to it.
+// offlineRunners lists a tier's offline, idle runners for the reconciler,
+// by name; Remove checks that one is this scale set's before removing it.
 type offlineRunners struct {
 	list interface {
 		Runners(context.Context) ([]ghrunners.Runner, error)
@@ -459,19 +459,24 @@ func (o offlineRunners) Offline(ctx context.Context) ([]string, error) {
 	}
 	var names []string
 	for _, r := range rs {
-		if r.Status != "offline" || r.Busy || !strings.HasPrefix(r.Name, o.jit.NamePrefix()) {
-			continue
+		if r.Status == "offline" && !r.Busy && strings.HasPrefix(r.Name, o.jit.NamePrefix()) {
+			names = append(names, r.Name)
 		}
-		// Another install's scale set may use the same name prefix.
-		if ok, err := o.jit.Owns(ctx, r.Name); err != nil || !ok {
-			continue
-		}
-		names = append(names, r.Name)
 	}
 	return names, nil
 }
 
+// Remove asks the scale-set API whose runner it is only now, at removal:
+// asking for every offline runner on every sweep would load the client
+// scale-down removals use.
 func (o offlineRunners) Remove(ctx context.Context, name string) error {
+	ours, err := o.jit.Owns(ctx, name)
+	switch {
+	case err != nil:
+		return err
+	case !ours:
+		return reconcile.ErrNotOurs
+	}
 	return o.jit.RemoveRunner(ctx, name)
 }
 

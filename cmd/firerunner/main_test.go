@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/firerunnerhq/firerunner/internal/ghrunners"
+	"github.com/firerunnerhq/firerunner/internal/reconcile"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -347,21 +348,29 @@ func (f *fakeTierJIT) RemoveRunner(_ context.Context, name string) error {
 	return nil
 }
 
-func TestOfflineRunnersSelectsThisScaleSetsIdleOfflineRunners(t *testing.T) {
-	jit := &fakeTierJIT{owned: map[string]bool{"cloud-a": true, "cloud-busy": true, "cloud-online": true, "cloud-lookupfails": true}}
+func TestOfflineRunnersAdapter(t *testing.T) {
+	jit := &fakeTierJIT{owned: map[string]bool{"cloud-a": true}}
 	o := offlineRunners{list: fakeRunnerList{
 		{Name: "cloud-a", Status: "offline"},
 		{Name: "cloud-busy", Status: "offline", Busy: true},
 		{Name: "cloud-online", Status: "online"},
-		{Name: "cloud-other", Status: "offline"},       // same prefix, another scale set
-		{Name: "cloud-lookupfails", Status: "offline"}, // unconfirmed: skipped
-		{Name: "gpu-a", Status: "offline"},             // another tier
+		{Name: "cloud-other", Status: "offline"}, // same prefix; Remove finds out
+		{Name: "gpu-a", Status: "offline"},       // another tier
 	}, jit: jit}
 	names, err := o.Offline(context.Background())
-	if err != nil || fmt.Sprint(names) != "[cloud-a]" {
-		t.Fatalf("Offline = %v, %v; want only cloud-a", names, err)
+	if err != nil || fmt.Sprint(names) != "[cloud-a cloud-other]" {
+		t.Fatalf("Offline = %v, %v", names, err)
 	}
 	if err := o.Remove(context.Background(), "cloud-a"); err != nil || fmt.Sprint(jit.removed) != "[cloud-a]" {
-		t.Fatalf("Remove: %v, removed %v", err, jit.removed)
+		t.Fatalf("Remove ours: %v, removed %v", err, jit.removed)
+	}
+	if err := o.Remove(context.Background(), "cloud-other"); !errors.Is(err, reconcile.ErrNotOurs) {
+		t.Fatalf("Remove another scale set's: %v", err)
+	}
+	if err := o.Remove(context.Background(), "cloud-lookupfails"); err == nil || errors.Is(err, reconcile.ErrNotOurs) {
+		t.Fatalf("Remove with a failed lookup: %v, want the error (retried later)", err)
+	}
+	if fmt.Sprint(jit.removed) != "[cloud-a]" {
+		t.Fatalf("removed %v", jit.removed)
 	}
 }

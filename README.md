@@ -467,14 +467,6 @@ running process tracks, and anything younger than 2 minutes.
 - **A pool instance of a tier that no longer keeps a pool:** terminated.
 - **A persistent spot request whose instance is gone:** cancelled.
 
-- **An offline runner the install does not track** (`--runner-sweep`, every
-  tier, EC2 or not): left in the scale set by a launch that died before its
-  runner connected, or by an earlier process. It is removed once two sweeps
-  in a row, 5 minutes apart, find it offline, idle and untracked, and GitHub
-  confirms it belongs to this scale set. `--runner-sweep dry-run` only logs;
-  `off` disables it. The listing uses an installation token that can only
-  read runners.
-
 Everything is found by the `firerunner:owner` tag, which defaults to the host
 name. **Set `--owner` (`FR_OWNER`) to a stable name when the control VM can be
 replaced**, so a new host takes over its predecessor's pool and leftovers.
@@ -560,6 +552,27 @@ and tier names, and cleans up only its own owner's resources.
    decodes to the single `FIRERUNNER_JIT_URL=` line.
 5. Check that nothing is left behind: the instance is `terminated`, and the
    runner no longer appears under the repository's runners.
+
+### Offline runner sweep (`--runner-sweep`)
+
+A runner is registered at GitHub just before its VM or instance boots. If
+the launch dies before the runner connects (a crash, a failed boot), the
+registration stays in the scale set as an offline runner nothing will use.
+Every 5 minutes each tier, EC2 or Firecracker, lists its scale set's runners:
+
+- **What it removes.** A runner that is offline, idle and not tracked by
+  firerunner, and still so 5 minutes after it was first seen. A runner
+  being launched or booting is tracked, and a busy one is never removed.
+- **Ownership check.** Before removing, it confirms through the scale-set
+  API that the runner belongs to this scale set: another install may use
+  the same names.
+- **One listing for all tiers.** It is shared for a minute, and the tiers
+  sweep at staggered times.
+- **Token.** With a GitHub App, the listing uses an installation token that
+  can only read runners. A PAT is used as it is.
+- **Visibility.** `status` shows the removals. `--runner-sweep dry-run`
+  only logs and shows what it would remove; `off` disables it. An
+  enterprise URL is not supported, and disables the sweep with a warning.
 
 ### Inspecting a deployment (`status`, `doctor`)
 
