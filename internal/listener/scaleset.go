@@ -59,7 +59,8 @@ type ScaleSet struct {
 	// non-context-aware mutex across every call, so sharing client would let a
 	// slow JIT generation stall a scale-down past its deadline, and a slow
 	// removal delay the next scale-up. The scheduler issues one removal at a
-	// time per tier, so nothing ever waits on this client's mutex.
+	// time per tier; the reconciler's lost-runner lookups and offline-runner
+	// removals (rare: one per leaked runner) are its only other callers.
 	removeClient *scaleset.Client
 	// jitClients generates JIT configs in parallel; see clientPool.
 	jitClients *clientPool
@@ -693,6 +694,21 @@ func (p *clientPool) seed(c jitClient) {
 
 // put returns a client the pool handed out.
 func (p *clientPool) put(c jitClient) { p.idle <- c }
+
+// NamePrefix is how every runner name this source generates begins.
+func (j *JITSource) NamePrefix() string { return j.namePrefix + "-" }
+
+// Owns reports whether the named runner is registered in this scale set: a
+// runner of the same name prefix may belong to another install's scale set.
+func (j *JITSource) Owns(ctx context.Context, name string) (bool, error) {
+	opCtx, cancel := context.WithTimeout(ctx, removeOpTimeout)
+	defer cancel()
+	r, err := j.remover.GetRunnerByName(opCtx, name)
+	if err != nil {
+		return false, err
+	}
+	return r != nil && r.RunnerScaleSetID == j.scaleSetID, nil
+}
 
 // Exists reports whether GitHub still knows the named runner.
 func (j *JITSource) Exists(ctx context.Context, name string) (bool, error) {

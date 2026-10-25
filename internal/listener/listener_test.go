@@ -354,3 +354,26 @@ func TestJITSourceExists(t *testing.T) {
 		}
 	}
 }
+
+func TestJITSourceOwns(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		l    lookup
+		want bool
+		err  bool
+	}{
+		{"this scale set", lookup{ref: &scaleset.RunnerReference{ID: 1, RunnerScaleSetID: 7}}, true, false},
+		{"another scale set", lookup{ref: &scaleset.RunnerReference{ID: 1, RunnerScaleSetID: 8}}, false, false},
+		{"unknown", lookup{}, false, false},
+		{"lookup failed", lookup{err: errors.New("503")}, false, true},
+	} {
+		j := &JITSource{remover: &fakeRemover{lookups: []lookup{c.l}}, scaleSetID: 7, namePrefix: "cloud"}
+		got, err := j.Owns(context.Background(), "cloud-abc")
+		if got != c.want || (err != nil) != c.err {
+			t.Errorf("%s: Owns = %v, %v", c.name, got, err)
+		}
+	}
+	if p := (&JITSource{namePrefix: "cloud"}).NamePrefix(); p != "cloud-" {
+		t.Errorf("NamePrefix = %q", p)
+	}
+}

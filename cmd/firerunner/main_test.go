@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/firerunnerhq/firerunner/internal/ghrunners"
+	"github.com/firerunnerhq/firerunner/internal/reconcile"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -322,5 +324,53 @@ func TestBuildVersion(t *testing.T) {
 		if got := buildVersion(c.ldflags, c.info, c.ok); got != c.want {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+type fakeRunnerList []ghrunners.Runner
+
+func (f fakeRunnerList) Runners(context.Context) ([]ghrunners.Runner, error) { return f, nil }
+
+type fakeTierJIT struct {
+	owned   map[string]bool
+	removed []string
+}
+
+func (f *fakeTierJIT) NamePrefix() string { return "cloud-" }
+func (f *fakeTierJIT) Owns(_ context.Context, name string) (bool, error) {
+	if name == "cloud-lookupfails" {
+		return false, errors.New("503")
+	}
+	return f.owned[name], nil
+}
+func (f *fakeTierJIT) RemoveRunner(_ context.Context, name string) error {
+	f.removed = append(f.removed, name)
+	return nil
+}
+
+func TestOfflineRunnersAdapter(t *testing.T) {
+	jit := &fakeTierJIT{owned: map[string]bool{"cloud-a": true}}
+	o := offlineRunners{list: fakeRunnerList{
+		{Name: "cloud-a", Status: "offline"},
+		{Name: "cloud-busy", Status: "offline", Busy: true},
+		{Name: "cloud-online", Status: "online"},
+		{Name: "cloud-other", Status: "offline"}, // same prefix; Remove finds out
+		{Name: "gpu-a", Status: "offline"},       // another tier
+	}, jit: jit}
+	names, err := o.Offline(context.Background())
+	if err != nil || fmt.Sprint(names) != "[cloud-a cloud-other]" {
+		t.Fatalf("Offline = %v, %v", names, err)
+	}
+	if err := o.Remove(context.Background(), "cloud-a"); err != nil || fmt.Sprint(jit.removed) != "[cloud-a]" {
+		t.Fatalf("Remove ours: %v, removed %v", err, jit.removed)
+	}
+	if err := o.Remove(context.Background(), "cloud-other"); !errors.Is(err, reconcile.ErrNotOurs) {
+		t.Fatalf("Remove another scale set's: %v", err)
+	}
+	if err := o.Remove(context.Background(), "cloud-lookupfails"); err == nil || errors.Is(err, reconcile.ErrNotOurs) {
+		t.Fatalf("Remove with a failed lookup: %v, want the error (retried later)", err)
+	}
+	if fmt.Sprint(jit.removed) != "[cloud-a]" {
+		t.Fatalf("removed %v", jit.removed)
 	}
 }

@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -32,10 +33,12 @@ type fakeRunners struct {
 	busy      map[string]bool
 	cancelled []string
 	running   int
+	tracked   map[string]bool
 }
 
 func (f *fakeRunners) IdleRunners(time.Duration) []string { return f.idle }
 func (f *fakeRunners) Running() int                       { return f.running }
+func (f *fakeRunners) Tracks(name string) bool            { return f.tracked[name] }
 func (f *fakeRunners) CancelLost(name string) bool {
 	if f.busy[name] {
 		return false
@@ -209,5 +212,146 @@ func TestRecycleWithNoLiveSessionIsRetried(t *testing.T) {
 	r.Check(context.Background())
 	if len(ss.recycles) != 1 || tr.Snapshot().Recycles != 1 {
 		t.Fatalf("recycles = %v (counted %d), want the retry at once", ss.recycles, tr.Snapshot().Recycles)
+	}
+}
+
+type fakeOffline struct {
+	names     []string
+	err       error
+	removeErr map[string]error
+	removed   []string
+	attempts  int
+	listed    int
+}
+
+func (f *fakeOffline) Offline(context.Context) ([]string, error) { f.listed++; return f.names, f.err }
+func (f *fakeOffline) Remove(_ context.Context, name string) error {
+	f.attempts++
+	if err := f.removeErr[name]; err != nil {
+		return err
+	}
+	f.removed = append(f.removed, name)
+	return nil
+}
+
+func newOfflineRec(off *fakeOffline, rn *fakeRunners, dry bool, c *clock) (*Reconciler, *health.Tracker) {
+	tr := health.NewTracker("t")
+	r := New(&fakeScaleSet{ok: true}, rn, nil, Options{Health: tr, Offline: off, OfflineDryRun: dry})
+	r.now = c.now
+	return r, tr
+}
+
+func TestOfflineRunnerRemovedAfterAnInterval(t *testing.T) {
+	off := &fakeOffline{names: []string{"t-orphan", "t-booting", "t-live"}}
+	rn := &fakeRunners{tracked: map[string]bool{"t-live": true}}
+	c := newClock()
+	r, tr := newOfflineRec(off, rn, false, c)
+	ctx := context.Background()
+
+	r.SweepOffline(ctx)
+	c.advance(4 * time.Minute)
+	r.SweepOffline(ctx)
+	if len(off.removed) != 0 {
+		t.Fatalf("removed %v before an interval had passed", off.removed)
+	}
+	// The booting runner has connected; the orphan is still offline.
+	off.names = []string{"t-orphan", "t-live"}
+	c.advance(time.Minute)
+	r.SweepOffline(ctx)
+	if fmt.Sprint(off.removed) != "[t-orphan]" {
+		t.Fatalf("removed %v, want only the orphan", off.removed)
+	}
+	if tr.Snapshot().OfflineRemoved != 1 {
+		t.Fatalf("health counted %d", tr.Snapshot().OfflineRemoved)
+	}
+	// A runner tracked by the next look is kept.
+	off.names = []string{"t-new"}
+	r.SweepOffline(ctx)
+	rn.tracked["t-new"] = true
+	c.advance(10 * time.Minute)
+	r.SweepOffline(ctx)
+	if len(off.removed) != 1 {
+		t.Fatalf("removed %v: a runner tracked by now must stay", off.removed)
+	}
+}
+
+func TestOfflineSightingSurvivesAMissedListing(t *testing.T) {
+	// Runners come and go between a listing's pages: one sweep missing the
+	// orphan must not restart its clock.
+	off := &fakeOffline{names: []string{"t-orphan"}}
+	c := newClock()
+	r, _ := newOfflineRec(off, &fakeRunners{}, false, c)
+	ctx := context.Background()
+	r.SweepOffline(ctx)
+	off.names = nil
+	c.advance(3 * time.Minute)
+	r.SweepOffline(ctx)
+	off.names = []string{"t-orphan"}
+	c.advance(3 * time.Minute)
+	r.SweepOffline(ctx)
+	if fmt.Sprint(off.removed) != "[t-orphan]" {
+		t.Fatalf("removed %v after 6m offline with one listing missing it", off.removed)
+	}
+	// Gone for over two intervals: forgotten, and its clock starts afresh.
+	off.removed, off.names = nil, []string{"t-b"}
+	r.SweepOffline(ctx)
+	off.names = nil
+	c.advance(11 * time.Minute)
+	r.SweepOffline(ctx)
+	off.names = []string{"t-b"}
+	r.SweepOffline(ctx)
+	if len(off.removed) != 0 {
+		t.Fatalf("removed %v on a sighting after the old one expired", off.removed)
+	}
+}
+
+func TestOfflineForeignDryRunAndErrors(t *testing.T) {
+	ctx := context.Background()
+	// Another scale set's runner: asked once, then left alone.
+	off := &fakeOffline{names: []string{"t-x"}, removeErr: map[string]error{"t-x": ErrNotOurs}}
+	c := newClock()
+	r, _ := newOfflineRec(off, &fakeRunners{}, false, c)
+	for range 4 {
+		r.SweepOffline(ctx)
+		c.advance(5 * time.Minute)
+	}
+	if off.attempts != 1 {
+		t.Fatalf("asked %d times about another scale set's runner, want 1", off.attempts)
+	}
+
+	// Dry run removes nothing and reports the count.
+	off = &fakeOffline{names: []string{"t-a", "t-b"}}
+	r, tr := newOfflineRec(off, &fakeRunners{}, true, c)
+	r.SweepOffline(ctx)
+	c.advance(5 * time.Minute)
+	r.SweepOffline(ctx)
+	if len(off.removed) != 0 || tr.Snapshot().OfflineWouldRemove != 2 {
+		t.Fatalf("dry run: removed %v, would %d", off.removed, tr.Snapshot().OfflineWouldRemove)
+	}
+
+	// A failed removal or listing is retried.
+	off = &fakeOffline{names: []string{"t-a"}, removeErr: map[string]error{"t-a": errors.New("503")}}
+	r, _ = newOfflineRec(off, &fakeRunners{}, false, c)
+	r.SweepOffline(ctx)
+	c.advance(5 * time.Minute)
+	r.SweepOffline(ctx) // remove fails
+	off.removeErr, off.err = nil, errors.New("listing down")
+	c.advance(5 * time.Minute)
+	r.SweepOffline(ctx) // listing fails
+	off.err = nil
+	c.advance(5 * time.Minute)
+	r.SweepOffline(ctx)
+	if fmt.Sprint(off.removed) != "[t-a]" {
+		t.Fatalf("removed %v, want the retry to succeed", off.removed)
+	}
+}
+
+func TestCheckDoesNotSweep(t *testing.T) {
+	// The sweep has its own loop: a slow listing never holds up a check.
+	off := &fakeOffline{names: []string{"t-a"}}
+	r, _ := newOfflineRec(off, &fakeRunners{}, false, newClock())
+	r.Check(context.Background())
+	if off.listed != 0 {
+		t.Fatalf("Check listed runners %d time(s)", off.listed)
 	}
 }

@@ -829,6 +829,21 @@ func TestParse_NeverEchoesCredentials(t *testing.T) {
 	}
 }
 
+func TestFromFlags_RunnerSweep(t *testing.T) {
+	c, err := FromFlags(baseArgs())
+	if err != nil || c.RunnerSweep != "on" {
+		t.Fatalf("default = %q, %v; want on", c.RunnerSweep, err)
+	}
+	for _, v := range []string{"dry-run", "off"} {
+		if c, err := FromFlags(append(baseArgs(), "--runner-sweep", v)); err != nil || c.RunnerSweep != v {
+			t.Fatalf("%s: %q, %v", v, c.RunnerSweep, err)
+		}
+	}
+	if _, err := FromFlags(append(baseArgs(), "--runner-sweep", "maybe")); err == nil {
+		t.Fatal("accepted --runner-sweep maybe")
+	}
+}
+
 func TestFromFlags_EC2Reaper(t *testing.T) {
 	c, err := FromFlags(baseArgs())
 	if err != nil || c.EC2Reaper != "on" {

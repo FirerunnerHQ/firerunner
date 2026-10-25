@@ -553,6 +553,27 @@ and tier names, and cleans up only its own owner's resources.
 5. Check that nothing is left behind: the instance is `terminated`, and the
    runner no longer appears under the repository's runners.
 
+### Offline runner sweep (`--runner-sweep`)
+
+A runner is registered at GitHub just before its VM or instance boots. If
+the launch dies before the runner connects (a crash, a failed boot), the
+registration stays in the scale set as an offline runner nothing will use.
+Every 5 minutes each tier, EC2 or Firecracker, lists its scale set's runners:
+
+- **What it removes.** A runner that is offline, idle and not tracked by
+  firerunner, and still so 5 minutes after it was first seen. A runner
+  being launched or booting is tracked, and a busy one is never removed.
+- **Ownership check.** Before removing, it confirms through the scale-set
+  API that the runner belongs to this scale set: another install may use
+  the same names.
+- **One listing for all tiers.** It is shared for a minute, and the tiers
+  sweep at staggered times.
+- **Token.** With a GitHub App, the listing uses an installation token that
+  can only read runners. A PAT is used as it is.
+- **Visibility.** `status` shows the removals. `--runner-sweep dry-run`
+  only logs and shows what it would remove; `off` disables it. An
+  enterprise URL is not supported, and disables the sweep with a warning.
+
 ### Inspecting a deployment (`status`, `doctor`)
 
 Two read-only subcommands help operators inspect and diagnose a runner host.

@@ -51,6 +51,12 @@ type Tier struct {
 	// LostRunners counts runners cancelled because GitHub no longer listed
 	// them.
 	LostRunners int `json:"lost_runners,omitempty"`
+	// OfflineRemoved counts offline runners removed because firerunner did
+	// not track them.
+	OfflineRemoved int `json:"offline_removed,omitempty"`
+	// OfflineWouldRemove is how many the last dry-run sweep would have
+	// removed.
+	OfflineWouldRemove int `json:"offline_would_remove,omitempty"`
 	// Sizes are the hot runners and pool size the tier's schedule set last;
 	// nil for a tier without a schedule.
 	Sizes *Sizes `json:"sizes,omitempty"`
@@ -156,6 +162,20 @@ func (tr *Tracker) SetSizes(sz Sizes) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	tr.t.Sizes = &sz
+}
+
+// OfflineRemoved counts an untracked offline runner removed.
+func (tr *Tracker) OfflineRemoved() {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.t.OfflineRemoved++
+}
+
+// OfflineWouldRemove records what a dry-run sweep would have removed.
+func (tr *Tracker) OfflineWouldRemove(n int) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.t.OfflineWouldRemove = n
 }
 
 // Recycled counts a session recycled by the reconciler.
