@@ -487,8 +487,7 @@ func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapaci
 			"jobStarted", len(m.JobStartedMessages), "jobCompleted", len(m.JobCompletedMessages))
 		for _, a := range m.JobAssignedMessages {
 			if a != nil {
-				t.log.Info("job assigned", "repository", a.OwnerName+"/"+a.RepositoryName, "job", a.JobDisplayName,
-					"event", a.EventName, "runnerRequestId", a.RunnerRequestID, "githubDelay", githubDelay(a.JobMessageBase))
+				t.log.Info("job assigned", jobAssignedAttrs(a.JobMessageBase)...)
 			}
 		}
 	}
@@ -499,13 +498,22 @@ func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapaci
 	return m, err
 }
 
-// githubDelay is how long GitHub took to assign a job to the scale set after
-// queueing it; 0 when either time is missing.
-func githubDelay(b scaleset.JobMessageBase) time.Duration {
-	if b.QueueTime.IsZero() || b.ScaleSetAssignTime.IsZero() {
-		return 0
+// jobAssignedAttrs are a JobAssigned message's log attributes. GitHub's
+// queue and assignment times, and the delay between them, appear only when
+// the message carries them: on a JIT scale set it has been seen without.
+func jobAssignedAttrs(b scaleset.JobMessageBase) []any {
+	attrs := []any{"repository", b.OwnerName + "/" + b.RepositoryName, "job", b.JobDisplayName,
+		"event", b.EventName, "runnerRequestId", b.RunnerRequestID, "jobId", b.JobID}
+	if !b.QueueTime.IsZero() {
+		attrs = append(attrs, "queuedAt", b.QueueTime)
 	}
-	return b.ScaleSetAssignTime.Sub(b.QueueTime).Round(time.Millisecond)
+	if !b.ScaleSetAssignTime.IsZero() {
+		attrs = append(attrs, "assignedAt", b.ScaleSetAssignTime)
+	}
+	if !b.QueueTime.IsZero() && !b.ScaleSetAssignTime.IsZero() {
+		attrs = append(attrs, "githubDelay", b.ScaleSetAssignTime.Sub(b.QueueTime).Round(time.Millisecond))
+	}
+	return attrs
 }
 
 // isFatal reports whether a session error is one retrying cannot fix: GitHub

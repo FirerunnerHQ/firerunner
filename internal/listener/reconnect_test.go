@@ -498,6 +498,24 @@ func TestTrackedSessionCountsJobsAssignedBeforeIt(t *testing.T) {
 	}
 }
 
+func TestJobAssignedAttrsOmitMissingTimes(t *testing.T) {
+	keys := func(attrs []any) string {
+		var ks []string
+		for i := 0; i < len(attrs); i += 2 {
+			ks = append(ks, attrs[i].(string))
+		}
+		return strings.Join(ks, ",")
+	}
+	if got := keys(jobAssignedAttrs(scaleset.JobMessageBase{JobID: "j"})); strings.Contains(got, "githubDelay") || strings.Contains(got, "queuedAt") {
+		t.Fatalf("attrs without times = %s", got)
+	}
+	q := time.Date(2026, 10, 25, 23, 0, 0, 0, time.UTC)
+	attrs := jobAssignedAttrs(scaleset.JobMessageBase{QueueTime: q, ScaleSetAssignTime: q.Add(1500 * time.Millisecond)})
+	if !strings.HasSuffix(keys(attrs), "queuedAt,assignedAt,githubDelay") || attrs[len(attrs)-1] != 1500*time.Millisecond {
+		t.Fatalf("attrs = %v", attrs)
+	}
+}
+
 func TestRecycleReconnectsAndStatsAreRecorded(t *testing.T) {
 	fastReconnect(t)
 	ctx, cancel := context.WithCancel(context.Background())
