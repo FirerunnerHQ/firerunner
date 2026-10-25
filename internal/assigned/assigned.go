@@ -32,6 +32,7 @@ type Job struct {
 	Labels      []string
 	QueuedAt    time.Time
 	AssignedAt  time.Time // when GitHub assigned it to the scale set
+	keys        []string
 	seen        time.Time
 	claimed     bool
 }
@@ -54,8 +55,14 @@ type Jobs struct {
 	policy *Policy
 	now    func() time.Time
 
-	mu   sync.Mutex
+	mu sync.Mutex
+	// jobs indexes each job under every key it has (see keys), so a message
+	// that carries only one of them still finds it.
 	jobs map[string]*Job
+	// unknown counts assigned jobs a new session reported that no message
+	// described (they were assigned before this session); each may take the
+	// pool once, as it would without a policy. unknownClaimed of them have.
+	unknown, unknownClaimed int
 }
 
 // New returns an empty set. A nil policy lets every launch take the pool.
@@ -63,12 +70,32 @@ func New(policy *Policy) *Jobs {
 	return &Jobs{policy: policy, now: time.Now, jobs: map[string]*Job{}}
 }
 
-// key identifies a job across its messages: the runner request, else the job.
-func key(b scaleset.JobMessageBase) string {
+// keys identify a job across its messages: its runner request and its job ID,
+// whichever it carries.
+func keys(b scaleset.JobMessageBase) []string {
+	var ks []string
 	if b.RunnerRequestID != 0 {
-		return "r" + strconv.FormatInt(b.RunnerRequestID, 10)
+		ks = append(ks, "r"+strconv.FormatInt(b.RunnerRequestID, 10))
 	}
-	return "j" + b.JobID
+	if b.JobID != "" {
+		ks = append(ks, "j"+b.JobID)
+	}
+	return ks
+}
+
+// Session records a new message session's count of assigned jobs. Those it
+// has no message for were assigned before this session (a restart or a
+// reconnect), and are let take the pool: their attributes are unknown, and a
+// pull request waiting through a deploy is what the pool is kept for.
+func (s *Jobs) Session(totalAssigned int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(s.now())
+	s.unknown = max(0, totalAssigned-len(s.uniqueLocked()))
+	s.unknownClaimed = 0
 }
 
 // Message records a message's assignments and forgets the jobs it reports
@@ -86,71 +113,124 @@ func (s *Jobs) Message(m *scaleset.RunnerScaleSetMessage) bool {
 		if a == nil {
 			continue
 		}
-		k := key(a.JobMessageBase)
-		if _, ok := s.jobs[k]; ok {
-			continue // a re-delivered message keeps its claim
+		ks := keys(a.JobMessageBase)
+		if len(ks) == 0 || slices.ContainsFunc(ks, func(k string) bool { return s.jobs[k] != nil }) {
+			continue // unidentifiable, or re-delivered: the job keeps its claim
 		}
-		s.jobs[k] = &Job{
+		j := &Job{
 			Repository: a.OwnerName + "/" + a.RepositoryName, WorkflowRef: a.JobWorkflowRef,
 			Name: a.JobDisplayName, Event: a.EventName, Labels: a.RequestLabels,
-			QueuedAt: a.QueueTime, AssignedAt: a.ScaleSetAssignTime, seen: now,
+			QueuedAt: a.QueueTime, AssignedAt: a.ScaleSetAssignTime, keys: ks, seen: now,
+		}
+		for _, k := range ks {
+			s.jobs[k] = j
 		}
 		changed = true
 	}
 	for _, st := range m.JobStartedMessages {
 		if st != nil {
-			changed = s.forgetLocked(key(st.JobMessageBase)) || changed
+			changed = s.forgetLocked(st.JobMessageBase, true) || changed
 		}
 	}
 	for _, c := range m.JobCompletedMessages {
 		if c != nil {
-			changed = s.forgetLocked(key(c.JobMessageBase)) || changed
+			changed = s.forgetLocked(c.JobMessageBase, false) || changed
 		}
 	}
 	return changed
 }
 
-func (s *Jobs) forgetLocked(k string) bool {
-	if _, ok := s.jobs[k]; !ok {
-		return false
+// forgetLocked forgets the job a message names. A start of a job no message
+// described is one of those assigned before the session; a completion is not
+// counted, as it usually follows that job's start.
+func (s *Jobs) forgetLocked(b scaleset.JobMessageBase, started bool) bool {
+	for _, k := range keys(b) {
+		if j := s.jobs[k]; j != nil {
+			s.deleteLocked(j)
+			return true
+		}
 	}
-	delete(s.jobs, k)
-	return true
+	if started && s.unknown > 0 {
+		// Its claim, if any, goes with it, as a known job's does.
+		s.unknown--
+		s.unknownClaimed = max(0, s.unknownClaimed-1)
+	}
+	return false
+}
+
+func (s *Jobs) deleteLocked(j *Job) {
+	for _, k := range j.keys {
+		delete(s.jobs, k)
+	}
 }
 
 func (s *Jobs) pruneLocked(now time.Time) bool {
 	changed := false
-	for k, j := range s.jobs {
+	for _, j := range s.uniqueLocked() {
 		if now.Sub(j.seen) > keepFor {
-			delete(s.jobs, k)
+			s.deleteLocked(j)
 			changed = true
 		}
 	}
 	return changed
 }
 
+// uniqueLocked returns each job once.
+func (s *Jobs) uniqueLocked() []*Job {
+	seen := map[*Job]bool{}
+	var out []*Job
+	for _, j := range s.jobs {
+		if !seen[j] {
+			seen[j] = true
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
 // ClaimPool reports whether a launch may take a pool instance. Without a
-// policy it always may. With one, each pending job the policy matches lets
-// one launch take the pool, oldest first; other launches cold-launch and
-// leave the pool for such jobs.
-func (s *Jobs) ClaimPool() bool {
+// policy it always may. With one, each pending job the policy matches (and
+// each job assigned before the session, see Session) lets one launch take
+// the pool, earliest queued first; other launches cold-launch and leave the
+// pool for such jobs. A launch that ends up not using the pool calls release,
+// so the job's claim is not spent.
+func (s *Jobs) ClaimPool() (ok bool, release func()) {
 	if s == nil || s.policy == nil {
-		return true
+		return true, func() {}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pruneLocked(s.now())
-	var oldest *Job
-	for _, j := range s.jobs {
-		if !j.claimed && s.policy.Matches(*j) && (oldest == nil || j.seen.Before(oldest.seen)) {
-			oldest = j
+	var first *Job
+	for _, j := range s.uniqueLocked() {
+		if !j.claimed && s.policy.Matches(*j) && (first == nil || earlier(j, first)) {
+			first = j
 		}
 	}
-	if oldest == nil {
-		return false
+	if first != nil {
+		first.claimed = true
+		return true, func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			first.claimed = false
+		}
 	}
-	oldest.claimed = true
-	return true
+	if s.unknownClaimed < s.unknown {
+		s.unknownClaimed++
+		return true, func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.unknownClaimed = max(0, s.unknownClaimed-1)
+		}
+	}
+	return false, func() {}
+}
+
+func earlier(a, b *Job) bool {
+	if !a.QueuedAt.Equal(b.QueuedAt) {
+		return a.QueuedAt.Before(b.QueuedAt)
+	}
+	return a.keys[0] < b.keys[0]
 }
 
 // Mix summarizes the pending jobs.
@@ -166,8 +246,10 @@ type Mix struct {
 func (s *Jobs) Mix() Mix {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m := Mix{Jobs: len(s.jobs), ByEvent: map[string]int{}}
-	for _, j := range s.jobs {
+	s.pruneLocked(s.now())
+	js := s.uniqueLocked()
+	m := Mix{Jobs: len(js), ByEvent: map[string]int{}}
+	for _, j := range js {
 		m.ByEvent[j.Event]++
 		if s.policy != nil && s.policy.Matches(*j) {
 			m.Kept++
