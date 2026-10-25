@@ -63,6 +63,7 @@ type Jobs struct {
 	// described (they were assigned before this session); each may take the
 	// pool once, as it would without a policy. unknownClaimed of them have.
 	unknown, unknownClaimed int
+	generation              int
 }
 
 // New returns an empty set. A nil policy lets every launch take the pool.
@@ -83,19 +84,27 @@ func keys(b scaleset.JobMessageBase) []string {
 	return ks
 }
 
-// Session records a new message session's count of assigned jobs. Those it
-// has no message for were assigned before this session (a restart or a
-// reconnect), and are let take the pool: their attributes are unknown, and a
-// pull request waiting through a deploy is what the pool is kept for.
-func (s *Jobs) Session(totalAssigned int) {
-	if s == nil {
+// Session records a new message session's statistics. The jobs assigned
+// but not running that no message described were assigned before this
+// session (a restart or a reconnect), and each may take the pool once: their
+// attributes are unknown, and a pull request waiting through a deploy is what
+// the pool is kept for.
+func (s *Jobs) Session(st *scaleset.RunnerScaleSetStatistic) {
+	if s == nil || st == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pruneLocked(s.now())
-	s.unknown = max(0, totalAssigned-len(s.uniqueLocked()))
+	s.unknown = s.waitingUnknownLocked(st)
 	s.unknownClaimed = 0
+	s.generation++ // releases of the old session's claims no longer count
+}
+
+// waitingUnknownLocked is how many jobs st says wait for a runner beyond
+// those a message described. (GitHub counts running jobs among the assigned.)
+func (s *Jobs) waitingUnknownLocked(st *scaleset.RunnerScaleSetStatistic) int {
+	return max(0, st.TotalAssignedJobs-st.TotalRunningJobs-len(s.uniqueLocked()))
 }
 
 // Message records a message's assignments and forgets the jobs it reports
@@ -129,31 +138,28 @@ func (s *Jobs) Message(m *scaleset.RunnerScaleSetMessage) bool {
 	}
 	for _, st := range m.JobStartedMessages {
 		if st != nil {
-			changed = s.forgetLocked(st.JobMessageBase, true) || changed
+			changed = s.forgetLocked(st.JobMessageBase) || changed
 		}
 	}
 	for _, c := range m.JobCompletedMessages {
 		if c != nil {
-			changed = s.forgetLocked(c.JobMessageBase, false) || changed
+			changed = s.forgetLocked(c.JobMessageBase) || changed
 		}
+	}
+	// The earlier jobs only ever start or go: their count only shrinks.
+	if m.Statistics != nil {
+		s.unknown = min(s.unknown, s.waitingUnknownLocked(m.Statistics))
+		s.unknownClaimed = min(s.unknownClaimed, s.unknown)
 	}
 	return changed
 }
 
-// forgetLocked forgets the job a message names. A start of a job no message
-// described is one of those assigned before the session; a completion is not
-// counted, as it usually follows that job's start.
-func (s *Jobs) forgetLocked(b scaleset.JobMessageBase, started bool) bool {
+func (s *Jobs) forgetLocked(b scaleset.JobMessageBase) bool {
 	for _, k := range keys(b) {
 		if j := s.jobs[k]; j != nil {
 			s.deleteLocked(j)
 			return true
 		}
-	}
-	if started && s.unknown > 0 {
-		// Its claim, if any, goes with it, as a known job's does.
-		s.unknown--
-		s.unknownClaimed = max(0, s.unknownClaimed-1)
 	}
 	return false
 }
@@ -217,10 +223,13 @@ func (s *Jobs) ClaimPool() (ok bool, release func()) {
 	}
 	if s.unknownClaimed < s.unknown {
 		s.unknownClaimed++
+		gen := s.generation
 		return true, func() {
 			s.mu.Lock()
 			defer s.mu.Unlock()
-			s.unknownClaimed = max(0, s.unknownClaimed-1)
+			if gen == s.generation {
+				s.unknownClaimed = max(0, s.unknownClaimed-1)
+			}
 		}
 	}
 	return false, func() {}

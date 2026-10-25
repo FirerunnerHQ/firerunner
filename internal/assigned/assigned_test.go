@@ -146,22 +146,42 @@ func TestEitherKeyForgetsTheJob(t *testing.T) {
 	}
 }
 
+func stats(assigned, running int) *scaleset.RunnerScaleSetStatistic {
+	return &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: assigned, TotalRunningJobs: running}
+}
+
 func TestJobsAssignedBeforeTheSessionMayTakeThePool(t *testing.T) {
 	s := New(&Policy{Events: []string{"pull_request"}})
 	s.Message(assigned(base(1, "push", "known")))
-	// A new session: 3 assigned, 1 known; 2 described by no message.
-	s.Session(3)
+	// A new session: 13 assigned, 10 of them running, 1 known: 2 earlier
+	// jobs wait for a runner. Running jobs earn no credit.
+	s.Session(stats(13, 10))
 	if got := claims(s, 3); !got[0] || !got[1] || got[2] {
-		t.Fatalf("claims = %v, want two for the unknown jobs", got)
+		t.Fatalf("claims = %v, want two for the earlier waiting jobs", got)
 	}
-	// One unknown job starts, taking its claim with it: the other keeps its.
-	s.Message(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: base(9, "", "")}}})
-	if got := claims(s, 1); got[0] {
-		t.Fatalf("after a start claims = %v, want none left", got)
+	// One earlier job starts: the next message's statistics shrink the
+	// credit, and its claim goes with it.
+	s.Message(&scaleset.RunnerScaleSetMessage{Statistics: stats(13, 11)})
+	if s.unknown != 1 || s.unknownClaimed != 1 {
+		t.Fatalf("unknown %d claimed %d, want 1 and 1", s.unknown, s.unknownClaimed)
 	}
-	// A new session recounts from scratch: 2 assigned, 1 known.
-	s.Session(2)
-	if got := claims(s, 2); !got[0] || got[1] {
-		t.Fatalf("after a new session claims = %v, want one", got)
+	// Statistics never grow the credit: new jobs come with their messages.
+	s.Message(&scaleset.RunnerScaleSetMessage{Statistics: stats(20, 11)})
+	if s.unknown != 1 {
+		t.Fatalf("unknown grew to %d", s.unknown)
+	}
+}
+
+func TestReleaseFromAnOldSessionIsIgnored(t *testing.T) {
+	s := New(&Policy{Events: []string{"pull_request"}})
+	s.Session(stats(1, 0))
+	_, release := s.ClaimPool()
+	s.Session(stats(1, 0))
+	if ok, _ := s.ClaimPool(); !ok {
+		t.Fatal("the new session's credit was not available")
+	}
+	release() // a launch from the old session gives up its claim
+	if ok, _ := s.ClaimPool(); ok {
+		t.Fatal("an old session's release granted an extra claim")
 	}
 }

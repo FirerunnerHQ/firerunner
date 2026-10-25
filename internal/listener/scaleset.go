@@ -472,9 +472,7 @@ func (t trackedSession) DeleteMessage(ctx context.Context, messageID int) error 
 // before the library sizes the tier from that count.
 func (t trackedSession) Session() scaleset.RunnerScaleSetSession {
 	sess := t.session.Session()
-	if sess.Statistics != nil {
-		t.pending.Session(sess.Statistics.TotalAssignedJobs)
-	}
+	t.pending.Session(sess.Statistics)
 	return sess
 }
 
