@@ -98,17 +98,29 @@ reported() { grep -qx "$1" "$STATE/reports" 2>/dev/null; }
 # powered_off <mode>: the script powered off exactly once, in that mode.
 powered_off() { [ "$(cat "$STATE/poweroff" 2>/dev/null)" = "$1" ]; }
 
-# run: run the script against the $STATE prepared by the caller, killing it
-# if it hangs (no coreutils timeout on macOS).
-run() {
-	PATH="${EXTRA_PATH:+$EXTRA_PATH:}$TMP/bin:$PATH" \
+# script: the boot script under test, with the fakes; it replaces the calling
+# (sub)shell, so a backgrounded call's $! is the script itself.
+script() {
+	exec env PATH="${EXTRA_PATH:+$EXTRA_PATH:}$TMP/bin:$PATH" \
 		FIRERUNNER_IMDS=imds.test \
 		FIRERUNNER_RUNNER_DIR="${RUNNER_DIR:-$TMP/runner}" \
 		FIRERUNNER_POWEROFF="$TMP/bin/fake-poweroff clean" \
 		FIRERUNNER_POWEROFF_FAST="$TMP/bin/fake-poweroff fast" \
 		FIRERUNNER_RETRY_SLEEP=0 \
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
-		sh "$SCRIPT" > "$STATE/stdout" 2> "$STATE/stderr" &
+		"${SCRIPT_SH:-sh}" "$SCRIPT"
+}
+
+# run: run the script against the $STATE prepared by the caller, killing it
+# if it hangs (no coreutils timeout on macOS). With BROKEN_STREAM set, its
+# stdout and stderr are a pipe nobody reads, as when the journal stream
+# breaks.
+run() {
+	if [ -n "${BROKEN_STREAM:-}" ]; then
+		(script 2>&1 | true) &
+	else
+		script > "$STATE/stdout" 2> "$STATE/stderr" &
+	fi
 	local pid=$!
 	if [ -n "${TERM_WHEN:-}" ]; then
 		# Signal the script once $STATE/$TERM_WHEN exists, as systemd does on
@@ -212,6 +224,14 @@ expect "missing runner: reports status 127" "$(cat "$STATE/reports" 2>/dev/null)
 expect "missing runner: powers off fast" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
 expect "missing runner: no other report" "$(cat "$STATE/reports" 2>/dev/null)" [ "$(wc -l < "$STATE/reports")" -eq 1 ]
 
+fresh no-runner-broken-stream
+echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+echo "200" > "$STATE/jit-codes"
+printf 'cfg' > "$STATE/jit-body"
+RUNNER_DIR="$TMP/missing" BROKEN_STREAM=1 run
+expect "missing runner, broken stream: reports status 127" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=127'
+expect "missing runner, broken stream: powers off" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
+
 # 8. Something the job left behind holds the runner's output open: the script
 #    still finishes with the runner, not with it.
 fresh lingering
@@ -270,35 +290,36 @@ expect "failed setup: powers off fast" "poweroff=$(cat "$STATE/poweroff" 2>/dev/
 
 # 13. A signal (shutdown, spot interruption, terminate) is the instance going
 #     away, not the runner failing: no exit report, and no second poweroff.
-fresh signalled
-echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
-echo "200" > "$STATE/jit-codes"
-printf 'cfg' > "$STATE/jit-body"
-# shellcheck disable=SC2016 # expanded by the fake run.sh
-runner 'touch "$STATE/running"; echo "Listening for Jobs"; sleep 1'
-TERM_WHEN=running run
-runner :
-expect "signal: no exit report" "$(cat "$STATE/reports" 2>/dev/null)" [ "$(grep -c '^phase=exited' "$STATE/reports" 2>/dev/null || true)" = 0 ]
-expect "signal: no poweroff" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" lacks poweroff
+#     Under bash too: dash never runs the EXIT trap on a signal, bash does.
+for sh in sh bash; do
+	fresh "signalled-$sh"
+	echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+	echo "200" > "$STATE/jit-codes"
+	printf 'cfg' > "$STATE/jit-body"
+	# shellcheck disable=SC2016 # expanded by the fake run.sh
+	runner 'touch "$STATE/running"; echo "Listening for Jobs"; sleep 1'
+	SCRIPT_SH=$sh TERM_WHEN=running run
+	runner :
+	expect "signal ($sh): no exit report" "$(cat "$STATE/reports" 2>/dev/null)" [ "$(grep -c '^phase=exited' "$STATE/reports" 2>/dev/null || true)" = 0 ]
+	expect "signal ($sh): no poweroff" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" lacks poweroff
+done
 
-# 14. The journal stream breaks mid-job (the script's stdout loses its
-#     reader): the runner keeps running and its exit is still reported.
-fresh broken-stdout
-echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
-echo "200" > "$STATE/jit-codes"
-printf 'cfg' > "$STATE/jit-body"
-# shellcheck disable=SC2016 # expanded by the fake run.sh
-runner 'echo "Listening for Jobs"; sleep 0.3; i=0; while [ $i -lt 200 ]; do echo "line $i"; i=$((i + 1)); done; touch "$STATE/runner-done"'
-PATH="$TMP/bin:$PATH" \
-	FIRERUNNER_IMDS=imds.test \
-	FIRERUNNER_RUNNER_DIR="$TMP/runner" \
-	FIRERUNNER_POWEROFF="$TMP/bin/fake-poweroff clean" \
-	FIRERUNNER_POWEROFF_FAST="$TMP/bin/fake-poweroff fast" \
-	FIRERUNNER_RETRY_SLEEP=0 \
-	sh "$SCRIPT" 2> "$STATE/stderr" | true
-runner :
-expect "broken stdout: the runner finishes" "runner did not finish" has runner-done
-expect "broken stdout: reports a zero exit" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=0'
+# 14. The journal stream breaks mid-job (the script's stdout and stderr lose
+#     their reader): the runner keeps running, and its exit is still
+#     reported, whatever it is, before the instance powers off.
+for want in 0 3; do
+	fresh "broken-stream-$want"
+	echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+	echo "200" > "$STATE/jit-codes"
+	printf 'cfg' > "$STATE/jit-body"
+	# shellcheck disable=SC2016 # expanded by the fake run.sh
+	runner 'echo "Listening for Jobs"; sleep 0.3; i=0; while [ $i -lt 200 ]; do echo "line $i"; i=$((i + 1)); done; touch "$STATE/runner-done"; exit '"$want"
+	BROKEN_STREAM=1 run
+	runner :
+	expect "broken stream, status $want: the runner finishes" "runner did not finish" has runner-done
+	expect "broken stream, status $want: reports it" "$(cat "$STATE/reports" 2>/dev/null)" reported "phase=exited&rc=$want"
+	expect "broken stream, status $want: powers off" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
+done
 
 for st in "$TMP"/state-*; do
 	expect "$(basename "$st"): finished" "hung" [ ! -f "$st/hung" ]

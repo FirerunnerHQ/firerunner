@@ -119,8 +119,10 @@ instead. The JIT config never appears in user-data:
    instance going away is not the runner failing. Reports are best effort (2 s
    each, `FIRERUNNER_REPORT_TIMEOUT`). The runner's output reaches the reader
    through a FIFO, so the script waits for the runner alone, not for a process
-   a job left holding its output; the reader ignores SIGPIPE, so a broken
-   journal stream costs log lines, not the job.
+   a job left holding its output. A broken journal stream costs log lines,
+   not the job or its report: the reader ignores SIGPIPE, and so does the
+   script once the runner has exited (not before, or the runner and its job
+   would inherit it).
 
 The unit has no `network-online.target` or docker ordering: the retry loop
 starts the fetch as soon as the NIC has an address. `images/test-ec2-run.sh`

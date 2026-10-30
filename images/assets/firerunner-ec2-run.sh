@@ -137,8 +137,9 @@ if [ -z "$jit" ]; then
 fi
 
 if ! cd "$RUNNER_DIR" 2>/dev/null || [ ! -x ./run.sh ]; then
-	log "no runnable $RUNNER_DIR/run.sh; powering off"
+	trap '' PIPE # no runner inherits it here; see below
 	report exited 127
+	log "no runnable $RUNNER_DIR/run.sh; powering off"
 	exit 0
 fi
 # The instance is single-use and thrown away after the job.
@@ -169,6 +170,10 @@ mkfifo "$fifo"
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
 rc=0
 ./run.sh --jitconfig "$jit" >"$fifo" 2>&1 || rc=$?
+# From here a broken journal stream must not kill this shell before the
+# report. (Not earlier: an ignored SIGPIPE would be inherited by the runner
+# and its job.)
+trap '' PIPE
 rm -f "$fifo"
-[ "$rc" -eq 0 ] || log "runner exited with status $rc"
 report exited "$rc"
+[ "$rc" -eq 0 ] || log "runner exited with status $rc"
