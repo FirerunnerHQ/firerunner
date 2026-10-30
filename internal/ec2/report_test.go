@@ -66,9 +66,10 @@ func TestLaunch_RunnerExitIgnoredWhenRemoved(t *testing.T) {
 	inst := h.instance(t)
 	h.fetch(inst.ip)
 	h.report(t, inst.ip, "phase=listening")
-	cancel()
-	eventually(t, "the terminate request", func() bool { return len(h.f.terminatedIDs()) == 1 })
+	// Reported before the cancel: the fake shuts the instance down on the
+	// terminate, after which Launch may revoke the registration at once.
 	h.report(t, inst.ip, "phase=exited&rc=143")
+	cancel()
 	if err := waitErr(t, errc); err != nil {
 		t.Fatalf("Launch = %v, want nil for a removed runner", err)
 	}
