@@ -120,9 +120,9 @@ instead. The JIT config never appears in user-data:
    each, `FIRERUNNER_REPORT_TIMEOUT`). The runner's output reaches the reader
    through a FIFO, so the script waits for the runner alone, not for a process
    a job left holding its output. A broken journal stream costs log lines,
-   not the job or its report: the reader ignores SIGPIPE, and so does the
-   script once the runner has exited (not before, or the runner and its job
-   would inherit it).
+   not the job or its report: the unit runs the script with SIGPIPE ignored
+   (`IgnoreSIGPIPE=yes`, systemd's default), the reader drops a line it cannot
+   write, and the script reports before it logs.
 
 The unit has no `network-online.target` or docker ordering: the retry loop
 starts the fetch as soon as the NIC has an address. `images/test-ec2-run.sh`

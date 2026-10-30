@@ -27,6 +27,11 @@
 # killed and the file systems unmounted or remounted read-only. Any other boot
 # (a pool instance's warm-up, an image build, a failure before user-data is
 # read) keeps the clean POWEROFF: that disk may boot again.
+#
+# systemd starts this with SIGPIPE ignored (IgnoreSIGPIPE=, on by default), so
+# a write to a broken journal stream fails with EPIPE rather than killing the
+# shell: under set -e the script exits, and the EXIT trap still reports and
+# powers off. Report before logging, so a failed log line costs no status.
 set -eu
 
 IMDS="${FIRERUNNER_IMDS:-169.254.169.254}"
@@ -137,8 +142,7 @@ if [ -z "$jit" ]; then
 fi
 
 if ! cd "$RUNNER_DIR" 2>/dev/null || [ ! -x ./run.sh ]; then
-	trap '' PIPE # no runner inherits it here; see below
-	report exited 127
+	report exited 127 # before the log line, which may fail (see below)
 	log "no runnable $RUNNER_DIR/run.sh; powering off"
 	exit 0
 fi
@@ -155,9 +159,8 @@ fifo="$(mktemp -u)"
 mkfifo "$fifo"
 (
 	# Nothing may end the reader early: a writer to a FIFO with no reader
-	# gets SIGPIPE, which would kill the runner mid-job. So a broken journal
-	# stream costs log lines, not the job.
-	trap '' PIPE
+	# fails (EPIPE), which can end the runner mid-job. So a line the broken
+	# journal stream will not take is dropped, never fatal under set -e.
 	trap - EXIT TERM INT HUP
 	while IFS= read -r line || [ -n "$line" ]; do
 		printf '%s\n' "$line" 2>/dev/null || :
@@ -170,10 +173,6 @@ mkfifo "$fifo"
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
 rc=0
 ./run.sh --jitconfig "$jit" >"$fifo" 2>&1 || rc=$?
-# From here a broken journal stream must not kill this shell before the
-# report. (Not earlier: an ignored SIGPIPE would be inherited by the runner
-# and its job.)
-trap '' PIPE
 rm -f "$fifo"
 report exited "$rc"
 [ "$rc" -eq 0 ] || log "runner exited with status $rc"

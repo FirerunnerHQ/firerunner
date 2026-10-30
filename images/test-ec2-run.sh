@@ -98,9 +98,11 @@ reported() { grep -qx "$1" "$STATE/reports" 2>/dev/null; }
 # powered_off <mode>: the script powered off exactly once, in that mode.
 powered_off() { [ "$(cat "$STATE/poweroff" 2>/dev/null)" = "$1" ]; }
 
-# script: the boot script under test, with the fakes; it replaces the calling
-# (sub)shell, so a backgrounded call's $! is the script itself.
+# script: the boot script under test, with the fakes and SIGPIPE ignored, as
+# systemd starts it; it replaces the calling (sub)shell, so a backgrounded
+# call's $! is the script itself.
 script() {
+	# shellcheck disable=SC2016 # expanded by the inner shell
 	exec env PATH="${EXTRA_PATH:+$EXTRA_PATH:}$TMP/bin:$PATH" \
 		FIRERUNNER_IMDS=imds.test \
 		FIRERUNNER_RUNNER_DIR="${RUNNER_DIR:-$TMP/runner}" \
@@ -108,7 +110,7 @@ script() {
 		FIRERUNNER_POWEROFF_FAST="$TMP/bin/fake-poweroff fast" \
 		FIRERUNNER_RETRY_SLEEP=0 \
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
-		"${SCRIPT_SH:-sh}" "$SCRIPT"
+		"${SCRIPT_SH:-sh}" -c 'trap "" PIPE; exec "$0" "$1"' "${SCRIPT_SH:-sh}" "$SCRIPT"
 }
 
 # run: run the script against the $STATE prepared by the caller, killing it
@@ -313,7 +315,8 @@ for want in 0 3; do
 	echo "200" > "$STATE/jit-codes"
 	printf 'cfg' > "$STATE/jit-body"
 	# shellcheck disable=SC2016 # expanded by the fake run.sh
-	runner 'echo "Listening for Jobs"; sleep 0.3; i=0; while [ $i -lt 200 ]; do echo "line $i"; i=$((i + 1)); done; touch "$STATE/runner-done"; exit '"$want"
+	# A runner that fails on a write error, as the real one may.
+	runner 'set -e; echo "Listening for Jobs"; sleep 0.3; i=0; while [ $i -lt 200 ]; do echo "line $i"; i=$((i + 1)); done; touch "$STATE/runner-done"; exit '"$want"
 	BROKEN_STREAM=1 run
 	runner :
 	expect "broken stream, status $want: the runner finishes" "runner did not finish" has runner-done
