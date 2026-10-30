@@ -2017,3 +2017,92 @@ func TestRemovalSparesOnlyRunnersGitHubMayHaveDeleted(t *testing.T) {
 		})
 	}
 }
+
+// TestRemovalRefusedThenFailureCounts: once GitHub answers that a removal
+// failed, the runner is plainly still registered, so its later failure is a
+// failed boot again.
+func TestRemovalRefusedThenFailureCounts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exit := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		entered <- struct{}{}
+		select {
+		case <-vmCtx.Done():
+			return nil
+		case <-exit:
+			return errors.New("runner failed on the instance")
+		}
+	})
+	var calls atomic.Int64
+	rm := removerFunc(func(context.Context, string) error {
+		calls.Add(1)
+		return errors.New("remove: 500 internal server error")
+	})
+	s := New(Options{Max: 1, Provisioner: prov, JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 1)
+	s.Reconcile(ctx, 0)
+	waitCalls(t, &calls, 1)
+	waitRemoverStopped(t, s)
+	close(exit)
+	waitFailures(t, s, 1)
+}
+
+// TestUnconfirmedRemovalIsNotReclaimed: a VM GitHub may already have removed
+// is not handed back to demand; demand gets a new VM, and the removal keeps
+// going.
+func TestUnconfirmedRemovalIsNotReclaimed(t *testing.T) {
+	old := removeRetryDelay
+	removeRetryDelay = time.Hour // the retry waits; reclaim gets its chance
+	defer func() { removeRetryDelay = old }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{}, 2)
+	var calls atomic.Int64
+	rm := removerFunc(func(context.Context, string) error {
+		calls.Add(1)
+		return fmt.Errorf("remove: %w", core.ErrRemovalUnknown)
+	})
+	s := New(Options{Max: 2, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 1)
+	s.Reconcile(ctx, 0)
+	waitCalls(t, &calls, 1)
+	s.Reconcile(ctx, 1)
+	select {
+	case <-entered: // a new VM for the demand
+	case <-time.After(3 * time.Second):
+		t.Fatal("demand reclaimed the VM GitHub may have removed instead of launching")
+	}
+	s.mu.Lock()
+	removing := 0
+	for _, h := range s.active {
+		if h.removing && h.deregistering {
+			removing++
+		}
+	}
+	queued := len(s.removeQ)
+	s.mu.Unlock()
+	if removing != 1 || queued != 1 {
+		t.Fatalf("removing=%d queued=%d, want the unconfirmed VM still removing and queued", removing, queued)
+	}
+	cancel() // stop the retrying loop before removeRetryDelay is restored
+	waitRemoverStopped(t, s)
+}
+
+func waitFailures(t *testing.T, s *Scheduler, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		s.mu.Lock()
+		got := s.failures
+		s.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("failures=%d, want %d", got, want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

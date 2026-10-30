@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -362,20 +363,30 @@ func (s *Scheduler) scaleDown(desired int) (int, bool) {
 // demand has risen past what is live, so a quick reversal keeps its warm VMs
 // instead of deregistering them one by one and booting replacements. The
 // removal removeLoop is running cannot be recalled; it is already off the
-// queue. Returns how many it reclaimed. Callers must hold s.mu.
+// queue. Nor can one GitHub may already have done (an unconfirmed removal
+// waiting to retry): its runner may be gone, so it stays queued. Returns how
+// many it reclaimed. Callers must hold s.mu.
 func (s *Scheduler) reclaimQueued(desired int) int {
 	need := max(desired, s.opts.Min) - s.live()
 	reclaimed := 0
+	var asked []string
 	for need > 0 && len(s.removeQ) > 0 {
 		last := len(s.removeQ) - 1
 		name := s.removeQ[last]
 		s.removeQ = s.removeQ[:last]
-		if h := s.active[name]; h != nil && h.removing && !h.cancelled {
+		h := s.active[name]
+		switch {
+		case h == nil || !h.removing || h.cancelled:
+		case h.deregistering:
+			asked = append(asked, name)
+		default:
 			h.removing = false
 			need--
 			reclaimed++
 		}
 	}
+	slices.Reverse(asked)
+	s.removeQ = append(s.removeQ, asked...)
 	return reclaimed
 }
 
