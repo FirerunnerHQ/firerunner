@@ -123,8 +123,8 @@ while :; do
 		# Served to this address and lost on the way, the config was spent on
 		# a runner that never ran: report it (firerunner ignores the report
 		# from an address it never served).
+		report exited 1 # before the log line, which may fail
 		log "JIT config already claimed or expired; powering off"
-		report exited 1
 		exit 0
 		;;
 	esac

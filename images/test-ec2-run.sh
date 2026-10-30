@@ -288,6 +288,12 @@ run
 expect "lost response: reports a failure" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=1'
 expect "lost response: runner not started" "runner ran" lacks runner-argv
 
+fresh lost-response-broken-stream
+echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+echo "000 404" > "$STATE/jit-codes"
+BROKEN_STREAM=1 run
+expect "lost response, broken stream: reports a failure" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=1'
+
 # 10. An empty config: the runner cannot start; report a failure.
 fresh empty-config
 echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
