@@ -25,6 +25,10 @@ import (
 // market the tier allows, was out of capacity.
 var ErrNoCapacity = errors.New("no EC2 capacity for any configured instance type and subnet")
 
+// ErrRunnerFailed reports that the runner on an instance exited with a
+// non-zero status, or could not be started, by the instance's own report.
+var ErrRunnerFailed = errors.New("runner failed on the instance")
+
 // capacityCodes are RunInstances errors that mean "not here, try the next
 // type or subnet" rather than "this launch is broken".
 var capacityCodes = []string{
@@ -344,6 +348,9 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			switch s {
 			case types.InstanceStateNameShuttingDown, types.InstanceStateNameTerminated:
 				w.log.Info("instance gone", "state", s)
+				if err := w.runnerResult(ip); result == nil && ctx.Err() == nil {
+					result = err
+				}
 				return result
 			case types.InstanceStateNamePending, types.InstanceStateNameRunning:
 				w.awaitStart = false
@@ -376,6 +383,38 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			}
 		}
 	}
+}
+
+// runnerResult logs the phases the instance reported for its runner and
+// returns ErrRunnerFailed when the runner reported a non-zero exit. No report
+// (a hard crash, an instance that never fetched its config) is no error.
+func (w *waiter) runnerResult(ip netip.Addr) error {
+	if !ip.IsValid() {
+		return nil
+	}
+	r := w.p.o.JIT.Report(ip)
+	if r.Served.IsZero() {
+		return nil
+	}
+	var attrs []any
+	span := func(key string, from, to time.Time) {
+		if !from.IsZero() && !to.IsZero() {
+			attrs = append(attrs, key, to.Sub(from).Round(time.Millisecond))
+		}
+	}
+	span("servedToListening", r.Served, r.Listening)
+	span("listeningToJob", r.Listening, r.Job)
+	span("jobToExit", r.Job, r.Exited)
+	if r.Exited.IsZero() {
+		w.log.Info("runner phases; no exit reported", attrs...)
+		return nil
+	}
+	attrs = append(attrs, "rc", r.ExitCode)
+	w.log.Info("runner phases", attrs...)
+	if r.ExitCode != 0 {
+		return fmt.Errorf("%w: instance %s, exit status %d", ErrRunnerFailed, w.id, r.ExitCode)
+	}
+	return nil
 }
 
 // terminate asks EC2 to terminate the instance. The first request is logged
