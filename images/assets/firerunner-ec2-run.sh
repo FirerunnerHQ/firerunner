@@ -37,6 +37,8 @@ poweroff_cmd="$POWEROFF"
 RETRY_SLEEP="${FIRERUNNER_RETRY_SLEEP:-0.2}"
 # Give up on a config that never arrives; firerunner revokes it long before.
 JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
+# Bounds each progress report to the control VM.
+REPORT_TIMEOUT="${FIRERUNNER_REPORT_TIMEOUT:-2}"
 # Read on a warm-up boot, so the first job does not pay for EBS fetching their
 # blocks from the snapshot.
 WARM_PATHS="${FIRERUNNER_WARM_PATHS:-$RUNNER_DIR /usr/bin/dockerd /usr/bin/containerd /usr/bin/docker /usr/bin/runc}"
@@ -100,10 +102,42 @@ if [ -z "$jit" ]; then
 	exit 0
 fi
 
-cd "$RUNNER_DIR"
+# report PHASE [RC]: tell the control VM how the runner is doing (see
+# internal/jitserver: listening, job, exited with its status), so a runner that
+# fails backs firerunner off instead of being relaunched at once, and boot time
+# splits into phases. Best effort: a report that fails changes nothing here.
+report() {
+	q="phase=$1"
+	[ $# -lt 2 ] || q="$q&rc=$2"
+	curl -s -m "$REPORT_TIMEOUT" -o /dev/null -X POST "$url/report?$q" || true
+}
+
+if ! cd "$RUNNER_DIR" 2>/dev/null || [ ! -x ./run.sh ]; then
+	log "no runnable $RUNNER_DIR/run.sh; powering off"
+	report exited 127
+	exit 0
+fi
 # The instance is single-use and thrown away after the job.
 export RUNNER_ALLOW_RUNASROOT=1
 export HOME=/root
 export USER=root
+
+# The runner's output goes through a FIFO to a reader that passes it on to the
+# journal and reports the phases it shows. A FIFO, not a pipeline: this script
+# waits for the runner alone, never for whatever else holds its output open (a
+# daemon a job step left behind).
+fifo="$(mktemp -u)"
+mkfifo "$fifo"
+while IFS= read -r line; do
+	printf '%s\n' "$line"
+	case "$line" in
+	*"Listening for Jobs"*) report listening ;;
+	*"Running job:"*) report job ;;
+	esac
+done <"$fifo" &
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
-./run.sh --jitconfig "$jit" || log "runner exited non-zero"
+rc=0
+./run.sh --jitconfig "$jit" >"$fifo" 2>&1 || rc=$?
+rm -f "$fifo"
+[ "$rc" -eq 0 ] || log "runner exited with status $rc"
+report exited "$rc"

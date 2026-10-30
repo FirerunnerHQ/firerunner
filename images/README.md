@@ -109,6 +109,13 @@ instead. The JIT config never appears in user-data:
 3. Run `./run.sh --jitconfig <config>` for one job, then power off. The
    instance is launched to terminate on shutdown. A pooled persistent-spot
    instance, which can only stop, is terminated by firerunner.
+4. Report progress with `POST <url>/report?phase=…`: `listening` and `job`
+   when the runner prints "Listening for Jobs" and "Running job:", and
+   `exited&rc=<status>` before powering off. A missing or non-executable
+   `run.sh` reports status 127. Reports are best effort (2 s each,
+   `FIRERUNNER_REPORT_TIMEOUT`). The runner's output reaches the reader through
+   a FIFO, so the script waits for the runner alone, not for a process a job
+   left holding its output.
 
 The unit has no `network-online.target` or docker ordering: the retry loop
 starts the fetch as soon as the NIC has an address. `images/test-ec2-run.sh`
