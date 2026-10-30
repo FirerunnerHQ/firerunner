@@ -2068,6 +2068,21 @@ func TestUnconfirmedRemovalIsNotReclaimed(t *testing.T) {
 	startIdle(t, ctx, s, entered, 1)
 	s.Reconcile(ctx, 0)
 	waitCalls(t, &calls, 1)
+	// The remover is called before the answer is settled: wait until the VM
+	// is back in the queue, where reclaim could take it.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		s.mu.Lock()
+		queued := len(s.removeQ)
+		s.mu.Unlock()
+		if queued == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the unconfirmed removal was never requeued")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	s.Reconcile(ctx, 1)
 	select {
 	case <-entered: // a new VM for the demand
