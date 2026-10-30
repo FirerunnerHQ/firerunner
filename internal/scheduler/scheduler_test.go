@@ -1900,3 +1900,45 @@ func waitEntered(t *testing.T, entered <-chan struct{}, n int) {
 		}
 	}
 }
+
+// TestVMEndingDuringRemovalIsNotABootFailure: a runner GitHub deleted may exit
+// non-zero before an unconfirmed removal settles and cancels its VM. The
+// launch's error then comes from the scale-down, so it must not back off.
+func TestVMEndingDuringRemovalIsNotABootFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exit := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+		entered <- struct{}{}
+		select {
+		case <-vmCtx.Done():
+			return nil
+		case <-exit:
+			return errors.New("runner failed on the instance")
+		}
+	})
+	var s *Scheduler
+	answered := make(chan struct{})
+	rm := removerFunc(func(context.Context, string) error {
+		defer close(answered)
+		close(exit) // the deregistered runner exits non-zero meanwhile
+		waitRunning(t, s, 0)
+		return fmt.Errorf("remove: %w", core.ErrRemovalUnknown)
+	})
+	s = New(Options{Max: 1, Provisioner: prov, JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	startIdle(t, ctx, s, entered, 1)
+	s.Reconcile(ctx, 0)
+	select {
+	case <-answered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the remover was never called")
+	}
+	waitRemoverStopped(t, s)
+	s.mu.Lock()
+	failures, backingOff := s.failures, s.backingOff
+	s.mu.Unlock()
+	if failures != 0 || backingOff != 0 {
+		t.Fatalf("failures=%d backingOff=%d after a VM ended during its removal, want 0", failures, backingOff)
+	}
+}

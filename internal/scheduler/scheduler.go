@@ -585,20 +585,27 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 	// would tie the provisioner's slot lifecycle to this lock. A failed launch
 	// keeps its place in running through backoff so plan bounds the retries.
 	s.mu.Lock()
+	// A VM scale-down was deregistering ended with it: its runner may have
+	// exited non-zero because GitHub deleted it, before an unconfirmed
+	// removal settled and cancelled it. That is churn, not a failed boot.
+	removing := false
 	if h := s.active[name]; h != nil {
 		jobDone = h.completed && s.reconciles > h.completedAt
+		removing = h.removing
 	}
 	delete(s.active, name)
-	failed := launchErr != nil && vmCtx.Err() == nil
+	removed := vmCtx.Err() != nil || removing
+	failed := launchErr != nil && !removed
 	if !failed {
 		finish()
 	}
 	s.mu.Unlock()
 	startReplanned()
 	switch {
-	case vmCtx.Err() != nil:
-		// We cancelled this VM ourselves (scale-down or shutdown); any error it
-		// returns is expected, so treat it as healthy churn.
+	case removed:
+		// We cancelled or were removing this VM ourselves (scale-down or
+		// shutdown); any error it returns is expected, so treat it as
+		// healthy churn.
 		s.resetBackoff()
 	case launchErr != nil:
 		s.opts.Logger.Error("launch microVM", "runner", name, "err", launchErr)
