@@ -1942,3 +1942,78 @@ func TestVMEndingDuringRemovalIsNotABootFailure(t *testing.T) {
 		t.Fatalf("failures=%d backingOff=%d after a VM ended during its removal, want 0", failures, backingOff)
 	}
 }
+
+// TestRemovalSparesOnlyRunnersGitHubMayHaveDeleted: a VM still queued for
+// removal (GitHub not asked yet), or busy with a job (GitHub never deletes
+// one), that fails is a failed boot like any other.
+func TestRemovalSparesOnlyRunnersGitHubMayHaveDeleted(t *testing.T) {
+	for _, busy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("busy=%v", busy), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var mu sync.Mutex
+			exits := map[string]chan struct{}{}
+			entered := make(chan struct{}, 2)
+			prov := provFunc(func(vmCtx context.Context, name, jit string, spec core.RunnerSpec, onBusy func()) error {
+				ch := make(chan struct{})
+				mu.Lock()
+				exits[name] = ch
+				mu.Unlock()
+				entered <- struct{}{}
+				select {
+				case <-vmCtx.Done():
+					return nil
+				case <-ch:
+					return errors.New("runner failed on the instance")
+				}
+			})
+			inRemoval := make(chan string, 2)
+			release := make(chan struct{})
+			rm := removerFunc(func(_ context.Context, name string) error {
+				inRemoval <- name
+				<-release
+				return fmt.Errorf("remove: %w", core.ErrRemovalUnknown)
+			})
+			s := New(Options{Max: 2, Provisioner: prov, JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+			defer close(release)
+			startIdle(t, ctx, s, entered, 2)
+			s.Reconcile(ctx, 0)
+			var asked string
+			select {
+			case asked = <-inRemoval:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the remover was never called")
+			}
+			// The failing VM: the one GitHub was asked about, now busy; or
+			// the other, still queued.
+			mu.Lock()
+			victim := asked
+			if !busy {
+				for name := range exits {
+					if name != asked {
+						victim = name
+					}
+				}
+			}
+			ch := exits[victim]
+			mu.Unlock()
+			if busy {
+				s.MarkBusy(victim)
+			}
+			close(ch)
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				s.mu.Lock()
+				failures := s.failures
+				s.mu.Unlock()
+				if failures == 1 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("failures=%d, want 1: the failure was masked", failures)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		})
+	}
+}
