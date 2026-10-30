@@ -10,6 +10,10 @@ ExecStart=/usr/local/bin/firerunner-ec2-run.sh
 StandardOutput=journal+console
 StandardError=journal+console
 TimeoutStartSec=0
+# The default, stated because firerunner-ec2-run.sh relies on it: a broken
+# journal stream fails writes (EPIPE) instead of killing the script before it
+# reports the runner's exit and powers off.
+IgnoreSIGPIPE=yes
 
 [Install]
 WantedBy=multi-user.target

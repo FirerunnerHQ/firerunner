@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -129,6 +130,11 @@ type vmHandle struct {
 	// counted it as gone. It returns to the pool (busy or idle) if GitHub
 	// refuses the removal, or if demand rises while it is still queued.
 	removing bool
+	// deregistering is set once removeLoop has asked GitHub to remove the
+	// runner, and stays set while the answer is unknown: GitHub may have
+	// deleted the runner, so its runner may exit non-zero because of us. A
+	// definite answer that left the runner registered clears it.
+	deregistering bool
 	// completed is set when GitHub reported the runner's job completed, while
 	// the VM was still tracked. completedAt is s.reconciles at that moment:
 	// a Reconcile after it carried a desired count that no longer counts the
@@ -357,20 +363,30 @@ func (s *Scheduler) scaleDown(desired int) (int, bool) {
 // demand has risen past what is live, so a quick reversal keeps its warm VMs
 // instead of deregistering them one by one and booting replacements. The
 // removal removeLoop is running cannot be recalled; it is already off the
-// queue. Returns how many it reclaimed. Callers must hold s.mu.
+// queue. Nor can one GitHub may already have done (an unconfirmed removal
+// waiting to retry): its runner may be gone, so it stays queued. Returns how
+// many it reclaimed. Callers must hold s.mu.
 func (s *Scheduler) reclaimQueued(desired int) int {
 	need := max(desired, s.opts.Min) - s.live()
 	reclaimed := 0
+	var asked []string
 	for need > 0 && len(s.removeQ) > 0 {
 		last := len(s.removeQ) - 1
 		name := s.removeQ[last]
 		s.removeQ = s.removeQ[:last]
-		if h := s.active[name]; h != nil && h.removing && !h.cancelled {
+		h := s.active[name]
+		switch {
+		case h == nil || !h.removing || h.cancelled:
+		case h.deregistering:
+			asked = append(asked, name)
+		default:
 			h.removing = false
 			need--
 			reclaimed++
 		}
 	}
+	slices.Reverse(asked)
+	s.removeQ = append(s.removeQ, asked...)
 	return reclaimed
 }
 
@@ -427,6 +443,7 @@ func (s *Scheduler) nextRemoval() (string, bool) {
 			h.removing = false
 			continue
 		}
+		h.deregistering = true
 		return name, true
 	}
 	return "", false
@@ -450,6 +467,9 @@ func (s *Scheduler) settleRemoval(name string, err error) bool {
 		return true
 	}
 	h.removing = false
+	if err != nil {
+		h.deregistering = false // GitHub answered: the runner is still registered
+	}
 	switch {
 	case errors.Is(err, core.ErrRunnerBusy):
 		h.busy = true
@@ -585,11 +605,17 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 	// would tie the provisioner's slot lifecycle to this lock. A failed launch
 	// keeps its place in running through backoff so plan bounds the retries.
 	s.mu.Lock()
+	// A VM whose runner scale-down asked GitHub to remove may exit non-zero
+	// because GitHub deleted it, before an unconfirmed removal settles and
+	// cancels the VM. Its error is then ours, not a failed boot. A runner
+	// with a job is never deleted, so a busy one's error still counts.
+	deregistered := false
 	if h := s.active[name]; h != nil {
 		jobDone = h.completed && s.reconciles > h.completedAt
+		deregistered = h.deregistering && !h.busy
 	}
 	delete(s.active, name)
-	failed := launchErr != nil && vmCtx.Err() == nil
+	failed := launchErr != nil && vmCtx.Err() == nil && !deregistered
 	if !failed {
 		finish()
 	}
@@ -600,6 +626,9 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 		// We cancelled this VM ourselves (scale-down or shutdown); any error it
 		// returns is expected, so treat it as healthy churn.
 		s.resetBackoff()
+	case launchErr != nil && deregistered:
+		// Neither a failure nor proof of a healthy boot: leave the count.
+		s.opts.Logger.Info("runner ended while GitHub was removing it", "runner", name, "err", launchErr)
 	case launchErr != nil:
 		s.opts.Logger.Error("launch microVM", "runner", name, "err", launchErr)
 		s.backoff(ctx)

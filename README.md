@@ -397,6 +397,17 @@ user-data**:
 3. The runner takes one job and the instance powers off. Instances are
    launched to terminate on shutdown, for both on-demand and one-time spot. If
    one ever stops instead, firerunner terminates it.
+4. Along the way, the instance reports its runner's progress to the same
+   endpoint (`POST /jit/report`, accepted only from the address that was
+   served the config): when the runner is listening, when its job starts, and
+   its exit status. firerunner logs each phase (`runner phase`, with the time
+   since the config was served) and, when the instance is gone, the spans
+   between them (`runner phases`).
+
+A runner that reports a non-zero exit, or that could not be started at all,
+fails its launch, so the tier backs off as it does after a failed microVM boot
+instead of relaunching a broken image at once. An instance that reports
+nothing, for example after a hard crash, is judged as before.
 
 firerunner also terminates an instance in these cases:
 

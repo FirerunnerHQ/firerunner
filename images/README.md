@@ -109,6 +109,26 @@ instead. The JIT config never appears in user-data:
 3. Run `./run.sh --jitconfig <config>` for one job, then power off. The
    instance is launched to terminate on shutdown. A pooled persistent-spot
    instance, which can only stop, is terminated by firerunner.
+4. Report progress with `POST <url>/report?phase=…`: `listening` and `job`
+   when the runner prints "Listening for Jobs" and "Running job:", and
+   `exited&rc=<status>` before powering off. The status is the listener's:
+   upstream's `run.sh` keeps the listener alive across retries and
+   self-updates but exits 0 for most fatal statuses, so the script reads the
+   status from the line `run-helper.sh` prints for it (terminated 1, session
+   conflict 5, unknown N), and waits (bounded, `FIRERUNNER_DRAIN_TICKS`) for
+   the output reader to reach `run.sh`'s last line, so the phase reports go
+   out before the exit's. A missing or non-executable
+   `run.sh` reports status 127. Any other exit after the config arrived (an
+   empty config, a failed setup step) reports a failure, as does a 404 after a
+   fetch whose response was lost. A signal (shutdown, spot interruption,
+   terminate) reports nothing and leaves the poweroff to whoever sent it: the
+   instance going away is not the runner failing. Reports are best effort (2 s
+   each, `FIRERUNNER_REPORT_TIMEOUT`). The runner's output reaches the reader
+   through a FIFO, so the script waits for the runner alone, not for a process
+   a job left holding its output. A broken journal stream costs log lines,
+   not the job or its report: the unit runs the script with SIGPIPE ignored
+   (`IgnoreSIGPIPE=yes`, systemd's default), the reader drops a line it cannot
+   write, and the script reports before it logs.
 
 The unit has no `network-online.target` or docker ordering: the retry loop
 starts the fetch as soon as the NIC has an address. `images/test-ec2-run.sh`

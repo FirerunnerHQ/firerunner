@@ -27,6 +27,11 @@
 # killed and the file systems unmounted or remounted read-only. Any other boot
 # (a pool instance's warm-up, an image build, a failure before user-data is
 # read) keeps the clean POWEROFF: that disk may boot again.
+#
+# systemd starts this with SIGPIPE ignored (IgnoreSIGPIPE=, on by default), so
+# a write to a broken journal stream fails with EPIPE rather than killing the
+# shell: under set -e the script exits, and the EXIT trap still reports and
+# powers off. Report before logging, so a failed log line costs no status.
 set -eu
 
 IMDS="${FIRERUNNER_IMDS:-169.254.169.254}"
@@ -37,18 +42,52 @@ poweroff_cmd="$POWEROFF"
 RETRY_SLEEP="${FIRERUNNER_RETRY_SLEEP:-0.2}"
 # Give up on a config that never arrives; firerunner revokes it long before.
 JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
+# Bounds each progress report to the control VM.
+REPORT_TIMEOUT="${FIRERUNNER_REPORT_TIMEOUT:-2}"
+# Bounds the wait for the output reader after the runner exits, in tenths of
+# a second: longer than one report, so a phase report in flight finishes.
+DRAIN_TICKS="${FIRERUNNER_DRAIN_TICKS:-50}"
 # Read on a warm-up boot, so the first job does not pay for EBS fetching their
 # blocks from the snapshot.
 WARM_PATHS="${FIRERUNNER_WARM_PATHS:-$RUNNER_DIR /usr/bin/dockerd /usr/bin/containerd /usr/bin/docker /usr/bin/runc}"
 
 log() { echo "firerunner: $*" >&2; }
 
+url=""
+# fetched is set once the config is in hand; exit_reported once the runner's
+# exit has been reported (see report).
+fetched=""
+exit_reported=""
+
+# report PHASE [RC]: tell the control VM how the runner is doing (see
+# internal/jitserver: listening, job, exited with its status), so a runner that
+# fails backs firerunner off instead of being relaunched at once, and boot time
+# splits into phases. Best effort: a report that fails changes nothing here.
+report() {
+	q="phase=$1"
+	[ $# -lt 2 ] || q="$q&rc=$2"
+	[ "$1" != exited ] || exit_reported=1
+	curl -s -m "$REPORT_TIMEOUT" -o /dev/null -X POST "$url/report?$q" || true
+}
+
+# finish STATUS runs on every exit but a signal's. Once the config is in
+# hand, an exit that has not reported the runner's status reports a failure
+# (STATUS, or 1 when STATUS is 0): this boot was meant to run a job and did
+# not get to.
 finish() {
+	if [ -n "$fetched" ] && [ -z "$exit_reported" ]; then
+		report exited "$([ "$1" -ne 0 ] && echo "$1" || echo 1)"
+	fi
 	sync
 	# shellcheck disable=SC2086 # poweroff_cmd is a command line.
 	$poweroff_cmd
 }
-trap finish EXIT
+trap 'finish $?' EXIT
+# A signal is the instance going away (shutdown, a spot interruption, a
+# terminate): it is not the runner failing, so exit with no report and leave
+# the poweroff to whoever is stopping it. Trapped explicitly because shells
+# differ on whether a signal runs the EXIT trap.
+trap 'trap - EXIT; exit 143' TERM INT HUP
 
 # IMDSv2 session token. IMDS can lag the first moments of boot.
 until tok="$(curl -sf -m 2 -X PUT "http://$IMDS/latest/api/token" \
@@ -71,7 +110,7 @@ fi
 poweroff_cmd="$POWEROFF_FAST"
 
 body="$(mktemp)"
-trap 'rm -f "$body"; finish' EXIT
+trap 'rc=$?; rm -f "$body"; finish "$rc"' EXIT
 start="$(date +%s)"
 while :; do
 	code="$(curl -s -m 5 -o "$body" -w '%{http_code}' "$url" || true)"
@@ -81,7 +120,11 @@ while :; do
 		;;
 	404)
 		# Already served (to an earlier attempt) or expired: it will never come.
+		# Served to this address and lost on the way, the config was spent on
+		# a runner that never ran: report it (firerunner ignores the report
+		# from an address it never served).
 		log "JIT config already claimed or expired; powering off"
+		report exited 1
 		exit 0
 		;;
 	esac
@@ -93,6 +136,7 @@ while :; do
 	fi
 	sleep "$RETRY_SLEEP"
 done
+fetched=1
 jit="$(cat "$body")"
 rm -f "$body"
 if [ -z "$jit" ]; then
@@ -100,10 +144,65 @@ if [ -z "$jit" ]; then
 	exit 0
 fi
 
-cd "$RUNNER_DIR"
+if ! cd "$RUNNER_DIR" 2>/dev/null || [ ! -x ./run.sh ]; then
+	report exited 127 # before the log line, which may fail (see below)
+	log "no runnable $RUNNER_DIR/run.sh; powering off"
+	exit 0
+fi
 # The instance is single-use and thrown away after the job.
 export RUNNER_ALLOW_RUNASROOT=1
 export HOME=/root
 export USER=root
+
+# The runner's output goes through a FIFO to a reader that passes it on to the
+# journal and reports the phases it shows. A FIFO, not a pipeline: this script
+# waits for the runner alone, never for whatever else holds its output open (a
+# daemon a job step left behind).
+#
+# run.sh's own status says little: upstream's run.sh and run-helper.sh keep
+# the listener alive across retries and self-updates, but exit 0 for every
+# fatal listener status but one. The reader takes the listener's status from
+# the line run-helper.sh prints for it instead.
+run_dir="$(mktemp -d)"
+fifo="$run_dir/output"
+mkfifo "$fifo"
+(
+	# Nothing may end the reader early: a writer to a FIFO with no reader
+	# fails (EPIPE), which can end the runner mid-job. So a line the broken
+	# journal stream will not take is dropped, never fatal under set -e.
+	trap - EXIT TERM INT HUP
+	while IFS= read -r line || [ -n "$line" ]; do
+		printf '%s\n' "$line" 2>/dev/null || :
+		case "$line" in
+		*"Listening for Jobs"*) report listening ;;
+		*"Running job:"*) report job ;;
+		# run-helper.sh's lines for the fatal statuses it hides.
+		*"Runner listener exit with terminated error"*) echo 1 >"$run_dir/listener" ;;
+		*"Runner listener exit with Session Conflict error"*) echo 5 >"$run_dir/listener" ;;
+		*"Exiting with unknown error code: "*)
+			n="${line##*: }"
+			case "$n" in '' | *[!0-9]*) ;; *) echo "$n" >"$run_dir/listener" ;; esac
+			;;
+		# run.sh's last line: every report before it has gone out.
+		*"Exiting runner..."*) : >"$run_dir/drained" ;;
+		esac
+	done <"$fifo"
+) &
+reader=$!
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
-./run.sh --jitconfig "$jit" || log "runner exited non-zero"
+rc=0
+./run.sh --jitconfig "$jit" >"$fifo" 2>&1 || rc=$?
+# Let the reader catch up with the runner's last lines, so the listener's
+# status is known and the phase reports precede the exit's. Bounded: a
+# process a job left behind may hold the FIFO open, so EOF may never come.
+waited=0
+while [ ! -e "$run_dir/drained" ] && kill -0 "$reader" 2>/dev/null && [ "$waited" -lt "$DRAIN_TICKS" ]; do
+	sleep 0.1
+	waited=$((waited + 1))
+done
+if [ "$rc" -eq 0 ] && [ -s "$run_dir/listener" ]; then
+	rc="$(cat "$run_dir/listener")"
+fi
+rm -rf "$run_dir"
+report exited "$rc"
+[ "$rc" -eq 0 ] || log "runner exited with status $rc"
