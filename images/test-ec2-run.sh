@@ -109,6 +109,7 @@ script() {
 		FIRERUNNER_POWEROFF="$TMP/bin/fake-poweroff clean" \
 		FIRERUNNER_POWEROFF_FAST="$TMP/bin/fake-poweroff fast" \
 		FIRERUNNER_RETRY_SLEEP=0 \
+		FIRERUNNER_DRAIN_TICKS="${DRAIN_TICKS:-50}" \
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
 		"${SCRIPT_SH:-sh}" -c 'trap "" PIPE; exec "$0" "$1"' "${SCRIPT_SH:-sh}" "$SCRIPT"
 }
@@ -151,7 +152,7 @@ echo 2 > "$STATE/token-fails"
 printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
 echo "000 403 403 200" > "$STATE/jit-codes"
 printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
-runner 'echo "Listening for Jobs"; echo "Running job: build"; echo "Job build completed"'
+runner 'echo "Listening for Jobs"; echo "Running job: build"; echo "Job build completed"; echo "Exiting runner..."'
 run
 expect "runner gets the fetched config" "argv=$(cat "$STATE/runner-argv" 2>/dev/null)" \
 	[ "$(cat "$STATE/runner-argv" 2>/dev/null)" = "$(printf -- '--jitconfig\neyJqaXQiOiJ4In0=')" ]
@@ -162,6 +163,8 @@ expect "reports listening" "$(cat "$STATE/reports" 2>/dev/null)" reported phase=
 expect "reports the job start" "$(cat "$STATE/reports" 2>/dev/null)" reported phase=job
 expect "reports a zero exit" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=0'
 expect "passes the runner's output on" "$(cat "$STATE/stdout")" grep -qx "Job build completed" "$STATE/stdout"
+expect "reports the phases before the exit" "$(cat "$STATE/reports" 2>/dev/null)" \
+	[ "$(tr '\n' ' ' < "$STATE/reports")" = "phase=listening phase=job phase=exited&rc=0 " ]
 runner :
 
 # 2. No endpoint in user-data (a warm-up or image-build boot): power off
@@ -235,16 +238,44 @@ expect "missing runner, broken stream: reports status 127" "$(cat "$STATE/report
 expect "missing runner, broken stream: powers off" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
 
 # 8. Something the job left behind holds the runner's output open: the script
-#    still finishes with the runner, not with it.
-fresh lingering
-echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
-echo "200" > "$STATE/jit-codes"
-printf 'cfg' > "$STATE/jit-body"
-runner 'sleep 8 & echo "Listening for Jobs"'
-began=$(date +%s)
-run
-expect "lingering output holder: finishes with the runner" "took $(($(date +%s) - began))s" [ $(($(date +%s) - began)) -lt 5 ]
-expect "lingering output holder: reports the exit" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=0'
+#    still finishes with the runner, not with it: at once when run.sh says
+#    it is exiting, and within the drain bound when it does not.
+for marker in yes no; do
+	fresh "lingering-$marker"
+	echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+	echo "200" > "$STATE/jit-codes"
+	printf 'cfg' > "$STATE/jit-body"
+	if [ "$marker" = yes ]; then
+		runner 'sleep 8 & echo "Listening for Jobs"; echo "Exiting runner..."'
+	else
+		runner 'sleep 8 & echo "Listening for Jobs"'
+	fi
+	# With the marker, the drain bound (3 s) is never reached.
+	if [ "$marker" = yes ]; then ticks=30 limit=2; else ticks=10 limit=4; fi
+	began=$(date +%s)
+	DRAIN_TICKS=$ticks run
+	expect "lingering output holder ($marker marker): finishes with the runner" "took $(($(date +%s) - began))s" [ $(($(date +%s) - began)) -lt $limit ]
+	expect "lingering output holder ($marker marker): reports the exit" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=0'
+done
+runner :
+
+# 8b. Upstream's run.sh exits 0 for most fatal listener statuses; the
+#     listener's status comes from run-helper.sh's line for it.
+while read -r want line; do
+	fresh "listener-$want"
+	echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+	echo "200" > "$STATE/jit-codes"
+	printf 'cfg' > "$STATE/jit-body"
+	runner "echo '$line'; echo 'Exiting runner...'; exit 0"
+	run
+	expect "listener status $want from \"$line\"" "$(cat "$STATE/reports" 2>/dev/null)" reported "phase=exited&rc=$want"
+done <<'LINES'
+1 Runner listener exit with terminated error, stop the service, no retry needed.
+5 Runner listener exit with Session Conflict error, stop the service, no retry needed.
+42 Exiting with unknown error code: 42
+0 Runner listener exit with 0 return code, stop the service, no retry needed.
+0 Exiting with unknown error code: x
+LINES
 runner :
 
 # 9. The config was served but its response lost, so the retry gets 404: the

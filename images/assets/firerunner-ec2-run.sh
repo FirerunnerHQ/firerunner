@@ -44,6 +44,9 @@ RETRY_SLEEP="${FIRERUNNER_RETRY_SLEEP:-0.2}"
 JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
 # Bounds each progress report to the control VM.
 REPORT_TIMEOUT="${FIRERUNNER_REPORT_TIMEOUT:-2}"
+# Bounds the wait for the output reader after the runner exits, in tenths of
+# a second: longer than one report, so a phase report in flight finishes.
+DRAIN_TICKS="${FIRERUNNER_DRAIN_TICKS:-50}"
 # Read on a warm-up boot, so the first job does not pay for EBS fetching their
 # blocks from the snapshot.
 WARM_PATHS="${FIRERUNNER_WARM_PATHS:-$RUNNER_DIR /usr/bin/dockerd /usr/bin/containerd /usr/bin/docker /usr/bin/runc}"
@@ -155,7 +158,13 @@ export USER=root
 # journal and reports the phases it shows. A FIFO, not a pipeline: this script
 # waits for the runner alone, never for whatever else holds its output open (a
 # daemon a job step left behind).
-fifo="$(mktemp -u)"
+#
+# run.sh's own status says little: upstream's run.sh and run-helper.sh keep
+# the listener alive across retries and self-updates, but exit 0 for every
+# fatal listener status but one. The reader takes the listener's status from
+# the line run-helper.sh prints for it instead.
+run_dir="$(mktemp -d)"
+fifo="$run_dir/output"
 mkfifo "$fifo"
 (
 	# Nothing may end the reader early: a writer to a FIFO with no reader
@@ -167,12 +176,33 @@ mkfifo "$fifo"
 		case "$line" in
 		*"Listening for Jobs"*) report listening ;;
 		*"Running job:"*) report job ;;
+		# run-helper.sh's lines for the fatal statuses it hides.
+		*"Runner listener exit with terminated error"*) echo 1 >"$run_dir/listener" ;;
+		*"Runner listener exit with Session Conflict error"*) echo 5 >"$run_dir/listener" ;;
+		*"Exiting with unknown error code: "*)
+			n="${line##*: }"
+			case "$n" in '' | *[!0-9]*) ;; *) echo "$n" >"$run_dir/listener" ;; esac
+			;;
+		# run.sh's last line: every report before it has gone out.
+		*"Exiting runner..."*) : >"$run_dir/drained" ;;
 		esac
 	done <"$fifo"
 ) &
+reader=$!
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
 rc=0
 ./run.sh --jitconfig "$jit" >"$fifo" 2>&1 || rc=$?
-rm -f "$fifo"
+# Let the reader catch up with the runner's last lines, so the listener's
+# status is known and the phase reports precede the exit's. Bounded: a
+# process a job left behind may hold the FIFO open, so EOF may never come.
+waited=0
+while [ ! -e "$run_dir/drained" ] && kill -0 "$reader" 2>/dev/null && [ "$waited" -lt "$DRAIN_TICKS" ]; do
+	sleep 0.1
+	waited=$((waited + 1))
+done
+if [ "$rc" -eq 0 ] && [ -s "$run_dir/listener" ]; then
+	rc="$(cat "$run_dir/listener")"
+fi
+rm -rf "$run_dir"
 report exited "$rc"
 [ "$rc" -eq 0 ] || log "runner exited with status $rc"

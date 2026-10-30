@@ -111,7 +111,13 @@ instead. The JIT config never appears in user-data:
    instance, which can only stop, is terminated by firerunner.
 4. Report progress with `POST <url>/report?phase=…`: `listening` and `job`
    when the runner prints "Listening for Jobs" and "Running job:", and
-   `exited&rc=<status>` before powering off. A missing or non-executable
+   `exited&rc=<status>` before powering off. The status is the listener's:
+   upstream's `run.sh` keeps the listener alive across retries and
+   self-updates but exits 0 for most fatal statuses, so the script reads the
+   status from the line `run-helper.sh` prints for it (terminated 1, session
+   conflict 5, unknown N), and waits (bounded, `FIRERUNNER_DRAIN_TICKS`) for
+   the output reader to reach `run.sh`'s last line, so the phase reports go
+   out before the exit's. A missing or non-executable
    `run.sh` reports status 127. Any other exit after the config arrived (an
    empty config, a failed setup step) reports a failure, as does a 404 after a
    fetch whose response was lost. A signal (shutdown, spot interruption,
