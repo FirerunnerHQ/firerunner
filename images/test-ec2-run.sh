@@ -101,7 +101,7 @@ powered_off() { [ "$(cat "$STATE/poweroff" 2>/dev/null)" = "$1" ]; }
 # run: run the script against the $STATE prepared by the caller, killing it
 # if it hangs (no coreutils timeout on macOS).
 run() {
-	PATH="$TMP/bin:$PATH" \
+	PATH="${EXTRA_PATH:+$EXTRA_PATH:}$TMP/bin:$PATH" \
 		FIRERUNNER_IMDS=imds.test \
 		FIRERUNNER_RUNNER_DIR="${RUNNER_DIR:-$TMP/runner}" \
 		FIRERUNNER_POWEROFF="$TMP/bin/fake-poweroff clean" \
@@ -110,6 +110,11 @@ run() {
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
 		sh "$SCRIPT" > "$STATE/stdout" 2> "$STATE/stderr" &
 	local pid=$!
+	if [ -n "${TERM_WHEN:-}" ]; then
+		# Signal the script once $STATE/$TERM_WHEN exists, as systemd does on
+		# a shutdown or a spot interruption.
+		(until [ -f "$STATE/$TERM_WHEN" ]; do sleep 0.05; done; kill -TERM "$pid") &
+	fi
 	(sleep 20 && kill "$pid" 2>/dev/null && touch "$STATE/hung") &
 	local watchdog=$!
 	local rc=0
@@ -219,6 +224,81 @@ run
 expect "lingering output holder: finishes with the runner" "took $(($(date +%s) - began))s" [ $(($(date +%s) - began)) -lt 5 ]
 expect "lingering output holder: reports the exit" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=0'
 runner :
+
+# 9. The config was served but its response lost, so the retry gets 404: the
+#    runner never ran, so report a failure (firerunner accepts it only if it
+#    did serve this address).
+fresh lost-response
+echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+echo "000 404" > "$STATE/jit-codes"
+run
+expect "lost response: reports a failure" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=1'
+expect "lost response: runner not started" "runner ran" lacks runner-argv
+
+# 10. An empty config: the runner cannot start; report a failure.
+fresh empty-config
+echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+echo "200" > "$STATE/jit-codes"
+: > "$STATE/jit-body"
+run
+expect "empty config: reports a failure" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=1'
+expect "empty config: powers off fast" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
+
+# 11. run.sh exists but is not executable: status 127.
+fresh not-executable
+echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+echo "200" > "$STATE/jit-codes"
+printf 'cfg' > "$STATE/jit-body"
+chmod -x "$TMP/runner/run.sh"
+run
+chmod +x "$TMP/runner/run.sh"
+expect "not executable: reports status 127" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=127'
+expect "not executable: runner not started" "runner ran" lacks runner-argv
+
+# 12. A step between the fetch and the runner fails under set -e: the exit
+#     trap still reports the failure.
+fresh mkfifo-fails
+echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+echo "200" > "$STATE/jit-codes"
+printf 'cfg' > "$STATE/jit-body"
+mkdir -p "$TMP/broken"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/broken/mkfifo"
+chmod +x "$TMP/broken/mkfifo"
+EXTRA_PATH="$TMP/broken" run
+expect "failed setup: reports a failure" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=1'
+expect "failed setup: powers off fast" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
+
+# 13. A signal (shutdown, spot interruption, terminate) is the instance going
+#     away, not the runner failing: no exit report, and no second poweroff.
+fresh signalled
+echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+echo "200" > "$STATE/jit-codes"
+printf 'cfg' > "$STATE/jit-body"
+# shellcheck disable=SC2016 # expanded by the fake run.sh
+runner 'touch "$STATE/running"; echo "Listening for Jobs"; sleep 1'
+TERM_WHEN=running run
+runner :
+expect "signal: no exit report" "$(cat "$STATE/reports" 2>/dev/null)" [ "$(grep -c '^phase=exited' "$STATE/reports" 2>/dev/null || true)" = 0 ]
+expect "signal: no poweroff" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" lacks poweroff
+
+# 14. The journal stream breaks mid-job (the script's stdout loses its
+#     reader): the runner keeps running and its exit is still reported.
+fresh broken-stdout
+echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
+echo "200" > "$STATE/jit-codes"
+printf 'cfg' > "$STATE/jit-body"
+# shellcheck disable=SC2016 # expanded by the fake run.sh
+runner 'echo "Listening for Jobs"; sleep 0.3; i=0; while [ $i -lt 200 ]; do echo "line $i"; i=$((i + 1)); done; touch "$STATE/runner-done"'
+PATH="$TMP/bin:$PATH" \
+	FIRERUNNER_IMDS=imds.test \
+	FIRERUNNER_RUNNER_DIR="$TMP/runner" \
+	FIRERUNNER_POWEROFF="$TMP/bin/fake-poweroff clean" \
+	FIRERUNNER_POWEROFF_FAST="$TMP/bin/fake-poweroff fast" \
+	FIRERUNNER_RETRY_SLEEP=0 \
+	sh "$SCRIPT" 2> "$STATE/stderr" | true
+runner :
+expect "broken stdout: the runner finishes" "runner did not finish" has runner-done
+expect "broken stdout: reports a zero exit" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=0'
 
 for st in "$TMP"/state-*; do
 	expect "$(basename "$st"): finished" "hung" [ ! -f "$st/hung" ]

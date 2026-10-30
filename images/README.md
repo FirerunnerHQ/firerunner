@@ -112,10 +112,15 @@ instead. The JIT config never appears in user-data:
 4. Report progress with `POST <url>/report?phase=…`: `listening` and `job`
    when the runner prints "Listening for Jobs" and "Running job:", and
    `exited&rc=<status>` before powering off. A missing or non-executable
-   `run.sh` reports status 127. Reports are best effort (2 s each,
-   `FIRERUNNER_REPORT_TIMEOUT`). The runner's output reaches the reader through
-   a FIFO, so the script waits for the runner alone, not for a process a job
-   left holding its output.
+   `run.sh` reports status 127. Any other exit after the config arrived (an
+   empty config, a failed setup step) reports a failure, as does a 404 after a
+   fetch whose response was lost. A signal (shutdown, spot interruption,
+   terminate) reports nothing and leaves the poweroff to whoever sent it: the
+   instance going away is not the runner failing. Reports are best effort (2 s
+   each, `FIRERUNNER_REPORT_TIMEOUT`). The runner's output reaches the reader
+   through a FIFO, so the script waits for the runner alone, not for a process
+   a job left holding its output; the reader ignores SIGPIPE, so a broken
+   journal stream costs log lines, not the job.
 
 The unit has no `network-online.target` or docker ordering: the retry loop
 starts the fetch as soon as the NIC has an address. `images/test-ec2-run.sh`
