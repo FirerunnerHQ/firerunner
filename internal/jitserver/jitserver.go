@@ -7,6 +7,11 @@
 // VPC delivers packets with their real source address, so a source IP inside
 // the runner subnet cannot be spoofed by another tenant; the control VM must
 // see guests' addresses unchanged (no proxy or SNAT in between).
+//
+// The same address reports its runner's progress back on POST /jit/report:
+// when the runner is listening, when its job starts, and its exit status. The
+// launcher reads them as a Report, so a runner that fails is an error, not
+// healthy churn, and boot time can be split into its phases.
 package jitserver
 
 import (
@@ -17,6 +22,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +30,21 @@ import (
 
 // Path is the URL path instances fetch their config from.
 const Path = "/jit"
+
+// ReportPath is the URL path instances report their runner's phases to, with
+// POST ?phase=<phase>, plus &rc=<status> for PhaseExited.
+const ReportPath = Path + "/report"
+
+// Phases an instance reports, in the order they happen.
+const (
+	// PhaseListening: the runner has connected and waits for its job.
+	PhaseListening = "listening"
+	// PhaseJob: the runner has started its job.
+	PhaseJob = "job"
+	// PhaseExited: the runner has exited, or could not be started, with
+	// the status in rc (0-255).
+	PhaseExited = "exited"
+)
 
 // UserDataKey names the only line firerunner writes into an instance's
 // user-data: the URL of this server's JIT endpoint.
@@ -50,6 +71,19 @@ type entry struct {
 	claimed bool
 	// served is set when the instance actually received the config.
 	served bool
+	report Report
+}
+
+// Report is what an instance told the server about its runner. A zero time
+// means the phase was not reported (yet). Times are the server's, taken when
+// the report arrived, so they compare with the launcher's clock.
+type Report struct {
+	Served    time.Time // the config was handed out
+	Listening time.Time
+	Job       time.Time
+	Exited    time.Time
+	// ExitCode is the runner's exit status; meaningful once Exited is set.
+	ExitCode int
 }
 
 // Server serves each registered config exactly once, to the address it was
@@ -120,11 +154,28 @@ func (s *Server) Served(ip netip.Addr) bool {
 	return ok && e.served
 }
 
+// Report returns what ip's instance has reported. The zero Report means
+// nothing, or no registration.
+func (s *Server) Report(ip netip.Addr) Report {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.entries[ip.Unmap()]; ok {
+		return e.report
+	}
+	return Report{}
+}
+
 // ServeHTTP answers GET /jit:
 //   - 200 with the config, the first time a registered address asks;
 //   - 404 when that address's config was already served or expired;
 //   - 403 for an address with no registration.
+//
+// and POST /jit/report (see reportHTTP).
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == ReportPath {
+		s.reportHTTP(w, r)
+		return
+	}
 	if r.URL.Path != Path {
 		http.NotFound(w, r)
 		return
@@ -169,7 +220,81 @@ func (s *Server) claim(ip netip.Addr) (jit, runner string, status int) {
 	}
 	jit = e.jit
 	e.claimed, e.served, e.jit = true, true, ""
+	e.report.Served = s.now()
 	return jit, e.runner, http.StatusOK
+}
+
+// reportHTTP answers POST /jit/report?phase=<phase>[&rc=<status>]:
+//   - 204 when recorded; a phase already reported keeps its first report;
+//   - 400 for an unknown phase, or an exit without a status in 0-255;
+//   - 403 unless the address holds a registration whose config it was
+//     served: only the instance running that runner may speak for it.
+func (s *Server) reportHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip, err := remoteIP(r)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	q := r.URL.Query()
+	phase, rc := q.Get("phase"), 0
+	switch phase {
+	case PhaseListening, PhaseJob:
+	case PhaseExited:
+		if rc, err = strconv.Atoi(q.Get("rc")); err != nil || rc < 0 || rc > 255 {
+			http.Error(w, "rc must be 0-255", http.StatusBadRequest)
+			return
+		}
+	default:
+		http.Error(w, "unknown phase", http.StatusBadRequest)
+		return
+	}
+	runner, rep, first, ok := s.record(ip, phase, rc)
+	if !ok {
+		s.log.Debug("runner report from an address without a served config", "ip", ip, "phase", phase)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if first {
+		attrs := []any{"runner", runner, "ip", ip, "phase", phase,
+			"sinceServed", s.now().Sub(rep.Served).Round(time.Millisecond)}
+		if phase == PhaseExited {
+			attrs = append(attrs, "rc", rc)
+		}
+		s.log.Info("runner phase", attrs...)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// record notes phase for ip's runner, keeping a phase's first report. ok is
+// false when ip has no registration or was never served its config.
+func (s *Server) record(ip netip.Addr, phase string, rc int) (runner string, rep Report, first, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, found := s.entries[ip]
+	if !found || !e.served {
+		return "", Report{}, false, false
+	}
+	var at *time.Time
+	switch phase {
+	case PhaseListening:
+		at = &e.report.Listening
+	case PhaseJob:
+		at = &e.report.Job
+	case PhaseExited:
+		at = &e.report.Exited
+	}
+	if at.IsZero() {
+		*at, first = s.now(), true
+		if phase == PhaseExited {
+			e.report.ExitCode = rc
+		}
+	}
+	return e.runner, e.report, first, true
 }
 
 func remoteIP(r *http.Request) (netip.Addr, error) {

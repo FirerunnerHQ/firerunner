@@ -246,3 +246,114 @@ func TestUserDataCarriesOnlyTheEndpoint(t *testing.T) {
 		t.Fatalf("UserData = %q, want exactly one key=url line", ud)
 	}
 }
+
+func report(t *testing.T, s *Server, remote, query string) int {
+	t.Helper()
+	code, _ := fetch(t, s, http.MethodPost, ReportPath+"?"+query, remote)
+	return code
+}
+
+func TestReportFromTheServedAddress(t *testing.T) {
+	s := New(time.Minute, nil)
+	now := time.Unix(1_000_000, 0)
+	s.now = func() time.Time { return now }
+	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	// Before its config is served, the address cannot report: the runner
+	// cannot have started.
+	if code := report(t, s, from(guest), "phase=listening"); code != http.StatusForbidden {
+		t.Fatalf("report before the fetch = %d, want 403", code)
+	}
+	fetch(t, s, http.MethodGet, Path, from(guest))
+	served := now
+	steps := []struct {
+		query string
+		after time.Duration
+	}{
+		{"phase=listening", 2 * time.Second},
+		{"phase=job", 3 * time.Second},
+		{"phase=exited&rc=3", 4 * time.Second},
+	}
+	for _, st := range steps {
+		now = served.Add(st.after)
+		if code := report(t, s, from(guest), st.query); code != http.StatusNoContent {
+			t.Fatalf("report %s = %d, want 204", st.query, code)
+		}
+	}
+	want := Report{
+		Served: served, Listening: served.Add(2 * time.Second), Job: served.Add(3 * time.Second),
+		Exited: served.Add(4 * time.Second), ExitCode: 3,
+	}
+	if got := s.Report(guest); got != want {
+		t.Fatalf("Report = %+v, want %+v", got, want)
+	}
+	// A repeated report keeps the first one.
+	now = served.Add(time.Minute)
+	if code := report(t, s, from(guest), "phase=exited&rc=0"); code != http.StatusNoContent {
+		t.Fatalf("repeated exit report = %d, want 204", code)
+	}
+	if got := s.Report(guest); got != want {
+		t.Fatalf("Report after a repeat = %+v, want the first %+v", got, want)
+	}
+}
+
+func TestReportFromAForeignAddressForbidden(t *testing.T) {
+	s := New(time.Minute, nil)
+	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	fetch(t, s, http.MethodGet, Path, from(guest))
+	if code := report(t, s, from(foreign), "phase=exited&rc=1"); code != http.StatusForbidden {
+		t.Fatalf("foreign report = %d, want 403", code)
+	}
+	if got := s.Report(guest); !got.Exited.IsZero() {
+		t.Fatalf("a foreign report was recorded: %+v", got)
+	}
+}
+
+func TestReportAfterRevokeIgnored(t *testing.T) {
+	s := New(time.Minute, nil)
+	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	fetch(t, s, http.MethodGet, Path, from(guest))
+	s.Revoke(guest)
+	if code := report(t, s, from(guest), "phase=exited&rc=1"); code != http.StatusForbidden {
+		t.Fatalf("report after revoke = %d, want 403", code)
+	}
+	// The address's next registration starts with no report.
+	if err := s.Register(guest, "runner-2", "secret2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Report(guest); got != (Report{}) {
+		t.Fatalf("Report of a new registration = %+v, want zero", got)
+	}
+}
+
+func TestReportRejectsBadRequests(t *testing.T) {
+	s := New(time.Minute, nil)
+	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	fetch(t, s, http.MethodGet, Path, from(guest))
+	for _, c := range []struct {
+		method, query string
+		want          int
+	}{
+		{http.MethodGet, "phase=listening", http.StatusMethodNotAllowed},
+		{http.MethodPost, "phase=booted", http.StatusBadRequest},
+		{http.MethodPost, "", http.StatusBadRequest},
+		{http.MethodPost, "phase=exited", http.StatusBadRequest},
+		{http.MethodPost, "phase=exited&rc=x", http.StatusBadRequest},
+		{http.MethodPost, "phase=exited&rc=-1", http.StatusBadRequest},
+		{http.MethodPost, "phase=exited&rc=256", http.StatusBadRequest},
+	} {
+		if code, _ := fetch(t, s, c.method, ReportPath+"?"+c.query, from(guest)); code != c.want {
+			t.Errorf("%s ?%s = %d, want %d", c.method, c.query, code, c.want)
+		}
+	}
+	if got := s.Report(guest); !got.Listening.IsZero() || !got.Exited.IsZero() {
+		t.Fatalf("a bad request was recorded: %+v", got)
+	}
+}
