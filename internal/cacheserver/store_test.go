@@ -456,3 +456,66 @@ func TestUploadOutlivingItsReservationLeavesNothing(t *testing.T) {
 		return !ok
 	})
 }
+
+func TestBlockOutlivingItsReservationLeavesNothing(t *testing.T) {
+	for _, mode := range []string{"disk", "store"} {
+		t.Run(mode, func(t *testing.T) {
+			s, err := newAuthorizedStore(t.TempDir(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "store" {
+				if err := s.SetBlobStore(newMemStore()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ts := httptest.NewServer(s)
+			t.Cleanup(ts.Close)
+			create := twirp(t, ts.URL, "CreateCacheEntry", createReq{Metadata: meta("owner/pinned"), Key: "k", Version: "v1"})
+			url := create["signed_upload_url"].(string) + "&comp=block&blockid=" + base64.StdEncoding.EncodeToString([]byte("b0"))
+
+			body, feed := io.Pipe()
+			code := make(chan int, 1)
+			go func() {
+				req, _ := http.NewRequest(http.MethodPut, url, body)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Errorf("PUT block: %v", err)
+					code <- 0
+					return
+				}
+				resp.Body.Close()
+				code <- resp.StatusCode
+			}()
+			if _, err := feed.Write([]byte("half")); err != nil {
+				t.Fatal(err)
+			}
+			waitUntil(t, "the block streaming in", func() bool {
+				blocks, _ := os.ReadDir(s.tmpDir(1))
+				return len(blocks) == 1
+			})
+			// gc reclaims the reservation while the block streams in.
+			s.mu.Lock()
+			for _, e := range s.entries {
+				e.UsedAt = 0
+			}
+			s.mu.Unlock()
+			s.gc()
+			_, _ = feed.Write([]byte(" more"))
+			feed.Close()
+
+			if c := <-code; c != http.StatusNotFound {
+				t.Fatalf("block outliving its reservation = %d, want 404", c)
+			}
+			s.mu.Lock()
+			n, staged := s.staged[1]
+			s.mu.Unlock()
+			if staged {
+				t.Fatalf("reclaimed entry still has %d staged bytes", n)
+			}
+			if _, err := os.Stat(s.tmpDir(1)); !os.IsNotExist(err) {
+				t.Fatalf("block directory of a reclaimed entry: %v", err)
+			}
+		})
+	}
+}

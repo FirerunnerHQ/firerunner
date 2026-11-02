@@ -598,7 +598,12 @@ func (s *Server) uploadBlock(w http.ResponseWriter, r *http.Request, e *Entry) {
 		http.Error(w, msg, code)
 		return
 	}
-	s.addStaged(e.ID, n)
+	if !s.addStaged(e, n) {
+		// Reclaimed while the block streamed in (see finishUpload).
+		_ = os.RemoveAll(dir)
+		http.Error(w, "cache reservation expired", http.StatusNotFound)
+		return
+	}
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -1051,10 +1056,16 @@ func uploadStatus(err error) (int, string) {
 
 // staged-byte accounting bounds the disk a not-yet-finalized entry occupies;
 // finishUpload records an assembled blob.
-func (s *Server) addStaged(id uint64, n int64) {
+// addStaged reports false, recording nothing, once e is no longer the
+// reserved entry.
+func (s *Server) addStaged(e *Entry, n int64) bool {
 	s.mu.Lock()
-	s.staged[id] += n
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.entries[e.ID] != e {
+		return false
+	}
+	s.staged[e.ID] += n
+	return true
 }
 func (s *Server) stagedBytes(id uint64) int64 {
 	s.mu.Lock()
