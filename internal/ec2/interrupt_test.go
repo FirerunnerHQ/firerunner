@@ -94,6 +94,9 @@ func TestLaunch_OtherEndsAreNoInterruption(t *testing.T) {
 	})
 	errc := h.launch(context.Background())
 	inst := h.instance(t)
+	h.f.mu.Lock()
+	h.f.instances[inst.id].spotStatus = "instance-terminated-by-user"
+	h.f.mu.Unlock()
 	h.f.setStateFor(inst.id, types.InstanceStateNameShuttingDown, "Client.InstanceInitiatedShutdown")
 	if err := waitErr(t, errc); err != nil {
 		t.Fatalf("Launch = %v", err)
@@ -229,5 +232,56 @@ func TestLaunch_InterruptionAfterTheJobEnded(t *testing.T) {
 	}
 	if got := seen.got(); len(got) != 1 || got[0] {
 		t.Fatalf("interruptions reported = %v, want [false]: the job had ended", got)
+	}
+}
+
+// TestLaunch_InterruptionFromTheSpotRequest: an interruption FIS sends
+// leaves Client.UserInitiatedShutdown on the instance; its spot request's
+// status says what happened (seen on AWS, 2026-11-02).
+func TestLaunch_InterruptionFromTheSpotRequest(t *testing.T) {
+	var seen interruptions
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Market = config.MarketSpot
+		o.Interrupted = seen.record
+	})
+	errc := h.launch(context.Background())
+	inst := h.instance(t)
+	if code, _ := h.fetch(inst.ip); code != http.StatusOK {
+		t.Fatalf("fetch = %d", code)
+	}
+	h.report(t, inst.ip, "phase=job")
+	h.f.mu.Lock()
+	h.f.instances[inst.id].spotStatus = "instance-terminated-by-experiment"
+	h.f.mu.Unlock()
+	h.f.setStateFor(inst.id, types.InstanceStateNameShuttingDown, "Client.UserInitiatedShutdown")
+	if err := waitErr(t, errc); err != nil {
+		t.Fatalf("Launch = %v", err)
+	}
+	if got := seen.got(); len(got) != 1 || !got[0] {
+		t.Fatalf("interruptions reported = %v, want [true]", got)
+	}
+	if bs := h.p.c.Breakers(); len(bs) != 1 || bs[0].Reason != "instance-terminated-by-experiment" {
+		t.Fatalf("breakers = %+v, want one with the request's status", bs)
+	}
+}
+
+func TestInterruptionStatus(t *testing.T) {
+	for code, want := range map[string]bool{
+		"marked-for-termination":                      true,
+		"marked-for-stop":                             true,
+		"instance-terminated-by-price":                true,
+		"instance-terminated-no-capacity":             true,
+		"instance-terminated-capacity-oversubscribed": true,
+		"instance-stopped-no-capacity":                true,
+		"instance-terminated-by-experiment":           true,
+		"instance-terminated-by-user":                 false,
+		"instance-stopped-by-user":                    false,
+		"fulfilled":                                   false,
+		"request-canceled-and-instance-running":       false,
+		"":                                            false,
+	} {
+		if got := interruptionStatus(code); got != want {
+			t.Errorf("interruptionStatus(%q) = %v, want %v", code, got, want)
+		}
 	}
 }

@@ -91,7 +91,8 @@ import (
 // throttling and other failures (cancelErrs, describeErr, terminateErr,
 // startErr, tagErr), a stale read right after a start (startStaysStopped), and
 // a RunInstances response without the private IP (noIPInRun), and a state
-// change's StateReason code (setStateFor), such as a spot interruption's.
+// change's StateReason code (setStateFor), such as a spot interruption's,
+// and a spot request's status code (spotStatus).
 // A reason stays until the next setStateFor, also across a start: whether
 // AWS clears it then is unchecked, so firerunner must not rely on either.
 //
@@ -119,6 +120,7 @@ type fakeInstance struct {
 	userData              string            // decoded
 	state                 types.InstanceStateName
 	stateReason           string // StateReason code, once set
+	spotStatus            string // its spot request's status code, once set
 	tags                  map[string]string
 	spotTags              map[string]string // tags on its spot request
 	launched              time.Time
@@ -341,9 +343,20 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []types.SpotInstanceRequest
+	byInstance := false
+	for _, fl := range in.Filters {
+		byInstance = byInstance || aws.ToString(fl.Name) == "instance-id"
+	}
 	for _, id := range f.order {
 		i := f.instances[id]
-		if i.spotReq == "" {
+		req := i.spotReq
+		if req == "" && i.spot && byInstance {
+			// A one-time instance's request, closed with it: listed only by
+			// instance-id, the one query that needs it, so the persistent
+			// requests every other listing is about stay alone there.
+			req = "sir-once-" + id
+		}
+		if req == "" {
 			continue
 		}
 		state := types.SpotInstanceStateActive
@@ -354,10 +367,13 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 			state = types.SpotInstanceStateDisabled
 		}
 		r := types.SpotInstanceRequest{
-			SpotInstanceRequestId: aws.String(i.spotReq),
+			SpotInstanceRequestId: aws.String(req),
 			InstanceId:            aws.String(i.id),
 			State:                 state,
 			CreateTime:            aws.Time(i.launched),
+		}
+		if i.spotStatus != "" {
+			r.Status = &types.SpotInstanceStatus{Code: aws.String(i.spotStatus)}
 		}
 		for k, v := range i.spotTags {
 			r.Tags = append(r.Tags, types.Tag{Key: aws.String(k), Value: aws.String(v)})
@@ -370,6 +386,8 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 				switch {
 				case name == "state":
 					ok = ok || string(state) == want
+				case name == "instance-id":
+					ok = ok || i.id == want
 				case strings.HasPrefix(name, "tag:"):
 					ok = ok || i.spotTags[strings.TrimPrefix(name, "tag:")] == want
 				}
