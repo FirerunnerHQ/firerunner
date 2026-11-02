@@ -124,30 +124,36 @@ func (s *Server) flushIndex() {
 	}
 }
 
-// putBlob hands an assembled local blob to the store, keeping it as a local copy
-// when there is room for one.
-func (s *Server) putBlob(r *http.Request, id uint64) error {
-	if s.store == nil {
-		return nil
-	}
-	path := s.blobPath(id)
-	fi, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if err := s.store.Put(r.Context(), id, path); err != nil {
-		_ = os.Remove(path)
-		s.log.Warn("cache blob upload to store failed", "id", id, "err", err)
-		return errStoreUnavailable
+// finishUpload hands the assembled blob of n bytes to the store, if any, and
+// records it as staged, so finalize can complete the entry. It answers the
+// status to fail the upload with, or 0. The reservation may have been
+// reclaimed meanwhile (gc, a stale reservation taken over), neither of which
+// waits for e.ioMu: the blob then goes, rather than outliving its entry.
+func (s *Server) finishUpload(r *http.Request, e *Entry, n int64) (int, error) {
+	if s.store != nil {
+		if err := s.store.Put(r.Context(), e.ID, s.blobPath(e.ID)); err != nil {
+			_ = os.Remove(s.blobPath(e.ID))
+			s.clearStaged(e.ID)
+			s.log.Warn("cache blob upload to store failed", "id", e.ID, "err", err)
+			return http.StatusInsufficientStorage, errStoreUnavailable
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.stored == nil {
-		s.stored = make(map[uint64]int64)
+	if s.entries[e.ID] != e {
+		s.removeBlob(e.ID)
+		delete(s.staged, e.ID)
+		return http.StatusNotFound, errors.New("cache reservation expired")
 	}
-	s.stored[id] = fi.Size()
-	s.keepLocal(id, fi.Size())
-	return nil
+	if s.store != nil {
+		if s.stored == nil {
+			s.stored = make(map[uint64]int64)
+		}
+		s.stored[e.ID] = n
+		s.keepLocal(e.ID, n)
+	}
+	s.staged[e.ID] = n
+	return 0, nil
 }
 
 // keepLocal records the blob at blobPath(id) as a local copy, or removes it when

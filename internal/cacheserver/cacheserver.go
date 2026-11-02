@@ -558,12 +558,10 @@ func (s *Server) uploadSingle(w http.ResponseWriter, r *http.Request, e *Entry) 
 		http.Error(w, msg, code)
 		return
 	}
-	if err := s.putBlob(r, e.ID); err != nil {
-		s.clearStaged(e.ID)
-		http.Error(w, err.Error(), http.StatusInsufficientStorage)
+	if code, err := s.finishUpload(r, e, n); err != nil {
+		http.Error(w, err.Error(), code)
 		return
 	}
-	s.setStaged(e.ID, n)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -674,12 +672,10 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 		return
 	}
 	_ = os.RemoveAll(dir)
-	if err := s.putBlob(r, e.ID); err != nil {
-		s.clearStaged(e.ID)
-		http.Error(w, err.Error(), http.StatusInsufficientStorage)
+	if code, err := s.finishUpload(r, e, total); err != nil {
+		http.Error(w, err.Error(), code)
 		return
 	}
-	s.setStaged(e.ID, total)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -1049,12 +1045,8 @@ func uploadStatus(err error) (int, string) {
 	return http.StatusInternalServerError, err.Error()
 }
 
-// staged-byte accounting bounds the disk a not-yet-finalized entry occupies.
-func (s *Server) setStaged(id uint64, n int64) {
-	s.mu.Lock()
-	s.staged[id] = n
-	s.mu.Unlock()
-}
+// staged-byte accounting bounds the disk a not-yet-finalized entry occupies;
+// finishUpload records an assembled blob.
 func (s *Server) addStaged(id uint64, n int64) {
 	s.mu.Lock()
 	s.staged[id] += n

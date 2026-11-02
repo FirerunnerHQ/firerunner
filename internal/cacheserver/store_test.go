@@ -24,6 +24,8 @@ type memStore struct {
 	failPut bool
 	failGet bool
 	getGate chan struct{} // when set, Get waits for it to close
+	// When set, Put signals putEntered, then waits for putGate to close.
+	putEntered, putGate chan struct{}
 }
 
 func newMemStore() *memStore { return &memStore{blobs: map[uint64][]byte{}} }
@@ -32,9 +34,15 @@ func (m *memStore) Put(_ context.Context, id uint64, path string) error {
 	if m.failPut {
 		return errors.New("store down")
 	}
+	// Read before the gate, as s3store opens the file before it uploads: an
+	// unlink meanwhile does not stop the upload.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
+	}
+	if m.putGate != nil {
+		m.putEntered <- struct{}{}
+		<-m.putGate
 	}
 	m.mu.Lock()
 	m.blobs[id] = data
@@ -368,4 +376,54 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func TestUploadOutlivingItsReservationLeavesNothing(t *testing.T) {
+	store := newMemStore()
+	s, ts := newStoreServer(t, store)
+	s.SetLocalCacheSize(1 << 20)
+	create := twirp(t, ts.URL, "CreateCacheEntry", createReq{Metadata: meta("owner/pinned"), Key: "k", Version: "v1"})
+	store.putEntered, store.putGate = make(chan struct{}), make(chan struct{})
+	code := make(chan int, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodPut, create["signed_upload_url"].(string), strings.NewReader("data"))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Errorf("PUT: %v", err)
+			code <- 0
+			return
+		}
+		resp.Body.Close()
+		code <- resp.StatusCode
+	}()
+	<-store.putEntered
+	// gc reclaims the reservation while its blob is on the way to the store.
+	s.mu.Lock()
+	for _, e := range s.entries {
+		e.UsedAt = 0
+	}
+	s.mu.Unlock()
+	s.gc()
+	close(store.putGate)
+
+	if c := <-code; c != http.StatusNotFound {
+		t.Fatalf("PUT outliving its reservation = %d, want 404", c)
+	}
+	s.mu.Lock()
+	_, staged := s.staged[1]
+	_, stored := s.stored[1]
+	_, local := s.local[1]
+	s.mu.Unlock()
+	if staged || stored || local {
+		t.Fatalf("reclaimed entry still tracked: staged %v stored %v local %v", staged, stored, local)
+	}
+	if _, err := os.Stat(s.blobPath(1)); !os.IsNotExist(err) {
+		t.Fatalf("local blob of a reclaimed entry: %v", err)
+	}
+	waitUntil(t, "the store's copy deleted", func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		_, ok := store.blobs[1]
+		return !ok
+	})
 }
