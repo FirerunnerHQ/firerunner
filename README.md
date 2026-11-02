@@ -525,10 +525,13 @@ other subnets and moves on to the next type, then to on-demand for a
 launch, and the scheduler backs off.
 
 An option EC2 refused backs off, for every tier, for 30 s, doubling with each
-refusal in a row up to 10 min, until a launch on it succeeds. Launches try
-backing-off options after all the others rather than not at all, so a
-backoff never fails a job by itself. `firerunner status` lists them under
-"EC2 launch options backing off" (`ec2_breakers` in `--json`). Each tier's
+refusal after a backoff ended, up to 10 min, until a launch on it succeeds or
+it stays quiet for 30 min. Launches meeting the same refusal at once count as
+one. Launches try backing-off options after the others in their market rather
+than not at all: spot still comes before on-demand, and a backoff never fails
+a job by itself. `firerunner status` lists them under
+"EC2 launch options backing off" (`ec2_breakers` in `--json`, which may
+include ones that expired since the daemon last wrote it). Each tier's
 instances placed off its first choice are counted by what differed: market,
 type or subnet (`fallbacks`).
 

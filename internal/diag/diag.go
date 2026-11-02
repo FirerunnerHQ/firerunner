@@ -432,14 +432,20 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				fmt.Fprintf(w, "  error: %s\n", truncate(rp.Error, 200))
 			}
 		}
-		if len(l.EC2Breakers) > 0 {
-			fmt.Fprintf(w, "\nEC2 launch options backing off (launches try them last):\n")
-			for _, b := range l.EC2Breakers {
+		var backingOff []health.Breaker
+		for _, b := range l.EC2Breakers {
+			if time.Until(b.Until) > 0 { // the file is up to healthInterval old
+				backingOff = append(backingOff, b)
+			}
+		}
+		if len(backingOff) > 0 {
+			fmt.Fprintf(w, "\nEC2 launch options backing off (launches try them last in their market):\n")
+			for _, b := range backingOff {
 				where := "every subnet (quota)"
 				if b.Subnet != "" {
 					where = b.Subnet
 				}
-				fmt.Fprintf(w, "  %s %s in %s: %s, %d refusal(s) in a row, retried first again in %s\n",
+				fmt.Fprintf(w, "  %s %s in %s: %s, backoff round %d, back to its place in %s\n",
 					b.Market, b.Type, where, b.Reason, b.Failures, humanDuration(time.Until(b.Until).Truncate(time.Second)))
 			}
 		}

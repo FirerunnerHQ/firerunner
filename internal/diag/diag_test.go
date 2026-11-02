@@ -714,6 +714,7 @@ func TestStatusShowsFallbacksAndBreakers(t *testing.T) {
 		EC2Breakers: []health.Breaker{
 			{Market: "spot", Type: "c8a.xlarge", Reason: "MaxSpotInstanceCountExceeded", Failures: 2, Since: now, Until: now.Add(90 * time.Second)},
 			{Market: "on-demand", Type: "c7a.xlarge", Subnet: "subnet-a", Reason: "InsufficientInstanceCapacity", Failures: 1, Since: now, Until: now.Add(30 * time.Second)},
+			{Market: "spot", Type: "c7a.xlarge", Subnet: "subnet-b", Reason: "Unsupported", Failures: 1, Since: now.Add(-time.Minute), Until: now.Add(-5 * time.Second)},
 		}}
 	if err := health.Write(filepath.Join(dir, health.FileName), f); err != nil {
 		t.Fatal(err)
@@ -726,12 +727,15 @@ func TestStatusShowsFallbacksAndBreakers(t *testing.T) {
 	out := text.String()
 	for _, want := range []string{
 		"a placed off its first choice: 3 on on-demand, 0 on a later type, 1 in a later subnet",
-		"spot c8a.xlarge in every subnet (quota): MaxSpotInstanceCountExceeded, 2 refusal(s) in a row",
-		"on-demand c7a.xlarge in subnet-a: InsufficientInstanceCapacity, 1 refusal(s) in a row",
+		"spot c8a.xlarge in every subnet (quota): MaxSpotInstanceCountExceeded, backoff round 2",
+		"on-demand c7a.xlarge in subnet-a: InsufficientInstanceCapacity, backoff round 1",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("status missing %q\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "subnet-b") {
+		t.Errorf("status shows a breaker that expired after the file was written\n%s", out)
 	}
 	var js bytes.Buffer
 	if err := Status(cfg, "test", &js, true); err != nil {
