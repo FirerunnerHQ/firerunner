@@ -543,9 +543,9 @@ each one per tier (`interruptions` in `status --json`: `job` or `idle`), and
 backs that spot option off like a refusal. It is not a runner failure, so the
 tier does not back off. GitHub marks a job that had started failed, as for any
 runner lost mid-job. Re-run it from the workflow run's page with **Re-run
-failed jobs** (or `gh run rerun RUN_ID --failed`), and it gets a new runner. To
-find the job a runner ran, look for the runner's name in the daemon's "job
-started" log line.
+failed jobs** (or `gh run rerun RUN_ID --failed`), and it gets a new runner. The
+daemon's "job started" log line for the runner's name gives the job's
+`repository`, `runId` and `jobId`.
 
 **Flags:**
 

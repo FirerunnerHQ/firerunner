@@ -632,7 +632,8 @@ func (a *scaler) advertiseCapacity() {
 }
 
 func (a *scaler) HandleJobStarted(ctx context.Context, j *scaleset.JobStarted) error {
-	a.log.Info("job started", "runner", j.RunnerName, "runnerRequestId", j.RunnerRequestID)
+	a.log.Info("job started", "runner", j.RunnerName, "runnerRequestId", j.RunnerRequestID,
+		"repository", j.OwnerName+"/"+j.RepositoryName, "runId", j.WorkflowRunID, "jobId", j.JobID)
 	if a.onBusy != nil && j.RunnerName != "" {
 		a.onBusy(j.RunnerName)
 	}
