@@ -53,7 +53,7 @@ type Pool struct {
 
 // pooled is a ready, stopped pool instance.
 type pooled struct {
-	id, ip, spotReq, itype string
+	id, ip, spotReq, itype, subnet, az string
 }
 
 // readyCheckEvery is how many passes (one per tick, 15 s) go between checks
@@ -261,6 +261,7 @@ func (pl *Pool) markReady(ctx context.Context, i types.Instance) {
 	pl.ready = append(pl.ready, pooled{
 		id: id, ip: aws.ToString(i.PrivateIpAddress),
 		spotReq: aws.ToString(i.SpotInstanceRequestId), itype: string(i.InstanceType),
+		subnet: aws.ToString(i.SubnetId), az: placementAZ(i),
 	})
 }
 

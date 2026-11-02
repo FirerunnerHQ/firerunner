@@ -114,6 +114,7 @@ type fakeInstance struct {
 	volumeTags            map[string]string // tags requested for the root volume
 	userData              string            // decoded
 	state                 types.InstanceStateName
+	stateReason           string // StateReason code, once set
 	tags                  map[string]string
 	spotTags              map[string]string // tags on its spot request
 	launched              time.Time
@@ -285,6 +286,10 @@ func (f *fakeEC2) view(i *fakeInstance) types.Instance {
 		InstanceType:     types.InstanceType(i.itype),
 		SubnetId:         aws.String(i.subnet),
 		State:            &types.InstanceState{Name: i.state},
+		Placement:        &types.Placement{AvailabilityZone: aws.String("az-of-" + i.subnet)},
+	}
+	if i.stateReason != "" {
+		v.StateReason = &types.StateReason{Code: aws.String(i.stateReason), Message: aws.String(i.stateReason + " (fake)")}
 	}
 	if i.spot {
 		v.InstanceLifecycle = types.InstanceLifecycleTypeSpot
@@ -584,6 +589,15 @@ func (f *fakeEC2) DescribeImages(_ context.Context, in *ec2.DescribeImagesInput,
 }
 
 // setState moves an instance to state, as the guest or AWS would.
+// setStateFor moves an instance to state for the reason AWS gives, e.g.
+// Server.SpotInstanceTermination.
+func (f *fakeEC2) setStateFor(id string, state types.InstanceStateName, reason string) {
+	f.setState(id, state)
+	f.mu.Lock()
+	f.instances[id].stateReason = reason
+	f.mu.Unlock()
+}
+
 func (f *fakeEC2) setState(id string, state types.InstanceStateName) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

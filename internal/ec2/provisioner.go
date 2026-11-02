@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -119,6 +120,9 @@ type Options struct {
 	// Launched, when set, is told each launch's path (PathPool, PathCold or
 	// PathKept).
 	Launched func(path string)
+	// Interrupted, when set, is told each spot instance AWS took back while
+	// it ran a runner; duringJob says whether its job had started.
+	Interrupted func(duringJob bool)
 	// FellBack, when set, is told each new instance that EC2 placed on
 	// other than the tier's first choice: FallbackMarket, FallbackType or
 	// FallbackSubnet, the first that differs.
@@ -244,7 +248,8 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 
 	states, stopWatch := p.c.watch.watch(id)
 	defer stopWatch()
-	w := &waiter{p: p, id: id, log: log, states: states}
+	w := &waiter{p: p, id: id, log: log, states: states,
+		itype: string(inst.InstanceType), subnet: aws.ToString(inst.SubnetId), az: placementAZ(inst)}
 
 	ip, err := p.privateIP(ctx, inst)
 	if err != nil {
@@ -321,7 +326,8 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string, onStar
 	defer stopWatch()
 	// Until it is seen running, a "stopped" state is the instance before
 	// the start took effect, not its job ending.
-	w := &waiter{p: p, id: in.id, log: log, states: states, awaitStart: true, spotReq: spotReq}
+	w := &waiter{p: p, id: in.id, log: log, states: states, awaitStart: true, spotReq: spotReq,
+		itype: in.itype, subnet: in.subnet, az: in.az}
 	return w.run(ctx, ip)
 }
 
@@ -330,7 +336,7 @@ type waiter struct {
 	p      *Provisioner
 	id     string
 	log    *slog.Logger
-	states <-chan types.InstanceStateName
+	states <-chan instanceState
 
 	terminating bool
 	termSince   time.Time // first termination request
@@ -341,6 +347,39 @@ type waiter struct {
 	// spotReq is a persistent spot request still to cancel before the
 	// instance may be terminated.
 	spotReq string
+	// Where the instance runs, for reporting a spot interruption.
+	itype, subnet, az string
+	interrupted       bool
+}
+
+// spotInterruptionCodes are the state reasons of a spot instance AWS took
+// back: terminated, or stopped (a persistent request's pool instance).
+var spotInterruptionCodes = []string{"Server.SpotInstanceTermination", "Server.SpotInstanceShutdown"}
+
+// spotInterrupted reports a spot instance AWS took back while it ran a
+// runner. It is not the runner failing, so the launch does not count as a
+// failure; but GitHub marks a job the runner had started failed, and the
+// instance's option goes to the end of its market for a while (see
+// breakers), since AWS wants that capacity back.
+func (w *waiter) spotInterrupted(ip netip.Addr, s instanceState) {
+	duringJob := ip.IsValid() && !w.p.o.JIT.Report(ip).Job.IsZero()
+	w.log.Warn("spot instance interrupted", "reason", s.reason, "state", s.name, "type", w.itype, "subnet", w.subnet, "az", w.az, "duringJob", duringJob)
+	if duringJob {
+		w.log.Warn("the runner's job fails at GitHub; re-run it from the run's page (Re-run failed jobs)")
+	}
+	if w.itype != "" && w.subnet != "" {
+		w.p.c.breakers.fail(option{config.MarketSpot, w.itype, w.subnet}, s.reason)
+	}
+	if w.p.o.Interrupted != nil {
+		w.p.o.Interrupted(duringJob)
+	}
+}
+
+func placementAZ(i types.Instance) string {
+	if i.Placement == nil {
+		return ""
+	}
+	return aws.ToString(i.Placement.AvailabilityZone)
 }
 
 // run waits for the instance to finish its job, terminating it when ctx is
@@ -361,9 +400,13 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			done = nil // terminate once; keep waiting for it to take effect
 			w.terminate(context.WithoutCancel(ctx), "runner removed while idle")
 		case s := <-w.states:
-			switch s {
+			if !w.terminating && !w.awaitStart && !w.interrupted && slices.Contains(spotInterruptionCodes, s.reason) {
+				w.interrupted = true
+				w.spotInterrupted(ip, s)
+			}
+			switch s.name {
 			case types.InstanceStateNameShuttingDown, types.InstanceStateNameTerminated:
-				w.log.Info("instance gone", "state", s)
+				w.log.Info("instance gone", "state", s.name, "reason", s.reason)
 				if err := w.runnerResult(ip); result == nil && ctx.Err() == nil {
 					result = err
 				}

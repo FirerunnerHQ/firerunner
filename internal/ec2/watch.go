@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go"
@@ -20,6 +21,13 @@ const describeBatch = 100
 // seconds (eventual consistency).
 const errNotFound = "InvalidInstanceID.NotFound"
 
+// instanceState is an instance's state and, once AWS gives one, the code of
+// why it changed (StateReason), e.g. Server.SpotInstanceTermination.
+type instanceState struct {
+	name   types.InstanceStateName
+	reason string
+}
+
 // watcher polls the state of every instance some Launch is waiting on with one
 // DescribeInstances call per interval, rather than one poller per instance,
 // and hands each waiter its instance's latest state. It runs only while
@@ -30,18 +38,18 @@ type watcher struct {
 	log      *slog.Logger
 
 	mu      sync.Mutex
-	subs    map[string]chan types.InstanceStateName
+	subs    map[string]chan instanceState
 	running bool
 }
 
 func newWatcher(api API, interval time.Duration, log *slog.Logger) *watcher {
-	return &watcher{api: api, interval: interval, log: log, subs: map[string]chan types.InstanceStateName{}}
+	return &watcher{api: api, interval: interval, log: log, subs: map[string]chan instanceState{}}
 }
 
 // watch returns a channel that receives id's state after each poll (only the
 // latest is kept if the reader falls behind) and a func to stop watching.
-func (w *watcher) watch(id string) (<-chan types.InstanceStateName, func()) {
-	ch := make(chan types.InstanceStateName, 1)
+func (w *watcher) watch(id string) (<-chan instanceState, func()) {
+	ch := make(chan instanceState, 1)
 	w.mu.Lock()
 	w.subs[id] = ch
 	if !w.running {
@@ -88,7 +96,7 @@ func (w *watcher) poll(ids []string) {
 	defer cancel()
 	states, err := w.describe(ctx, ids)
 	if isCode(err, errNotFound) && len(ids) > 1 {
-		states, err = map[string]types.InstanceStateName{}, nil
+		states, err = map[string]instanceState{}, nil
 		for _, id := range ids {
 			s, err1 := w.describe(ctx, []string{id})
 			switch {
@@ -117,16 +125,20 @@ func (w *watcher) poll(ids []string) {
 	}
 }
 
-func (w *watcher) describe(ctx context.Context, ids []string) (map[string]types.InstanceStateName, error) {
+func (w *watcher) describe(ctx context.Context, ids []string) (map[string]instanceState, error) {
 	out, err := w.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: ids})
 	if err != nil {
 		return nil, err
 	}
-	states := make(map[string]types.InstanceStateName, len(ids))
+	states := make(map[string]instanceState, len(ids))
 	for _, r := range out.Reservations {
 		for _, i := range r.Instances {
 			if i.InstanceId != nil && i.State != nil {
-				states[*i.InstanceId] = i.State.Name
+				st := instanceState{name: i.State.Name}
+				if i.StateReason != nil {
+					st.reason = aws.ToString(i.StateReason.Code)
+				}
+				states[*i.InstanceId] = st
 			}
 		}
 	}
