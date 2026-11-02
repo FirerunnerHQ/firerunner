@@ -300,13 +300,66 @@ func TestLaunch_SpotOnlyRunsOutOfCapacity(t *testing.T) {
 
 func TestLaunch_NonCapacityErrorEndsWalk(t *testing.T) {
 	h := newHarness(t, func(o *Options) { o.EC2.Market = config.MarketSpotThenOnDemand })
-	h.f.runErrs["*/*/spot"] = apiErr("MaxSpotInstanceCountExceeded")
+	h.f.runErrs["*/*/spot"] = apiErr("InvalidParameterValue")
 	err := waitErr(t, h.launch(context.Background()))
-	if err == nil || errors.Is(err, ErrNoCapacity) || !isCode(err, "MaxSpotInstanceCountExceeded") {
-		t.Fatalf("err = %v, want the quota error itself", err)
+	if err == nil || errors.Is(err, ErrNoCapacity) || !isCode(err, "InvalidParameterValue") {
+		t.Fatalf("err = %v, want the error itself", err)
 	}
 	if got := h.f.attemptLog(); got != "c8a.xlarge/subnet-a/spot" {
-		t.Fatalf("attempts = %s, want one (quota fallback is a separate policy)", got)
+		t.Fatalf("attempts = %s, want one", got)
+	}
+}
+
+func TestLaunch_SpotQuotaFallsBackToOnDemand(t *testing.T) {
+	var fellBack []string
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Market = config.MarketSpotThenOnDemand
+		o.FellBack = func(kind string) { fellBack = append(fellBack, kind) }
+	})
+	h.f.runErrs["*/*/spot"] = apiErr("MaxSpotInstanceCountExceeded")
+	errc := h.launch(context.Background())
+	inst := h.instance(t)
+	h.f.setState(inst.id, types.InstanceStateNameTerminated)
+	waitErr(t, errc)
+	// The quota is regional: one spot attempt per type, never the other subnet.
+	want := "c8a.xlarge/subnet-a/spot c7a.xlarge/subnet-a/spot c8a.xlarge/subnet-a/on-demand"
+	if got := h.f.attemptLog(); got != want {
+		t.Fatalf("attempts:\n got %s\nwant %s", got, want)
+	}
+	if inst.spot {
+		t.Fatal("launched on spot past its quota")
+	}
+	if len(fellBack) != 1 || fellBack[0] != FallbackMarket {
+		t.Fatalf("fallbacks reported = %v, want [market]", fellBack)
+	}
+}
+
+func TestLaunch_OnDemandQuotaTriesTheNextFamily(t *testing.T) {
+	var fellBack []string
+	h := newHarness(t, func(o *Options) { o.FellBack = func(kind string) { fellBack = append(fellBack, kind) } })
+	h.f.runErrs["c8a.xlarge/*/on-demand"] = apiErr("VcpuLimitExceeded")
+	errc := h.launch(context.Background())
+	inst := h.instance(t)
+	h.f.setState(inst.id, types.InstanceStateNameTerminated)
+	waitErr(t, errc)
+	if got, want := h.f.attemptLog(), "c8a.xlarge/subnet-a/on-demand c7a.xlarge/subnet-a/on-demand"; got != want {
+		t.Fatalf("attempts:\n got %s\nwant %s", got, want)
+	}
+	if len(fellBack) != 1 || fellBack[0] != FallbackType {
+		t.Fatalf("fallbacks reported = %v, want [type]", fellBack)
+	}
+}
+
+func TestLaunch_QuotaEverywhereIsNoCapacity(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.EC2.Market = config.MarketSpotThenOnDemand })
+	h.f.runErrs["*/*/spot"] = apiErr("MaxSpotInstanceCountExceeded")
+	h.f.runErrs["*/*/on-demand"] = apiErr("VcpuLimitExceeded")
+	err := waitErr(t, h.launch(context.Background()))
+	if !errors.Is(err, ErrNoCapacity) || !isCode(err, "VcpuLimitExceeded") {
+		t.Fatalf("err = %v, want ErrNoCapacity wrapping the last quota error", err)
+	}
+	if n := len(strings.Fields(h.f.attemptLog())); n != 4 {
+		t.Fatalf("%d attempts, want one per market and type (4)", n)
 	}
 }
 

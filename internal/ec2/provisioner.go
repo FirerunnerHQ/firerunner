@@ -51,10 +51,11 @@ const (
 // Client holds what every EC2 tier in a process shares: the AWS clients, the
 // AMI cache and the instance-state watcher.
 type Client struct {
-	api   API
-	amis  *amiResolver
-	watch *watcher
-	log   *slog.Logger
+	api      API
+	amis     *amiResolver
+	watch    *watcher
+	breakers *breakers
+	log      *slog.Logger
 
 	// live holds the instances some Launch in this process is responsible
 	// for; the reaper leaves them alone.
@@ -89,7 +90,7 @@ func NewClient(api API, params ParamAPI, pollInterval time.Duration, log *slog.L
 	if pollInterval <= 0 {
 		pollInterval = DefaultPollInterval
 	}
-	return &Client{api: api, amis: newAMIResolver(api, params), watch: newWatcher(api, pollInterval, log), log: log, live: map[string]bool{}}
+	return &Client{api: api, amis: newAMIResolver(api, params), watch: newWatcher(api, pollInterval, log), breakers: newBreakers(), log: log, live: map[string]bool{}}
 }
 
 // Options configures one EC2 tier's provisioner.
@@ -118,6 +119,10 @@ type Options struct {
 	// Launched, when set, is told each launch's path (PathPool, PathCold or
 	// PathKept).
 	Launched func(path string)
+	// FellBack, when set, is told each new instance that EC2 placed on
+	// other than the tier's first choice: FallbackMarket, FallbackType or
+	// FallbackSubnet, the first that differs.
+	FellBack func(kind string)
 	Logger   *slog.Logger
 }
 
@@ -131,6 +136,17 @@ const (
 	// PathKept launched a new instance although the pool had one ready,
 	// leaving it for the jobs ec2.pool_for names.
 	PathKept = "kept"
+)
+
+// Fallbacks, as Options.FellBack reports them.
+const (
+	// FallbackMarket: the tier's first market (spot, for
+	// spot-then-on-demand) had nothing to give.
+	FallbackMarket = "market"
+	// FallbackType: a later instance type in the tier's list.
+	FallbackType = "type"
+	// FallbackSubnet: the first type, in a later subnet.
+	FallbackSubnet = "subnet"
 )
 
 // Provisioner launches one EC2 instance per runner for one tier.
@@ -460,8 +476,11 @@ const (
 )
 
 // run walks markets × instance types × subnets in the configured order and
-// returns the first instance EC2 accepts. Capacity errors move on to the next
-// combination; any other error ends the walk.
+// returns the first instance EC2 accepts. A capacity error moves on to the
+// next subnet, a quota error to the next type or market (the quota is
+// regional); any other error ends the walk. Options EC2 refused lately (see
+// breakers) go to the end of the walk rather than out of it, so a launch
+// still takes one when nothing else works.
 func (p *Provisioner) run(ctx context.Context, name string, img image, kind launchKind) (types.Instance, error) {
 	var markets []string
 	switch p.o.EC2.Market {
@@ -472,29 +491,75 @@ func (p *Provisioner) run(ctx context.Context, name string, img image, kind laun
 	default: // spot-then-on-demand
 		markets = []string{config.MarketSpot, config.MarketOnDemand}
 	}
-	var last error
+	var ready, backingOff []option
 	for _, market := range markets {
 		for _, itype := range p.o.EC2.InstanceTypes {
 			for _, subnet := range p.o.EC2.Subnets {
-				if err := ctx.Err(); err != nil {
-					return types.Instance{}, err
+				o := option{market, itype, subnet}
+				if p.c.breakers.blocked(o) {
+					backingOff = append(backingOff, o)
+				} else {
+					ready = append(ready, o)
 				}
-				out, err := p.c.api.RunInstances(ctx, p.input(name, img, market, itype, subnet, kind))
-				if err == nil {
-					if len(out.Instances) != 1 {
-						return types.Instance{}, fmt.Errorf("RunInstances returned %d instances, want 1", len(out.Instances))
-					}
-					return out.Instances[0], nil
-				}
-				if !isCapacityErr(err) {
-					return types.Instance{}, fmt.Errorf("run %s %s in %s: %w", market, itype, subnet, err)
-				}
-				p.log.Info("no capacity; trying the next option", "runner", name, "market", market, "type", itype, "subnet", subnet, "err", err)
-				last = err
 			}
 		}
 	}
+	firstChoice := option{markets[0], p.o.EC2.InstanceTypes[0], p.o.EC2.Subnets[0]}
+	if len(backingOff) > 0 {
+		p.log.Info("launch options backing off; trying them last", "runner", name, "backingOff", len(backingOff), "of", len(ready)+len(backingOff))
+	}
+	overQuota := map[option]bool{} // market and type, this walk
+	var last error
+	for _, o := range append(ready, backingOff...) {
+		if overQuota[option{o.market, o.itype, ""}] {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return types.Instance{}, err
+		}
+		out, err := p.c.api.RunInstances(ctx, p.input(name, img, o.market, o.itype, o.subnet, kind))
+		if err == nil {
+			if len(out.Instances) != 1 {
+				return types.Instance{}, fmt.Errorf("RunInstances returned %d instances, want 1", len(out.Instances))
+			}
+			p.c.breakers.succeeded(o)
+			p.fellBack(name, firstChoice, o)
+			return out.Instances[0], nil
+		}
+		switch {
+		case isQuotaErr(err):
+			q := option{o.market, o.itype, ""}
+			overQuota[q] = true
+			p.c.breakers.fail(q, errorCode(err))
+			p.log.Warn("vCPU quota used up; trying the next type or market", "runner", name, "market", o.market, "type", o.itype, "err", err)
+		case isCapacityErr(err):
+			p.c.breakers.fail(o, errorCode(err))
+			p.log.Info("no capacity; trying the next option", "runner", name, "market", o.market, "type", o.itype, "subnet", o.subnet, "err", err)
+		default:
+			return types.Instance{}, fmt.Errorf("run %s %s in %s: %w", o.market, o.itype, o.subnet, err)
+		}
+		last = err
+	}
 	return types.Instance{}, fmt.Errorf("%w: %w", ErrNoCapacity, last)
+}
+
+// fellBack reports where an instance landed, when not at the first choice.
+func (p *Provisioner) fellBack(name string, first, got option) {
+	kind := ""
+	switch {
+	case got.market != first.market:
+		kind = FallbackMarket
+	case got.itype != first.itype:
+		kind = FallbackType
+	case got.subnet != first.subnet:
+		kind = FallbackSubnet
+	default:
+		return
+	}
+	p.log.Info("launched on a fallback option", "runner", name, "fallback", kind, "market", got.market, "type", got.itype, "subnet", got.subnet)
+	if p.o.FellBack != nil {
+		p.o.FellBack(kind)
+	}
 }
 
 func isCapacityErr(err error) bool {

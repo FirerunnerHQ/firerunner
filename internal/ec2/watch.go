@@ -138,3 +138,12 @@ func isCode(err error, code string) bool {
 	var ae smithy.APIError
 	return errors.As(err, &ae) && ae.ErrorCode() == code
 }
+
+// errorCode is err's AWS error code, or its text when it has none.
+func errorCode(err error) string {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return ae.ErrorCode()
+	}
+	return err.Error()
+}
