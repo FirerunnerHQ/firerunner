@@ -1072,9 +1072,14 @@ func (s *Server) stagedBytes(id uint64) int64 {
 	defer s.mu.Unlock()
 	return s.staged[id]
 }
+
+// clearStaged forgets a failed upload, including an earlier one's blob in
+// the store: the failure removed its local file, so finalize must not
+// complete the entry with it.
 func (s *Server) clearStaged(id uint64) {
 	s.mu.Lock()
 	delete(s.staged, id)
+	delete(s.stored, id)
 	s.mu.Unlock()
 }
 

@@ -519,3 +519,29 @@ func TestBlockOutlivingItsReservationLeavesNothing(t *testing.T) {
 		})
 	}
 }
+
+func TestFailedRetryLeavesNothingToFinalize(t *testing.T) {
+	store := newMemStore()
+	s, ts := newStoreServer(t, store)
+	s.SetLocalCacheSize(1 << 20)
+	create := twirp(t, ts.URL, "CreateCacheEntry", createReq{Metadata: meta("owner/pinned"), Key: "k", Version: "v1"})
+	upload := create["signed_upload_url"].(string)
+	putBlob(t, upload, []byte("first"))
+
+	store.failPut = true // the retry's blob never reaches the store
+	req, _ := http.NewRequest(http.MethodPut, upload, strings.NewReader("second"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusInsufficientStorage {
+		t.Fatalf("retried PUT with store down = %v %v, want 507", err, resp.StatusCode)
+	}
+	resp.Body.Close()
+	if fin := twirp(t, ts.URL, "FinalizeCacheEntryUpload", finalizeReq{Metadata: meta("owner/pinned"), Key: "k", Version: "v1"}); fin["ok"] == true {
+		t.Fatalf("finalize succeeded after the last upload failed: %v", fin)
+	}
+	s.mu.Lock()
+	_, local := s.local[1]
+	s.mu.Unlock()
+	if local {
+		t.Fatal("local copy recorded for a blob whose upload failed")
+	}
+}
