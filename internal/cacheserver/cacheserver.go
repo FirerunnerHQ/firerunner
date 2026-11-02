@@ -463,6 +463,10 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 	e.UsedAt = time.Now().Unix()
 	delete(s.staged, e.ID) // it now counts as a completed blob, not in-flight
 	delete(s.stored, e.ID)
+	if s.store != nil {
+		// Only now: an upload never finalized must not displace a copy.
+		s.keepLocal(e.ID, size)
+	}
 	s.saves++
 	s.evictLRU(e.ID)
 	if err := s.save(); err != nil {

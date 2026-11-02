@@ -294,6 +294,35 @@ func TestFreshServerFillsLocalCopyFromStore(t *testing.T) {
 	}
 }
 
+func TestUnfinalizedUploadDisplacesNoLocalCopy(t *testing.T) {
+	store := newMemStore()
+	s, ts := newStoreServer(t, store)
+	s.SetLocalCacheSize(40)
+	for _, k := range []string{"a", "b"} {
+		saveEntry(t, ts.URL, "owner/pinned", k, "v1", 16)
+	}
+	create := twirp(t, ts.URL, "CreateCacheEntry", createReq{Metadata: meta("owner/pinned"), Key: "c", Version: "v1"})
+	putBlob(t, create["signed_upload_url"].(string), bytes.Repeat([]byte("c"), 16))
+
+	s.mu.Lock()
+	_, a := s.local[1]
+	_, b := s.local[2]
+	_, c := s.local[3]
+	s.mu.Unlock()
+	if !a || !b || c {
+		t.Fatalf("local copies a %v b %v c %v, want a and b kept, none for the unfinalized c", a, b, c)
+	}
+	if fin := twirp(t, ts.URL, "FinalizeCacheEntryUpload", finalizeReq{Metadata: meta("owner/pinned"), Key: "c", Version: "v1", SizeBytes: "16"}); fin["ok"] != true {
+		t.Fatalf("finalize: %v", fin)
+	}
+	s.mu.Lock()
+	_, c = s.local[3]
+	s.mu.Unlock()
+	if !c {
+		t.Fatal("no local copy of c once finalized")
+	}
+}
+
 func TestLocalCopiesTrimmedButStillServedFromStore(t *testing.T) {
 	store := newMemStore()
 	s, ts := newStoreServer(t, store)

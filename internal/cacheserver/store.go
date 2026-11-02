@@ -149,14 +149,13 @@ func (s *Server) finishUpload(r *http.Request, e *Entry, n int64) (int, error) {
 		if s.stored == nil {
 			s.stored = make(map[uint64]int64)
 		}
-		s.stored[e.ID] = n
-		s.keepLocal(e.ID, n)
+		s.stored[e.ID] = n // the local file stays until finalize decides on a copy
 	}
 	s.staged[e.ID] = n
 	return 0, nil
 }
 
-// keepLocal records the blob at blobPath(id) as a local copy, or removes it when
+// keepLocal records the blob at blobPath(id) of a completed entry as a local copy, or removes it when
 // copies are off or it cannot fit. The caller holds s.mu.
 func (s *Server) keepLocal(id uint64, size int64) {
 	if s.localCap <= 0 || size > s.localCap {
