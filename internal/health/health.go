@@ -70,6 +70,10 @@ type Tier struct {
 	// choice, by the first thing that differed: "market" (on-demand for a
 	// spot-then-on-demand tier), "type" or "subnet".
 	Fallbacks map[string]int `json:"fallbacks,omitempty"`
+	// Interruptions counts spot instances AWS took back under a runner:
+	// "job" when its job had started (GitHub marks it failed), "idle"
+	// before.
+	Interruptions map[string]int `json:"interruptions,omitempty"`
 }
 
 // Pending is a tier's assigned-but-not-started jobs.
@@ -213,6 +217,20 @@ func (tr *Tracker) FellBack(kind string) {
 	tr.t.Fallbacks[kind]++
 }
 
+// Interrupted counts a spot instance AWS took back under a runner.
+func (tr *Tracker) Interrupted(duringJob bool) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.t.Interruptions == nil {
+		tr.t.Interruptions = map[string]int{}
+	}
+	if duringJob {
+		tr.t.Interruptions["job"]++
+	} else {
+		tr.t.Interruptions["idle"]++
+	}
+}
+
 // OfflineRemoved counts an untracked offline runner removed.
 func (tr *Tracker) OfflineRemoved() {
 	tr.mu.Lock()
@@ -257,6 +275,7 @@ func (tr *Tracker) Snapshot() Tier {
 	}
 	t.Launches = maps.Clone(t.Launches)
 	t.Fallbacks = maps.Clone(t.Fallbacks)
+	t.Interruptions = maps.Clone(t.Interruptions)
 	return t
 }
 

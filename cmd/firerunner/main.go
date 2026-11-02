@@ -755,6 +755,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				UsePool:     tierJobs[t.Name].ClaimPool,
 				Launched:    tierHealth[t.Name].Launched,
 				FellBack:    tierHealth[t.Name].FellBack,
+				Interrupted: tierHealth[t.Name].Interrupted,
 				Logger:      log.With("tier", t.Name),
 			})
 			// A tier's stopped pool fills and refills in the background for

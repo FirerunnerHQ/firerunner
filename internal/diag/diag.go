@@ -410,6 +410,10 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				fmt.Fprintf(w, "  %s launches: %d from the pool, %d cold, %d cold with the pool kept\n",
 					t.Name, t.Launches["pool"], t.Launches["cold"], t.Launches["kept"])
 			}
+			if n := t.Interruptions; len(n) > 0 {
+				fmt.Fprintf(w, "  %s spot interruptions: %d during a job (failed at GitHub; re-run it), %d before one\n",
+					t.Name, n["job"], n["idle"])
+			}
 			if len(t.Fallbacks) > 0 {
 				fmt.Fprintf(w, "  %s placed off its first choice: %d on on-demand, %d on a later type, %d in a later subnet\n",
 					t.Name, t.Fallbacks["market"], t.Fallbacks["type"], t.Fallbacks["subnet"])

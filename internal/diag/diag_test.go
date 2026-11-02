@@ -710,7 +710,7 @@ func TestStatusShowsFallbacksAndBreakers(t *testing.T) {
 	now := time.Now()
 	f := health.File{PID: 1, WrittenAt: now,
 		Tiers: []health.Tier{{Name: "a", State: health.Connected, Since: now,
-			Fallbacks: map[string]int{"market": 3, "subnet": 1}}},
+			Fallbacks: map[string]int{"market": 3, "subnet": 1}, Interruptions: map[string]int{"job": 2}}},
 		EC2Breakers: []health.Breaker{
 			{Market: "spot", Type: "c8a.xlarge", Reason: "MaxSpotInstanceCountExceeded", Failures: 2, Since: now, Until: now.Add(90 * time.Second)},
 			{Market: "on-demand", Type: "c7a.xlarge", Subnet: "subnet-a", Reason: "InsufficientInstanceCapacity", Failures: 1, Since: now, Until: now.Add(30 * time.Second)},
@@ -727,6 +727,7 @@ func TestStatusShowsFallbacksAndBreakers(t *testing.T) {
 	out := text.String()
 	for _, want := range []string{
 		"a placed off its first choice: 3 on on-demand, 0 on a later type, 1 in a later subnet",
+		"a spot interruptions: 2 during a job (failed at GitHub; re-run it), 0 before one",
 		"spot c8a.xlarge in every subnet (quota): MaxSpotInstanceCountExceeded, backoff round 2",
 		"on-demand c7a.xlarge in subnet-a: InsufficientInstanceCapacity, backoff round 1",
 	} {
@@ -741,7 +742,7 @@ func TestStatusShowsFallbacksAndBreakers(t *testing.T) {
 	if err := Status(cfg, "test", &js, true); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"ec2_breakers"`, `"reason": "MaxSpotInstanceCountExceeded"`, `"fallbacks"`} {
+	for _, want := range []string{`"ec2_breakers"`, `"reason": "MaxSpotInstanceCountExceeded"`, `"fallbacks"`, `"interruptions"`} {
 		if !strings.Contains(js.String(), want) {
 			t.Errorf("status --json missing %s\n%s", want, js.String())
 		}

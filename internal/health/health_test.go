@@ -23,6 +23,21 @@ func TestTrackerCountsFallbacks(t *testing.T) {
 	}
 }
 
+func TestTrackerCountsInterruptions(t *testing.T) {
+	tr := NewTracker("a")
+	tr.Interrupted(true)
+	tr.Interrupted(true)
+	tr.Interrupted(false)
+	snap := tr.Snapshot()
+	if got := snap.Interruptions; got["job"] != 2 || got["idle"] != 1 || len(got) != 2 {
+		t.Fatalf("interruptions = %v, want job 2, idle 1", got)
+	}
+	tr.Interrupted(false)
+	if snap.Interruptions["idle"] != 1 {
+		t.Fatal("a snapshot shares its interruptions map with the tracker")
+	}
+}
+
 func TestTrackerTransitions(t *testing.T) {
 	now := time.Unix(1000, 0)
 	tr := NewTracker("a")
