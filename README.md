@@ -889,6 +889,9 @@ firerunner cache-server --dir /var/lib/firerunner/cache \
   blob.
 - **Replacing the server.** A new cache-server whose local index is empty loads
   the index from the bucket, so it serves everything its predecessor finalized.
+- **A blob missing from the bucket**, for example after a lifecycle rule or
+  when a disk-mode `--dir` is switched to S3, answers its restore with 404 and
+  drops the entry, so the job misses and the next save of that key succeeds.
 - **Credentials and region** come from the default AWS chain, for example an
   instance profile. The profile needs object read, write and delete on the
   prefix, plus `s3:ListBucket` scoped to it. Without `ListBucket`, a missing

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -48,7 +49,7 @@ func (m *memStore) Get(_ context.Context, id uint64, offset, length int64) (io.R
 	defer m.mu.Unlock()
 	data, ok := m.blobs[id]
 	if !ok {
-		return nil, errors.New("no such blob")
+		return nil, fmt.Errorf("blob %d: %w", id, fs.ErrNotExist)
 	}
 	return io.NopCloser(bytes.NewReader(data[offset : offset+length])), nil
 }
@@ -305,4 +306,23 @@ func TestLocalCopiesTrimmedButStillServedFromStore(t *testing.T) {
 	if code, body := getBody(t, downloadURL(t, ts.URL, "a")); code != http.StatusOK || len(body) != 16 {
 		t.Fatalf("trimmed entry GET = %d len %d, want it from the store", code, len(body))
 	}
+}
+
+func TestBlobMissingFromStoreDropsTheEntry(t *testing.T) {
+	store := newMemStore()
+	_, ts := newStoreServer(t, store)
+	saveEntry(t, ts.URL, "owner/pinned", "k", "v1", 8)
+	url := downloadURL(t, ts.URL, "k")
+
+	// A lifecycle rule, or a delete whose index update a crash lost.
+	if err := store.Delete(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := getBody(t, url); code != http.StatusNotFound {
+		t.Fatalf("GET of a blob the store lost = %d, want 404", code)
+	}
+	if get := twirp(t, ts.URL, "GetCacheEntryDownloadURL", getReq{Metadata: meta("owner/pinned"), Key: "k", Version: "v1"}); get["ok"] == true {
+		t.Fatalf("lost entry still found: %v", get)
+	}
+	saveEntry(t, ts.URL, "owner/pinned", "k", "v1", 8) // the key is free again
 }

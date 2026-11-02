@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"strconv"
@@ -19,7 +20,8 @@ import (
 type BlobStore interface {
 	// Put copies the fully assembled blob at path to the store under id.
 	Put(ctx context.Context, id uint64, path string) error
-	// Get streams length bytes of blob id starting at offset.
+	// Get streams length bytes of blob id starting at offset. A blob the store
+	// does not have is an error wrapping fs.ErrNotExist.
 	Get(ctx context.Context, id uint64, offset, length int64) (io.ReadCloser, error)
 	Delete(ctx context.Context, id uint64) error
 	// LoadIndex returns the stored index, or nil when there is none yet.
@@ -220,7 +222,7 @@ func (s *Server) openLocal(id uint64) (*os.File, error) {
 // background, once at a time per blob, so the next restore reads from disk.
 func (s *Server) fillLocal(e *Entry) {
 	s.mu.Lock()
-	if s.localCap <= 0 || e.Size <= 0 || e.Size > s.localCap || s.filling[e.ID] {
+	if s.localCap <= 0 || e.Size <= 0 || e.Size > s.localCap || s.filling[e.ID] || s.entries[e.ID] != e {
 		s.mu.Unlock()
 		return
 	}
@@ -243,6 +245,10 @@ func (s *Server) fillLocal(e *Entry) {
 		tmp := s.blobPath(e.ID) + ".fill"
 		if err := s.fetchBlob(e.ID, e.Size, tmp); err != nil {
 			_ = os.Remove(tmp)
+			if errors.Is(err, fs.ErrNotExist) {
+				s.dropLost(e)
+				return
+			}
 			s.log.Warn("cache local copy fetch failed", "id", e.ID, "err", err)
 			return
 		}
@@ -273,6 +279,26 @@ func (s *Server) fetchBlob(id uint64, size int64, path string) error {
 		err = fmt.Errorf("fetched %d of %d bytes", n, size)
 	}
 	return err
+}
+
+// dropLost forgets a completed entry whose blob the store no longer has (a
+// lifecycle rule, a delete whose index update a crash lost, a disk-mode --dir
+// switched to a store), so its key can be saved again: kept, it would fail
+// every restore and refuse every save of that key.
+func (s *Server) dropLost(e *Entry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.entries[e.ID] != e {
+		return
+	}
+	s.log.Warn("cache blob missing from store; dropping the entry", "id", e.ID, "key", e.Key)
+	_ = os.Remove(s.blobPath(e.ID))
+	delete(s.entries, e.ID)
+	delete(s.local, e.ID)
+	delete(s.stored, e.ID)
+	if err := s.save(); err != nil {
+		s.log.Warn("cache index save failed", "err", err)
+	}
 }
 
 // removeBlob deletes a blob wherever it lives; the caller holds s.mu. Store deletes run in the
@@ -312,6 +338,11 @@ func (s *Server) serveFromStore(w http.ResponseWriter, r *http.Request, e *Entry
 		return
 	}
 	body, err := s.store.Get(r.Context(), e.ID, start, end-start+1)
+	if errors.Is(err, fs.ErrNotExist) {
+		s.dropLost(e)
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		s.log.Warn("cache blob read from store failed", "id", e.ID, "err", err)
 		http.Error(w, errStoreUnavailable.Error(), http.StatusInsufficientStorage)

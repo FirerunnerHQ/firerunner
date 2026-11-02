@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -93,6 +94,10 @@ func (s *Store) Get(ctx context.Context, id uint64, offset, length int64) (io.Re
 		Key:    aws.String(s.blobKey(id)),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)),
 	})
+	var missing *types.NoSuchKey
+	if errors.As(err, &missing) {
+		return nil, fmt.Errorf("%s: %w", s.blobKey(id), fs.ErrNotExist)
+	}
 	if err != nil {
 		return nil, err
 	}
