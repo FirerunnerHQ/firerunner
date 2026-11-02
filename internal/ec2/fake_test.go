@@ -90,9 +90,14 @@ import (
 // Scripted per test, not enforced: capacity and quota errors (runErrs),
 // throttling and other failures (cancelErrs, describeErr, terminateErr,
 // startErr, tagErr), a stale read right after a start (startStaysStopped), and
-// a RunInstances response without the private IP (noIPInRun).
+// a RunInstances response without the private IP (noIPInRun), and a state
+// change's StateReason code (setStateFor), such as a spot interruption's,
+// and a spot request's status code (spotStatus).
+// A reason stays until the next setStateFor, also across a start: whether
+// AWS clears it then is unchecked, so firerunner must not rely on either.
 //
-// Not modelled, so no test may rely on it: a spot interruption; the
+// Not modelled, so no test may rely on it: the rebalance recommendation and
+// two-minute warning before a spot interruption; the
 // replacement a persistent request launches (R10 fails the test instead); a
 // cap on IDs per DescribeInstances call (the watcher batches 100 on its own;
 // on 2026-10-23 a call accepted 5000 copies of one ID, so a cap on distinct
@@ -114,6 +119,8 @@ type fakeInstance struct {
 	volumeTags            map[string]string // tags requested for the root volume
 	userData              string            // decoded
 	state                 types.InstanceStateName
+	stateReason           string // StateReason code, once set
+	spotStatus            string // its spot request's status code, once set
 	tags                  map[string]string
 	spotTags              map[string]string // tags on its spot request
 	launched              time.Time
@@ -285,6 +292,10 @@ func (f *fakeEC2) view(i *fakeInstance) types.Instance {
 		InstanceType:     types.InstanceType(i.itype),
 		SubnetId:         aws.String(i.subnet),
 		State:            &types.InstanceState{Name: i.state},
+		Placement:        &types.Placement{AvailabilityZone: aws.String("az-of-" + i.subnet)},
+	}
+	if i.stateReason != "" {
+		v.StateReason = &types.StateReason{Code: aws.String(i.stateReason), Message: aws.String(i.stateReason + " (fake)")}
 	}
 	if i.spot {
 		v.InstanceLifecycle = types.InstanceLifecycleTypeSpot
@@ -332,9 +343,22 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []types.SpotInstanceRequest
+	byInstance := false
+	for _, fl := range in.Filters {
+		byInstance = byInstance || aws.ToString(fl.Name) == "instance-id"
+	}
 	for _, id := range f.order {
 		i := f.instances[id]
-		if i.spotReq == "" {
+		req := i.spotReq
+		if req == "" && i.spot && byInstance {
+			// A one-time instance's request. Real AWS lists it in every
+			// query (active while the instance runs, then closed); the fake
+			// lists it only by instance-id, so the other listings, all about
+			// persistent requests, keep their tests' expectations. See the
+			// reaper issue #131, which can see active ones.
+			req = "sir-once-" + id
+		}
+		if req == "" {
 			continue
 		}
 		state := types.SpotInstanceStateActive
@@ -345,10 +369,13 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 			state = types.SpotInstanceStateDisabled
 		}
 		r := types.SpotInstanceRequest{
-			SpotInstanceRequestId: aws.String(i.spotReq),
+			SpotInstanceRequestId: aws.String(req),
 			InstanceId:            aws.String(i.id),
 			State:                 state,
 			CreateTime:            aws.Time(i.launched),
+		}
+		if i.spotStatus != "" {
+			r.Status = &types.SpotInstanceStatus{Code: aws.String(i.spotStatus)}
 		}
 		for k, v := range i.spotTags {
 			r.Tags = append(r.Tags, types.Tag{Key: aws.String(k), Value: aws.String(v)})
@@ -361,6 +388,8 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 				switch {
 				case name == "state":
 					ok = ok || string(state) == want
+				case name == "instance-id":
+					ok = ok || i.id == want
 				case strings.HasPrefix(name, "tag:"):
 					ok = ok || i.spotTags[strings.TrimPrefix(name, "tag:")] == want
 				}
@@ -581,6 +610,15 @@ func (f *fakeEC2) DescribeImages(_ context.Context, in *ec2.DescribeImagesInput,
 		}
 	}
 	return &ec2.DescribeImagesOutput{Images: out}, nil
+}
+
+// setStateFor moves an instance to state for the reason AWS gives, e.g.
+// Server.SpotInstanceTermination.
+func (f *fakeEC2) setStateFor(id string, state types.InstanceStateName, reason string) {
+	f.setState(id, state)
+	f.mu.Lock()
+	f.instances[id].stateReason = reason
+	f.mu.Unlock()
 }
 
 // setState moves an instance to state, as the guest or AWS would.

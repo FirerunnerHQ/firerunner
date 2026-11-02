@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,6 +121,9 @@ type Options struct {
 	// Launched, when set, is told each launch's path (PathPool, PathCold or
 	// PathKept).
 	Launched func(path string)
+	// Interrupted, when set, is told each spot instance AWS took back while
+	// it ran a runner; duringJob says whether its job had started.
+	Interrupted func(duringJob bool)
 	// FellBack, when set, is told each new instance that EC2 placed on
 	// other than the tier's first choice: FallbackMarket, FallbackType or
 	// FallbackSubnet, the first that differs.
@@ -244,7 +249,9 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 
 	states, stopWatch := p.c.watch.watch(id)
 	defer stopWatch()
-	w := &waiter{p: p, id: id, log: log, states: states}
+	w := &waiter{p: p, id: id, log: log, states: states,
+		itype: string(inst.InstanceType), subnet: aws.ToString(inst.SubnetId), az: placementAZ(inst),
+		spot: inst.InstanceLifecycle == types.InstanceLifecycleTypeSpot}
 
 	ip, err := p.privateIP(ctx, inst)
 	if err != nil {
@@ -321,7 +328,8 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string, onStar
 	defer stopWatch()
 	// Until it is seen running, a "stopped" state is the instance before
 	// the start took effect, not its job ending.
-	w := &waiter{p: p, id: in.id, log: log, states: states, awaitStart: true, spotReq: spotReq}
+	w := &waiter{p: p, id: in.id, log: log, states: states, awaitStart: true, spotReq: spotReq,
+		itype: in.itype, subnet: in.subnet, az: in.az, spot: in.spotReq != ""}
 	return w.run(ctx, ip)
 }
 
@@ -330,7 +338,7 @@ type waiter struct {
 	p      *Provisioner
 	id     string
 	log    *slog.Logger
-	states <-chan types.InstanceStateName
+	states <-chan instanceState
 
 	terminating bool
 	termSince   time.Time // first termination request
@@ -341,6 +349,107 @@ type waiter struct {
 	// spotReq is a persistent spot request still to cancel before the
 	// instance may be terminated.
 	spotReq string
+	// Where the instance runs, for reporting a spot interruption; spot says
+	// it is a spot instance, whose request's status may tell one.
+	itype, subnet, az string
+	spot              bool
+	interrupted       bool
+	checkedRequest    bool
+}
+
+// spotInterruptionCodes are the state reasons of a spot instance AWS took
+// back: terminated, or stopped (a persistent request's pool instance).
+var spotInterruptionCodes = []string{"Server.SpotInstanceTermination", "Server.SpotInstanceShutdown"}
+
+// interruptionStatus reports whether a spot request status code says AWS
+// took the instance back. A state reason alone is not enough: an
+// interruption FIS sends shows Client.UserInitiatedShutdown on the instance
+// and instance-terminated-by-experiment on its request (seen 2026-11-02).
+func interruptionStatus(code string) bool {
+	if strings.HasPrefix(code, "marked-for-") {
+		return true
+	}
+	for _, p := range []string{"instance-terminated-", "instance-stopped-", "instance-hibernated-"} {
+		if rest, ok := strings.CutPrefix(code, p); ok {
+			switch rest {
+			case "by-price", "no-capacity", "capacity-oversubscribed", "launch-group-constraint", "by-experiment":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// interruption returns why a spot instance that is ending was taken back by
+// AWS, or "" when it was not: the state reason, else (asked once) its spot
+// request's status code. That fallback is proven for one-time requests only:
+// a pool instance's persistent request is cancelled once it starts, and
+// whether AWS still updates a cancelled request's status is unchecked. An
+// end after the runner reported its exit is its own power-off, so it is not
+// asked about.
+func (w *waiter) interruption(ctx context.Context, ip netip.Addr, s instanceState) string {
+	if slices.Contains(spotInterruptionCodes, s.reason) {
+		return s.reason
+	}
+	if !w.spot || w.checkedRequest || (ip.IsValid() && !w.p.o.JIT.Report(ip).Exited.IsZero()) {
+		return ""
+	}
+	w.checkedRequest = true
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	out, err := w.p.c.api.DescribeSpotInstanceRequests(ctx, &ec2.DescribeSpotInstanceRequestsInput{
+		Filters: []types.Filter{{Name: aws.String("instance-id"), Values: []string{w.id}}},
+	})
+	if err != nil {
+		w.log.Warn("read the spot request of an ending instance", "err", err)
+		return ""
+	}
+	for _, r := range out.SpotInstanceRequests {
+		if r.Status != nil && interruptionStatus(aws.ToString(r.Status.Code)) {
+			return aws.ToString(r.Status.Code)
+		}
+	}
+	return ""
+}
+
+// spotInterrupted reports a spot instance AWS took back while it ran a
+// runner. It is not the runner failing, so the launch does not count as a
+// failure; but GitHub marks a job the runner had started failed, and the
+// instance's option goes to the end of its market for a while (see
+// breakers), since AWS wants that capacity back.
+func (w *waiter) spotInterrupted(ip netip.Addr, s instanceState, why string) {
+	r := w.p.o.JIT.Report(ip)
+	duringJob := ip.IsValid() && !r.Job.IsZero() && r.Exited.IsZero()
+	// The waiter's logger already names the runner, instance, type and subnet.
+	w.log.Warn("spot instance interrupted", "reason", why, "state", s.name, "az", w.az, "duringJob", duringJob)
+	if duringJob {
+		w.log.Warn("the runner's job fails at GitHub; re-run it from the run's page (Re-run failed jobs)")
+	}
+	if w.itype != "" && w.subnet != "" {
+		w.p.c.breakers.fail(option{config.MarketSpot, w.itype, w.subnet}, why)
+	}
+	if w.p.o.Interrupted != nil {
+		w.p.o.Interrupted(duringJob)
+	}
+}
+
+// endingState reports a stop or termination: the only states whose reason
+// says why the instance ended. A pending or running read can carry a reason
+// left from an earlier stop.
+func endingState(s types.InstanceStateName) bool {
+	switch s {
+	case types.InstanceStateNameStopping, types.InstanceStateNameStopped,
+		types.InstanceStateNameShuttingDown, types.InstanceStateNameTerminated:
+		return true
+	}
+	return false
+}
+
+func placementAZ(i types.Instance) string {
+	if i.Placement == nil {
+		return ""
+	}
+	return aws.ToString(i.Placement.AvailabilityZone)
 }
 
 // run waits for the instance to finish its job, terminating it when ctx is
@@ -361,9 +470,15 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			done = nil // terminate once; keep waiting for it to take effect
 			w.terminate(context.WithoutCancel(ctx), "runner removed while idle")
 		case s := <-w.states:
-			switch s {
+			if !w.terminating && !w.awaitStart && !w.interrupted && endingState(s.name) {
+				if why := w.interruption(ctx, ip, s); why != "" {
+					w.interrupted = true
+					w.spotInterrupted(ip, s, why)
+				}
+			}
+			switch s.name {
 			case types.InstanceStateNameShuttingDown, types.InstanceStateNameTerminated:
-				w.log.Info("instance gone", "state", s)
+				w.log.Info("instance gone", "state", s.name, "reason", s.reason)
 				if err := w.runnerResult(ip); result == nil && ctx.Err() == nil {
 					result = err
 				}

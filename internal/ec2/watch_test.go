@@ -38,11 +38,11 @@ func launchN(t *testing.T, f *fakeEC2, n int) []string {
 	return ids
 }
 
-func next(t *testing.T, ch <-chan types.InstanceStateName) types.InstanceStateName {
+func next(t *testing.T, ch <-chan instanceState) types.InstanceStateName {
 	t.Helper()
 	select {
 	case s := <-ch:
-		return s
+		return s.name
 	case <-time.After(2 * time.Second):
 		t.Fatal("no state published")
 		return ""
@@ -53,7 +53,7 @@ func TestWatcher_BatchesAllInstancesIntoOneCall(t *testing.T) {
 	f := newFakeEC2(t)
 	ids := launchN(t, f, 3)
 	w := newWatcher(f, 5*time.Millisecond, quietLog())
-	var chans []<-chan types.InstanceStateName
+	var chans []<-chan instanceState
 	for _, id := range ids {
 		ch, stop := w.watch(id)
 		defer stop()
@@ -101,7 +101,7 @@ func TestWatcher_NotFoundFallsBackPerInstance(t *testing.T) {
 	}
 	select {
 	case s := <-young:
-		t.Fatalf("invisible instance published state %q", s)
+		t.Fatalf("invisible instance published state %q", s.name)
 	default:
 	}
 	// Once it becomes visible, its state flows.
