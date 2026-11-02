@@ -18,6 +18,7 @@ import (
 
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/ec2"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/listener"
 	"github.com/firerunnerhq/firerunner/internal/provisioner"
@@ -180,11 +181,23 @@ func TestServeTiers_AllTiersStoppedShutsDown(t *testing.T) {
 	}
 }
 
+func TestHealthBreakersCarryEveryField(t *testing.T) {
+	since, until := time.Unix(100, 0), time.Unix(130, 0)
+	got := healthBreakers([]ec2.Breaker{{Market: "spot", Type: "c8a.xlarge", Subnet: "subnet-a", Reason: "InsufficientInstanceCapacity", Failures: 2, Since: since, Until: until}})
+	want := health.Breaker{Market: "spot", Type: "c8a.xlarge", Subnet: "subnet-a", Reason: "InsufficientInstanceCapacity", Failures: 2, Since: since.UTC(), Until: until.UTC()}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("healthBreakers = %+v, want [%+v]", got, want)
+	}
+	if healthBreakers(nil) != nil {
+		t.Fatal("no breakers should publish none (omitted from the file)")
+	}
+}
+
 func TestPublishHealth(t *testing.T) {
 	path := filepath.Join(t.TempDir(), health.FileName)
 	a, b := health.NewTracker("a"), health.NewTracker("b")
 	reaped := &health.Reaper{At: time.Unix(5, 0).UTC(), Instances: []string{"i-1"}}
-	stop := publishHealth(path, []*health.Tracker{a, b}, func() *health.Reaper { return reaped }, slog.New(slog.DiscardHandler))
+	stop := publishHealth(path, []*health.Tracker{a, b}, func(f *health.File) { f.Reaper = reaped }, slog.New(slog.DiscardHandler))
 	f, err := health.Read(path)
 	if err != nil || len(f.Tiers) != 2 || f.PID != os.Getpid() {
 		t.Fatalf("initial file = %+v, %v", f, err)

@@ -8,6 +8,21 @@ import (
 	"time"
 )
 
+func TestTrackerCountsFallbacks(t *testing.T) {
+	tr := NewTracker("a")
+	tr.FellBack("market")
+	tr.FellBack("market")
+	tr.FellBack("type")
+	snap := tr.Snapshot()
+	if got := snap.Fallbacks; got["market"] != 2 || got["type"] != 1 || len(got) != 2 {
+		t.Fatalf("fallbacks = %v, want market 2, type 1", got)
+	}
+	tr.FellBack("subnet") // a snapshot is a copy, safe to read meanwhile
+	if _, ok := snap.Fallbacks["subnet"]; ok {
+		t.Fatal("a snapshot shares its fallbacks map with the tracker")
+	}
+}
+
 func TestTrackerTransitions(t *testing.T) {
 	now := time.Unix(1000, 0)
 	tr := NewTracker("a")

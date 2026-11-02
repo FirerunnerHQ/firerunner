@@ -385,8 +385,9 @@ func TestPool_WarmFailureBacksOff(t *testing.T) {
 	h.f.mu.Lock()
 	attempts := len(h.f.attempts)
 	h.f.mu.Unlock()
-	if attempts != 1 {
-		t.Fatalf("%d RunInstances attempts in 60ms after a quota error, want 1 (backoff)", attempts)
+	// One walk: each type once, since a quota covers every subnet.
+	if attempts != 2 {
+		t.Fatalf("%d RunInstances attempts in 60ms after a quota error, want 2, one walk (backoff)", attempts)
 	}
 }
 
