@@ -340,6 +340,14 @@ func TestLocalCopiesTrimmedButStillServedFromStore(t *testing.T) {
 	if code, body := getBody(t, downloadURL(t, ts.URL, "a")); code != http.StatusOK || len(body) != 16 {
 		t.Fatalf("trimmed entry GET = %d len %d, want it from the store", code, len(body))
 	}
+	// That restore fills a local copy of a in the background, possibly only
+	// once the response is read; let it land before the test's directory goes.
+	waitUntil(t, "the local copy of a", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		_, ok := s.local[1]
+		return ok && len(s.filling) == 0
+	})
 }
 
 func TestBlobMissingFromStoreDropsTheEntry(t *testing.T) {

@@ -893,9 +893,25 @@ firerunner cache-server --dir /var/lib/firerunner/cache \
   when a disk-mode `--dir` is switched to S3, answers its restore with 404 and
   drops the entry, so the job misses and the next save of that key succeeds.
 - **Credentials and region** come from the default AWS chain, for example an
-  instance profile. The profile needs object read, write and delete on the
-  prefix, plus `s3:ListBucket` scoped to it. Without `ListBucket`, a missing
-  index reads as 403 rather than 404, and startup fails.
+  instance profile. Without `--s3-region` or `AWS_REGION`, the region comes
+  from instance metadata. The policy below is the least the server needs
+  (`my-ci-cache` and `firerunner-cache/` stand for your bucket and prefix):
+
+  ```json
+  {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow",
+     "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+     "Resource": "arn:aws:s3:::my-ci-cache/firerunner-cache/*"},
+    {"Effect": "Allow", "Action": "s3:ListBucket",
+     "Resource": "arn:aws:s3:::my-ci-cache",
+     "Condition": {"StringLike": {"s3:prefix": ["firerunner-cache/*"]}}}
+  ]}
+  ```
+
+  `s3:ListBucket` is what lets S3 answer 404 for a missing key: without it, or
+  with its condition on a prefix that does not cover `--s3-prefix`, the
+  missing index of a new prefix reads as 403 and startup fails with `load
+  cache index from store: … not authorized to perform: s3:ListBucket`.
 - **One live server per prefix.** Entry ids are allocated by the server, so two
   live servers on one prefix would overwrite each other's blobs.
 - **When S3 fails.** Uploads and downloads answer 507. The toolkit does not
