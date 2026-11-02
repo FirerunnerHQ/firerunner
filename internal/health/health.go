@@ -66,6 +66,10 @@ type Tier struct {
 	// Launches counts EC2 launches by path: "pool", "cold", or "kept" (a
 	// cold launch that left the pool for jobs ec2.pool_for names).
 	Launches map[string]int `json:"launches,omitempty"`
+	// Fallbacks counts EC2 instances placed elsewhere than the tier's first
+	// choice, by the first thing that differed: "market" (on-demand for a
+	// spot-then-on-demand tier), "type" or "subnet".
+	Fallbacks map[string]int `json:"fallbacks,omitempty"`
 }
 
 // Pending is a tier's assigned-but-not-started jobs.
@@ -198,6 +202,17 @@ func (tr *Tracker) Launched(path string) {
 	tr.t.Launches[path]++
 }
 
+// FellBack counts an EC2 instance placed elsewhere than the tier's first
+// choice.
+func (tr *Tracker) FellBack(kind string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.t.Fallbacks == nil {
+		tr.t.Fallbacks = map[string]int{}
+	}
+	tr.t.Fallbacks[kind]++
+}
+
 // OfflineRemoved counts an untracked offline runner removed.
 func (tr *Tracker) OfflineRemoved() {
 	tr.mu.Lock()
@@ -241,6 +256,7 @@ func (tr *Tracker) Snapshot() Tier {
 		t.Pending = &p
 	}
 	t.Launches = maps.Clone(t.Launches)
+	t.Fallbacks = maps.Clone(t.Fallbacks)
 	return t
 }
 
@@ -258,6 +274,22 @@ type File struct {
 	Tiers     []Tier    `json:"tiers"`
 	// Reaper is the EC2 reaper's latest sweep, when one runs.
 	Reaper *Reaper `json:"reaper,omitempty"`
+	// EC2Breakers are the EC2 launch options backing off after a refusal,
+	// shared by every EC2 tier; launches try them last.
+	EC2Breakers []Breaker `json:"ec2_breakers,omitempty"`
+}
+
+// Breaker is one EC2 launch option backing off.
+type Breaker struct {
+	Market string `json:"market"`
+	Type   string `json:"type"`
+	// Subnet is empty for a vCPU quota, which covers every subnet.
+	Subnet string `json:"subnet,omitempty"`
+	// Reason is the error code of the latest refusal.
+	Reason   string    `json:"reason"`
+	Failures int       `json:"failures"`
+	Since    time.Time `json:"since"`
+	Until    time.Time `json:"until"`
 }
 
 // Reaper is what the EC2 reaper's latest sweep did.

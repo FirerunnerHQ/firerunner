@@ -410,6 +410,10 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				fmt.Fprintf(w, "  %s launches: %d from the pool, %d cold, %d cold with the pool kept\n",
 					t.Name, t.Launches["pool"], t.Launches["cold"], t.Launches["kept"])
 			}
+			if len(t.Fallbacks) > 0 {
+				fmt.Fprintf(w, "  %s placed off its first choice: %d on on-demand, %d on a later type, %d in a later subnet\n",
+					t.Name, t.Fallbacks["market"], t.Fallbacks["type"], t.Fallbacks["subnet"])
+			}
 			if t.OfflineWouldRemove > 0 {
 				fmt.Fprintf(w, "  %s runner sweep (dry run): would remove %d offline runner(s)\n", t.Name, t.OfflineWouldRemove)
 			}
@@ -426,6 +430,17 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				humanDuration(time.Since(rp.At).Truncate(time.Second)), mode, len(rp.Instances), len(rp.SpotRequests), len(rp.Busy), len(rp.Young))
 			if rp.Error != "" {
 				fmt.Fprintf(w, "  error: %s\n", truncate(rp.Error, 200))
+			}
+		}
+		if len(l.EC2Breakers) > 0 {
+			fmt.Fprintf(w, "\nEC2 launch options backing off (launches try them last):\n")
+			for _, b := range l.EC2Breakers {
+				where := "every subnet (quota)"
+				if b.Subnet != "" {
+					where = b.Subnet
+				}
+				fmt.Fprintf(w, "  %s %s in %s: %s, %d refusal(s) in a row, retried first again in %s\n",
+					b.Market, b.Type, where, b.Reason, b.Failures, humanDuration(time.Until(b.Until).Truncate(time.Second)))
 			}
 		}
 	}

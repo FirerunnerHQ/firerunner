@@ -560,20 +560,33 @@ func tierNames(tiers []config.Tier) []string {
 	return names
 }
 
+// healthBreakers converts the EC2 launch options backing off for the health
+// file.
+func healthBreakers(bs []ec2.Breaker) []health.Breaker {
+	var out []health.Breaker
+	for _, b := range bs {
+		out = append(out, health.Breaker{
+			Market: b.Market, Type: b.Type, Subnet: b.Subnet, Reason: b.Reason,
+			Failures: b.Failures, Since: b.Since.UTC(), Until: b.Until.UTC(),
+		})
+	}
+	return out
+}
+
 // healthInterval is how often the listener health file is rewritten.
 const healthInterval = 10 * time.Second
 
-// publishHealth writes the trackers' state, and the reaper's when reaper is
-// non-nil, to path now and every healthInterval until the returned func is
-// called, which writes it once more.
-func publishHealth(path string, trackers []*health.Tracker, reaper func() *health.Reaper, log *slog.Logger) func() {
+// publishHealth writes the trackers' state, with whatever fill adds (the
+// reaper's, the EC2 breakers) when fill is non-nil, to path now and every
+// healthInterval until the returned func is called, which writes it once more.
+func publishHealth(path string, trackers []*health.Tracker, fill func(*health.File), log *slog.Logger) func() {
 	write := func() {
 		f := health.File{PID: os.Getpid(), WrittenAt: time.Now().UTC()}
 		for _, tr := range trackers {
 			f.Tiers = append(f.Tiers, tr.Snapshot())
 		}
-		if reaper != nil {
-			f.Reaper = reaper()
+		if fill != nil {
+			fill(&f)
 		}
 		if err := health.Write(path, f); err != nil {
 			log.Warn("write listener health", "path", path, "err", err)
@@ -741,6 +754,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				MaxLifetime: cfg.Firecracker.MaxVMLifetime,
 				UsePool:     tierJobs[t.Name].ClaimPool,
 				Launched:    tierHealth[t.Name].Launched,
+				FellBack:    tierHealth[t.Name].FellBack,
 				Logger:      log.With("tier", t.Name),
 			})
 			// A tier's stopped pool fills and refills in the background for
@@ -865,7 +879,14 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	// Publish each tier's listener health for status and doctor.
 	healthPath := filepath.Join(cfg.Firecracker.WorkDir, health.FileName)
-	stopHealth := publishHealth(healthPath, trackers, reaperState, log)
+	stopHealth := publishHealth(healthPath, trackers, func(f *health.File) {
+		if reaperState != nil {
+			f.Reaper = reaperState()
+		}
+		if ec2Client != nil {
+			f.EC2Breakers = healthBreakers(ec2Client.Breakers())
+		}
+	}, log)
 
 	// Drive every tier's listener concurrently. A listener reconnects its own
 	// session; one that stops on a fatal error leaves the other tiers running.

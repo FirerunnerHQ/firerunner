@@ -517,8 +517,20 @@ No instance is terminated while its spot request may still be open.
 
 When a type has no capacity in a subnet, firerunner tries the next subnet, then
 the next type: `InsufficientInstanceCapacity`, `Unsupported` and
-`InsufficientFreeAddressesInSubnet` all move on. Any other error (a quota,
-permissions) fails the launch, and the scheduler backs off.
+`InsufficientFreeAddressesInSubnet` all move on. A used-up vCPU quota
+(`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`,
+`InstanceLimitExceeded`) covers the whole region, so it skips the type's
+other subnets and moves on to the next type, then to on-demand for a
+`spot-then-on-demand` tier. Any other error, such as permissions, fails the
+launch, and the scheduler backs off.
+
+An option EC2 refused backs off, for every tier, for 30 s, doubling with each
+refusal in a row up to 10 min, until a launch on it succeeds. Launches try
+backing-off options after all the others rather than not at all, so a
+backoff never fails a job by itself. `firerunner status` lists them under
+"EC2 launch options backing off" (`ec2_breakers` in `--json`). Each tier's
+instances placed off its first choice are counted by what differed: market,
+type or subnet (`fallbacks`).
 
 **Flags:**
 
