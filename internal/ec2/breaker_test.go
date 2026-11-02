@@ -17,6 +17,9 @@ func TestBreakers_BackOffDoublesToTheCapAndSuccessCloses(t *testing.T) {
 	b.now = func() time.Time { return now }
 	o := option{"spot", "c8a.xlarge", "subnet-a"}
 	for i, want := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 10 * time.Minute, 10 * time.Minute, 10 * time.Minute} {
+		if i > 0 {
+			now = b.open[o].until // refused again once the last backoff ended
+		}
 		b.fail(o, "InsufficientInstanceCapacity")
 		if got := b.open[o].until.Sub(now); got != want {
 			t.Fatalf("refusal %d: backs off %v, want %v", i+1, got, want)
@@ -33,6 +36,51 @@ func TestBreakers_BackOffDoublesToTheCapAndSuccessCloses(t *testing.T) {
 	b.fail(o, "InsufficientInstanceCapacity")
 	if got := b.open[o].until.Sub(now); got != breakerBase {
 		t.Fatalf("after a success the next refusal backs off %v, want %v", got, breakerBase)
+	}
+}
+
+func TestBreakers_ConcurrentRefusalsCountOnce(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	b := newBreakers()
+	b.now = func() time.Time { return now }
+	o := option{"spot", "c8a.xlarge", "subnet-a"}
+	for range 6 { // six launches chose o before it opened
+		b.fail(o, "InsufficientInstanceCapacity")
+	}
+	if t0 := b.open[o]; t0.failures != 1 || t0.until.Sub(now) != breakerBase {
+		t.Fatalf("after one burst: %d failures, backoff %v; want 1, %v", t0.failures, t0.until.Sub(now), breakerBase)
+	}
+}
+
+func TestBreakers_QuietOptionStartsOver(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	b := newBreakers()
+	b.now = func() time.Time { return now }
+	o := option{"spot", "c8a.xlarge", "subnet-a"}
+	for range 6 {
+		b.fail(o, "InsufficientInstanceCapacity")
+		now = b.open[o].until // each refusal after the last backoff ended
+	}
+	now = now.Add(7 * 24 * time.Hour) // never tried again: nothing closed it
+	b.fail(o, "InsufficientInstanceCapacity")
+	if got := b.open[o].until.Sub(now); got != breakerBase {
+		t.Fatalf("a refusal a week later backs off %v, want %v", got, breakerBase)
+	}
+	if !b.open[o].since.Equal(now) {
+		t.Fatalf("since = %v, want the new refusal", b.open[o].since)
+	}
+}
+
+func TestLaunch_BackingOffSpotStillComesBeforeOnDemand(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.EC2.Market = config.MarketSpotThenOnDemand })
+	for _, s := range []string{"subnet-a", "subnet-b"} {
+		for _, it := range []string{"c8a.xlarge", "c7a.xlarge"} {
+			h.p.c.breakers.fail(option{"spot", it, s}, "InsufficientInstanceCapacity")
+		}
+	}
+	launchOnce(t, h, "runner-1") // spot has capacity again
+	if got := h.f.attemptLog(); got != "c8a.xlarge/subnet-a/spot" {
+		t.Fatalf("attempts = %s, want spot first though every spot option backs off", got)
 	}
 }
 

@@ -479,8 +479,9 @@ const (
 // returns the first instance EC2 accepts. A capacity error moves on to the
 // next subnet, a quota error to the next type or market (the quota is
 // regional); any other error ends the walk. Options EC2 refused lately (see
-// breakers) go to the end of the walk rather than out of it, so a launch
-// still takes one when nothing else works.
+// breakers) go to the end of their market rather than out of the walk: spot
+// still comes before on-demand, since a refused call costs only time and an
+// on-demand job costs more for its whole run.
 func (p *Provisioner) run(ctx context.Context, name string, img image, kind launchKind) (types.Instance, error) {
 	var markets []string
 	switch p.o.EC2.Market {
@@ -491,26 +492,30 @@ func (p *Provisioner) run(ctx context.Context, name string, img image, kind laun
 	default: // spot-then-on-demand
 		markets = []string{config.MarketSpot, config.MarketOnDemand}
 	}
-	var ready, backingOff []option
+	var walk []option
+	backingOff := 0
 	for _, market := range markets {
+		var ready, later []option
 		for _, itype := range p.o.EC2.InstanceTypes {
 			for _, subnet := range p.o.EC2.Subnets {
 				o := option{market, itype, subnet}
 				if p.c.breakers.blocked(o) {
-					backingOff = append(backingOff, o)
+					later = append(later, o)
 				} else {
 					ready = append(ready, o)
 				}
 			}
 		}
+		backingOff += len(later)
+		walk = append(append(walk, ready...), later...)
 	}
 	firstChoice := option{markets[0], p.o.EC2.InstanceTypes[0], p.o.EC2.Subnets[0]}
-	if len(backingOff) > 0 {
-		p.log.Info("launch options backing off; trying them last", "runner", name, "backingOff", len(backingOff), "of", len(ready)+len(backingOff))
+	if backingOff > 0 {
+		p.log.Info("launch options backing off; trying them last in their market", "runner", name, "backingOff", backingOff, "of", len(walk))
 	}
 	overQuota := map[option]bool{} // market and type, this walk
 	var last error
-	for _, o := range append(ready, backingOff...) {
+	for _, o := range walk {
 		if overQuota[option{o.market, o.itype, ""}] {
 			continue
 		}

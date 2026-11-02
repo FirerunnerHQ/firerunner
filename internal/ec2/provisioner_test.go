@@ -334,7 +334,7 @@ func TestLaunch_SpotQuotaFallsBackToOnDemand(t *testing.T) {
 	}
 }
 
-func TestLaunch_OnDemandQuotaTriesTheNextFamily(t *testing.T) {
+func TestLaunch_OnDemandQuotaTriesTheNextType(t *testing.T) {
 	var fellBack []string
 	h := newHarness(t, func(o *Options) { o.FellBack = func(kind string) { fellBack = append(fellBack, kind) } })
 	h.f.runErrs["c8a.xlarge/*/on-demand"] = apiErr("VcpuLimitExceeded")

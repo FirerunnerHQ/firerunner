@@ -6,12 +6,14 @@ import (
 	"time"
 )
 
-// quotaCodes are RunInstances errors that mean the account's vCPU quota for
-// the type's family is used up in that market. The quota is regional, so no
-// other subnet helps, but another market or family may.
+// quotaCodes are RunInstances errors that mean the account's vCPU quota is
+// used up in that market for the type's quota group (one covers every
+// Standard type: A, C, D, H, I, M, R, T, Z). The quota is regional, so no
+// other subnet helps. Another market may, as may a type in another group or a
+// smaller type that fits the vCPUs left, so the walk goes on by type.
 var quotaCodes = []string{
-	"MaxSpotInstanceCountExceeded", // spot vCPU quota for the family
-	"VcpuLimitExceeded",            // on-demand vCPU quota for the family
+	"MaxSpotInstanceCountExceeded", // spot vCPU quota for the group
+	"VcpuLimitExceeded",            // on-demand vCPU quota for the group
 	"InstanceLimitExceeded",        // the older per-type instance count limit
 }
 
@@ -24,11 +26,13 @@ func isQuotaErr(err error) bool {
 	return false
 }
 
-// Breaker backoff: a refused option is skipped for breakerBase, doubling with
-// each consecutive refusal up to breakerMax.
+// Breaker backoff: a refused option goes last for breakerBase, doubling with
+// each refusal after a backoff ended, up to breakerMax. An option quiet for
+// breakerQuiet past its backoff starts over.
 const (
-	breakerBase = 30 * time.Second
-	breakerMax  = 10 * time.Minute
+	breakerBase  = 30 * time.Second
+	breakerMax   = 10 * time.Minute
+	breakerQuiet = 30 * time.Minute
 )
 
 // option is one launch choice. An empty subnet stands for every subnet: a
@@ -72,13 +76,19 @@ func (b *breakers) blocked(o option) bool {
 	return false
 }
 
-// fail records a refusal of o and backs it off.
+// fail records a refusal of o and backs it off. Refusals while it backs off
+// (concurrent launches that chose it before it opened) do not count again:
+// one capacity event is one refusal, however many jobs met it.
 func (b *breakers) fail(o option, reason string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now()
 	t := b.open[o]
-	if t == nil {
+	if t != nil && now.Before(t.until) {
+		t.reason = reason
+		return
+	}
+	if t == nil || now.After(t.until.Add(breakerQuiet)) {
 		t = &trip{since: now}
 		b.open[o] = t
 	}
