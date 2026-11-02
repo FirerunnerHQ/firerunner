@@ -90,9 +90,13 @@ import (
 // Scripted per test, not enforced: capacity and quota errors (runErrs),
 // throttling and other failures (cancelErrs, describeErr, terminateErr,
 // startErr, tagErr), a stale read right after a start (startStaysStopped), and
-// a RunInstances response without the private IP (noIPInRun).
+// a RunInstances response without the private IP (noIPInRun), and a state
+// change's StateReason code (setStateFor), such as a spot interruption's.
+// A reason stays until the next setStateFor, also across a start: whether
+// AWS clears it then is unchecked, so firerunner must not rely on either.
 //
-// Not modelled, so no test may rely on it: a spot interruption; the
+// Not modelled, so no test may rely on it: the rebalance recommendation and
+// two-minute warning before a spot interruption; the
 // replacement a persistent request launches (R10 fails the test instead); a
 // cap on IDs per DescribeInstances call (the watcher batches 100 on its own;
 // on 2026-10-23 a call accepted 5000 copies of one ID, so a cap on distinct
@@ -588,7 +592,6 @@ func (f *fakeEC2) DescribeImages(_ context.Context, in *ec2.DescribeImagesInput,
 	return &ec2.DescribeImagesOutput{Images: out}, nil
 }
 
-// setState moves an instance to state, as the guest or AWS would.
 // setStateFor moves an instance to state for the reason AWS gives, e.g.
 // Server.SpotInstanceTermination.
 func (f *fakeEC2) setStateFor(id string, state types.InstanceStateName, reason string) {
@@ -598,6 +601,7 @@ func (f *fakeEC2) setStateFor(id string, state types.InstanceStateName, reason s
 	f.mu.Unlock()
 }
 
+// setState moves an instance to state, as the guest or AWS would.
 func (f *fakeEC2) setState(id string, state types.InstanceStateName) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

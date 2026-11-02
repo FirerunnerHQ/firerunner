@@ -362,7 +362,8 @@ var spotInterruptionCodes = []string{"Server.SpotInstanceTermination", "Server.S
 // instance's option goes to the end of its market for a while (see
 // breakers), since AWS wants that capacity back.
 func (w *waiter) spotInterrupted(ip netip.Addr, s instanceState) {
-	duringJob := ip.IsValid() && !w.p.o.JIT.Report(ip).Job.IsZero()
+	r := w.p.o.JIT.Report(ip)
+	duringJob := ip.IsValid() && !r.Job.IsZero() && r.Exited.IsZero()
 	w.log.Warn("spot instance interrupted", "reason", s.reason, "state", s.name, "type", w.itype, "subnet", w.subnet, "az", w.az, "duringJob", duringJob)
 	if duringJob {
 		w.log.Warn("the runner's job fails at GitHub; re-run it from the run's page (Re-run failed jobs)")
@@ -373,6 +374,18 @@ func (w *waiter) spotInterrupted(ip netip.Addr, s instanceState) {
 	if w.p.o.Interrupted != nil {
 		w.p.o.Interrupted(duringJob)
 	}
+}
+
+// endingState reports a stop or termination: the only states whose reason
+// says why the instance ended. A pending or running read can carry a reason
+// left from an earlier stop.
+func endingState(s types.InstanceStateName) bool {
+	switch s {
+	case types.InstanceStateNameStopping, types.InstanceStateNameStopped,
+		types.InstanceStateNameShuttingDown, types.InstanceStateNameTerminated:
+		return true
+	}
+	return false
 }
 
 func placementAZ(i types.Instance) string {
@@ -400,7 +413,7 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			done = nil // terminate once; keep waiting for it to take effect
 			w.terminate(context.WithoutCancel(ctx), "runner removed while idle")
 		case s := <-w.states:
-			if !w.terminating && !w.awaitStart && !w.interrupted && slices.Contains(spotInterruptionCodes, s.reason) {
+			if !w.terminating && !w.awaitStart && !w.interrupted && endingState(s.name) && slices.Contains(spotInterruptionCodes, s.reason) {
 				w.interrupted = true
 				w.spotInterrupted(ip, s)
 			}

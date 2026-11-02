@@ -11,6 +11,20 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/config"
 )
 
+// polledAlone counts the DescribeInstances calls for id alone: the
+// watcher's polls of that one instance, not the pool's own listings.
+func (f *fakeEC2) polledAlone(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, ids := range f.describeIDs {
+		if len(ids) == 1 && ids[0] == id {
+			n++
+		}
+	}
+	return n
+}
+
 // interruptions records what Options.Interrupted is told.
 type interruptions struct {
 	mu        sync.Mutex
@@ -112,14 +126,8 @@ func TestLaunch_PooledSpotInterruptionStops(t *testing.T) {
 	h.f.setState(pooledID, types.InstanceStateNameRunning)
 	// Let the waiter see it running, so a stop is no longer the one from
 	// before the start.
-	h.f.mu.Lock()
-	n := h.f.describeCalls
-	h.f.mu.Unlock()
-	eventually(t, "polls of the running instance", func() bool {
-		h.f.mu.Lock()
-		defer h.f.mu.Unlock()
-		return h.f.describeCalls >= n+3
-	})
+	n := h.f.polledAlone(pooledID)
+	eventually(t, "polls of the running instance", func() bool { return h.f.polledAlone(pooledID) >= n+2 })
 	h.f.setStateFor(pooledID, types.InstanceStateNameStopped, "Server.SpotInstanceShutdown")
 	eventually(t, "the stopped instance terminated", func() bool {
 		for _, id := range h.f.terminatedIDs() {
@@ -153,14 +161,9 @@ func TestLaunch_PooledStaleInterruptionIgnored(t *testing.T) {
 	h.f.mu.Lock()
 	h.f.instances[pooledID].stateReason = "Server.SpotInstanceShutdown"
 	h.f.startStaysStopped = true // the first reads after the start are stale
-	n := h.f.describeCalls
 	h.f.mu.Unlock()
 	errc := h.launch(context.Background())
-	eventually(t, "stale stopped reads after the start", func() bool {
-		h.f.mu.Lock()
-		defer h.f.mu.Unlock()
-		return len(h.f.started) == 1 && h.f.describeCalls >= n+3
-	})
+	eventually(t, "stale stopped reads after the start", func() bool { return h.f.polledAlone(pooledID) >= 2 })
 	in := h.f.instance(pooledID)
 	if code, _ := h.fetch(in.ip); code != http.StatusOK {
 		t.Fatalf("fetch = %d", code)
@@ -171,5 +174,60 @@ func TestLaunch_PooledStaleInterruptionIgnored(t *testing.T) {
 	}
 	if got := seen.got(); len(got) != 0 {
 		t.Fatalf("interruptions reported = %v, want none: the stop predates this job", got)
+	}
+}
+
+// TestLaunch_StaleReasonWhileRunningIgnored: a running pool instance may
+// still carry the reason of an interruption during its warm-up; only a stop
+// or termination's reason says why it ends.
+func TestLaunch_StaleReasonWhileRunningIgnored(t *testing.T) {
+	var seen interruptions
+	h := readyPool(t, 1)
+	h.p.o.Interrupted = seen.record
+	pooledID := h.f.launched()[0].id
+	h.f.mu.Lock()
+	h.f.instances[pooledID].stateReason = "Server.SpotInstanceShutdown"
+	h.f.mu.Unlock()
+	errc := h.launch(context.Background())
+	eventually(t, "the pooled instance to start", func() bool {
+		h.f.mu.Lock()
+		defer h.f.mu.Unlock()
+		return len(h.f.started) == 1
+	})
+	h.f.setState(pooledID, types.InstanceStateNameRunning) // the reason stays
+	n := h.f.polledAlone(pooledID)
+	eventually(t, "polls of the running instance", func() bool { return h.f.polledAlone(pooledID) >= n+2 })
+	h.f.setStateFor(pooledID, types.InstanceStateNameShuttingDown, "Client.InstanceInitiatedShutdown")
+	if err := waitErr(t, errc); err != nil {
+		t.Fatalf("Launch = %v", err)
+	}
+	if got := seen.got(); len(got) != 0 {
+		t.Fatalf("interruptions reported = %v, want none for a stale reason on a running instance", got)
+	}
+}
+
+// TestLaunch_InterruptionAfterTheJobEnded: a runner that reported its exit
+// had finished its job; an interruption before the instance is seen going
+// is not one during a job.
+func TestLaunch_InterruptionAfterTheJobEnded(t *testing.T) {
+	var seen interruptions
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Market = config.MarketSpot
+		o.Interrupted = seen.record
+	})
+	errc := h.launch(context.Background())
+	inst := h.instance(t)
+	if code, _ := h.fetch(inst.ip); code != http.StatusOK {
+		t.Fatalf("fetch = %d", code)
+	}
+	for _, q := range []string{"phase=listening", "phase=job", "phase=exited&rc=0"} {
+		h.report(t, inst.ip, q)
+	}
+	h.f.setStateFor(inst.id, types.InstanceStateNameShuttingDown, "Server.SpotInstanceTermination")
+	if err := waitErr(t, errc); err != nil {
+		t.Fatalf("Launch = %v", err)
+	}
+	if got := seen.got(); len(got) != 1 || got[0] {
+		t.Fatalf("interruptions reported = %v, want [false]: the job had ended", got)
 	}
 }
