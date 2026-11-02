@@ -224,8 +224,9 @@ func (s *Server) openLocal(id uint64) (*os.File, error) {
 }
 
 // fillLocal fetches a completed blob from the store into a local copy in the
-// background, once at a time per blob and at most localCap bytes in all, so
-// the next restore reads from disk.
+// background, once at a time per blob and with at most localCap bytes in
+// flight (on top of the copies' own localCap), so the next restore reads from
+// disk.
 func (s *Server) fillLocal(e *Entry) {
 	s.mu.Lock()
 	if s.localCap <= 0 || e.Size <= 0 || e.Size > s.localCap || s.filling[e.ID] || s.entries[e.ID] != e {
