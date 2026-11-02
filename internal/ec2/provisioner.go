@@ -416,7 +416,8 @@ func (w *waiter) interruption(ctx context.Context, s instanceState) string {
 func (w *waiter) spotInterrupted(ip netip.Addr, s instanceState, why string) {
 	r := w.p.o.JIT.Report(ip)
 	duringJob := ip.IsValid() && !r.Job.IsZero() && r.Exited.IsZero()
-	w.log.Warn("spot instance interrupted", "reason", why, "state", s.name, "type", w.itype, "subnet", w.subnet, "az", w.az, "duringJob", duringJob)
+	// The waiter's logger already names the runner, instance, type and subnet.
+	w.log.Warn("spot instance interrupted", "reason", why, "state", s.name, "az", w.az, "duringJob", duringJob)
 	if duringJob {
 		w.log.Warn("the runner's job fails at GitHub; re-run it from the run's page (Re-run failed jobs)")
 	}
