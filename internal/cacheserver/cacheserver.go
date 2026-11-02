@@ -130,9 +130,10 @@ type Server struct {
 
 	// With a store, local copies of completed blobs serve restores at disk speed;
 	// the store stays the durable tier. localCap 0 keeps no copies.
-	localCap int64
-	local    map[uint64]int64 // local copies by size
-	filling  map[uint64]bool  // copies being fetched from the store
+	localCap  int64
+	local     map[uint64]int64 // local copies by size
+	filling   map[uint64]bool  // copies being fetched from the store
+	fillBytes int64            // their total size
 
 	// counters (under mu) for observability via /stats and /metrics.
 	hits      uint64

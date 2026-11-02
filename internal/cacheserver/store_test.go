@@ -23,6 +23,7 @@ type memStore struct {
 	index   []byte
 	failPut bool
 	failGet bool
+	getGate chan struct{} // when set, Get waits for it to close
 }
 
 func newMemStore() *memStore { return &memStore{blobs: map[uint64][]byte{}} }
@@ -42,6 +43,9 @@ func (m *memStore) Put(_ context.Context, id uint64, path string) error {
 }
 
 func (m *memStore) Get(_ context.Context, id uint64, offset, length int64) (io.ReadCloser, error) {
+	if m.getGate != nil {
+		<-m.getGate
+	}
 	if m.failGet {
 		return nil, errors.New("store down")
 	}
@@ -270,19 +274,12 @@ func TestFreshServerFillsLocalCopyFromStore(t *testing.T) {
 	if code, body := getBody(t, url); code != http.StatusOK || len(body) != 64 {
 		t.Fatalf("first GET = %d len %d", code, len(body))
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
+	waitUntil(t, "a local copy filled after a store read", func() bool {
 		fresh.mu.Lock()
+		defer fresh.mu.Unlock()
 		_, ok := fresh.local[1]
-		fresh.mu.Unlock()
-		if ok {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("no local copy filled after a store read")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return ok
+	})
 	store.failGet = true
 	if code, body := getBody(t, url); code != http.StatusOK || len(body) != 64 {
 		t.Fatalf("GET after fill with store down = %d len %d", code, len(body))
@@ -325,4 +322,50 @@ func TestBlobMissingFromStoreDropsTheEntry(t *testing.T) {
 		t.Fatalf("lost entry still found: %v", get)
 	}
 	saveEntry(t, ts.URL, "owner/pinned", "k", "v1", 8) // the key is free again
+}
+
+func TestLocalFillsInFlightStayWithinTheCap(t *testing.T) {
+	store := newMemStore()
+	first, ts := newStoreServer(t, store)
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		saveEntry(t, ts.URL, "owner/pinned", k, "v1", 80)
+	}
+	first.StartIndexSync()()
+
+	store.getGate = make(chan struct{})
+	fresh, _ := newStoreServer(t, store)
+	fresh.SetLocalCacheSize(100)
+	fresh.mu.Lock()
+	entries := make([]*Entry, 0, len(fresh.entries))
+	for _, e := range fresh.entries {
+		entries = append(entries, e)
+	}
+	fresh.mu.Unlock()
+	for _, e := range entries {
+		fresh.fillLocal(e) // as five restores would, each of a different entry
+	}
+	fresh.mu.Lock()
+	inFlight, bytes := len(fresh.filling), fresh.fillBytes
+	fresh.mu.Unlock()
+	close(store.getGate)
+	if inFlight != 1 || bytes != 80 {
+		t.Fatalf("fills in flight = %d (%d bytes), want 1 (80 bytes) under a 100-byte cap", inFlight, bytes)
+	}
+	waitUntil(t, "the fill to finish", func() bool {
+		fresh.mu.Lock()
+		defer fresh.mu.Unlock()
+		return len(fresh.filling) == 0 && fresh.fillBytes == 0
+	})
+}
+
+// waitUntil waits for cond, which background work makes true.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
