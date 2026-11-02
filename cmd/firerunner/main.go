@@ -218,7 +218,9 @@ func cacheServe(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	drained := make(chan struct{})
 	go func() {
+		defer close(drained)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
@@ -229,6 +231,9 @@ func cacheServe(args []string) error {
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
+	// ListenAndServe returns as Shutdown starts. Wait for the requests in
+	// flight, so the deferred index sync pushes the entries they finalize.
+	<-drained
 	log.Info("cache-server stopped")
 	return nil
 }
