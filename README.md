@@ -537,9 +537,9 @@ type or subnet (`fallbacks`).
 
 **Spot interruptions.** When AWS takes a spot instance back under its runner
 (state reason `Server.SpotInstanceTermination`, or `Server.SpotInstanceShutdown`
-for a pool instance, which stops; or, for any other ending firerunner did not
-start, a spot request status such as `instance-terminated-no-capacity` or, for
-an AWS FIS experiment, `instance-terminated-by-experiment`), firerunner logs "spot instance interrupted"
+for a pool instance, which stops; or, for a cold instance's ending firerunner
+did not start, a spot request status such as `instance-terminated-no-capacity`
+or, for an AWS FIS experiment, `instance-terminated-by-experiment`), firerunner logs "spot instance interrupted"
 with the runner, type, subnet, AZ and whether its job had started. It counts
 each one per tier (`interruptions` in `status --json`: `job` or `idle`), and
 backs that spot option off like a refusal. It is not a runner failure, so the

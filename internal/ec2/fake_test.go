@@ -351,9 +351,11 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 		i := f.instances[id]
 		req := i.spotReq
 		if req == "" && i.spot && byInstance {
-			// A one-time instance's request, closed with it: listed only by
-			// instance-id, the one query that needs it, so the persistent
-			// requests every other listing is about stay alone there.
+			// A one-time instance's request. Real AWS lists it in every
+			// query (active while the instance runs, then closed); the fake
+			// lists it only by instance-id, so the other listings, all about
+			// persistent requests, keep their tests' expectations. See the
+			// reaper issue #131, which can see active ones.
 			req = "sir-once-" + id
 		}
 		if req == "" {

@@ -285,3 +285,30 @@ func TestInterruptionStatus(t *testing.T) {
 		}
 	}
 }
+
+// TestLaunch_NoRequestReadAfterAReportedExit: a runner that reported its exit
+// powers its instance off itself; that end costs no DescribeSpotInstanceRequests
+// call, and a stale interruption status is not read.
+func TestLaunch_NoRequestReadAfterAReportedExit(t *testing.T) {
+	var seen interruptions
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Market = config.MarketSpot
+		o.Interrupted = seen.record
+	})
+	errc := h.launch(context.Background())
+	inst := h.instance(t)
+	if code, _ := h.fetch(inst.ip); code != http.StatusOK {
+		t.Fatalf("fetch = %d", code)
+	}
+	h.report(t, inst.ip, "phase=exited&rc=0")
+	h.f.mu.Lock()
+	h.f.instances[inst.id].spotStatus = "instance-terminated-by-experiment" // would count if read
+	h.f.mu.Unlock()
+	h.f.setStateFor(inst.id, types.InstanceStateNameShuttingDown, "Client.InstanceInitiatedShutdown")
+	if err := waitErr(t, errc); err != nil {
+		t.Fatalf("Launch = %v", err)
+	}
+	if got := seen.got(); len(got) != 0 {
+		t.Fatalf("interruptions reported = %v, want none: the spot request was not to be read", got)
+	}
+}

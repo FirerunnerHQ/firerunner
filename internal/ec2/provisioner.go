@@ -382,12 +382,16 @@ func interruptionStatus(code string) bool {
 
 // interruption returns why a spot instance that is ending was taken back by
 // AWS, or "" when it was not: the state reason, else (asked once) its spot
-// request's status code.
-func (w *waiter) interruption(ctx context.Context, s instanceState) string {
+// request's status code. That fallback is proven for one-time requests only:
+// a pool instance's persistent request is cancelled once it starts, and
+// whether AWS still updates a cancelled request's status is unchecked. An
+// end after the runner reported its exit is its own power-off, so it is not
+// asked about.
+func (w *waiter) interruption(ctx context.Context, ip netip.Addr, s instanceState) string {
 	if slices.Contains(spotInterruptionCodes, s.reason) {
 		return s.reason
 	}
-	if !w.spot || w.checkedRequest {
+	if !w.spot || w.checkedRequest || (ip.IsValid() && !w.p.o.JIT.Report(ip).Exited.IsZero()) {
 		return ""
 	}
 	w.checkedRequest = true
@@ -467,7 +471,7 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			w.terminate(context.WithoutCancel(ctx), "runner removed while idle")
 		case s := <-w.states:
 			if !w.terminating && !w.awaitStart && !w.interrupted && endingState(s.name) {
-				if why := w.interruption(ctx, s); why != "" {
+				if why := w.interruption(ctx, ip, s); why != "" {
 					w.interrupted = true
 					w.spotInterrupted(ip, s, why)
 				}
