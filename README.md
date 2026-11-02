@@ -871,6 +871,36 @@ total over the cap, the least-recently-used entries are evicted until it fits
 firerunner cache-server --dir /var/lib/firerunner/cache --max-size 50GB
 ```
 
+**Keeping the cache in S3.** With `--s3-bucket`, completed blobs and the
+entry index live in S3 instead of `--dir`, which then only stages uploads:
+
+```bash
+firerunner cache-server --dir /var/lib/firerunner/cache \
+  --s3-bucket my-ci-cache --s3-prefix firerunner-cache/
+```
+
+- **Where data goes.** An assembled blob goes to S3 before its upload is
+  acknowledged. Index changes are pushed within a few seconds.
+- **Local copies.** The most recently used blobs stay in `--dir` up to
+  `--s3-local-cache-size` (default 20GB), and restores read them at disk speed.
+  A blob without a local copy streams its requested byte ranges from S3, and
+  the server fetches it into a local copy in the background for the next
+  restore. Dropping a local copy never loses data, because S3 keeps every
+  blob.
+- **Replacing the server.** A new cache-server whose local index is empty loads
+  the index from the bucket, so it serves everything its predecessor finalized.
+- **A blob missing from the bucket**, for example after a lifecycle rule or
+  when a disk-mode `--dir` is switched to S3, answers its restore with 404 and
+  drops the entry, so the job misses and the next save of that key succeeds.
+- **Credentials and region** come from the default AWS chain, for example an
+  instance profile. The profile needs object read, write and delete on the
+  prefix, plus `s3:ListBucket` scoped to it. Without `ListBucket`, a missing
+  index reads as 403 rather than 404, and startup fails.
+- **One live server per prefix.** Entry ids are allocated by the server, so two
+  live servers on one prefix would overwrite each other's blobs.
+- **When S3 fails.** Uploads and downloads answer 507. The toolkit does not
+  retry that status, so a job drops the cache and carries on.
+
 The server also exposes `GET /stats` (JSON: entry count, bytes, hits, misses,
 saves, evictions) and `GET /metrics` (Prometheus text, no client library
 needed) for scraping. `firerunner status` reads `/stats` and shows the live
