@@ -363,10 +363,7 @@ func TestReportRejectsBadRequests(t *testing.T) {
 // forgotten.
 func TestCacheBundleOnceAfterTheConfig(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.AttachCache(guest, []byte(`{"key":"k"}`)); err != nil {
+	if err := s.RegisterWithCache(guest, "runner-1", "secret", []byte(`{"key":"k"}`)); err != nil {
 		t.Fatal(err)
 	}
 	if code, _ := fetch(t, s, http.MethodGet, CachePath, from(guest)); code != http.StatusForbidden {
@@ -395,19 +392,16 @@ func TestCacheBundleOnceAfterTheConfig(t *testing.T) {
 
 func TestCacheBundleRules(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.AttachCache(guest, []byte("b")); err == nil {
-		t.Fatal("attached a bundle to no registration")
+	if err := s.RegisterWithCache(guest, "runner-1", "secret", nil); err == nil {
+		t.Fatal("registered with an empty bundle")
 	}
 	if err := s.Register(guest, "runner-1", "secret"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AttachCache(guest, nil); err == nil {
-		t.Fatal("attached an empty bundle")
+	if err := s.RegisterWithCache(guest, "runner-2", "secret", []byte("b")); err == nil {
+		t.Fatal("a second registration took the address")
 	}
 	fetch(t, s, http.MethodGet, Path, from(guest))
-	if err := s.AttachCache(guest, []byte("b")); err == nil {
-		t.Fatal("attached a bundle after the config was claimed")
-	}
 	// Without a bundle, a served instance just finds none.
 	if code, _ := fetch(t, s, http.MethodGet, CachePath, from(guest)); code != http.StatusNotFound {
 		t.Fatalf("no bundle = %d, want 404", code)
@@ -418,10 +412,7 @@ func TestCacheBundleDroppedWithAnExpiredConfig(t *testing.T) {
 	s := New(time.Minute, nil)
 	now := time.Unix(1_000_000, 0)
 	s.now = func() time.Time { return now }
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.AttachCache(guest, []byte("key")); err != nil {
+	if err := s.RegisterWithCache(guest, "runner-1", "secret", []byte("key")); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(2 * time.Minute)

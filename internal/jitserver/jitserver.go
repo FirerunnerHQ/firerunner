@@ -35,7 +35,7 @@ const Path = "/jit"
 // POST ?phase=<phase>, plus &rc=<status> for PhaseExited.
 const ReportPath = Path + "/report"
 
-// CachePath serves an instance its cache bundle (see AttachCache), once,
+// CachePath serves an instance its cache bundle (see RegisterWithCache), once,
 // after its config.
 const CachePath = Path + "/cache"
 
@@ -122,6 +122,10 @@ func New(ttl time.Duration, log *slog.Logger) *Server {
 // registration, served or not, until Revoke, so a recycled IP never inherits a
 // stale config.
 func (s *Server) Register(ip netip.Addr, runner, jit string) error {
+	return s.register(ip, runner, jit, nil)
+}
+
+func (s *Server) register(ip netip.Addr, runner, jit string, cache []byte) error {
 	ip = ip.Unmap()
 	if !ip.IsValid() || ip.IsUnspecified() || runner == "" || jit == "" {
 		return ErrInvalid
@@ -131,25 +135,20 @@ func (s *Server) Register(ip netip.Addr, runner, jit string) error {
 	if e, ok := s.entries[ip]; ok {
 		return errors.Join(ErrRegistered, errors.New("held by runner "+e.runner))
 	}
-	s.entries[ip] = &entry{runner: runner, jit: jit, expires: s.now().Add(s.ttl)}
+	s.entries[ip] = &entry{runner: runner, jit: jit, expires: s.now().Add(s.ttl), cache: cache}
 	return nil
 }
 
-// AttachCache gives ip's registration a cache bundle (its proxy's TLS
-// material and the cache-server address), handed out once at CachePath to
-// that address after its config. It holds a private key, so nothing logs it.
-func (s *Server) AttachCache(ip netip.Addr, bundle []byte) error {
+// RegisterWithCache is Register with a cache bundle (the proxy's TLS
+// material and the cache-server address), set in the same step so the
+// instance cannot fetch its config before the bundle is there. The bundle is
+// handed out once at CachePath to that address after its config. It holds a
+// private key, so nothing logs it.
+func (s *Server) RegisterWithCache(ip netip.Addr, runner, jit string, bundle []byte) error {
 	if len(bundle) == 0 {
 		return ErrInvalid
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e, ok := s.entries[ip.Unmap()]
-	if !ok || e.claimed {
-		return errors.Join(ErrInvalid, errors.New("no unclaimed registration for "+ip.String()))
-	}
-	e.cache = append([]byte(nil), bundle...)
-	return nil
+	return s.register(ip, runner, jit, append([]byte(nil), bundle...))
 }
 
 // Revoke drops ip's registration, served or not. The launcher calls it when
