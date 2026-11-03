@@ -357,3 +357,70 @@ func TestReportRejectsBadRequests(t *testing.T) {
 		t.Fatalf("a bad request was recorded: %+v", got)
 	}
 }
+
+// TestCacheBundleOnceAfterTheConfig: the bundle holds a private key, so it
+// goes only to the address that was served its config, once, and is then
+// forgotten.
+func TestCacheBundleOnceAfterTheConfig(t *testing.T) {
+	s := New(time.Minute, nil)
+	if err := s.RegisterWithCache(guest, "runner-1", "secret", []byte(`{"key":"k"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := fetch(t, s, http.MethodGet, CachePath, from(guest)); code != http.StatusForbidden {
+		t.Fatalf("bundle before the config = %d, want 403", code)
+	}
+	fetch(t, s, http.MethodGet, Path, from(guest))
+	if code, _ := fetch(t, s, http.MethodGet, CachePath, from(foreign)); code != http.StatusForbidden {
+		t.Fatalf("bundle to a foreign address = %d, want 403", code)
+	}
+	if code, body := fetch(t, s, http.MethodGet, CachePath, from(guest)); code != http.StatusOK || body != `{"key":"k"}` {
+		t.Fatalf("bundle = %d %q, want 200 with it", code, body)
+	}
+	if code, body := fetch(t, s, http.MethodGet, CachePath, from(guest)); code != http.StatusNotFound || strings.Contains(body, "key") {
+		t.Fatalf("second bundle fetch = %d %q, want 404 without it", code, body)
+	}
+	s.mu.Lock()
+	left := s.entries[guest].cache
+	s.mu.Unlock()
+	if left != nil {
+		t.Fatal("the bundle's key stays in memory after it was handed out")
+	}
+	if code, _ := fetch(t, s, http.MethodPost, CachePath, from(guest)); code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST = %d, want 405", code)
+	}
+}
+
+func TestCacheBundleRules(t *testing.T) {
+	s := New(time.Minute, nil)
+	if err := s.RegisterWithCache(guest, "runner-1", "secret", nil); err == nil {
+		t.Fatal("registered with an empty bundle")
+	}
+	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RegisterWithCache(guest, "runner-2", "secret", []byte("b")); err == nil {
+		t.Fatal("a second registration took the address")
+	}
+	fetch(t, s, http.MethodGet, Path, from(guest))
+	// Without a bundle, a served instance just finds none.
+	if code, _ := fetch(t, s, http.MethodGet, CachePath, from(guest)); code != http.StatusNotFound {
+		t.Fatalf("no bundle = %d, want 404", code)
+	}
+}
+
+func TestCacheBundleDroppedWithAnExpiredConfig(t *testing.T) {
+	s := New(time.Minute, nil)
+	now := time.Unix(1_000_000, 0)
+	s.now = func() time.Time { return now }
+	if err := s.RegisterWithCache(guest, "runner-1", "secret", []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)
+	fetch(t, s, http.MethodGet, Path, from(guest)) // expired: 404, tombstone
+	s.mu.Lock()
+	left := s.entries[guest].cache
+	s.mu.Unlock()
+	if left != nil {
+		t.Fatal("an expired registration still holds its bundle's key")
+	}
+}
