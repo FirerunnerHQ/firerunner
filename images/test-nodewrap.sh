@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Tests for assets/nodewrap.c: build it with cc, put it where the runner's
+# node would be, and check what the real node (a fake) is run with. Linux
+# only (nodewrap finds itself through /proc/self/exe).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+ext="$TMP/externals"
+mkdir -p "$ext/node20/bin"
+cc -O2 -static -o "$ext/node20/bin/node" "$HERE/assets/nodewrap.c" 2>/dev/null ||
+	cc -O2 -o "$ext/node20/bin/node" "$HERE/assets/nodewrap.c"
+cat >"$ext/node20/bin/node.real" <<'FAKE'
+#!/bin/sh
+echo "ca=${NODE_EXTRA_CA_CERTS:-}"
+echo "args=$*"
+env | grep -c '^INPUT_INCLUDE-HIDDEN-FILES=yes$' | sed 's/^/dashed=/'
+FAKE
+chmod +x "$ext/node20/bin/node.real"
+
+fails=0
+expect() {
+	local name="$1" got="$2" want="$3"
+	if printf '%s\n' "$got" | grep -qx -- "$want"; then
+		echo "ok   $name"
+	else
+		echo "FAIL $name: got $(printf '%s' "$got" | tr '\n' '|')"
+		fails=$((fails + 1))
+	fi
+}
+node() { env 'INPUT_INCLUDE-HIDDEN-FILES=yes' "$@" "$ext/node20/bin/node" script.js --flag; }
+
+out="$(node)"
+expect "no CA file: no extra CA (node would warn about a missing one)" "$out" 'ca='
+expect "no CA file: the real node gets the arguments" "$out" 'args=script.js --flag'
+expect "a dashed action input survives (a shell wrapper would drop it)" "$out" 'dashed=1'
+
+echo CA >"$ext/firerunner-ca.pem"
+out="$(node)"
+expect "CA file: node gets it" "$out" "ca=$ext/node20/bin/../../firerunner-ca.pem"
+out="$(node NODE_EXTRA_CA_CERTS=/job/own.pem)"
+expect "a job's own NODE_EXTRA_CA_CERTS is kept" "$out" 'ca=/job/own.pem'
+
+rm "$ext/node20/bin/node.real"
+rc=0
+node >/dev/null 2>&1 || rc=$?
+expect "no real node: exit 127" "$rc" 127
+
+if [ "$fails" -ne 0 ]; then
+	echo "$fails failure(s)"
+	exit 1
+fi
+echo "all passed"
