@@ -518,7 +518,8 @@ func (f *Firecracker) ensureHostForward(ctx context.Context) error {
 		f.log.Debug("no ip/filter FORWARD chain; skipping host forward accept", "err", err)
 		return nil
 	}
-	if strings.Contains(out, forwardComment(f.cfg.TapPrefix)) {
+	// Quoted: a peer's prefix may extend ours (fr, frx).
+	if strings.Contains(out, `comment "`+forwardComment(f.cfg.TapPrefix)+`"`) {
 		return nil // our accept rules are already present
 	}
 	if !strings.Contains(out, "policy drop") {

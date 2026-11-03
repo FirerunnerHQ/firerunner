@@ -286,10 +286,12 @@ func TestEnsureHostForward(t *testing.T) {
 		{name: "no forward chain", outErr: errors.New("no such chain"), wantRun: false},
 		{name: "permissive policy", out: "chain FORWARD { policy accept; }", wantRun: false},
 		{name: "drop policy applies rules", out: dropChain, wantRun: true},
-		{name: "already present is idempotent", out: dropChain + " firerunner-egress-fr", wantRun: false},
+		{name: "already present is idempotent", out: dropChain + ` comment "firerunner-egress-fr"`, wantRun: false},
 		// Regression: a peer instance's prefix-keyed comment must NOT make us
 		// think our own tap accepts are already installed.
-		{name: "peer instance comment does not suppress ours", out: dropChain + " firerunner-egress-fn", wantRun: true},
+		{name: "peer instance comment does not suppress ours", out: dropChain + ` comment "firerunner-egress-fn"`, wantRun: true},
+		// Nor one whose prefix extends ours (frx contains fr).
+		{name: "extended peer prefix does not suppress ours", out: dropChain + ` comment "firerunner-egress-frx"`, wantRun: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
