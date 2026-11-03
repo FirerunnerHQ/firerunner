@@ -45,6 +45,15 @@ case "$url" in
 	echo "${url#*\?}" >> "$STATE/reports"
 	if [ -n "$write" ]; then printf 204; fi
 	;;
+*/jit/cache)
+	if [ -f "$STATE/cache-bundle" ]; then
+		cat "$STATE/cache-bundle" > "$out"
+		printf 200
+	else
+		: > "$out"
+		printf 404
+	fi
+	;;
 */jit)
 	codes=($(cat "$STATE/jit-codes"))
 	code=${codes[0]}
@@ -111,6 +120,8 @@ script() {
 		FIRERUNNER_RETRY_SLEEP=0 \
 		FIRERUNNER_DRAIN_TICKS="${DRAIN_TICKS:-50}" \
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
+		FIRERUNNER_CACHE_SETUP="$TMP/bin/fake-cache-setup" \
+		TMPDIR="${SCRIPT_TMPDIR:-${TMPDIR:-/tmp}}" \
 		"${SCRIPT_SH:-sh}" -c 'trap "" PIPE; exec "$0" "$1"' "${SCRIPT_SH:-sh}" "$SCRIPT"
 }
 
@@ -360,6 +371,47 @@ for want in 0 3; do
 	expect "broken stream, status $want: reports it" "$(cat "$STATE/reports" 2>/dev/null)" reported "phase=exited&rc=$want"
 	expect "broken stream, status $want: powers off" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
 done
+
+# 15. A tier that caches: the instance's bundle, fetched once after its
+#     config, is handed to the cache setup before the runner starts, and
+#     removed after; a setup that fails leaves the job running.
+cat > "$TMP/bin/fake-cache-setup" <<'FAKE'
+#!/bin/sh
+cp "$1" "$STATE/setup-got"
+[ -f "$STATE/runner-argv" ] && touch "$STATE/setup-after-runner"
+[ ! -f "$STATE/setup-fails" ]
+FAKE
+chmod +x "$TMP/bin/fake-cache-setup"
+for c in ok fails; do
+	fresh "cache-$c"
+	printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+	echo 200 > "$STATE/jit-codes"
+	printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+	printf '{"key":"K","upstream":"10.0.0.5:8099"}' > "$STATE/cache-bundle"
+	[ "$c" = ok ] || touch "$STATE/setup-fails"
+	mkdir -p "$STATE/tmp"
+	runner 'echo "Listening for Jobs"; echo "Exiting runner..."'
+	SCRIPT_TMPDIR="$STATE/tmp" run
+	expect "cache $c: setup gets the bundle" "$(cat "$STATE/setup-got" 2>/dev/null)" \
+		[ "$(cat "$STATE/setup-got" 2>/dev/null)" = '{"key":"K","upstream":"10.0.0.5:8099"}' ]
+	expect "cache $c: before the runner starts" "" lacks setup-after-runner
+	expect "cache $c: the runner still runs" "argv=$(cat "$STATE/runner-argv" 2>/dev/null)" has runner-argv
+	expect "cache $c: asked once, after the config" "$(cat "$STATE/requests")" \
+		[ "$(grep -c '/jit/cache$' "$STATE/requests")" = 1 ]
+	expect "cache $c: says which cache the job uses" "$(cat "$STATE/stderr")" \
+		grep -q "$([ "$c" = ok ] && echo "firerunner's cache-server" || echo "uses GitHub's cache")" "$STATE/stderr"
+	expect "cache $c: the bundle's copy is removed (it holds a private key)" "$(find "$STATE/tmp" -type f)" \
+		bash -c "! grep -rq '\"key\":\"K\"' '$STATE/tmp'"
+done
+
+fresh cache-none
+printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+runner 'echo "Exiting runner..."'
+run
+expect "no bundle: no setup" "" lacks setup-got
+expect "no bundle: the runner runs" "" has runner-argv
 
 for st in "$TMP"/state-*; do
 	expect "$(basename "$st"): finished" "hung" [ ! -f "$st/hung" ]
