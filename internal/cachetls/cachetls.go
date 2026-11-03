@@ -16,6 +16,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -161,6 +162,29 @@ func (c *CA) Leaf(ttl time.Duration) (certPEM, keyPEM []byte, err error) {
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), nil
+}
+
+// Bundle is what an instance's cache proxy needs, handed to it once with its
+// config (jitserver.CachePath): the CA to trust, its own leaf, and where
+// cache-server listens.
+type Bundle struct {
+	CA       string `json:"ca"`
+	Cert     string `json:"cert"`
+	Key      string `json:"key"`
+	Upstream string `json:"upstream"` // host:port of cache-server
+}
+
+// Bundle issues a leaf for one instance, valid for ttl, and packs it with the
+// CA and cache-server's address as JSON.
+func (c *CA) Bundle(ttl time.Duration, upstream string) ([]byte, error) {
+	if upstream == "" {
+		return nil, errors.New("cachetls: a bundle needs the cache-server address")
+	}
+	cert, key, err := c.Leaf(ttl)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(Bundle{CA: string(c.certPEM), Cert: string(cert), Key: string(key), Upstream: upstream})
 }
 
 func serial() *big.Int {

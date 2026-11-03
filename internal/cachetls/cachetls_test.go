@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"io"
 	"net/http"
@@ -154,4 +155,28 @@ func TestLeafServesTLSAsTheResultsHost(t *testing.T) {
 		t.Fatalf("TLS as %s: %v", ResultsHost, err)
 	}
 	resp.Body.Close()
+}
+
+func TestBundleCarriesAWorkingLeafAndTheUpstream(t *testing.T) {
+	ca, err := LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := ca.Bundle(time.Hour, "10.0.0.5:8099")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b Bundle
+	if err := json.Unmarshal(raw, &b); err != nil {
+		t.Fatal(err)
+	}
+	if b.Upstream != "10.0.0.5:8099" || b.CA != string(ca.CertPEM()) {
+		t.Fatalf("bundle upstream %q, CA match %v", b.Upstream, b.CA == string(ca.CertPEM()))
+	}
+	if _, err := tls.X509KeyPair([]byte(b.Cert), []byte(b.Key)); err != nil {
+		t.Fatalf("bundle's leaf and key do not pair: %v", err)
+	}
+	if _, err := ca.Bundle(time.Hour, ""); err == nil {
+		t.Fatal("a bundle without an upstream")
+	}
 }
