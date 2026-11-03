@@ -170,9 +170,11 @@ type VMJobs interface {
 }
 
 // register hands the instance at ip its JIT config and, for a cached tier,
-// its cache bundle, and binds the address to the runner. A failure on the
-// cache side is logged and leaves the job uncached rather than failing it.
-// release undoes all of it.
+// its cache bundle, and binds the address to the runner. No bundle leaves the
+// job uncached. A binding that fails fails the launch: cache-server knows a
+// job by its address alone, and the failure may be another live job holding
+// this address, whose scope the instance would then act in. release undoes
+// all of it.
 func (p *Provisioner) register(ip netip.Addr, name, jit string) (release func(), err error) {
 	c := p.o.Cache
 	if c == nil || !p.o.EC2.Cache {
@@ -192,20 +194,17 @@ func (p *Provisioner) register(ip netip.Addr, name, jit string) (release func(),
 	if err := p.o.JIT.RegisterWithCache(ip, name, jit, bundle); err != nil {
 		return nil, err
 	}
-	bound := false
-	if c.Jobs != nil {
-		if err := c.Jobs.Register(name, ip.String()); err != nil {
-			p.log.Warn("cache identity not registered; cache-server will deny this job", "runner", name, "ip", ip, "err", err)
-		} else {
-			bound = true
-		}
+	if c.Jobs == nil {
+		return func() { p.o.JIT.Revoke(ip) }, nil
+	}
+	if err := c.Jobs.Register(name, ip.String()); err != nil {
+		p.o.JIT.Revoke(ip)
+		return nil, fmt.Errorf("bind cache identity for %s: %w", ip, err)
 	}
 	return func() {
 		p.o.JIT.Revoke(ip)
-		if bound {
-			if err := c.Jobs.Release(name); err != nil {
-				p.log.Warn("release cache identity", "runner", name, "err", err)
-			}
+		if err := c.Jobs.Release(name); err != nil {
+			p.log.Warn("release cache identity", "runner", name, "err", err)
 		}
 	}, nil
 }

@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -118,23 +120,29 @@ func TestLaunch_UncachedTierGetsNoBundle(t *testing.T) {
 	waitErr(t, errc)
 }
 
-func TestLaunch_IdentityFailureLeavesTheJobRunning(t *testing.T) {
-	jobs := &fakeJobs{bound: map[string]string{}, fail: errors.New("disk full")}
+// TestLaunch_IdentityFailureFailsClosed: cache-server knows a job by its
+// address alone, and a binding can fail because another live job holds the
+// address; the instance must then get neither its config nor a bundle, or
+// its cache calls would run in that job's scope.
+func TestLaunch_IdentityFailureFailsClosed(t *testing.T) {
+	jobs := &fakeJobs{bound: map[string]string{}, fail: errors.New("address already registered")}
 	h := newHarness(t, func(o *Options) {
 		o.EC2.Cache = true
 		o.Cache = cacheOpts(t, jobs)
 	})
-	errc := h.launch(context.Background())
-	inst := h.instance(t)
-	if code, _ := h.cacheBundle(t, inst.ip); code != http.StatusOK {
-		t.Fatalf("bundle = %d, want it despite the identity failure", code)
+	err := waitErr(t, h.launch(context.Background()))
+	if err == nil || !strings.Contains(err.Error(), "bind cache identity") {
+		t.Fatalf("Launch = %v, want it to fail on the binding", err)
 	}
-	h.f.setState(inst.id, types.InstanceStateNameTerminated)
-	if err := waitErr(t, errc); err != nil {
-		t.Fatalf("Launch = %v", err)
+	inst := h.f.launched()[0]
+	if h.jit.Pending(netip.MustParseAddr(inst.ip)) {
+		t.Fatal("the instance's config is still registered after the binding failed")
 	}
 	if len(jobs.released) != 0 {
 		t.Fatal("released an identity that was never bound")
+	}
+	if len(h.f.terminatedIDs()) == 0 {
+		t.Fatal("the instance was left running")
 	}
 }
 
@@ -160,5 +168,8 @@ func TestLaunch_PooledCachedTierGetsABundle(t *testing.T) {
 	h.f.setState(pooledID, types.InstanceStateNameShuttingDown)
 	if err := waitErr(t, errc); err != nil {
 		t.Fatalf("Launch = %v", err)
+	}
+	if jobs.ipOf("runner-1") != "" || len(jobs.released) != 1 {
+		t.Fatalf("pooled identity not released with the instance: %+v", jobs)
 	}
 }
