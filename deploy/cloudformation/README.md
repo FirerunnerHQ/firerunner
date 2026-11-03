@@ -106,6 +106,36 @@ first `deploy-control.sh` sets a version. Pass `HostedZoneId=Z...` with `ZoneNam
 private zone. Use `ImageId=/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`
 with an x86 `InstanceType`.
 
+**The dependency cache (`Cache`, default `off`).** With `disk` or `s3`, the
+control VM also runs `firerunner cache-server` for EC2 tiers that set
+`ec2.cache`:
+
+- **The server.** It runs as its own `firerunner-cache` user on the VM's VPC
+  address, port `CachePort` (8099), and only when a tier sets `ec2.cache`.
+  A security group rule lets only the runners' group in. It reads the job
+  identities the daemon writes in `/run/firerunner/jobs` and cannot read
+  `/etc/firerunner`.
+- **The disk.** The root volume is `RootVolumeGiB` (30). The cache gets a
+  share of it: blobs up to 40% on `disk`, local copies up to 30% with `s3`,
+  and one upload stages at most 15%.
+- **`disk`.** Blobs live on the VM and go with it. cache-server cannot reach
+  instance metadata, so it holds no AWS credentials.
+- **`s3`.** The stack makes a private, encrypted bucket. The role may read,
+  write and delete under `firerunner-cache/` and list only that prefix (the
+  README's least policy). A replacement VM serves what its predecessor
+  saved. The bucket is **kept** when the stack is deleted; empty and delete
+  it by hand (the `CacheBucket` output names it). A lifecycle rule aborts
+  multipart uploads left incomplete after a day. ⚠️ cache-server needs the
+  instance role's credentials for S3, so it can reach instance metadata, and
+  that role is the control plane's: a compromised cache-server could act as
+  the control VM (#138 scopes this down).
+- **The address.** The bootstrap tells runners the cache-server address
+  (`FR_EC2_CACHE_ADDR=<jit name>:<port>`) only when a tier sets
+  `ec2.cache`. Such a tier with `Cache=off` fails `config check`.
+- **Changing `Cache`** updates the launch template, not the running VM:
+  refresh it (`deploy-control.sh`) for the change to take effect. Switching
+  from `s3` away and back makes a new bucket and keeps the old one.
+
 ## Deploy, roll back
 
 ```sh

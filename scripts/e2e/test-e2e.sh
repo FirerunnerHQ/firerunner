@@ -106,11 +106,15 @@ case "$1 $2" in
 	fake-answer create-stack optional
 	;;
 "cloudformation delete-stack") fake-answer delete-stack optional ;;
+"cloudformation describe-stack-resource") fake-answer stack-resource ;;
+"resourcegroupstaggingapi get-resources") fake-answer tagged ;;
 "cloudformation describe-stack-events") fake-answer stack-events ;;
 "autoscaling describe-auto-scaling-groups") fake-answer asg ;;
 "route53 list-resource-record-sets") fake-answer rrs ;;
 "route53 change-resource-record-sets") arg --change-batch "$@" >"$STATE/rr-change.json" ;;
 "s3 cp") fake-answer s3-cp optional ;;
+"s3 rm") fake-answer s3-rm optional ;;
+"s3api delete-bucket") fake-answer delete-bucket optional ;;
 "s3 presign") fake-answer presign ;;
 *) echo "unexpected aws call: $*" >&2; exit 1 ;;
 esac
@@ -922,6 +926,8 @@ expect "up: tags the stack with the session's owner" "" called "Key=firerunner:e
 expect "up: the stack's Owner is the session's" "$(cat "$STATE/create-params.json")" \
 	jqe 'map({key: .ParameterKey, value: .ParameterValue}) | from_entries | .Owner == "e2e-test" and .ParameterPrefix == "/fr/e2e/sessions/e2e-test" and .JitName == "e2e-test" and .HostedZoneId == "Z0SHARED" and .ZoneName == "zone.internal" and .VpcId == "vpc-0aaa" and .SubnetIds == "subnet-0aaa,subnet-0bbb"' "$STATE/create-params.json"
 expect "up: passes no parameter the template lacks" "" jqe 'all(.[]; .ParameterKey != "Retired")' "$STATE/create-params.json"
+expect "up: the cache is off by default" "" \
+	jqe 'map({key: .ParameterKey, value: .ParameterValue}) | from_entries | .Cache == "off"' "$STATE/create-params.json"
 expect "up: suffixes tier names and labels" "$(ssm_val $S/control/tiers)" \
 	jqe '[.[].name] == ["cloud-test", "lit-test"] and .[0].labels == ["cloud-arm-test"]' "$STATE/ssm$S/control/tiers"
 expect "up: moves AMI parameters under the session prefix" "" \
@@ -1021,6 +1027,32 @@ run control-vm.sh list
 expect "list: every live control VM with its owner, oldest first" "$(dump)" \
 	last_json '[.[] | [.instance, .owner]] == [["i-0a", "e2e-x"], ["i-0b", "e2e-shared"], ["i-0c", null]]'
 
+vm_fresh vm-up-cache
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack CREATE_COMPLETE)"
+answer asg 1 i-0ctl
+answer invocation 1 "$(inv Success 0 $'active\nfirerunner v1.2.0\n' '')"
+run control-vm.sh up --cache s3
+expect "up --cache s3: exit 0" "$(dump)" rc_is 0
+expect "up --cache s3: sets the stack's Cache" "$(cat "$STATE/create-params.json" 2>&1)" \
+	jqe 'map({key: .ParameterKey, value: .ParameterValue}) | from_entries | .Cache == "s3"' "$STATE/create-params.json"
+run control-vm.sh up --cache memory
+expect "up --cache memory: a usage error" "$(dump)" rc_is 2
+
+vm_fresh vm-down-cache
+# A stack that failed to create has no outputs; its retained bucket is a
+# resource all the same.
+answer stack-st-e2e-test 1 "$(session_stack ROLLBACK_COMPLETE)"
+answer stack-resource 1 st-e2e-test-cachebucket-abc
+answer stack-st-e2e-test 2 "$NOSTACK"
+inventory_answers
+run control-vm.sh down
+expect "down, cache bucket: exit 0" "$(dump)" rc_is 0
+expect "down, cache bucket: empties then deletes the session's bucket" "$(cat "$STATE/calls")" \
+	bash -c "grep -q 's3 rm --recursive --only-show-errors s3://st-e2e-test-cachebucket-abc' '$STATE/calls' && grep -q 's3api delete-bucket --bucket st-e2e-test-cachebucket-abc' '$STATE/calls'"
+expect "down, cache bucket: only after the stack is gone" "$(cat "$STATE/calls")" \
+	[ "$(line_of delete-stack)" -lt "$(line_of "s3 rm")" ]
+
 vm_fresh vm-down
 answer stack-st-e2e-test 1 "$(session_stack CREATE_COMPLETE)"
 answer stack-st-e2e-test 2 "$(session_stack DELETE_IN_PROGRESS)"
@@ -1043,6 +1075,16 @@ expect "down: deletes the session's parameters" "" test ! -e "$STATE/ssm$S/contr
 expect "down: keeps the shared parameters" "" [ -e "$STATE/ssm/fr/e2e/control/tiers" ]
 expect "down: keeps other sessions' parameters" "" [ -e "$STATE/ssm/fr/e2e/sessions/e2e-other/control/version" ]
 expect "down: reports" "" last_json '.parameters_deleted == 3 and .jit_name_deleted == true and .cleanup.terminate_instances == ["i-0mine", "i-0pool"]'
+expect "down: no cache bucket, none deleted" "" not_called "delete-bucket"
+
+vm_fresh vm-down-leftover-bucket
+answer stack-st 1 "$(base_stack e2e-shared)"
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer tagged 1 arn:aws:s3:::st-e2e-test-cachebucket-old
+inventory_answers
+run control-vm.sh down
+expect "down, no stack: finds the bucket an earlier down left, by its tag" "$(dump)" \
+	bash -c "grep -q 'tag-filters Key=firerunner:control,Values=st-e2e-test' '$STATE/calls' && grep -q 's3api delete-bucket --bucket st-e2e-test-cachebucket-old' '$STATE/calls'"
 
 vm_fresh vm-down-shared-owner
 answer stack-st 1 "$(base_stack e2e-test)"

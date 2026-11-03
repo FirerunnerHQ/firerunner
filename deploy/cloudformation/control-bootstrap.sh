@@ -14,6 +14,12 @@
 #   FR_JIT_HOST   the JIT name, e.g. control.firerunner.internal
 #   FR_JIT_PORT   the JIT port
 #   AWS_REGION    the region
+#   FR_CACHE      off, disk or s3: whether this VM runs cache-server for EC2
+#                 tiers with ec2.cache, and where it keeps blobs (optional;
+#                 default off)
+#   FR_CACHE_PORT its port (default 8099)
+#   FR_CACHE_BUCKET  with s3, the bucket (prefix firerunner-cache/)
+#   FR_ROOT_GIB   the root volume's size, which caps the cache's local use
 #
 # and these SSM parameters under $FR_PREFIX/control/:
 #   env              FR_* lines (non-secret): FR_URL, FR_APP_CLIENT_ID, ...
@@ -86,6 +92,29 @@ printf '%s\n' "$tiers" > "$etc/tiers.json"
 	echo "FR_WORKDIR=/var/lib/firerunner"
 } > "$etc/firerunner.env"
 
+# The cache: cache-server on this VM, as its own user, reading the job
+# identities the daemon writes (README: separate service users). Instances
+# are told its address only when a tier caches, or config check would refuse
+# the address as a likely typo.
+cache="${FR_CACHE:-off}"
+cache_port="${FR_CACHE_PORT:-8099}"
+case "$cache" in
+off | disk) ;;
+s3) [ -n "${FR_CACHE_BUCKET:-}" ] || { log "FR_CACHE=s3 needs FR_CACHE_BUCKET"; false; } ;;
+*) log "FR_CACHE=$cache: want off, disk or s3"; false ;;
+esac
+cache_tier=$(python3 -c 'import json, sys
+print(any((t.get("ec2") or {}).get("cache") for t in json.load(open(sys.argv[1]))))' "$etc/tiers.json")
+if [ "$cache" != off ]; then
+	id -u firerunner-cache > /dev/null 2>&1 ||
+		useradd --system --no-create-home --shell /sbin/nologin firerunner-cache
+	echo "FR_CACHE_JOBS_DIR=/run/firerunner/jobs" >> "$etc/firerunner.env"
+	if [ "$cache_tier" = True ]; then
+		echo "FR_EC2_CACHE_ADDR=$FR_JIT_HOST:$cache_port" >> "$etc/firerunner.env"
+	fi
+elif [ "$cache_tier" = True ]; then
+	log "a tier sets ec2.cache but the stack's Cache parameter is off: set it to disk or s3"
+fi
 key=$(param app-private-key)
 token=$(param token)
 if [ -n "$key" ]; then
@@ -139,10 +168,64 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+$(if [ "$cache" != off ]; then
+	# The job identities cache-server reads: the daemon's group is the cache
+	# user's, and what it writes is not world-readable. A restart keeps the
+	# records of jobs still running.
+	printf '%s\n' "RuntimeDirectory=firerunner" "RuntimeDirectoryMode=0750" "RuntimeDirectoryPreserve=restart" "Group=firerunner-cache" "UMask=0027"
+fi)
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+if [ "$cache" != off ] && [ "$cache_tier" != True ]; then
+	log "Cache=$cache but no tier sets ec2.cache: not starting cache-server"
+elif [ "$cache" != off ]; then
+	# The root volume is the daemon's and the journal's too: the cache gets a
+	# share of it. On disk, blobs are capped at 40%; with S3, local copies at
+	# 30% (S3 holds the rest). One upload stages at most 15%.
+	gib="${FR_ROOT_GIB:-8}"
+	caps=" --max-size $((gib * 40 / 100))GB --max-entry-size $((gib * 15 / 100))GB"
+	imds="IPAddressDeny=169.254.169.254/32"
+	if [ "$cache" = s3 ]; then
+		caps=" --max-entry-size $((gib * 15 / 100))GB --s3-bucket $FR_CACHE_BUCKET --s3-prefix firerunner-cache/ --s3-local-cache-size $((gib * 30 / 100))GB"
+		# S3 needs the instance role's credentials, from IMDS.
+		imds="# IMDS stays reachable: S3 needs the instance role (see README)"
+	fi
+	cat > "$units/firerunner-cache.service" <<EOF
+[Unit]
+Description=firerunner cache-server for EC2 tiers
+After=firerunner.service
+Wants=firerunner.service
+[Service]
+User=firerunner-cache
+Group=firerunner-cache
+# Bound to the VPC address; the control security group admits the runners'.
+ExecStart=/usr/local/bin/firerunner cache-server --addr $ip:$cache_port --dir /var/lib/firerunner-cache --jobs-dir /run/firerunner/jobs --jobs-owner-uid 0$caps
+# Without S3 it needs no AWS credentials, so it cannot fetch the role's.
+$imds
+Restart=always
+RestartSec=5
+StateDirectory=firerunner-cache
+StateDirectoryMode=0700
+# The daemon alone owns /run/firerunner, and its secrets stay out of reach.
+ReadOnlyPaths=/run
+InaccessiblePaths=/etc/firerunner
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
 
 cat > "$units/firerunner-unhealthy.service" <<EOF
 [Unit]
@@ -156,4 +239,8 @@ EOF
 
 "$systemctl" daemon-reload
 "$systemctl" enable --now firerunner.service
+if [ -f "$units/firerunner-cache.service" ]; then
+	"$systemctl" enable --now firerunner-cache.service
+	log "started cache-server on $ip:$cache_port ($cache)"
+fi
 log "started firerunner $("$bin/firerunner" version) as owner $FR_OWNER"
