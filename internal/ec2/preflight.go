@@ -28,6 +28,7 @@ type PreflightAPI interface {
 // QuotaAPI reads a vCPU quota from Service Quotas.
 type QuotaAPI interface {
 	GetServiceQuota(context.Context, *servicequotas.GetServiceQuotaInput, ...func(*servicequotas.Options)) (*servicequotas.GetServiceQuotaOutput, error)
+	GetAWSDefaultServiceQuota(context.Context, *servicequotas.GetAWSDefaultServiceQuotaInput, ...func(*servicequotas.Options)) (*servicequotas.GetAWSDefaultServiceQuotaOutput, error)
 }
 
 // IdentityAPI tells who the credentials are.
@@ -53,17 +54,35 @@ func failf(name, f string, a ...any) Finding { return Finding{"FAIL", name, fmt.
 func (c *Client) Preflight(ctx context.Context, region string, pre PreflightAPI, quotas QuotaAPI, id IdentityAPI, tiers []config.Tier) []Finding {
 	who, err := id.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
-		return []Finding{failf("aws-identity", "no usable AWS credentials in %s: %v; on EC2 the instance profile provides them, elsewhere set AWS_PROFILE (and --aws-region)", or(region, "no region"), err)}
+		return []Finding{identityFailure(region, err)}
 	}
 	out := []Finding{passf("aws-identity", "%s in %s", aws.ToString(who.Arn), region)}
+	// doctor loads the configuration leniently, to report on a broken one:
+	// an ec2 tier that would not load gets no AWS checks, only why.
+	var valid []config.Tier
 	for _, t := range tiers {
 		if !t.IsEC2() {
 			continue
 		}
+		if err := t.ValidateEC2(); err != nil {
+			out = append(out, failf("tier["+t.Name+"]", "%v", err))
+			continue
+		}
+		valid = append(valid, t)
 		out = append(out, c.amiCheck(ctx, t), subnetCheck(ctx, pre, t), securityGroupCheck(ctx, pre, t))
 	}
 	out = append(out, metadataCheck())
-	return append(out, quotaChecks(ctx, pre, quotas, tiers)...)
+	return append(out, quotaChecks(ctx, pre, quotas, valid)...)
+}
+
+// identityFailure tells credentials AWS rejected from an STS it could not
+// reach, which needs a route or an endpoint rather than credentials.
+func identityFailure(region string, err error) Finding {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return failf("aws-identity", "AWS rejected the credentials in %s: %v; on EC2 the instance profile provides them, elsewhere set AWS_PROFILE (and --aws-region)", or(region, "no region"), err)
+	}
+	return failf("aws-identity", "cannot reach STS in %s: %v; check the route to AWS (or a VPC endpoint for sts), and --aws-region", or(region, "no region"), err)
 }
 
 func (c *Client) amiCheck(ctx context.Context, t config.Tier) Finding {
@@ -133,7 +152,7 @@ func defaultRoute(ctx context.Context, pre PreflightAPI, s types.Subnet) (string
 			if aws.ToString(r.DestinationCidrBlock) != "0.0.0.0/0" || r.State == types.RouteStateBlackhole {
 				continue
 			}
-			for _, target := range []*string{r.GatewayId, r.NatGatewayId, r.TransitGatewayId, r.NetworkInterfaceId, r.VpcPeeringConnectionId, r.InstanceId} {
+			for _, target := range []*string{r.GatewayId, r.NatGatewayId, r.TransitGatewayId, r.NetworkInterfaceId, r.VpcPeeringConnectionId, r.InstanceId, r.CarrierGatewayId, r.LocalGatewayId, r.CoreNetworkArn} {
 				if aws.ToString(target) != "" {
 					return aws.ToString(target), nil
 				}
@@ -155,30 +174,55 @@ func securityGroupCheck(ctx context.Context, pre PreflightAPI, t config.Tier) Fi
 	if err != nil {
 		return denied(name, "ec2:DescribeSecurityGroups", err, "ec2.security_groups %v: %v", t.EC2.SecurityGroups, err)
 	}
-	vpcs := map[string]bool{}
-	egress := false
+	egress, https := false, false
 	var inbound []string
 	for _, g := range out.SecurityGroups {
-		vpcs[aws.ToString(g.VpcId)] = true
 		egress = egress || len(g.IpPermissionsEgress) > 0
+		for _, r := range g.IpPermissionsEgress {
+			https = https || allowsHTTPSOut(r)
+		}
 		if n := len(g.IpPermissions); n > 0 {
 			inbound = append(inbound, fmt.Sprintf("%s (%d)", aws.ToString(g.GroupId), n))
 		}
 	}
 	if subs, err := pre.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{SubnetIds: t.EC2.Subnets}); err == nil {
 		for _, s := range subs.Subnets {
-			if !vpcs[aws.ToString(s.VpcId)] {
-				return failf(name, "%v are not in %s, the VPC of subnet %s: RunInstances would refuse them", t.EC2.SecurityGroups, aws.ToString(s.VpcId), aws.ToString(s.SubnetId))
+			for _, g := range out.SecurityGroups {
+				if aws.ToString(g.VpcId) != aws.ToString(s.VpcId) {
+					return failf(name, "%s is in %s, not %s, the VPC of subnet %s: RunInstances would refuse it", aws.ToString(g.GroupId), aws.ToString(g.VpcId), aws.ToString(s.VpcId), aws.ToString(s.SubnetId))
+				}
 			}
 		}
 	}
 	switch {
 	case !egress:
 		return failf(name, "%v allow no outbound traffic: instances cannot fetch their config or reach GitHub", t.EC2.SecurityGroups)
+	case !https:
+		return warnf(name, "%v allow no HTTPS to the internet (tcp 443, or all traffic, to 0.0.0.0/0 or a prefix list): unless a proxy or endpoint carries it, the runner cannot reach GitHub", t.EC2.SecurityGroups)
 	case len(inbound) > 0:
 		return warnf(name, "inbound rules on %s: runner instances need none (they only connect out), and a job runs untrusted code; remove them", strings.Join(inbound, ", "))
 	}
 	return passf(name, "%v: outbound only", t.EC2.SecurityGroups)
+}
+
+// allowsHTTPSOut reports an outbound rule letting tcp 443 reach anywhere: all
+// traffic or tcp covering 443, to 0.0.0.0/0 or to a prefix list.
+func allowsHTTPSOut(r types.IpPermission) bool {
+	switch aws.ToString(r.IpProtocol) {
+	case "-1":
+	case "tcp", "6":
+		if aws.ToInt32(r.FromPort) > 443 || aws.ToInt32(r.ToPort) < 443 {
+			return false
+		}
+	default:
+		return false
+	}
+	for _, ip := range r.IpRanges {
+		if aws.ToString(ip.CidrIp) == "0.0.0.0/0" {
+			return true
+		}
+	}
+	return len(r.PrefixListIds) > 0
 }
 
 // metadataCheck states the instance metadata options every launch sets, so a
@@ -203,7 +247,6 @@ var quotaGroups = []struct {
 	prefix string
 	group  quotaGroup
 }{
-	{"u-", quotaGroup{"High Memory", "", "L-43DA4232"}},
 	{"inf", quotaGroup{"Inf", "L-B5D1601B", "L-1945791B"}},
 	{"trn", quotaGroup{"Trn", "L-6B0D517C", "L-2C3B7624"}},
 	{"hpc", quotaGroup{"HPC", "", "L-F7808C92"}},
@@ -222,6 +265,11 @@ var standardQuota = quotaGroup{"Standard", "L-34B43A08", "L-1216C47A"}
 func groupOf(itype string) (quotaGroup, bool) {
 	if strings.HasPrefix(itype, "mac") {
 		return quotaGroup{}, false
+	}
+	// High Memory: u-6tb1.metal and the like, and u7i-12tb.224xlarge,
+	// u7in-…, u7inh-….
+	if len(itype) > 1 && itype[0] == 'u' && (itype[1] == '-' || itype[1] >= '0' && itype[1] <= '9') {
+		return quotaGroup{"High Memory", "", "L-43DA4232"}, true
 	}
 	for _, g := range quotaGroups {
 		if strings.HasPrefix(itype, g.prefix) {
@@ -312,12 +360,16 @@ func quotaChecks(ctx context.Context, pre PreflightAPI, quotas QuotaAPI, tiers [
 			findings = append(findings, warnf(name, "the %s group has no %s quota; its types cannot launch on %s", k.group.name, k.market, k.market))
 			continue
 		}
-		q, err := quotas.GetServiceQuota(ctx, &servicequotas.GetServiceQuotaInput{ServiceCode: aws.String("ec2"), QuotaCode: aws.String(code)})
-		if err != nil || q.Quota == nil {
-			findings = append(findings, denied(name, "servicequotas:GetServiceQuota", err, "quota %s: %v", code, err))
+		have, err := readQuota(ctx, quotas, code)
+		if err != nil {
+			// The quota is advice: one that cannot be read warns.
+			if f := denied(name, "servicequotas:GetServiceQuota", err, ""); f.Level == "WARN" {
+				findings = append(findings, f)
+			} else {
+				findings = append(findings, warnf(name, "cannot read quota %s: %v; check it in Service Quotas by hand", code, err))
+			}
 			continue
 		}
-		have := int(aws.ToFloat64(q.Quota.Value))
 		if need[k] > have {
 			findings = append(findings, warnf(name, "the tiers' max needs %d vCPUs, the quota (%s) is %d: request an increase in Service Quotas, or lower max", need[k], code, have))
 			continue
@@ -325,6 +377,30 @@ func quotaChecks(ctx context.Context, pre PreflightAPI, quotas QuotaAPI, tiers [
 		findings = append(findings, passf(name, "the tiers' max needs %d vCPUs of %d (%s); other instances in the account share it", need[k], have, code))
 	}
 	return findings
+}
+
+// readQuota reads an EC2 quota's value: the account's applied one, else
+// (when none is stored) AWS's default.
+func readQuota(ctx context.Context, quotas QuotaAPI, code string) (int, error) {
+	in := &servicequotas.GetServiceQuotaInput{ServiceCode: aws.String("ec2"), QuotaCode: aws.String(code)}
+	q, err := quotas.GetServiceQuota(ctx, in)
+	if isCode(err, "NoSuchResourceException") {
+		d, derr := quotas.GetAWSDefaultServiceQuota(ctx, &servicequotas.GetAWSDefaultServiceQuotaInput{ServiceCode: in.ServiceCode, QuotaCode: in.QuotaCode})
+		if derr != nil {
+			return 0, derr
+		}
+		if d.Quota == nil {
+			return 0, errors.New("no default value")
+		}
+		return int(aws.ToFloat64(d.Quota.Value)), nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if q.Quota == nil {
+		return 0, errors.New("no value")
+	}
+	return int(aws.ToFloat64(q.Quota.Value)), nil
 }
 
 func markets(policy string) []string {

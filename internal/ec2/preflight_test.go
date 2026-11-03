@@ -2,6 +2,7 @@ package ec2
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -25,8 +26,12 @@ type fakeAccount struct {
 	groups  map[string]types.SecurityGroup
 	vcpus   map[string]int32
 	quotas  map[string]float64
-	denied  map[string]bool
-	noID    bool
+	// quotaErr fails GetServiceQuota for a code; defaults answers
+	// GetAWSDefaultServiceQuota.
+	quotaErr map[string]error
+	defaults map[string]float64
+	denied   map[string]bool
+	idErr    error
 }
 
 func (a *fakeAccount) DescribeSubnets(_ context.Context, in *ec2.DescribeSubnetsInput, _ ...func(*ec2.Options)) (*ec2.DescribeSubnetsOutput, error) {
@@ -88,12 +93,23 @@ func (a *fakeAccount) GetServiceQuota(_ context.Context, in *servicequotas.GetSe
 	if a.denied["GetServiceQuota"] {
 		return nil, apiErr("AccessDeniedException")
 	}
+	if err := a.quotaErr[aws.ToString(in.QuotaCode)]; err != nil {
+		return nil, err
+	}
 	return &servicequotas.GetServiceQuotaOutput{Quota: &sqtypes.ServiceQuota{Value: aws.Float64(a.quotas[aws.ToString(in.QuotaCode)])}}, nil
 }
 
+func (a *fakeAccount) GetAWSDefaultServiceQuota(_ context.Context, in *servicequotas.GetAWSDefaultServiceQuotaInput, _ ...func(*servicequotas.Options)) (*servicequotas.GetAWSDefaultServiceQuotaOutput, error) {
+	v, ok := a.defaults[aws.ToString(in.QuotaCode)]
+	if !ok {
+		return nil, apiErr("NoSuchResourceException")
+	}
+	return &servicequotas.GetAWSDefaultServiceQuotaOutput{Quota: &sqtypes.ServiceQuota{Value: aws.Float64(v)}}, nil
+}
+
 func (a *fakeAccount) GetCallerIdentity(context.Context, *sts.GetCallerIdentityInput, ...func(*sts.Options)) (*sts.GetCallerIdentityOutput, error) {
-	if a.noID {
-		return nil, apiErr("InvalidClientTokenId")
+	if a.idErr != nil {
+		return nil, a.idErr
 	}
 	return &sts.GetCallerIdentityOutput{Arn: aws.String("arn:aws:sts::000000000000:assumed-role/control/i-1")}, nil
 }
@@ -108,10 +124,12 @@ func goodAccount() *fakeAccount {
 		subnets: map[string]types.Subnet{"subnet-a": sub("subnet-a", true), "subnet-b": sub("subnet-b", false)},
 		routes:  map[string]string{"subnet-b": "nat-1", "main:vpc-1": "igw-1"},
 		groups: map[string]types.SecurityGroup{"sg-1": {GroupId: aws.String("sg-1"), VpcId: aws.String("vpc-1"),
-			IpPermissionsEgress: []types.IpPermission{{IpProtocol: aws.String("-1")}}}},
-		vcpus:  map[string]int32{"c8a.xlarge": 4, "c7a.xlarge": 4},
-		quotas: map[string]float64{"L-34B43A08": 640, "L-1216C47A": 640},
-		denied: map[string]bool{},
+			IpPermissionsEgress: []types.IpPermission{{IpProtocol: aws.String("-1"), IpRanges: []types.IpRange{{CidrIp: aws.String("0.0.0.0/0")}}}}}},
+		vcpus:    map[string]int32{"c8a.xlarge": 4, "c7a.xlarge": 4},
+		quotas:   map[string]float64{"L-34B43A08": 640, "L-1216C47A": 640},
+		denied:   map[string]bool{},
+		quotaErr: map[string]error{},
+		defaults: map[string]float64{},
 	}
 }
 
@@ -150,11 +168,48 @@ func TestPreflight_AGoodDeploymentPasses(t *testing.T) {
 }
 
 func TestPreflight_NoCredentialsStopsThere(t *testing.T) {
-	a := goodAccount()
-	a.noID = true
-	got := preflight(t, a, ec2Tier(nil))
-	if len(got) != 1 || got["aws-identity"].Level != "FAIL" {
-		t.Fatalf("findings = %+v, want only a failed aws-identity", got)
+	for _, c := range []struct {
+		name, detail string
+		err          error
+	}{
+		{"rejected", "AWS rejected the credentials", apiErr("InvalidClientTokenId")},
+		{"unreachable", "cannot reach STS", errors.New("dial tcp: i/o timeout")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			a := goodAccount()
+			a.idErr = c.err
+			got := preflight(t, a, ec2Tier(nil))
+			if f := got["aws-identity"]; len(got) != 1 || f.Level != "FAIL" || !strings.Contains(f.Detail, c.detail) {
+				t.Fatalf("findings = %+v, want only a failed aws-identity saying %q", got, c.detail)
+			}
+		})
+	}
+}
+
+// TestPreflight_InvalidTierGetsNoAWSChecks: doctor loads the configuration
+// leniently, so an ec2 tier without an ec2 block, or with no subnets, reaches
+// the preflight. It fails that tier (instead of panicking, or asking AWS
+// about every subnet in the region) and checks the others.
+func TestPreflight_InvalidTierGetsNoAWSChecks(t *testing.T) {
+	noBlock := config.Tier{Name: "broken", Provisioner: config.ProvisionerEC2, Max: 2}
+	noSubnets := ec2Tier(func(e *config.EC2Tier) { e.Subnets = nil })
+	noSubnets.Name = "nosubnets"
+	got := preflight(t, goodAccount(), noBlock, noSubnets, ec2Tier(nil))
+	for _, name := range []string{"tier[broken]", "tier[nosubnets]"} {
+		if f := got[name]; f.Level != "FAIL" {
+			t.Errorf("%s = %+v, want FAIL", name, f)
+		}
+	}
+	for _, name := range []string{"ami[broken]", "subnets[nosubnets]", "security-groups[nosubnets]"} {
+		if f, ok := got[name]; ok {
+			t.Errorf("%s ran for an invalid tier: %+v", name, f)
+		}
+	}
+	if f := got["vcpu-quota[Standard/spot]"]; !strings.Contains(f.Detail, "needs 40 vCPUs") {
+		t.Errorf("quota = %+v, want only the valid tier counted", f)
+	}
+	if f := got["subnets[cloud]"]; f.Level != "PASS" {
+		t.Errorf("subnets[cloud] = %+v, want the valid tier still checked", f)
 	}
 }
 
@@ -183,13 +238,26 @@ func TestPreflight_Failures(t *testing.T) {
 			g.IpPermissionsEgress = nil
 			a.groups["sg-1"] = g
 		}, nil},
-		{"group in another VPC", "security-groups[cloud]", "FAIL", "not in vpc-1", func(a *fakeAccount) {
+		{"group in another VPC", "security-groups[cloud]", "FAIL", "sg-1 is in vpc-2, not vpc-1", func(a *fakeAccount) {
 			g := a.groups["sg-1"]
 			g.VpcId = aws.String("vpc-2")
 			a.groups["sg-1"] = g
 		}, nil},
 		{"quota too small", "vcpu-quota[Standard/spot]", "WARN", "needs 40 vCPUs, the quota (L-34B43A08) is 32", func(a *fakeAccount) { a.quotas["L-34B43A08"] = 32 }, nil},
-		{"quota not readable", "vcpu-quota[Standard/spot]", "WARN", "servicequotas:GetServiceQuota", func(a *fakeAccount) { a.denied["GetServiceQuota"] = true }, nil},
+		{"quota not allowed", "vcpu-quota[Standard/spot]", "WARN", "servicequotas:GetServiceQuota", func(a *fakeAccount) { a.denied["GetServiceQuota"] = true }, nil},
+		{"quota unreachable", "vcpu-quota[Standard/spot]", "WARN", "cannot read quota L-34B43A08", func(a *fakeAccount) { a.quotaErr["L-34B43A08"] = errors.New("dial tcp: i/o timeout") }, nil},
+		{"no applied quota: AWS default", "vcpu-quota[Standard/spot]", "PASS", "needs 40 vCPUs of 256", func(a *fakeAccount) {
+			a.quotaErr["L-34B43A08"] = apiErr("NoSuchResourceException")
+			a.defaults["L-34B43A08"] = 256
+		}, nil},
+		{"group in a second VPC", "security-groups[cloud]", "FAIL", "sg-2 is in vpc-2", func(a *fakeAccount) {
+			a.groups["sg-2"] = types.SecurityGroup{GroupId: aws.String("sg-2"), VpcId: aws.String("vpc-2"), IpPermissionsEgress: a.groups["sg-1"].IpPermissionsEgress}
+		}, func(e *config.EC2Tier) { e.SecurityGroups = []string{"sg-1", "sg-2"} }},
+		{"no HTTPS out", "security-groups[cloud]", "WARN", "no HTTPS to the internet", func(a *fakeAccount) {
+			g := a.groups["sg-1"]
+			g.IpPermissionsEgress = []types.IpPermission{{IpProtocol: aws.String("tcp"), FromPort: aws.Int32(22), ToPort: aws.Int32(22), IpRanges: []types.IpRange{{CidrIp: aws.String("10.0.0.0/8")}}}}
+			a.groups["sg-1"] = g
+		}, nil},
 		{"unknown family", "vcpu-quota", "WARN", "mac2.metal", nil, func(e *config.EC2Tier) { e.InstanceTypes = []string{"mac2.metal"} }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -237,6 +305,11 @@ func TestGroupOf(t *testing.T) {
 	} {
 		if g, ok := groupOf(it); !ok || g.name != want {
 			t.Errorf("groupOf(%s) = %q, %v; want %q", it, g.name, ok, want)
+		}
+	}
+	for _, it := range []string{"u7i-12tb.224xlarge", "u7in-16tb.224xlarge", "u7inh-32tb.480xlarge"} {
+		if g, ok := groupOf(it); !ok || g.name != "High Memory" {
+			t.Errorf("groupOf(%s) = %q, %v; want High Memory", it, g.name, ok)
 		}
 	}
 	if _, ok := groupOf("mac2.metal"); ok {
