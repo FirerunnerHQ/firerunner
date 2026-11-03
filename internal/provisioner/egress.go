@@ -34,6 +34,9 @@ type EgressConfig struct {
 	RefreshInterval time.Duration
 }
 
+// Has reports whether the egress categories include category, e.g. "dns".
+func (e EgressConfig) Has(category string) bool { return e.has(category) }
+
 func (e EgressConfig) has(category string) bool {
 	for _, c := range e.Categories {
 		if strings.EqualFold(c, category) {

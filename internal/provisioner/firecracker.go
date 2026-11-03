@@ -482,6 +482,9 @@ func forwardComment(tapPrefix string) string {
 	return "firerunner-egress-" + tapPrefix
 }
 
+// ForwardComment is forwardComment, for doctor to find those rules.
+func ForwardComment(tapPrefix string) string { return forwardComment(tapPrefix) }
+
 // hostForwardScript returns an nft script that inserts accept rules for
 // firerunner's tap interfaces into the host's ip/filter FORWARD chain.
 //
@@ -515,7 +518,8 @@ func (f *Firecracker) ensureHostForward(ctx context.Context) error {
 		f.log.Debug("no ip/filter FORWARD chain; skipping host forward accept", "err", err)
 		return nil
 	}
-	if strings.Contains(out, forwardComment(f.cfg.TapPrefix)) {
+	// Quoted: a peer's prefix may extend ours (fr, frx).
+	if strings.Contains(out, `comment "`+forwardComment(f.cfg.TapPrefix)+`"`) {
 		return nil // our accept rules are already present
 	}
 	if !strings.Contains(out, "policy drop") {
