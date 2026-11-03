@@ -642,6 +642,11 @@ func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitse
 	}, nil
 }
 
+// firecrackerCache reports whether microVMs use a local cache-server.
+func firecrackerCache(cfg *config.Config) bool {
+	return cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != ""
+}
+
 // leafTTL is how long an EC2 instance's cache leaf must live: through the
 // wait for its config, its boot, and the longest the backstop lets it run
 // (a day when that backstop is off).
@@ -741,7 +746,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	var onJobStarted func(context.Context, jobidentity.Job)
 	var cacheJobs *jobidentity.Registry
-	if cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != "" || cfg.UsesEC2Cache() {
+	if firecrackerCache(cfg) || cfg.UsesEC2Cache() {
 		jobs, err := jobidentity.NewRegistry(cfg.CacheJobsDir, log)
 		if err != nil {
 			return fmt.Errorf("cache job registry: %w", err)
@@ -751,7 +756,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if err != nil {
 			return err
 		}
-		cfg.Firecracker.Jobs = jobs
+		// Firecracker guests get identities only when their own cache is
+		// on: one for the EC2 cache alone would give them scope there too.
+		if firecrackerCache(cfg) {
+			cfg.Firecracker.Jobs = jobs
+		}
 		cacheJobs = jobs
 		onJobStarted = func(ctx context.Context, j jobidentity.Job) { jobs.Start(ctx, j, resolver) }
 	}

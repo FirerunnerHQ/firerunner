@@ -181,6 +181,17 @@ func TestServeTiers_AllTiersStoppedShutsDown(t *testing.T) {
 	}
 }
 
+func TestFirecrackerCacheOnlyWhenItsOwnIsOn(t *testing.T) {
+	cfg := &config.Config{}
+	if firecrackerCache(cfg) {
+		t.Fatal("no Firecracker cache flags, yet microVMs would get cache identities")
+	}
+	cfg.Firecracker.CachePort = 8099
+	if !firecrackerCache(cfg) {
+		t.Fatal("--cache-port set, yet microVMs would get no cache identity")
+	}
+}
+
 func TestLeafTTLCoversTheInstancesLife(t *testing.T) {
 	cfg := &config.Config{JITTTL: 5 * time.Minute}
 	cfg.Firecracker.MaxVMLifetime = 6 * time.Hour

@@ -769,6 +769,12 @@ func TestFromFlags_EC2CacheAddr(t *testing.T) {
 	if c, err := FromFlags(args(plain)); err != nil || c.UsesEC2Cache() {
 		t.Fatalf("a tier without ec2.cache needs no address: uses=%v err=%v", c != nil && c.UsesEC2Cache(), err)
 	}
+	if _, err := FromFlags(args(plain, "--ec2-cache-addr", "10.0.0.5:8099")); err == nil || !strings.Contains(err.Error(), "no ec2 tier sets ec2.cache") {
+		t.Fatalf("an address with no cached tier: %v", err)
+	}
+	if _, err := FromFlags(args(cached, "--ec2-cache-addr", "10.0.0.5:8099", "--cache-jobs-dir", "jobs")); err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("a relative --cache-jobs-dir with a cached ec2 tier: %v", err)
+	}
 }
 
 func TestFromFlags_JITHost(t *testing.T) {

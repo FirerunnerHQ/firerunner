@@ -564,7 +564,7 @@ func (c *Config) validate() error {
 	if c.Firecracker.ConnectTimeout != 0 && c.Firecracker.MaxVMLifetime != 0 && c.Firecracker.ConnectTimeout >= c.Firecracker.MaxVMLifetime {
 		return fmt.Errorf("--vm-connect-timeout %s must be shorter than --max-vm-lifetime %s", c.Firecracker.ConnectTimeout, c.Firecracker.MaxVMLifetime)
 	}
-	if (c.Firecracker.CachePort != 0 || c.Firecracker.CacheURL != "") && !filepath.IsAbs(c.CacheJobsDir) {
+	if (c.Firecracker.CachePort != 0 || c.Firecracker.CacheURL != "" || c.UsesEC2Cache()) && !filepath.IsAbs(c.CacheJobsDir) {
 		return fmt.Errorf("--cache-jobs-dir must be an absolute path")
 	}
 	if c.Firecracker.CacheURL != "" {
@@ -741,11 +741,13 @@ func (c *Config) UsesEC2Cache() bool {
 // validateEC2Cache requires a cache-server address instances can reach when
 // a tier sends its cache there: an IP or DNS name, and a port.
 func (c *Config) validateEC2Cache() error {
-	if c.EC2CacheAddr == "" {
-		if c.UsesEC2Cache() {
-			return fmt.Errorf("--ec2-cache-addr is required with an ec2 tier that sets ec2.cache")
-		}
+	switch {
+	case c.EC2CacheAddr == "" && c.UsesEC2Cache():
+		return fmt.Errorf("--ec2-cache-addr is required with an ec2 tier that sets ec2.cache")
+	case c.EC2CacheAddr == "":
 		return nil
+	case !c.UsesEC2Cache():
+		return fmt.Errorf("--ec2-cache-addr is set but no ec2 tier sets ec2.cache; set it on the tiers to cache, or drop the flag")
 	}
 	host, port, err := net.SplitHostPort(c.EC2CacheAddr)
 	if err != nil {
