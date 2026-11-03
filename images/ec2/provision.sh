@@ -42,7 +42,7 @@ apt_get() { apt-get -o DPkg::Lock::Timeout=600 "$@"; }
 apt_get update
 apt_get install -y --no-install-recommends \
 	docker.io zstd curl jq git ca-certificates \
-	nginx dnsmasq-base gcc libc6-dev
+	nginx gcc libc6-dev
 
 # Docker with the containerd image store, as on GitHub-hosted runners.
 install -d /etc/docker
@@ -82,7 +82,10 @@ for node in /opt/runner/externals/node*/bin/node; do
 	install -m 0755 /usr/local/libexec/nodewrap "$node"
 done
 # Every wrapped node must still start, or every node action would fail.
+# (node*_alpine is musl-built, for Alpine job containers: it cannot start on
+# this glibc host, wrapped or not.)
 for node in /opt/runner/externals/node*/bin/node; do
+	case "$node" in */node*_alpine/*) continue ;; esac
 	"$node" --version
 done
 apt_get purge -y --auto-remove gcc libc6-dev
