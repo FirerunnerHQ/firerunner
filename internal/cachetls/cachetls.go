@@ -37,7 +37,12 @@ const (
 )
 
 // caLifetime bounds the CA; a replaced control VM makes a new one anyway.
-const caLifetime = 5 * 365 * 24 * time.Hour
+// One within caRenew of expiry is replaced at start: nothing but the bundles
+// trusts it, and live instances keep the copy they booted with.
+const (
+	caLifetime = 5 * 365 * 24 * time.Hour
+	caRenew    = 30 * 24 * time.Hour
+)
 
 // CA signs leaf certificates for ResultsHost.
 type CA struct {
@@ -48,23 +53,34 @@ type CA struct {
 }
 
 // LoadOrCreate reads the CA from dir, or creates one there: its key mode
-// 0600, in a directory only its owner may enter.
+// 0600, in a directory only its owner may enter. The directory must belong to
+// this process's user (a looser mode is tightened), so no other local user can
+// plant a CA of their own. A lone certificate or key, as a crash between the
+// two writes leaves, or a CA near its expiry, is replaced; a certificate and
+// key that do not belong together are refused.
 func LoadOrCreate(dir string) (*CA, error) {
-	certPath, keyPath := filepath.Join(dir, caCertFile), filepath.Join(dir, caKeyFile)
-	certPEM, certErr := os.ReadFile(certPath)
-	keyPEM, keyErr := os.ReadFile(keyPath)
-	switch {
-	case certErr == nil && keyErr == nil:
-		return parse(certPEM, keyPEM)
-	case !errors.Is(certErr, os.ErrNotExist) && certErr != nil:
-		return nil, certErr
-	case !errors.Is(keyErr, os.ErrNotExist) && keyErr != nil:
-		return nil, keyErr
-	case certErr == nil || keyErr == nil:
-		return nil, fmt.Errorf("cachetls: %s holds only half a CA (certificate or key); remove both to make a new one", dir)
-	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
+	}
+	if err := ownDir(dir); err != nil {
+		return nil, err
+	}
+	certPath, keyPath := filepath.Join(dir, caCertFile), filepath.Join(dir, caKeyFile)
+	certPEM, certErr := os.ReadFile(certPath)
+	keyPEM, keyErr := readKey(keyPath)
+	switch {
+	case certErr == nil && keyErr == nil:
+		ca, err := parse(certPEM, keyPEM)
+		if err != nil {
+			return nil, err
+		}
+		if time.Now().Add(caRenew).Before(ca.cert.NotAfter) {
+			return ca, nil
+		}
+	case certErr != nil && !errors.Is(certErr, os.ErrNotExist):
+		return nil, certErr
+	case keyErr != nil && !errors.Is(keyErr, os.ErrNotExist):
+		return nil, keyErr
 	}
 	ca, keyDER, err := create(time.Now())
 	if err != nil {
@@ -77,6 +93,41 @@ func LoadOrCreate(dir string) (*CA, error) {
 		return nil, err
 	}
 	return ca, nil
+}
+
+// ownDir refuses a CA directory another user owns, or that is a symlink, and
+// tightens one of ours to 0700.
+func ownDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("cachetls: %s is not a directory", dir)
+	}
+	if uid, ok := owner(fi); ok && uid != os.Getuid() {
+		return fmt.Errorf("cachetls: %s belongs to uid %d, not this process's %d: another user could plant a CA there", dir, uid, os.Getuid())
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		return os.Chmod(dir, 0o700)
+	}
+	return nil
+}
+
+// readKey reads the CA key, which must be a regular file only its owner may
+// read.
+func readKey(path string) ([]byte, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("cachetls: %s is not a regular file (%v): the key must not be a link", path, fi.Mode())
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("cachetls: %s has mode %v; the key must have mode 0600", path, fi.Mode().Perm())
+	}
+	return os.ReadFile(path)
 }
 
 func create(now time.Time) (*CA, []byte, error) {
@@ -141,7 +192,8 @@ func (c *CA) Leaf(ttl time.Duration) (certPEM, keyPEM []byte, err error) {
 	now := c.now()
 	notAfter := now.Add(ttl)
 	if notAfter.After(c.cert.NotAfter) {
-		notAfter = c.cert.NotAfter
+		// The leaf would outlive the CA and stop verifying mid-job.
+		return nil, nil, fmt.Errorf("cachetls: the CA expires at %s, before a leaf for %s would; restart to replace it", c.cert.NotAfter.Format(time.RFC3339), ttl)
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: serial(),
@@ -208,6 +260,10 @@ func writeFile(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil { // a power loss must not leave it empty
 		tmp.Close()
 		return err
 	}

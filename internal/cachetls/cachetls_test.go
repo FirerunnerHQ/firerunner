@@ -52,16 +52,17 @@ func TestLoadOrCreateKeepsTheKeyPrivateAndReloads(t *testing.T) {
 	}
 }
 
-func TestLoadOrCreateRefusesHalfACAOrAMismatch(t *testing.T) {
+func TestLoadOrCreateRefusesAMismatchAndReplacesHalfACA(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := LoadOrCreate(dir); err != nil {
+	first, err := LoadOrCreate(dir)
+	if err != nil {
 		t.Fatal(err)
 	}
 	other := t.TempDir()
 	if _, err := LoadOrCreate(other); err != nil {
 		t.Fatal(err)
 	}
-	// Another CA's key with this certificate.
+	// Another CA's key with this certificate: tampering, not a crash.
 	key, _ := os.ReadFile(filepath.Join(other, caKeyFile))
 	if err := os.WriteFile(filepath.Join(dir, caKeyFile), key, 0o600); err != nil {
 		t.Fatal(err)
@@ -69,11 +70,93 @@ func TestLoadOrCreateRefusesHalfACAOrAMismatch(t *testing.T) {
 	if _, err := LoadOrCreate(dir); err == nil || !strings.Contains(err.Error(), "do not belong together") {
 		t.Fatalf("mismatched key: %v", err)
 	}
+	// A crash between the two writes leaves one file: start over.
 	if err := os.Remove(filepath.Join(dir, caKeyFile)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadOrCreate(dir); err == nil || !strings.Contains(err.Error(), "only half a CA") {
-		t.Fatalf("certificate without key: %v", err)
+	ca, err := LoadOrCreate(dir)
+	if err != nil {
+		t.Fatalf("certificate without key: %v, want a new CA", err)
+	}
+	if string(ca.CertPEM()) == string(first.CertPEM()) {
+		t.Fatal("kept a certificate whose key is gone")
+	}
+}
+
+func TestLoadOrCreateGuardsTheDirectoryAndKey(t *testing.T) {
+	loose := filepath.Join(t.TempDir(), "loose")
+	if err := os.Mkdir(loose, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loose, 0o777); err != nil { // past the umask
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreate(loose); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(loose); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("a loose CA dir stayed %v, want 0700", fi.Mode().Perm())
+	}
+
+	dir := t.TempDir()
+	if _, err := LoadOrCreate(dir); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(dir, caKeyFile)
+	if err := os.Chmod(keyPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreate(dir); err == nil || !strings.Contains(err.Error(), "must have mode 0600") {
+		t.Fatalf("readable key: %v, want refused", err)
+	}
+	planted := filepath.Join(t.TempDir(), "planted.key")
+	key, _ := os.ReadFile(keyPath)
+	if err := os.WriteFile(planted, key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(planted, keyPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreate(dir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("symlinked key: %v, want refused", err)
+	}
+}
+
+func TestLoadOrCreateReplacesACANearExpiry(t *testing.T) {
+	dir := t.TempDir()
+	old, keyDER, err := create(time.Now().Add(-caLifetime + 10*24*time.Hour)) // 10 days left
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile(filepath.Join(dir, caKeyFile), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile(filepath.Join(dir, caCertFile), old.CertPEM(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ca, err := LoadOrCreate(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ca.CertPEM()) == string(old.CertPEM()) || ca.cert.NotAfter.Before(time.Now().Add(caLifetime-time.Hour)) {
+		t.Fatal("a CA 10 days from expiry was kept")
+	}
+}
+
+func TestLeafRefusesToOutliveTheCA(t *testing.T) {
+	ca, err := LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca.now = func() time.Time { return ca.cert.NotAfter.Add(-time.Hour) }
+	if _, _, err := ca.Leaf(2 * time.Hour); err == nil {
+		t.Fatal("issued a leaf that outlives its CA")
+	}
+	if _, _, err := ca.Leaf(30 * time.Minute); err != nil {
+		t.Fatalf("a leaf within the CA's life: %v", err)
 	}
 }
 
