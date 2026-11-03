@@ -101,6 +101,20 @@ render_userdata() {
 	echo 'FIRERUNNER_UNIT'
 	echo 'systemctl enable firerunner-ec2-runner.service'
 	echo '}'
+	# The dependency cache proxy (#28): inactive until a bundle arrives.
+	echo 'install_cache_proxy() {'
+	echo 'install -d /usr/local/libexec /etc/firerunner'
+	echo "cat >/usr/local/libexec/firerunner-cache-setup <<'FIRERUNNER_CACHE_SETUP'"
+	cat "$HERE/assets/firerunner-cache-setup.sh"
+	echo 'FIRERUNNER_CACHE_SETUP'
+	echo 'chmod 0755 /usr/local/libexec/firerunner-cache-setup'
+	echo "cat >/etc/firerunner/cache-nginx.conf <<'FIRERUNNER_CACHE_NGINX'"
+	cat "$HERE/assets/firerunner-cache-nginx.conf"
+	echo 'FIRERUNNER_CACHE_NGINX'
+	echo "cat >/tmp/nodewrap.c <<'FIRERUNNER_NODEWRAP'"
+	cat "$HERE/assets/nodewrap.c"
+	echo 'FIRERUNNER_NODEWRAP'
+	echo '}'
 	sed '1d' "$HERE/ec2/provision.sh"
 }
 
@@ -128,8 +142,11 @@ cleanup() {
 trap cleanup EXIT
 
 render_userdata >"$work/user-data.sh"
-size=$(wc -c <"$work/user-data.sh")
-[ "$size" -le 16384 ] || die "user-data is $size bytes; EC2 allows 16384"
+# cloud-init runs gzip'd user-data as it would the script; EC2 counts the
+# compressed bytes against its limit.
+gzip -9n <"$work/user-data.sh" >"$work/user-data.gz"
+size=$(wc -c <"$work/user-data.gz")
+[ "$size" -le 16384 ] || die "user-data is $size bytes compressed; EC2 allows 16384"
 
 base_ami="$(aws ssm get-parameter \
 	--name "/aws/service/canonical/ubuntu/server/24.04/stable/current/${ubuntu_arch}/hvm/ebs-gp3/ami-id" \
@@ -145,7 +162,7 @@ done
 instance="$(aws ec2 run-instances \
 	--image-id "$base_ami" --instance-type "$itype" --count 1 \
 	--subnet-id "$subnet" --security-group-ids "$sg" \
-	--user-data "file://$work/user-data.sh" \
+	--user-data "fileb://$work/user-data.gz" \
 	--metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
 	--instance-initiated-shutdown-behavior stop \
 	--block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$volume,VolumeType=gp3,DeleteOnTermination=true}" \
