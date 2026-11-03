@@ -574,6 +574,7 @@ func firecrackerHostChecks(cfg *config.Config) []Check {
 
 	checks = append(checks, fileCheck("kernel", fc.KernelImage, 1<<20)) // >=1MiB
 	var goldens []string
+	readable := map[string]string{} // tier -> a golden that passed, for resolvChecks
 	if len(cfg.Tiers) > 0 {
 		// Tier-catalog mode: each tier has its own golden (and optional
 		// toolcache); the top-level --golden may be unset, so check per tier
@@ -583,15 +584,23 @@ func firecrackerHostChecks(cfg *config.Config) []Check {
 				// An ec2 tier boots no image from this host.
 				continue
 			}
-			checks = append(checks, fileCheck("golden["+t.Name+"]", t.Golden, 64<<20))
+			c := fileCheck("golden["+t.Name+"]", t.Golden, 64<<20)
+			checks = append(checks, c)
 			goldens = append(goldens, t.Golden)
+			if c.Level == levelPass {
+				readable[t.Name] = t.Golden
+			}
 			if t.ToolCache != "" {
 				checks = append(checks, fileCheck("toolcache["+t.Name+"]", t.ToolCache, 1<<20))
 			}
 		}
 	} else {
-		checks = append(checks, fileCheck("golden", fc.GoldenRootFS, 64<<20)) // >=64MiB
+		c := fileCheck("golden", fc.GoldenRootFS, 64<<20) // >=64MiB
+		checks = append(checks, c)
 		goldens = append(goldens, fc.GoldenRootFS)
+		if c.Level == levelPass {
+			readable[or(cfg.ScaleSetName, "golden")] = fc.GoldenRootFS
+		}
 		if fc.ToolCacheImage != "" {
 			checks = append(checks, fileCheck("toolcache", fc.ToolCacheImage, 1<<20))
 		}
@@ -619,6 +628,8 @@ func firecrackerHostChecks(cfg *config.Config) []Check {
 	} else {
 		checks = append(checks, pass("nftables", "nft present"))
 	}
+	checks = append(checks, forwardChecks(fc)...)
+	checks = append(checks, resolvChecks(cfg, readable)...)
 
 	// Reflink only works within one filesystem, so a golden on a different
 	// device than the workdir silently defeats it however capable the workdir is.

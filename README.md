@@ -680,7 +680,16 @@ so GitHub Enterprise Server works too). Then:
 
 - **Firecracker tiers:** `/dev/kvm`, the firecracker/jailer binaries, the
   kernel and golden images, the egress interface, `ip_forward`, `nftables`,
-  and a reflink-capable work dir. A host with only EC2 tiers skips them.
+  and a reflink-capable work dir. A host with only EC2 tiers skips them. Also:
+  - `forward-policy`: whether the `ip filter` FORWARD chain drops by default
+    (Docker, ufw) and, if so, whether the daemon's accepts for its taps are
+    there;
+  - `forward-legacy`: fails on a legacy-iptables FORWARD policy of DROP
+    (Docker on iptables-legacy), which firerunner's nftables rules cannot
+    override, with the rules to add;
+  - `resolv[tier]`: the golden image's `/etc/resolv.conf` (read with
+    `debugfs`) names resolvers that `--dns-servers` lets guests reach and that
+    answer for github.com from this host's network.
 - **EC2 tiers**, read from the account with the daemon's credentials:
   - `aws-identity`: whose credentials, in which region;
   - `ami[tier]`: the image ID or SSM parameter resolves;

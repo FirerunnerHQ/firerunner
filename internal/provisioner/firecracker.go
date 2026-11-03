@@ -482,6 +482,9 @@ func forwardComment(tapPrefix string) string {
 	return "firerunner-egress-" + tapPrefix
 }
 
+// ForwardComment is forwardComment, for doctor to find those rules.
+func ForwardComment(tapPrefix string) string { return forwardComment(tapPrefix) }
+
 // hostForwardScript returns an nft script that inserts accept rules for
 // firerunner's tap interfaces into the host's ip/filter FORWARD chain.
 //
