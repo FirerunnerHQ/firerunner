@@ -742,6 +742,41 @@ func TestFromFlags_JITAddr(t *testing.T) {
 	}
 }
 
+func TestFromFlags_EC2CacheAddr(t *testing.T) {
+	cached := writeTiers(t, `[`+strings.Replace(ec2TierJSON, `"ec2":{`, `"ec2":{"cache":true,`, 1)+`]`)
+	plain := writeTiers(t, `[`+ec2TierJSON+`]`)
+	args := func(tiers string, extra ...string) []string {
+		return append([]string{"--url", "u", "--token", "t", "--tiers", tiers, "--jit-addr", "10.0.0.5:8098"}, extra...)
+	}
+	c, err := FromFlags(args(cached, "--ec2-cache-addr", "10.0.0.5:8099"))
+	if err != nil || !c.UsesEC2Cache() || c.EC2CacheAddr != "10.0.0.5:8099" {
+		t.Fatalf("cached tier with an address: c.UsesEC2Cache=%v err=%v", c != nil && c.UsesEC2Cache(), err)
+	}
+	if _, err := FromFlags(args(cached, "--ec2-cache-addr", "control.firerunner.internal:8099")); err != nil {
+		t.Fatalf("a DNS name: %v", err)
+	}
+	if _, err := FromFlags(args(cached)); err == nil || !strings.Contains(err.Error(), "--ec2-cache-addr is required") {
+		t.Fatalf("cached tier without an address: %v", err)
+	}
+	for name, addr := range map[string]string{
+		"no port": "10.0.0.5", "port zero": "10.0.0.5:0", "loopback": "127.0.0.1:8099",
+		"wildcard": "0.0.0.0:8099", "bad name": "con trol:8099",
+	} {
+		if _, err := FromFlags(args(cached, "--ec2-cache-addr", addr)); err == nil {
+			t.Errorf("%s: --ec2-cache-addr %q accepted", name, addr)
+		}
+	}
+	if c, err := FromFlags(args(plain)); err != nil || c.UsesEC2Cache() {
+		t.Fatalf("a tier without ec2.cache needs no address: uses=%v err=%v", c != nil && c.UsesEC2Cache(), err)
+	}
+	if _, err := FromFlags(args(plain, "--ec2-cache-addr", "10.0.0.5:8099")); err == nil || !strings.Contains(err.Error(), "no ec2 tier sets ec2.cache") {
+		t.Fatalf("an address with no cached tier: %v", err)
+	}
+	if _, err := FromFlags(args(cached, "--ec2-cache-addr", "10.0.0.5:8099", "--cache-jobs-dir", "jobs")); err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("a relative --cache-jobs-dir with a cached ec2 tier: %v", err)
+	}
+}
+
 func TestFromFlags_JITHost(t *testing.T) {
 	ec2Only := writeTiers(t, `[`+ec2TierJSON+`]`)
 	args := func(extra ...string) []string {

@@ -376,6 +376,7 @@ See [`examples/tiers-ec2.json`](examples/tiers-ec2.json):
 | `market` | `spot`, `on-demand`, or `spot-then-on-demand` (every spot option before any on-demand one) |
 | `root_volume_gib`, `root_volume_type` | optional root EBS override (default: the AMI's size, type `gp3`) |
 | `pool` | how many pre-warmed, stopped instances to keep ready (default 0, every job cold-launches); see below |
+| `cache` | `true` sends the tier's `actions/cache` traffic to firerunner's cache-server at `--ec2-cache-addr` (default off). Each instance gets, once and with its JIT config, a certificate for GitHub's results host from a CA that never leaves the control VM and can sign no other name. Work in progress (#28): the runner AMI's proxy that uses it is not released yet |
 
 `vcpu`, `mem_mib`, `golden` and `toolcache` are Firecracker fields and are
 rejected on an EC2 tier. EC2 tiers do not count against `--max-runners`, which
@@ -557,6 +558,9 @@ daemon's "job started" log line for the runner's name gives the job's
   that IP, for example `control.firerunner.internal`. It keeps one address
   across control VM replacements; it must resolve to `--jit-addr`'s IP.
 - `--jit-ttl` / `FR_JIT_TTL`: how long a config waits to be fetched.
+- `--ec2-cache-addr` / `FR_EC2_CACHE_ADDR`: the cache-server's `host:port`
+  as instances reach it over the VPC (e.g. `10.0.0.5:8099`, or the
+  `--jit-host` name); required when a tier sets `ec2.cache`.
 - `--aws-region` / `FR_AWS_REGION`: defaults to the SDK's sources, then the
   control VM's own region.
 

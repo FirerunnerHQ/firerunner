@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
+	"github.com/firerunnerhq/firerunner/internal/cachetls"
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/jitserver"
@@ -121,6 +122,10 @@ type Options struct {
 	// Launched, when set, is told each launch's path (PathPool, PathCold or
 	// PathKept).
 	Launched func(path string)
+	// Cache, when set and the tier sets ec2.cache, gives each instance a
+	// cache bundle and binds its address to its runner's job for
+	// cache-server's scope checks.
+	Cache *CacheOptions
 	// Interrupted, when set, is told each spot instance AWS took back while
 	// it ran a runner; duringJob says whether its job had started.
 	Interrupted func(duringJob bool)
@@ -142,6 +147,67 @@ const (
 	// leaving it for the jobs ec2.pool_for names.
 	PathKept = "kept"
 )
+
+// CacheOptions are what an EC2 tier's cache proxy needs from the control VM.
+type CacheOptions struct {
+	// CA issues each instance's leaf for the results host.
+	CA *cachetls.CA
+	// Upstream is cache-server's host:port as instances reach it.
+	Upstream string
+	// Jobs binds an instance's address to its runner, as cache-server reads
+	// it; nil leaves cache-server to deny every request.
+	Jobs VMJobs
+	// LeafTTL is how long a leaf lives: the instance's whole life, from its
+	// registration through boot and its job.
+	LeafTTL time.Duration
+}
+
+// VMJobs binds instance addresses to the runners on them (jobidentity's
+// Registry), so cache-server knows whose job a request comes from.
+type VMJobs interface {
+	Register(runner, ip string) error
+	Release(runner string) error
+}
+
+// register hands the instance at ip its JIT config and, for a cached tier,
+// its cache bundle, and binds the address to the runner. No bundle leaves the
+// job uncached. A binding that fails fails the launch: cache-server knows a
+// job by its address alone, and the failure may be another live job holding
+// this address, whose scope the instance would then act in. release undoes
+// all of it.
+func (p *Provisioner) register(ip netip.Addr, name, jit string) (release func(), err error) {
+	c := p.o.Cache
+	if c == nil || !p.o.EC2.Cache {
+		if err := p.o.JIT.Register(ip, name, jit); err != nil {
+			return nil, err
+		}
+		return func() { p.o.JIT.Revoke(ip) }, nil
+	}
+	bundle, err := c.CA.Bundle(c.LeafTTL, c.Upstream)
+	if err != nil {
+		p.log.Warn("no cache bundle; the job runs without the cache", "runner", name, "err", err)
+		if err := p.o.JIT.Register(ip, name, jit); err != nil {
+			return nil, err
+		}
+		return func() { p.o.JIT.Revoke(ip) }, nil
+	}
+	if err := p.o.JIT.RegisterWithCache(ip, name, jit, bundle); err != nil {
+		return nil, err
+	}
+	if c.Jobs == nil {
+		return func() { p.o.JIT.Revoke(ip) }, nil
+	}
+	if err := c.Jobs.Register(name, ip.String()); err != nil {
+		p.o.JIT.Revoke(ip)
+		return nil, fmt.Errorf("bind cache identity for %s: %w", ip, err)
+	}
+	return func() {
+		p.o.JIT.Revoke(ip)
+		if err := c.Jobs.Release(name); err != nil {
+			p.log.Warn("release cache identity", "runner", name, "err", err)
+		}
+	}, nil
+}
 
 // Fallbacks, as Options.FellBack reports them.
 const (
@@ -257,10 +323,11 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 	if err != nil {
 		return w.abort(ctx, "no private IP", err)
 	}
-	if err := p.o.JIT.Register(ip, name, jit); err != nil {
+	release, err := p.register(ip, name, jit)
+	if err != nil {
 		return w.abort(ctx, "jit registration failed", fmt.Errorf("register jit config for %s at %s: %w", id, ip, err))
 	}
-	defer p.o.JIT.Revoke(ip)
+	defer release()
 	return w.run(ctx, ip)
 }
 
@@ -296,11 +363,12 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string, onStar
 		return fmt.Errorf("%w: pool instance %s private IP %q: %w", errPoolStart, in.id, in.ip, err)
 	}
 	// Register before the start, so the boot script's first fetch succeeds.
-	if err := p.o.JIT.Register(ip, name, jit); err != nil {
+	release, err := p.register(ip, name, jit)
+	if err != nil {
 		p.pool.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
 		return fmt.Errorf("register jit config for %s at %s: %w", in.id, ip, err)
 	}
-	defer p.o.JIT.Revoke(ip)
+	defer release()
 	claimed := time.Now()
 	if _, err := p.c.api.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{in.id}}); err != nil {
 		// A stopped spot instance can lack capacity to start again.
