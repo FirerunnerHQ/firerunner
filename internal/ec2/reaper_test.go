@@ -192,6 +192,33 @@ func TestReaper_CancelsSpotRequestsWithoutAnInstance(t *testing.T) {
 	}
 }
 
+// TestReaper_LeavesOneTimeRequestsAlone: a cold spot instance's one-time
+// request carries the owner tag and may still read active for a moment after
+// the instance ends. It can never launch a replacement, so the reaper must
+// neither cancel nor count it (#131).
+func TestReaper_LeavesOneTimeRequestsAlone(t *testing.T) {
+	f := newFakeEC2(t)
+	f.lagClose = true
+	id := f.put(job("runner-1"), types.InstanceStateNameShuttingDown, old, false)
+	f.mu.Lock()
+	f.instances[id].spot = true
+	f.instances[id].spotTags = map[string]string{TagOwner: "test-owner"}
+	f.mu.Unlock()
+	r, _ := reaperFor(f, &githubRunners{}, nil)
+	rep, err := r.Sweep(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.SpotRequests) != 0 {
+		t.Fatalf("reaper cancelled %v, want no one-time request touched", rep.SpotRequests)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cancelled["sir-once-"+id] {
+		t.Fatal("cancelled a one-time request")
+	}
+}
+
 func TestReaper_DryRunChangesNothing(t *testing.T) {
 	f := newFakeEC2(t)
 	stopped := f.put(job("a", TagPool, PoolClaimed), types.InstanceStateNameStopped, old, true)

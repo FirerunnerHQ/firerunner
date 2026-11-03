@@ -173,6 +173,9 @@ type fakeEC2 struct {
 	// termWithOpenRequest records terminates of an instance whose persistent
 	// request was still open: AWS would launch a replacement (R10).
 	termWithOpenRequest []string
+	// lagClose keeps a one-time spot request active after its instance
+	// ends, as AWS may for a moment.
+	lagClose bool
 	// violations records calls AWS would never allow, or states it would
 	// never produce; the end-of-test check reports them.
 	violations []string
@@ -343,28 +346,23 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []types.SpotInstanceRequest
-	byInstance := false
-	for _, fl := range in.Filters {
-		byInstance = byInstance || aws.ToString(fl.Name) == "instance-id"
-	}
 	for _, id := range f.order {
 		i := f.instances[id]
-		req := i.spotReq
-		if req == "" && i.spot && byInstance {
-			// A one-time instance's request. Real AWS lists it in every
-			// query (active while the instance runs, then closed); the fake
-			// lists it only by instance-id, so the other listings, all about
-			// persistent requests, keep their tests' expectations. See the
-			// reaper issue #131, which can see active ones.
-			req = "sir-once-" + id
+		req, kind := i.spotReq, types.SpotInstanceTypePersistent
+		if req == "" && i.spot {
+			// A one-time instance's request, listed as AWS lists it: active
+			// while the instance runs, closed once it ends.
+			req, kind = "sir-once-"+id, types.SpotInstanceTypeOneTime
 		}
 		if req == "" {
 			continue
 		}
 		state := types.SpotInstanceStateActive
 		switch {
-		case f.cancelled[i.spotReq]:
+		case f.cancelled[req]:
 			state = types.SpotInstanceStateCancelled
+		case kind == types.SpotInstanceTypeOneTime && !f.lagClose && (i.state == types.InstanceStateNameShuttingDown || i.state == types.InstanceStateNameTerminated):
+			state = types.SpotInstanceStateClosed
 		case i.state == types.InstanceStateNameStopped:
 			state = types.SpotInstanceStateDisabled
 		}
@@ -372,6 +370,7 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 			SpotInstanceRequestId: aws.String(req),
 			InstanceId:            aws.String(i.id),
 			State:                 state,
+			Type:                  kind,
 			CreateTime:            aws.Time(i.launched),
 		}
 		if i.spotStatus != "" {
@@ -390,6 +389,8 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 					ok = ok || string(state) == want
 				case name == "instance-id":
 					ok = ok || i.id == want
+				case name == "type":
+					ok = ok || string(kind) == want
 				case strings.HasPrefix(name, "tag:"):
 					ok = ok || i.spotTags[strings.TrimPrefix(name, "tag:")] == want
 				}
