@@ -445,6 +445,18 @@ func endingState(s types.InstanceStateName) bool {
 	return false
 }
 
+// launchMetadataOptions: IMDSv2 only, one hop, so a job's containers cannot
+// reach IMDS. No instance profile is attached, so IMDS holds no credentials
+// anyway. doctor reports them (see metadataCheck).
+func launchMetadataOptions() *types.InstanceMetadataOptionsRequest {
+	return &types.InstanceMetadataOptionsRequest{
+		HttpEndpoint:            types.InstanceMetadataEndpointStateEnabled,
+		HttpTokens:              types.HttpTokensStateRequired,
+		HttpPutResponseHopLimit: aws.Int32(1),
+		InstanceMetadataTags:    types.InstanceMetadataTagsStateDisabled,
+	}
+}
+
 func placementAZ(i types.Instance) string {
 	if i.Placement == nil {
 		return ""
@@ -712,15 +724,8 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 		SubnetId:         aws.String(subnet),
 		SecurityGroupIds: p.o.EC2.SecurityGroups,
 		// The only user-data is the JIT endpoint: nothing secret.
-		UserData: aws.String(base64.StdEncoding.EncodeToString([]byte(jitserver.UserData(p.o.JITURL)))),
-		// IMDSv2 only, one hop: a job's containers cannot reach IMDS. No
-		// instance profile is attached, so IMDS holds no credentials anyway.
-		MetadataOptions: &types.InstanceMetadataOptionsRequest{
-			HttpEndpoint:            types.InstanceMetadataEndpointStateEnabled,
-			HttpTokens:              types.HttpTokensStateRequired,
-			HttpPutResponseHopLimit: aws.Int32(1),
-			InstanceMetadataTags:    types.InstanceMetadataTagsStateDisabled,
-		},
+		UserData:        aws.String(base64.StdEncoding.EncodeToString([]byte(jitserver.UserData(p.o.JITURL)))),
+		MetadataOptions: launchMetadataOptions(),
 		TagSpecifications: []types.TagSpecification{
 			{ResourceType: types.ResourceTypeInstance, Tags: tags},
 			{ResourceType: types.ResourceTypeVolume, Tags: tags},
