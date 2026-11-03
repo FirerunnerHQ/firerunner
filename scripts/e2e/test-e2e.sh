@@ -106,6 +106,8 @@ case "$1 $2" in
 	fake-answer create-stack optional
 	;;
 "cloudformation delete-stack") fake-answer delete-stack optional ;;
+"cloudformation describe-stack-resource") fake-answer stack-resource ;;
+"resourcegroupstaggingapi get-resources") fake-answer tagged ;;
 "cloudformation describe-stack-events") fake-answer stack-events ;;
 "autoscaling describe-auto-scaling-groups") fake-answer asg ;;
 "route53 list-resource-record-sets") fake-answer rrs ;;
@@ -1038,7 +1040,10 @@ run control-vm.sh up --cache memory
 expect "up --cache memory: a usage error" "$(dump)" rc_is 2
 
 vm_fresh vm-down-cache
-answer stack-st-e2e-test 1 "$(session_stack CREATE_COMPLETE | jq -c '.Stacks[0].Outputs += [{OutputKey: "CacheBucket", OutputValue: "st-e2e-test-cachebucket-abc"}]')"
+# A stack that failed to create has no outputs; its retained bucket is a
+# resource all the same.
+answer stack-st-e2e-test 1 "$(session_stack ROLLBACK_COMPLETE)"
+answer stack-resource 1 st-e2e-test-cachebucket-abc
 answer stack-st-e2e-test 2 "$NOSTACK"
 inventory_answers
 run control-vm.sh down
@@ -1071,6 +1076,15 @@ expect "down: keeps the shared parameters" "" [ -e "$STATE/ssm/fr/e2e/control/ti
 expect "down: keeps other sessions' parameters" "" [ -e "$STATE/ssm/fr/e2e/sessions/e2e-other/control/version" ]
 expect "down: reports" "" last_json '.parameters_deleted == 3 and .jit_name_deleted == true and .cleanup.terminate_instances == ["i-0mine", "i-0pool"]'
 expect "down: no cache bucket, none deleted" "" not_called "delete-bucket"
+
+vm_fresh vm-down-leftover-bucket
+answer stack-st 1 "$(base_stack e2e-shared)"
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer tagged 1 arn:aws:s3:::st-e2e-test-cachebucket-old
+inventory_answers
+run control-vm.sh down
+expect "down, no stack: finds the bucket an earlier down left, by its tag" "$(dump)" \
+	bash -c "grep -q 'tag-filters Key=firerunner:control,Values=st-e2e-test' '$STATE/calls' && grep -q 's3api delete-bucket --bucket st-e2e-test-cachebucket-old' '$STATE/calls'"
 
 vm_fresh vm-down-shared-owner
 answer stack-st 1 "$(base_stack e2e-test)"

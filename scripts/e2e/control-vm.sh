@@ -396,7 +396,10 @@ cmd_down() {
 		prefix="$(param "$s" ParameterPrefix)"
 		zone_id="$(param "$s" HostedZoneId)"
 		jit="$(output "$s" JitHost)"
-		bucket="$(output "$s" CacheBucket)"
+		# From the resource, not the outputs: a stack that failed to create
+		# has none, but its retained bucket outlives it.
+		bucket="$(aws cloudformation describe-stack-resource --stack-name "$stack" --logical-resource-id CacheBucket \
+			--query StackResourceDetail.PhysicalResourceId --output text 2>/dev/null)" || bucket=""
 		aws cloudformation delete-stack --stack-name "$stack" || e2e_die 1 "delete-stack $stack failed"
 		e2e_log "deleting stack $stack"
 		while :; do
@@ -416,6 +419,12 @@ cmd_down() {
 		[ -z "$b" ] || prefix="$(output "$b" ParameterPrefix)/sessions/$owner"
 		[ -z "$b" ] || zone_id="$(output "$b" HostedZoneId)"
 		[ -z "$b" ] || { jit="$(output "$b" JitHost)" && jit="$owner.${jit#*.}"; }
+		# A bucket an earlier down left: the stack tags it with its name.
+		bucket="$(aws resourcegroupstaggingapi get-resources --resource-type-filters s3 \
+			--tag-filters "Key=firerunner:control,Values=$stack" --query 'ResourceTagMappingList[0].ResourceARN' \
+			--output text 2>/dev/null)" || bucket=""
+		bucket="${bucket#arn:aws:s3:::}"
+		[ "$bucket" != None ] || bucket=""
 	fi
 
 	# The stack keeps its cache bucket; a session's is this session's alone.
