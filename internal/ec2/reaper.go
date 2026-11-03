@@ -129,6 +129,10 @@ func (r *Reaper) Sweep(ctx context.Context) (ReapReport, error) {
 	sp := ec2.NewDescribeSpotInstanceRequestsPaginator(r.c.api, &ec2.DescribeSpotInstanceRequestsInput{Filters: []types.Filter{
 		{Name: aws.String("tag:" + TagOwner), Values: []string{r.o.Owner}},
 		{Name: aws.String("state"), Values: []string{"open", "active", "disabled"}},
+		// A cold instance's one-time request carries the owner tag too, and
+		// may read active a moment after its instance ends; it never
+		// launches a replacement, so it is no orphan.
+		{Name: aws.String("type"), Values: []string{string(types.SpotInstanceTypePersistent)}},
 	}})
 	for sp.HasMorePages() {
 		page, err := sp.NextPage(ctx)
