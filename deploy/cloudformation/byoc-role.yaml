@@ -115,6 +115,7 @@ Resources:
                   - ec2:DescribeSecurityGroups
                   - ec2:DescribeInstanceTypes
                   - servicequotas:GetServiceQuota
+                  - servicequotas:GetAWSDefaultServiceQuota
                 Resource: "*"
               - Effect: Allow
                 Action: [ec2:TerminateInstances, ec2:StartInstances, ec2:ModifyInstanceAttribute]
