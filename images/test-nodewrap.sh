@@ -12,11 +12,14 @@ ext="$TMP/externals"
 mkdir -p "$ext/node20/bin"
 cc -O2 -static -o "$ext/node20/bin/node" "$HERE/assets/nodewrap.c" 2>/dev/null ||
 	cc -O2 -o "$ext/node20/bin/node" "$HERE/assets/nodewrap.c"
+# The fake node is python, not sh: dash (Ubuntu's sh) drops dashed names
+# itself, which would hide what nodewrap passes on.
 cat >"$ext/node20/bin/node.real" <<'FAKE'
-#!/bin/sh
-echo "ca=${NODE_EXTRA_CA_CERTS:-}"
-echo "args=$*"
-env | grep -c '^INPUT_INCLUDE-HIDDEN-FILES=yes$' | sed 's/^/dashed=/'
+#!/usr/bin/env python3
+import os, sys
+print("ca=" + os.environ.get("NODE_EXTRA_CA_CERTS", ""))
+print("args=" + " ".join(sys.argv[1:]))
+print("dashed=%d" % (os.environ.get("INPUT_INCLUDE-HIDDEN-FILES") == "yes"))
 FAKE
 chmod +x "$ext/node20/bin/node.real"
 
