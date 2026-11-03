@@ -143,6 +143,13 @@ Resources:
                   - ec2:DescribeInstances
                   - ec2:DescribeImages
                   - ec2:DescribeSpotInstanceRequests
+                  # firerunner doctor: the tiers' subnets, routes, groups
+                  # and instance types, and the vCPU quotas they use.
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeInstanceTypes
+                  - servicequotas:GetServiceQuota
                 Resource: "*"
               - Effect: Allow
                 Action: [ec2:TerminateInstances, ec2:StartInstances, ec2:ModifyInstanceAttribute]
