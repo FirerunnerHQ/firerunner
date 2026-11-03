@@ -60,6 +60,9 @@ type Config struct {
 	// how long a config waits to be fetched.
 	JITAddr string
 	JITTTL  time.Duration
+	// EC2CacheAddr is the host:port of the cache-server EC2 tiers with
+	// ec2.cache reach over the VPC; required with such a tier.
+	EC2CacheAddr string
 	// JITHost, when set, is the name instances are told to fetch from
 	// instead of JITAddr's IP: a stable private DNS name that follows a
 	// replaced control VM. The port stays JITAddr's.
@@ -198,6 +201,11 @@ type EC2Tier struct {
 	// takes a pool instance only for a pending job it matches, and others
 	// cold-launch. Unset, every launch takes the pool while it has one.
 	PoolFor *PoolFor `json:"pool_for,omitempty"`
+	// Cache sends the tier's actions/cache traffic to firerunner's
+	// cache-server at --ec2-cache-addr: each instance gets a proxy that
+	// answers as GitHub's results host (see internal/cachetls). Off by
+	// default.
+	Cache bool `json:"cache,omitempty"`
 }
 
 // PoolFor matches pending jobs by event (e.g. "pull_request") or by job
@@ -342,6 +350,7 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.StringVar(&c.JITAddr, "jit-addr", env("FR_JIT_ADDR", ""), "VPC IP:port where EC2 runner instances fetch their JIT config, served once to each instance's private IP so no secret goes into user-data (e.g. 10.0.0.5:8098); required with an ec2 tier. Bind the control VM's VPC address, never a public one")
 	fs.StringVar(&c.AWSRegion, "aws-region", env("FR_AWS_REGION", ""), "AWS region for ec2 tiers; defaults to AWS_REGION/shared config, then the control VM's own region from IMDS")
 	fs.StringVar(&c.JITHost, "jit-host", env("FR_JIT_HOST", ""), "DNS name EC2 runner instances use for the JIT endpoint instead of --jit-addr's IP (e.g. control.firerunner.internal), so a replaced control VM keeps one address; it must resolve to --jit-addr's IP inside the VPC. The port is --jit-addr's")
+	fs.StringVar(&c.EC2CacheAddr, "ec2-cache-addr", env("FR_EC2_CACHE_ADDR", ""), "host:port of the cache-server that EC2 tiers with ec2.cache reach over the VPC (e.g. 10.0.0.5:8099, or the --jit-host name); required with such a tier")
 	fs.DurationVar(&c.JITTTL, "jit-ttl", er.duration("FR_JIT_TTL", 5*time.Minute), "how long an EC2 instance's JIT config waits to be fetched before it expires")
 	fs.StringVar(&c.Owner, "owner", env("FR_OWNER", ""), "name of this install: tagged as firerunner:owner on every instance it launches, so its pool and reaper find them again. Defaults to the host name; set a stable value when the control VM can be replaced. Setting it also keeps the tiers' scale sets registered across restarts (without it, a scale set this process created is deleted when it stops)")
 	fs.StringVar(&c.RunnerSweep, "runner-sweep", env("FR_RUNNER_SWEEP", "on"), "every 5 minutes, remove offline runners in this install's scale sets that it does not track (left by a launch that died before connecting, or by an earlier process), once two sweeps in a row find them: on, dry-run (log only), or off")
@@ -715,6 +724,42 @@ func (c *Config) validateJIT() error {
 	}
 	if c.JITTTL < 30*time.Second {
 		return fmt.Errorf("--jit-ttl %s is too small; an instance needs time to boot before it asks (use >= 30s)", c.JITTTL)
+	}
+	return c.validateEC2Cache()
+}
+
+// UsesEC2Cache reports whether any effective EC2 tier sets ec2.cache.
+func (c *Config) UsesEC2Cache() bool {
+	for _, t := range c.EffectiveTiers() {
+		if t.IsEC2() && t.EC2 != nil && t.EC2.Cache {
+			return true
+		}
+	}
+	return false
+}
+
+// validateEC2Cache requires a cache-server address instances can reach when
+// a tier sends its cache there: an IP or DNS name, and a port.
+func (c *Config) validateEC2Cache() error {
+	if c.EC2CacheAddr == "" {
+		if c.UsesEC2Cache() {
+			return fmt.Errorf("--ec2-cache-addr is required with an ec2 tier that sets ec2.cache")
+		}
+		return nil
+	}
+	host, port, err := net.SplitHostPort(c.EC2CacheAddr)
+	if err != nil {
+		return fmt.Errorf("--ec2-cache-addr %q must be <host>:<port>: %w", c.EC2CacheAddr, err)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("--ec2-cache-addr %q needs a port in 1-65535", c.EC2CacheAddr)
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() {
+			return fmt.Errorf("--ec2-cache-addr %q must be an address instances can reach over the VPC", c.EC2CacheAddr)
+		}
+	} else if !validHostname(host) {
+		return fmt.Errorf("--ec2-cache-addr %q: %q is neither an IP nor a DNS name", c.EC2CacheAddr, host)
 	}
 	return nil
 }
