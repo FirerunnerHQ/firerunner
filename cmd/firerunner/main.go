@@ -36,6 +36,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/cacheserver"
 	"github.com/firerunnerhq/firerunner/internal/cacheserver/s3store"
+	"github.com/firerunnerhq/firerunner/internal/cachetls"
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/diag"
 	"github.com/firerunnerhq/firerunner/internal/ec2"
@@ -641,6 +642,17 @@ func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitse
 	}, nil
 }
 
+// leafTTL is how long an EC2 instance's cache leaf must live: through the
+// wait for its config, its boot, and the longest the backstop lets it run
+// (a day when that backstop is off).
+func leafTTL(cfg *config.Config) time.Duration {
+	life := cfg.Firecracker.MaxVMLifetime
+	if life <= 0 {
+		life = 24 * time.Hour
+	}
+	return cfg.JITTTL + 15*time.Minute + life
+}
+
 // ec2Preflight runs the EC2 account checks for doctor when a tier launches
 // instances; none otherwise.
 func ec2Preflight(cfg *config.Config) []diag.Check {
@@ -728,7 +740,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// slot budget, while each keeps its own microVM shape and golden image.
 
 	var onJobStarted func(context.Context, jobidentity.Job)
-	if cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != "" {
+	var cacheJobs *jobidentity.Registry
+	if cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != "" || cfg.UsesEC2Cache() {
 		jobs, err := jobidentity.NewRegistry(cfg.CacheJobsDir, log)
 		if err != nil {
 			return fmt.Errorf("cache job registry: %w", err)
@@ -739,7 +752,17 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			return err
 		}
 		cfg.Firecracker.Jobs = jobs
+		cacheJobs = jobs
 		onJobStarted = func(ctx context.Context, j jobidentity.Job) { jobs.Start(ctx, j, resolver) }
+	}
+	var ec2Cache *ec2.CacheOptions
+	if cfg.UsesEC2Cache() {
+		ca, err := cachetls.LoadOrCreate(filepath.Join(cfg.Firecracker.WorkDir, "cache-tls"))
+		if err != nil {
+			return fmt.Errorf("cache CA: %w", err)
+		}
+		ec2Cache = &ec2.CacheOptions{CA: ca, Upstream: cfg.EC2CacheAddr, Jobs: cacheJobs, LeafTTL: leafTTL(cfg)}
+		log.Info("EC2 cache proxy enabled", "upstream", cfg.EC2CacheAddr, "leafTTL", ec2Cache.LeafTTL)
 	}
 	var fc *provisioner.Firecracker
 	if cfg.UsesFirecracker() {
@@ -788,6 +811,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				JITURL:      jitserver.URL(cfg.JITEndpoint()),
 				MaxLifetime: cfg.Firecracker.MaxVMLifetime,
 				UsePool:     tierJobs[t.Name].ClaimPool,
+				Cache:       ec2Cache,
 				Launched:    tierHealth[t.Name].Launched,
 				FellBack:    tierHealth[t.Name].FellBack,
 				Interrupted: tierHealth[t.Name].Interrupted,

@@ -181,6 +181,18 @@ func TestServeTiers_AllTiersStoppedShutsDown(t *testing.T) {
 	}
 }
 
+func TestLeafTTLCoversTheInstancesLife(t *testing.T) {
+	cfg := &config.Config{JITTTL: 5 * time.Minute}
+	cfg.Firecracker.MaxVMLifetime = 6 * time.Hour
+	if got, want := leafTTL(cfg), 6*time.Hour+20*time.Minute; got != want {
+		t.Fatalf("leafTTL = %v, want the backstop plus the config wait and boot (%v)", got, want)
+	}
+	cfg.Firecracker.MaxVMLifetime = 0
+	if got := leafTTL(cfg); got < 24*time.Hour {
+		t.Fatalf("leafTTL with no backstop = %v, want at least a day", got)
+	}
+}
+
 func TestHealthBreakersCarryEveryField(t *testing.T) {
 	since, until := time.Unix(100, 0), time.Unix(130, 0)
 	got := healthBreakers([]ec2.Breaker{{Market: "spot", Type: "c8a.xlarge", Subnet: "subnet-a", Reason: "InsufficientInstanceCapacity", Failures: 2, Since: since, Until: until}})
