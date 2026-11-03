@@ -3,7 +3,7 @@
 # deploy/cloudformation/control.yaml.
 #
 # Usage:
-#   scripts/e2e/control-vm.sh up [--version V] [--tiers FILE]
+#   scripts/e2e/control-vm.sh up [--version V] [--tiers FILE] [--cache off|disk|s3]
 #   scripts/e2e/control-vm.sh status
 #   scripts/e2e/control-vm.sh install FILE
 #   scripts/e2e/control-vm.sh down
@@ -28,7 +28,9 @@
 #            from the JSON's tiers.
 #            The shared catalog loses its idle capacity on the way: no
 #            ec2.pool, no schedule, min 0, so a session bills only for the
-#            jobs it runs. To test a pool or hot runners, pass --tiers FILE,
+#            jobs it runs. --cache sets the stack's Cache parameter (default
+#            off): cache-server on the VM for tiers with ec2.cache.
+#            To test a pool or hot runners, pass --tiers FILE,
 #            which is taken as written.
 #   status   the stack, its VM, whether firerunner is active there, and the
 #            session's tier names.
@@ -64,11 +66,15 @@ up | status | install | down | list) shift ;;
 '') usage 2 >&2 ;;
 *) e2e_log "unknown command: $cmd" && usage 2 >&2 ;;
 esac
-version="" tiers_file="" binary=""
+version="" tiers_file="" binary="" cache=""
 while [ $# -gt 0 ]; do
 	case "$cmd $1" in
 	"up --version") version="${2:-}" && shift ;;
 	"up --tiers") tiers_file="${2:-}" && shift ;;
+	"up --cache")
+		cache="${2:-}" && shift
+		case "$cache" in off | disk | s3) ;; *) e2e_die 2 "--cache $cache: want off, disk or s3" ;; esac
+		;;
 	*" -h" | *" --help") usage ;;
 	"install "[!-]*)
 		[ -z "$binary" ] || e2e_die 2 "install takes one FILE"
@@ -256,12 +262,12 @@ seed_and_create() {
 
 	keys="$(aws cloudformation get-template-summary --template-body "file://$TEMPLATE" \
 		--query 'Parameters[].ParameterKey' --output json)" || e2e_die 1 "get-template-summary failed"
-	jq -c --argjson keys "$keys" --arg o "$owner" --arg p "$prefix" --arg z "$zone_id" --arg zn "$zone" '
-		[.Parameters[] | select(.ParameterKey | IN("Owner", "ParameterPrefix", "HostedZoneId", "ZoneName", "JitName") | not)
+	jq -c --argjson keys "$keys" --arg o "$owner" --arg p "$prefix" --arg z "$zone_id" --arg zn "$zone" --arg c "${cache:-off}" '
+		[.Parameters[] | select(.ParameterKey | IN("Owner", "ParameterPrefix", "HostedZoneId", "ZoneName", "JitName", "Cache") | not)
 			| {ParameterKey, ParameterValue}]
 		+ [{ParameterKey: "Owner", ParameterValue: $o}, {ParameterKey: "ParameterPrefix", ParameterValue: $p},
 			{ParameterKey: "HostedZoneId", ParameterValue: $z}, {ParameterKey: "ZoneName", ParameterValue: $zn},
-			{ParameterKey: "JitName", ParameterValue: $o}]
+			{ParameterKey: "JitName", ParameterValue: $o}, {ParameterKey: "Cache", ParameterValue: $c}]
 		| map(select(.ParameterKey | IN($keys[])))' <<<"$b" >"$work/params.json"
 	aws cloudformation create-stack --stack-name "$stack" --template-body "file://$TEMPLATE" \
 		--capabilities CAPABILITY_IAM --parameters "file://$work/params.json" \
@@ -381,7 +387,7 @@ systemctl is-active firerunner || true
 # --- down --------------------------------------------------------------------
 
 cmd_down() {
-	local prefix="" zone_id="" jit="" st b cleanup rc=0 names n=0 rrs dns=false
+	local prefix="" zone_id="" jit="" bucket="" st b cleanup rc=0 names n=0 rrs dns=false
 	b="$(stack_json "$base")"
 	[ -z "$b" ] || not_shared_owner "$b"
 	s="$(stack_json "$stack")"
@@ -390,6 +396,7 @@ cmd_down() {
 		prefix="$(param "$s" ParameterPrefix)"
 		zone_id="$(param "$s" HostedZoneId)"
 		jit="$(output "$s" JitHost)"
+		bucket="$(output "$s" CacheBucket)"
 		aws cloudformation delete-stack --stack-name "$stack" || e2e_die 1 "delete-stack $stack failed"
 		e2e_log "deleting stack $stack"
 		while :; do
@@ -409,6 +416,16 @@ cmd_down() {
 		[ -z "$b" ] || prefix="$(output "$b" ParameterPrefix)/sessions/$owner"
 		[ -z "$b" ] || zone_id="$(output "$b" HostedZoneId)"
 		[ -z "$b" ] || { jit="$(output "$b" JitHost)" && jit="$owner.${jit#*.}"; }
+	fi
+
+	# The stack keeps its cache bucket; a session's is this session's alone.
+	if [ -n "$bucket" ] && [ "$bucket" != null ]; then
+		if aws s3 rm --recursive --only-show-errors "s3://$bucket" && aws s3api delete-bucket --bucket "$bucket"; then
+			e2e_log "deleted the cache bucket $bucket"
+		else
+			e2e_log "could not delete the cache bucket $bucket; empty and delete it by hand"
+			rc=1
+		fi
 	fi
 
 	# The VM is gone, so nothing replaces what this removes.

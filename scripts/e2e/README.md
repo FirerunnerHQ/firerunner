@@ -123,6 +123,11 @@ The shared catalog arrives without idle capacity: no `ec2.pool`, no
 stopped pool instances' disks or hot runners. To test a pool or hot runners,
 write the catalog yourself and pass `--tiers FILE`; it is used as written.
 
+`--cache off|disk|s3` sets the stack's `Cache` parameter (default `off`), so
+the VM runs cache-server for tiers that set `ec2.cache`. With `s3` the stack
+makes a bucket and keeps it on delete; `down` empties and deletes it, since a
+session's bucket is that session's alone.
+
 `control-vm.sh install FILE` swaps in a development build (`GOOS=linux`, the
 VM's architecture). It goes up to `FR_E2E_BUCKET` and the VM fetches it
 through a presigned URL. A VM that the group replaces boots the release again.
