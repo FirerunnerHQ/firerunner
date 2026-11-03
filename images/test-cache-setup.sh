@@ -57,33 +57,25 @@ setup() {
 		sh "$SCRIPT" "$STATE/bundle.json" >"$STATE/out" 2>&1
 }
 refused() { ! setup; }
-setup_nodocker() { FIRERUNNER_DOCKER=no-such-docker setup; }
 mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 line() { grep -n -- "$1" "$STATE/calls" | head -n 1 | cut -d: -f1; }
 diverted() { grep -q 'results-receiver.actions.githubusercontent.com' "$R/etc/hosts"; }
 
-# 1. A bundle on a host with Docker.
-fresh docker control.fr.internal:8099
-expect "docker: succeeds" "$(cat "$STATE/out" 2>/dev/null)" setup
-expect "docker: the key is owner-only" "$(mode "$R/etc/firerunner-cache/server.key")" [ "$(mode "$R/etc/firerunner-cache/server.key")" = 600 ]
-expect "docker: the key and leaf are the bundle's" "" bash -c "[ \"\$(cat '$R/etc/firerunner-cache/server.key')\" = KEY-PEM ] && [ \"\$(cat '$R/etc/firerunner-cache/server.pem')\" = LEAF-PEM ]"
-expect "docker: the CA joins the system store" "$(cat "$STATE/calls")" \
+# 1. A bundle: the host is diverted to a loopback proxy; containers are not.
+fresh host control.fr.internal:8099
+expect "host: succeeds" "$(cat "$STATE/out" 2>/dev/null)" setup
+expect "host: the key is owner-only" "$(mode "$R/etc/firerunner-cache/server.key")" [ "$(mode "$R/etc/firerunner-cache/server.key")" = 600 ]
+expect "host: the key and leaf are the bundle's" "" bash -c "[ \"\$(cat '$R/etc/firerunner-cache/server.key')\" = KEY-PEM ] && [ \"\$(cat '$R/etc/firerunner-cache/server.pem')\" = LEAF-PEM ]"
+expect "host: the CA joins the system store" "$(cat "$STATE/calls")" \
 	bash -c "[ \"\$(cat '$R/usr/local/share/ca-certificates/firerunner-cache.crt')\" = CA-PEM ] && grep -q update-ca-certificates '$STATE/calls'"
-expect "docker: node gets the CA through externals" "" [ "$(cat "$STATE/runner/externals/firerunner-ca.pem")" = CA-PEM ]
-expect "docker: nginx forwards the cache to the upstream" "" grep -q 'server control.fr.internal:8099;' "$R/etc/nginx/nginx.conf"
-expect "docker: nginx checked, then started" "$(cat "$STATE/calls")" [ "$(line 'nginx -t')" -lt "$(line 'systemctl start nginx')" ]
-expect "docker: containers resolve the results host to this VM" "$(cat "$STATE/calls")" \
-	grep -q 'dnsmasq --listen-address=10.0.1.7 .*--address=/results-receiver.actions.githubusercontent.com/10.0.1.7' "$STATE/calls"
-expect "docker: Docker hands containers that resolver, keeping its settings" "$(cat "$R/etc/docker/daemon.json")" \
-	jq -e '.dns == ["10.0.1.7"] and .features["containerd-snapshotter"] == true' "$R/etc/docker/daemon.json"
-expect "docker: and restarts with it" "" grep -q 'systemctl restart docker' "$STATE/calls"
-expect "docker: the results host points here" "$(cat "$R/etc/hosts")" grep -qx '127.0.0.1 results-receiver.actions.githubusercontent.com' "$R/etc/hosts"
-
-# 2. No Docker: no container resolver.
-fresh nodocker 10.0.0.5:8099
-expect "no docker: succeeds" "$(cat "$STATE/out" 2>/dev/null)" setup_nodocker
-expect "no docker: no dnsmasq" "$(cat "$STATE/calls")" bash -c "! grep -q dnsmasq '$STATE/calls'"
-expect "no docker: diverted" "" diverted
+expect "host: node gets the CA through externals" "" [ "$(cat "$STATE/runner/externals/firerunner-ca.pem")" = CA-PEM ]
+expect "host: nginx forwards the cache to the upstream" "" grep -q 'server control.fr.internal:8099;' "$R/etc/nginx/nginx.conf"
+expect "host: nginx listens on loopback only" "$(grep listen "$R/etc/nginx/nginx.conf")" \
+	bash -c "[ \"\$(grep -c '^ *listen ' '$R/etc/nginx/nginx.conf')\" = \"\$(grep -c '^ *listen 127.0.0.1:' '$R/etc/nginx/nginx.conf')\" ]"
+expect "host: nginx checked, then started" "$(cat "$STATE/calls")" [ "$(line 'nginx -t')" -lt "$(line 'systemctl start nginx')" ]
+expect "host: the results host points here" "$(cat "$R/etc/hosts")" grep -qx '127.0.0.1 results-receiver.actions.githubusercontent.com' "$R/etc/hosts"
+expect "host: containers keep GitHub's cache (buildkit would refuse the CA)" "$(cat "$STATE/calls")" \
+	bash -c "! grep -q -e dnsmasq -e 'restart docker' '$STATE/calls' && [ \"\$(cat '$R/etc/docker/daemon.json')\" = '{\"features\":{\"containerd-snapshotter\":true}}' ]"
 
 # 3. Anything that fails leaves nothing diverted: the job keeps GitHub's cache.
 fresh nginx-bad 10.0.0.5:8099

@@ -10,8 +10,12 @@ trap 'rm -rf "$TMP"' EXIT
 
 ext="$TMP/externals"
 mkdir -p "$ext/node20/bin"
-cc -O2 -static -o "$ext/node20/bin/node" "$HERE/assets/nodewrap.c" 2>/dev/null ||
-	cc -O2 -o "$ext/node20/bin/node" "$HERE/assets/nodewrap.c"
+# Static, as the AMI builds it: it must run in musl job containers too.
+cc -O2 -static -o "$ext/node20/bin/node" "$HERE/assets/nodewrap.c"
+if command -v file >/dev/null && ! file "$ext/node20/bin/node" | grep -q 'statically linked'; then
+	echo "FAIL nodewrap is not statically linked: $(file "$ext/node20/bin/node")"
+	exit 1
+fi
 # The fake node is python, not sh: dash (Ubuntu's sh) drops dashed names
 # itself, which would hide what nodewrap passes on.
 cat >"$ext/node20/bin/node.real" <<'FAKE'

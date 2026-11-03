@@ -152,7 +152,11 @@ fi
 cache_body="$(mktemp "${TMPDIR:-/tmp}/firerunner-cache.XXXXXX")"
 code="$(curl -s -m 5 -o "$cache_body" -w '%{http_code}' "$url/cache" || true)"
 if [ "$code" = 200 ]; then
-	if "$CACHE_SETUP" "$cache_body"; then
+	# Bounded where coreutils' timeout is there (the AMI): a stuck setup must
+	# not hold the job back.
+	bound=""
+	command -v timeout >/dev/null 2>&1 && bound="timeout 60"
+	if $bound "$CACHE_SETUP" "$cache_body"; then
 		log "dependency cache: firerunner's cache-server"
 	else
 		log "dependency cache setup failed; the job uses GitHub's cache"
