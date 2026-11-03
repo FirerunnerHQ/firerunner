@@ -143,7 +143,7 @@ expect "token: env file owner-only" "" \
 units="$TMP/root/etc/systemd/system"
 cachetiers='[{"name":"cloud","provisioner":"ec2","ec2":{"cache":true}}]'
 setup
-printf 'FR_CACHE=s3\nFR_CACHE_BUCKET=fr-cache-bucket\n' >> "$FR_ROOT/etc/firerunner/bootstrap.env"
+printf 'FR_CACHE=s3\nFR_CACHE_BUCKET=fr-cache-bucket\nFR_ROOT_GIB=100\n' >> "$FR_ROOT/etc/firerunner/bootstrap.env"
 echo "$cachetiers" > "$STATE/ssm/tiers"
 expect "cache s3: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "cache s3: instances told the cache address" "$(envfile)" grep -qx 'FR_EC2_CACHE_ADDR=control.fr.internal:8099' <(envfile)
@@ -151,11 +151,12 @@ expect "cache s3: identities where cache-server reads them" "$(envfile)" grep -q
 expect "cache s3: config checked with the cache address" "$(cat "$STATE/check-env" 2>/dev/null)" \
 	grep -qx 'FR_EC2_CACHE_ADDR=control.fr.internal:8099' "$STATE/check-env"
 expect "cache s3: cache user made" "$(cat "$STATE/useradd" 2>/dev/null)" grep -q 'firerunner-cache' "$STATE/useradd"
-for want in RuntimeDirectory=firerunner RuntimeDirectoryMode=0750 Group=firerunner-cache UMask=0027; do
+for want in RuntimeDirectory=firerunner RuntimeDirectoryMode=0750 RuntimeDirectoryPreserve=restart Group=firerunner-cache UMask=0027; do
 	expect "cache s3: daemon unit has $want" "" grep -qx "$want" "$units/firerunner.service"
 done
 expect "cache s3: cache-server on the VPC address, reading the daemon's identities, in S3" "$(cat "$units/firerunner-cache.service" 2>/dev/null)" \
-	grep -q 'cache-server --addr 10.1.2.3:8099 --dir /var/lib/firerunner-cache --jobs-dir /run/firerunner/jobs --jobs-owner-uid 0 --s3-bucket fr-cache-bucket --s3-prefix firerunner-cache/$' "$units/firerunner-cache.service"
+	grep -q 'cache-server --addr 10.1.2.3:8099 --dir /var/lib/firerunner-cache --jobs-dir /run/firerunner/jobs --jobs-owner-uid 0 --max-entry-size 15GB --s3-bucket fr-cache-bucket --s3-prefix firerunner-cache/ --s3-local-cache-size 30GB$' "$units/firerunner-cache.service"
+expect "cache s3: IMDS reachable, for S3's credentials" "" bash -c "! grep -q '^IPAddressDeny' '$units/firerunner-cache.service'"
 expect "cache s3: cache-server as its own user, away from the secrets" "" \
 	bash -c "grep -qx 'User=firerunner-cache' '$units/firerunner-cache.service' && grep -qx 'InaccessiblePaths=/etc/firerunner' '$units/firerunner-cache.service'"
 expect "cache s3: cache-server started" "$(cat "$STATE/systemctl" 2>/dev/null)" grep -qx 'enable --now firerunner-cache.service' "$STATE/systemctl"
@@ -166,12 +167,20 @@ expect "cache s3: rerun succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "cache s3: an existing cache user is kept" "$(cat "$STATE/useradd" 2>/dev/null)" test ! -f "$STATE/useradd"
 
 setup
+printf 'FR_CACHE=disk\nFR_ROOT_GIB=50\n' >> "$FR_ROOT/etc/firerunner/bootstrap.env"
+echo "$cachetiers" > "$STATE/ssm/tiers"
+expect "cache disk: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "cache disk: blobs on disk, capped to a share of the root volume" "$(cat "$units/firerunner-cache.service" 2>/dev/null)" \
+	bash -c "grep -q -- '--jobs-owner-uid 0 --max-size 20GB --max-entry-size 7GB$' '$units/firerunner-cache.service' && ! grep -q -- --s3-bucket '$units/firerunner-cache.service'"
+expect "cache disk: no IMDS, so no role credentials" "" grep -qx 'IPAddressDeny=169.254.169.254/32' "$units/firerunner-cache.service"
+
+setup
 printf 'FR_CACHE=disk\n' >> "$FR_ROOT/etc/firerunner/bootstrap.env"
 expect "cache disk, no cached tier: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
-expect "cache disk: cache-server keeps blobs on disk" "$(cat "$units/firerunner-cache.service" 2>/dev/null)" \
-	bash -c "grep -q -- '--jobs-owner-uid 0$' '$units/firerunner-cache.service' && ! grep -q -- --s3-bucket '$units/firerunner-cache.service'"
 expect "cache disk, no cached tier: no cache address (config check would refuse it)" "$(envfile)" \
 	bash -c "! grep -q FR_EC2_CACHE_ADDR '$FR_ROOT/etc/firerunner/firerunner.env'"
+expect "cache disk, no cached tier: no cache-server (it would restart forever without job records)" "$(cat "$STATE/systemctl" 2>/dev/null)" \
+	bash -c "[ ! -f '$units/firerunner-cache.service' ] && ! grep -q firerunner-cache.service '$STATE/systemctl'"
 
 setup
 expect "cache off: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
@@ -241,7 +250,7 @@ m = re.search(r"Fn::Base64: !Sub\n            - \|\n(.*?)\n            - ZoneId"
 body = "\n".join(l[14:] for l in m.group(1).split("\n"))
 vals = {"AWS::Region": "us-west-2", "ParameterPrefix": "/fr", "Owner": "prod-a", "AWS::StackName": "fr",
         "ZoneId": "Z123", "JitName": "control", "ZoneName": "fr.internal", "JitPort": "8098", "ReleaseRepo": "acme/fr",
-        "Cache": "s3", "CachePort": "8099", "CacheBucketName": "fr-cache-bucket"}
+        "Cache": "s3", "CachePort": "8099", "CacheBucketName": "fr-cache-bucket", "RootVolumeGiB": "30"}
 body = re.sub(r"\$\{([A-Za-z:]+)\}", lambda m: vals[m.group(1)], body)
 print(body.replace("/etc/firerunner", sys.argv[2] + "/etc/firerunner"))
 PY2
@@ -293,7 +302,7 @@ export -f userdata
 		grep -q "https://github.com/acme/fr/releases/download/v1.2.3/firerunner_linux_$arch" "$STATE/downloads"
 	expect "user-data: bootstrap env written" "" grep -qx 'FR_JIT_HOST=control.fr.internal' "$FR_ROOT/etc/firerunner/bootstrap.env"
 	expect "user-data: bootstrap env names the cache mode and bucket" "$(cat "$FR_ROOT/etc/firerunner/bootstrap.env")" \
-		bash -c "grep -qx 'FR_CACHE=s3' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_CACHE_PORT=8099' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_CACHE_BUCKET=fr-cache-bucket' '$FR_ROOT/etc/firerunner/bootstrap.env'"
+		bash -c "grep -qx 'FR_CACHE=s3' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_CACHE_PORT=8099' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_CACHE_BUCKET=fr-cache-bucket' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_ROOT_GIB=30' '$FR_ROOT/etc/firerunner/bootstrap.env'"
 	expect "user-data: bootstrap ran with the verified binary" "$(cat "$STATE/bootstrapped" 2>/dev/null)" \
 		cmp -s "$STATE/release/firerunner_linux_arm64" "$(cat "$STATE/bootstrapped" 2>/dev/null)/firerunner"
 	expect "user-data: healthy" "" test ! -f "$STATE/autoscaling"

@@ -71,6 +71,13 @@ Parameters:
   CachePort:
     Type: Number
     Default: 8099
+  RootVolumeGiB:
+    Type: Number
+    Default: 30
+    MinValue: 8
+    Description: >-
+      The control VM's root volume (gp3). With Cache on, cache-server's
+      local blobs, copies and staged uploads are capped to a share of it.
 
 Conditions:
   CreateZone: !Equals [!Ref HostedZoneId, ""]
@@ -128,6 +135,9 @@ Resources:
         RestrictPublicBuckets: true
       OwnershipControls:
         Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      # Parts of an upload a crash or a replaced VM left behind.
+      LifecycleConfiguration:
+        Rules: [{ Id: abort-incomplete-uploads, Status: Enabled, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }]
       Tags: [{ Key: firerunner:control, Value: !Ref AWS::StackName }]
 
   ControlRole:
@@ -245,6 +255,9 @@ Resources:
         InstanceType: !Ref InstanceType
         IamInstanceProfile: { Arn: !GetAtt ControlProfile.Arn }
         MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: !Ref RootVolumeGiB, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
         NetworkInterfaces:
           - DeviceIndex: 0
             AssociatePublicIpAddress: !Ref AssociatePublicIp
@@ -280,6 +293,7 @@ Resources:
               FR_CACHE=${Cache}
               FR_CACHE_PORT=${CachePort}
               FR_CACHE_BUCKET=${CacheBucketName}
+              FR_ROOT_GIB=${RootVolumeGiB}
               EOF
               version=$(aws ssm get-parameter --name ${ParameterPrefix}/control/version --query Parameter.Value --output text)
               case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) false ;; esac

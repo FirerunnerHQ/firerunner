@@ -19,6 +19,7 @@
 #                 default off)
 #   FR_CACHE_PORT its port (default 8099)
 #   FR_CACHE_BUCKET  with s3, the bucket (prefix firerunner-cache/)
+#   FR_ROOT_GIB   the root volume's size, which caps the cache's local use
 #
 # and these SSM parameters under $FR_PREFIX/control/:
 #   env              FR_* lines (non-secret): FR_URL, FR_APP_CLIENT_ID, ...
@@ -169,17 +170,29 @@ ProtectHome=true
 PrivateTmp=true
 $(if [ "$cache" != off ]; then
 	# The job identities cache-server reads: the daemon's group is the cache
-	# user's, and what it writes is not world-readable.
-	printf '%s\n' "RuntimeDirectory=firerunner" "RuntimeDirectoryMode=0750" "Group=firerunner-cache" "UMask=0027"
+	# user's, and what it writes is not world-readable. A restart keeps the
+	# records of jobs still running.
+	printf '%s\n' "RuntimeDirectory=firerunner" "RuntimeDirectoryMode=0750" "RuntimeDirectoryPreserve=restart" "Group=firerunner-cache" "UMask=0027"
 fi)
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-if [ "$cache" != off ]; then
-	s3=""
-	[ "$cache" = s3 ] && s3=" --s3-bucket $FR_CACHE_BUCKET --s3-prefix firerunner-cache/"
+if [ "$cache" != off ] && [ "$cache_tier" != True ]; then
+	log "Cache=$cache but no tier sets ec2.cache: not starting cache-server"
+elif [ "$cache" != off ]; then
+	# The root volume is the daemon's and the journal's too: the cache gets a
+	# share of it. On disk, blobs are capped at 40%; with S3, local copies at
+	# 30% (S3 holds the rest). One upload stages at most 15%.
+	gib="${FR_ROOT_GIB:-8}"
+	caps=" --max-size $((gib * 40 / 100))GB --max-entry-size $((gib * 15 / 100))GB"
+	imds="IPAddressDeny=169.254.169.254/32"
+	if [ "$cache" = s3 ]; then
+		caps=" --max-entry-size $((gib * 15 / 100))GB --s3-bucket $FR_CACHE_BUCKET --s3-prefix firerunner-cache/ --s3-local-cache-size $((gib * 30 / 100))GB"
+		# S3 needs the instance role's credentials, from IMDS.
+		imds="# IMDS stays reachable: S3 needs the instance role (see README)"
+	fi
 	cat > "$units/firerunner-cache.service" <<EOF
 [Unit]
 Description=firerunner cache-server for EC2 tiers
@@ -189,7 +202,9 @@ Wants=firerunner.service
 User=firerunner-cache
 Group=firerunner-cache
 # Bound to the VPC address; the control security group admits the runners'.
-ExecStart=/usr/local/bin/firerunner cache-server --addr $ip:$cache_port --dir /var/lib/firerunner-cache --jobs-dir /run/firerunner/jobs --jobs-owner-uid 0$s3
+ExecStart=/usr/local/bin/firerunner cache-server --addr $ip:$cache_port --dir /var/lib/firerunner-cache --jobs-dir /run/firerunner/jobs --jobs-owner-uid 0$caps
+# Without S3 it needs no AWS credentials, so it cannot fetch the role's.
+$imds
 Restart=always
 RestartSec=5
 StateDirectory=firerunner-cache
@@ -224,7 +239,7 @@ EOF
 
 "$systemctl" daemon-reload
 "$systemctl" enable --now firerunner.service
-if [ "$cache" != off ]; then
+if [ -f "$units/firerunner-cache.service" ]; then
 	"$systemctl" enable --now firerunner-cache.service
 	log "started cache-server on $ip:$cache_port ($cache)"
 fi
