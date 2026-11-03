@@ -108,6 +108,12 @@ else
 	skip docker-shim "needs Linux (/proc)"
 fi
 step ec2-boot-script images/test-ec2-run.sh
+step ec2-cache-setup images/test-cache-setup.sh
+if [ "$(uname -s)" = Linux ] && command -v cc >/dev/null; then
+	step nodewrap images/test-nodewrap.sh
+else
+	skip nodewrap "needs Linux (/proc/self/exe) and cc"
+fi
 step ec2-ami-build images/test-build-ec2-ami.sh
 step mutate-script scripts/test-mutate.sh
 if command -v jq >/dev/null; then
@@ -137,6 +143,7 @@ else
 fi
 if command -v shellcheck >/dev/null; then
 	step shellcheck shellcheck images/assets/firerunner-ec2-run.sh images/test-ec2-run.sh \
+		images/assets/firerunner-cache-setup.sh images/test-cache-setup.sh images/test-nodewrap.sh \
 		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh scripts/check.sh \
 		scripts/mutate.sh scripts/test-mutate.sh \
 		scripts/merge-stack.sh scripts/test-merge-stack.sh \

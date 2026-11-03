@@ -41,7 +41,8 @@ export DEBIAN_FRONTEND=noninteractive
 apt_get() { apt-get -o DPkg::Lock::Timeout=600 "$@"; }
 apt_get update
 apt_get install -y --no-install-recommends \
-	docker.io zstd curl jq git ca-certificates
+	docker.io zstd curl jq git ca-certificates \
+	nginx gcc libc6-dev
 
 # Docker with the containerd image store, as on GitHub-hosted runners.
 install -d /etc/docker
@@ -66,6 +67,28 @@ rm runner.tgz
 
 # Boot unit and script: install_boot_unit is defined above, by build-ec2-ami.sh.
 install_boot_unit
+
+# The dependency cache proxy (#28), installed inactive: firerunner-ec2-run.sh
+# runs firerunner-cache-setup only when the instance's tier caches. nginx
+# starts then, not at boot.
+install_cache_proxy
+systemctl disable nginx.service
+gcc -O2 -static -o /usr/local/libexec/nodewrap /tmp/nodewrap.c
+rm -f /tmp/nodewrap.c
+# Each node the runner bundles execs through nodewrap, which adds the cache
+# CA when the bundle put it in externals (host and job containers alike).
+for node in /opt/runner/externals/node*/bin/node; do
+	mv "$node" "$node.real"
+	install -m 0755 /usr/local/libexec/nodewrap "$node"
+done
+# Every wrapped node must still start, or every node action would fail.
+# (node*_alpine is musl-built, for Alpine job containers: it cannot start on
+# this glibc host, wrapped or not.)
+for node in /opt/runner/externals/node*/bin/node; do
+	case "$node" in */node*_alpine/*) continue ;; esac
+	"$node" --version
+done
+apt_get purge -y --auto-remove gcc libc6-dev
 
 # A netplan that matches any NIC. cloud-init's 50-cloud-init.yaml matches the
 # builder's MAC address, which leaves every instance from this image without

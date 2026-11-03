@@ -18,7 +18,7 @@ echo "$*" >>"$STATE/calls"
 case "$*" in
 *"ssm get-parameter"*) echo ami-0base ;;
 *"ec2 run-instances"*)
-	for a in "$@"; do case "$a" in file://*) cp "${a#file://}" "$STATE/user-data" ;; esac; done
+	for a in "$@"; do case "$a" in fileb://*) gunzip -c "${a#fileb://}" > "$STATE/user-data" && cp "${a#fileb://}" "$STATE/user-data.gz" ;; esac; done
 	echo i-0build
 	;;
 *"ec2 describe-instances"*)
@@ -78,7 +78,11 @@ expect "user-data pins the runner" "" grep -q '^RUNNER_VERSION=9.9.9$' "$STATE/u
 expect "user-data installs the boot unit" "" grep -q 'FIRERUNNER_JIT_URL' "$STATE/user-data"
 expect "user-data drops cloud-init's netplan" "" grep -q 'rm -f /etc/netplan/50-cloud-init.yaml' "$STATE/user-data"
 expect "user-data resets the hostname" "" grep -q 'truncate -s 0 /etc/hostname' "$STATE/user-data"
-expect "user-data fits EC2's limit" "" [ "$(wc -c <"$STATE/user-data")" -le 16384 ]
+expect "user-data fits EC2's limit, compressed" "" [ "$(wc -c <"$STATE/user-data.gz")" -le 16384 ]
+expect "user-data installs the cache proxy, inactive" "" \
+	bash -c "grep -q 'install_cache_proxy\$' '$STATE/user-data' && grep -q 'systemctl disable nginx.service' '$STATE/user-data' && grep -q '^upstream cache_backend\|server __UPSTREAM__;' '$STATE/user-data'"
+# shellcheck disable=SC2016 # a literal $node in the user-data
+expect "user-data wraps every bundled node" "" grep -q 'install -m 0755 /usr/local/libexec/nodewrap "\$node"' "$STATE/user-data"
 
 # 2. The build instance dies instead of stopping: no image, no publish, and
 # the instance is still terminated.

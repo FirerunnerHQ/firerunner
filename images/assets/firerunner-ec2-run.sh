@@ -44,6 +44,8 @@ RETRY_SLEEP="${FIRERUNNER_RETRY_SLEEP:-0.2}"
 JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
 # Bounds each progress report to the control VM.
 REPORT_TIMEOUT="${FIRERUNNER_REPORT_TIMEOUT:-2}"
+# Sets up the dependency cache from this instance's bundle (see below).
+CACHE_SETUP="${FIRERUNNER_CACHE_SETUP:-/usr/local/libexec/firerunner-cache-setup}"
 # Bounds the wait for the output reader after the runner exits, in tenths of
 # a second: longer than one report, so a phase report in flight finishes.
 DRAIN_TICKS="${FIRERUNNER_DRAIN_TICKS:-50}"
@@ -143,6 +145,24 @@ if [ -z "$jit" ]; then
 	log "empty JIT config; powering off"
 	exit 0
 fi
+
+# A tier that caches has a bundle for this instance, served once after its
+# config (internal/jitserver CachePath); any other answer means none. Setting
+# it up is best effort: on failure the job uses GitHub's cache, as without one.
+cache_body="$(mktemp "${TMPDIR:-/tmp}/firerunner-cache.XXXXXX")"
+code="$(curl -s -m 5 -o "$cache_body" -w '%{http_code}' "$url/cache" || true)"
+if [ "$code" = 200 ]; then
+	# Bounded where coreutils' timeout is there (the AMI): a stuck setup must
+	# not hold the job back.
+	bound=""
+	command -v timeout >/dev/null 2>&1 && bound="timeout 60"
+	if $bound "$CACHE_SETUP" "$cache_body"; then
+		log "dependency cache: firerunner's cache-server"
+	else
+		log "dependency cache setup failed; the job uses GitHub's cache"
+	fi
+fi
+rm -f "$cache_body" # it held this instance's private key
 
 if ! cd "$RUNNER_DIR" 2>/dev/null || [ ! -x ./run.sh ]; then
 	report exited 127 # before the log line, which may fail (see below)
