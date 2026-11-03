@@ -106,6 +106,24 @@ first `deploy-control.sh` sets a version. Pass `HostedZoneId=Z...` with `ZoneNam
 private zone. Use `ImageId=/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`
 with an x86 `InstanceType`.
 
+**The dependency cache (`Cache`, default `off`).** With `disk` or `s3`, the
+control VM also runs `firerunner cache-server` for EC2 tiers that set
+`ec2.cache`:
+
+- **The server.** It runs as its own `firerunner-cache` user on the VM's VPC
+  address, port `CachePort` (8099). A security group rule lets only the
+  runners' group in. It reads the job identities the daemon writes in
+  `/run/firerunner/jobs` and cannot read `/etc/firerunner`.
+- **`disk`.** Blobs live on the VM and go with it.
+- **`s3`.** The stack makes a private, encrypted bucket. The role may read,
+  write and delete under `firerunner-cache/` and list only that prefix (the
+  README's least policy). A replacement VM serves what its predecessor
+  saved. The bucket is **kept** when the stack is deleted; empty and delete
+  it by hand (the `CacheBucket` output names it).
+- **The address.** The bootstrap tells runners the cache-server address
+  (`FR_EC2_CACHE_ADDR=<jit name>:<port>`) only when a tier sets
+  `ec2.cache`. Such a tier with `Cache=off` fails `config check`.
+
 ## Deploy, roll back
 
 ```sh
