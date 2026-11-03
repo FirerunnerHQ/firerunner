@@ -546,6 +546,37 @@ func TestDoctor_SkipsEC2TierGolden(t *testing.T) {
 	}
 }
 
+// TestDoctor_EC2OnlyHostSkipsFirecrackerChecks: a control VM serving only EC2
+// tiers has no KVM, firecracker binary, kernel or guest network, and must not
+// fail doctor for it (every EC2 control VM did, 2026-11-02).
+func TestDoctor_EC2OnlyHostSkipsFirecrackerChecks(t *testing.T) {
+	ec2Tier := config.Tier{Name: "cloud", Provisioner: config.ProvisionerEC2, Max: 4, EC2: &config.EC2Tier{}}
+	hostOnly := []string{"kvm", "firecracker", "kernel", "ext-iface", "ip_forward", "nftables", "reflink-locality"}
+	names := func(cfg *config.Config) map[string]string {
+		got := map[string]string{}
+		for _, c := range runDoctor(cfg, "test").Checks {
+			got[c.Name] = c.Level
+		}
+		return got
+	}
+	got := names(&config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir()}, Tiers: []config.Tier{ec2Tier}})
+	for _, n := range hostOnly {
+		if _, ok := got[n]; ok {
+			t.Errorf("EC2-only doctor ran the Firecracker host check %q", n)
+		}
+	}
+	if got["host"] != levelPass || got["workdir"] == "" {
+		t.Errorf("EC2-only doctor: host %q, workdir %q; want a passing host line and the workdir check", got["host"], got["workdir"])
+	}
+	mixed := names(&config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir()},
+		Tiers: []config.Tier{ec2Tier, {Name: "vm", Golden: "/nope.ext4"}}})
+	for _, n := range []string{"kvm", "kernel", "ext-iface"} {
+		if _, ok := mixed[n]; !ok {
+			t.Errorf("a catalog with a Firecracker tier skipped the host check %q", n)
+		}
+	}
+}
+
 // writeListenerHealth publishes a daemon health file in dir, written at at.
 func writeListenerHealth(t *testing.T, dir string, at time.Time, tiers ...health.Tier) {
 	t.Helper()
