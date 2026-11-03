@@ -35,6 +35,10 @@ const Path = "/jit"
 // POST ?phase=<phase>, plus &rc=<status> for PhaseExited.
 const ReportPath = Path + "/report"
 
+// CachePath serves an instance its cache bundle (see AttachCache), once,
+// after its config.
+const CachePath = Path + "/cache"
+
 // Phases an instance reports, in the order they happen.
 const (
 	// PhaseListening: the runner has connected and waits for its job.
@@ -72,6 +76,10 @@ type entry struct {
 	// served is set when the instance actually received the config.
 	served bool
 	report Report
+	// cache is the instance's cache bundle until it is handed out; then
+	// cacheServed.
+	cache       []byte
+	cacheServed bool
 }
 
 // Report is what an instance told the server about its runner. A zero time
@@ -127,6 +135,23 @@ func (s *Server) Register(ip netip.Addr, runner, jit string) error {
 	return nil
 }
 
+// AttachCache gives ip's registration a cache bundle (its proxy's TLS
+// material and the cache-server address), handed out once at CachePath to
+// that address after its config. It holds a private key, so nothing logs it.
+func (s *Server) AttachCache(ip netip.Addr, bundle []byte) error {
+	if len(bundle) == 0 {
+		return ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[ip.Unmap()]
+	if !ok || e.claimed {
+		return errors.Join(ErrInvalid, errors.New("no unclaimed registration for "+ip.String()))
+	}
+	e.cache = append([]byte(nil), bundle...)
+	return nil
+}
+
 // Revoke drops ip's registration, served or not. The launcher calls it when
 // the instance is terminated or its launch is abandoned.
 func (s *Server) Revoke(ip netip.Addr) {
@@ -176,6 +201,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.reportHTTP(w, r)
 		return
 	}
+	if r.URL.Path == CachePath {
+		s.cacheHTTP(w, r)
+		return
+	}
 	if r.URL.Path != Path {
 		http.NotFound(w, r)
 		return
@@ -215,13 +244,59 @@ func (s *Server) claim(ip netip.Addr) (jit, runner string, status int) {
 		return "", "", http.StatusForbidden
 	}
 	if e.claimed || !s.now().Before(e.expires) {
-		e.claimed, e.jit = true, ""
+		e.claimed, e.jit, e.cache = true, "", nil
 		return "", e.runner, http.StatusNotFound
 	}
 	jit = e.jit
 	e.claimed, e.served, e.jit = true, true, ""
 	e.report.Served = s.now()
 	return jit, e.runner, http.StatusOK
+}
+
+// cacheHTTP answers GET /jit/cache:
+//   - 200 with the cache bundle, the first time the address that was served
+//     its config asks;
+//   - 404 when it has no bundle, or was already handed it;
+//   - 403 for an address without a registration whose config it was served.
+func (s *Server) cacheHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip, err := remoteIP(r)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	bundle, runner, status := s.claimCache(ip)
+	switch status {
+	case http.StatusOK:
+		s.log.Info("served cache bundle", "runner", runner, "ip", ip)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(bundle)
+	case http.StatusNotFound:
+		http.NotFound(w, r)
+	default:
+		s.log.Debug("cache bundle requested by an address without a served config", "ip", ip)
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}
+}
+
+// claimCache hands out ip's cache bundle once, and forgets it.
+func (s *Server) claimCache(ip netip.Addr) (bundle []byte, runner string, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[ip]
+	switch {
+	case !ok || !e.served:
+		return nil, "", http.StatusForbidden
+	case e.cacheServed || e.cache == nil:
+		return nil, e.runner, http.StatusNotFound
+	}
+	bundle, e.cache, e.cacheServed = e.cache, nil, true
+	return bundle, e.runner, http.StatusOK
 }
 
 // reportHTTP answers POST /jit/report?phase=<phase>[&rc=<status>]:
