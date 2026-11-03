@@ -467,11 +467,13 @@ func renderStatusText(r StatusReport, w io.Writer) {
 	}
 }
 
-// Doctor runs preflight health checks. When asJSON is set it emits a
-// DoctorReport as JSON; otherwise one PASS/WARN/FAIL line each. It returns a
-// non-nil error if any check FAILs, so the command exits non-zero either way.
-func Doctor(cfg *config.Config, version string, w io.Writer, asJSON bool) error {
-	r := runDoctor(cfg, version)
+// Doctor runs preflight health checks, followed by extra (the EC2 account's,
+// which need AWS clients this package does not build). When asJSON is set it
+// emits a DoctorReport as JSON; otherwise one PASS/WARN/FAIL line each. It
+// returns a non-nil error if any check FAILs, so the command exits non-zero
+// either way.
+func Doctor(cfg *config.Config, version string, w io.Writer, asJSON bool, extra ...Check) error {
+	r := runDoctor(cfg, version, extra...)
 	if asJSON {
 		if err := writeJSON(w, r); err != nil {
 			return err
@@ -489,7 +491,7 @@ func Doctor(cfg *config.Config, version string, w io.Writer, asJSON bool) error 
 }
 
 // runDoctor executes the preflight checks and folds them into a DoctorReport.
-func runDoctor(cfg *config.Config, version string) DoctorReport {
+func runDoctor(cfg *config.Config, version string, extra ...Check) DoctorReport {
 	fc := cfg.Firecracker
 	var checks []Check
 
@@ -531,6 +533,7 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 		checks = append(checks, *c)
 	}
 
+	checks = append(checks, extra...)
 	checks = append(checks, listenerChecks(fc, time.Now())...)
 
 	failed := 0
@@ -676,6 +679,7 @@ const (
 	levelFail = "FAIL"
 )
 
+// Check is one doctor finding. Level is "PASS", "WARN" or "FAIL".
 type Check struct {
 	Level  string `json:"level"`
 	Name   string `json:"name"`
