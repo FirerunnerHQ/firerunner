@@ -84,6 +84,9 @@ func (c *Client) amiCheck(ctx context.Context, t config.Tier) Finding {
 func subnetCheck(ctx context.Context, pre PreflightAPI, t config.Tier) Finding {
 	name := "subnets[" + t.Name + "]"
 	subs, err := pre.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{SubnetIds: t.EC2.Subnets})
+	if isCode(err, "InvalidSubnetID.NotFound") {
+		return failf(name, "ec2.subnets %v: %s", t.EC2.Subnets, notFound(err))
+	}
 	if err != nil {
 		return denied(name, "ec2:DescribeSubnets", err, "ec2.subnets %v: %v", t.EC2.Subnets, err)
 	}
@@ -146,6 +149,9 @@ func defaultRoute(ctx context.Context, pre PreflightAPI, s types.Subnet) (string
 func securityGroupCheck(ctx context.Context, pre PreflightAPI, t config.Tier) Finding {
 	name := "security-groups[" + t.Name + "]"
 	out, err := pre.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{GroupIds: t.EC2.SecurityGroups})
+	if isCode(err, "InvalidGroup.NotFound") {
+		return failf(name, "ec2.security_groups %v: %s", t.EC2.SecurityGroups, notFound(err))
+	}
 	if err != nil {
 		return denied(name, "ec2:DescribeSecurityGroups", err, "ec2.security_groups %v: %v", t.EC2.SecurityGroups, err)
 	}
@@ -350,6 +356,16 @@ func denied(name, action string, err error, f string, a ...any) Finding {
 		}
 	}
 	return failf(name, f, a...)
+}
+
+// notFound is the AWS message of a not-found error ("The subnet ID 'subnet-x'
+// does not exist"), plus where it looked.
+func notFound(err error) string {
+	var ae smithy.APIError
+	if errors.As(err, &ae) && ae.ErrorMessage() != "" {
+		return ae.ErrorMessage() + " in this region"
+	}
+	return err.Error()
 }
 
 func or(s, def string) string {

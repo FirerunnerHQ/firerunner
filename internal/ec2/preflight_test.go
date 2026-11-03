@@ -165,7 +165,7 @@ func TestPreflight_Failures(t *testing.T) {
 		tier                       func(*config.EC2Tier)
 	}{
 		{"ami missing", "ami[cloud]", "FAIL", "does not resolve", nil, func(e *config.EC2Tier) { e.AMI = "ami-gone" }},
-		{"subnet missing", "subnets[cloud]", "FAIL", "subnet-x", nil, func(e *config.EC2Tier) { e.Subnets = []string{"subnet-x"} }},
+		{"subnet missing", "subnets[cloud]", "FAIL", "InvalidSubnetID.NotFound (fake) in this region", nil, func(e *config.EC2Tier) { e.Subnets = []string{"subnet-x"} }},
 		{"public route, no public IP", "subnets[cloud]", "FAIL", "--map-public-ip-on-launch", func(a *fakeAccount) {
 			s := a.subnets["subnet-a"]
 			s.MapPublicIpOnLaunch = aws.Bool(false)
