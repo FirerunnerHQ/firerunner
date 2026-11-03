@@ -721,6 +721,10 @@ func (c *Config) validateJIT() error {
 
 // validateEC2Tier rejects Firecracker-only fields on an EC2 tier, so a tier
 // never half-describes a microVM it will not boot, and checks the ec2 block.
+// ValidateEC2 checks an ec2 tier's settings as loading a catalog does; for
+// callers, such as doctor, that load a configuration leniently.
+func (t Tier) ValidateEC2() error { return validateEC2Tier(t) }
+
 func validateEC2Tier(t Tier) error {
 	for _, f := range []struct {
 		name string

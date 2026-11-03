@@ -26,9 +26,12 @@ import (
 	"time"
 
 	"github.com/actions/scaleset"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
+	awssq "github.com/aws/aws-sdk-go-v2/service/servicequotas"
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
+	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/cacheserver"
@@ -131,7 +134,7 @@ func diagnose(cmd string, args []string) error {
 	case "status":
 		return diag.Status(cfg, version, os.Stdout, asJSON)
 	case "doctor":
-		return diag.Doctor(cfg, version, os.Stdout, asJSON)
+		return diag.Doctor(cfg, version, os.Stdout, asJSON, ec2Preflight(cfg)...)
 	}
 	return nil
 }
@@ -638,20 +641,52 @@ func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitse
 	}, nil
 }
 
-// newEC2Client builds the AWS clients shared by every EC2 tier from the
-// default credential chain (the control VM's instance role). The region is
-// --aws-region when set, else the SDK's usual sources, falling back to IMDS.
-func newEC2Client(ctx context.Context, cfg *config.Config, log *slog.Logger) (*ec2.Client, error) {
+// ec2Preflight runs the EC2 account checks for doctor when a tier launches
+// instances; none otherwise.
+func ec2Preflight(cfg *config.Config) []diag.Check {
+	if !cfg.UsesEC2() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	awsCfg, err := loadAWSConfig(ctx, cfg)
+	if err != nil {
+		return []diag.Check{{Level: "FAIL", Name: "aws-identity", Detail: err.Error()}}
+	}
+	ec2API := awsec2.NewFromConfig(awsCfg)
+	client := ec2.NewClient(ec2API, awsssm.NewFromConfig(awsCfg), 0, nil)
+	var out []diag.Check
+	for _, f := range client.Preflight(ctx, awsCfg.Region, ec2API, awssq.NewFromConfig(awsCfg), awssts.NewFromConfig(awsCfg), cfg.EffectiveTiers()) {
+		out = append(out, diag.Check{Level: f.Level, Name: f.Name, Detail: f.Detail})
+	}
+	return out
+}
+
+// loadAWSConfig loads the default credential chain (the control VM's
+// instance role). The region is --aws-region when set, else the SDK's usual
+// sources, falling back to IMDS.
+func loadAWSConfig(ctx context.Context, cfg *config.Config) (aws.Config, error) {
 	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithEC2IMDSRegion()}
 	if cfg.AWSRegion != "" {
 		opts = append(opts, awsconfig.WithRegion(cfg.AWSRegion))
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("load AWS config: %w", err)
+		return aws.Config{}, fmt.Errorf("load AWS config: %w", err)
 	}
 	if awsCfg.Region == "" {
-		return nil, errors.New("no AWS region: set --aws-region or run on EC2")
+		return aws.Config{}, errors.New("no AWS region: set --aws-region or run on EC2")
+	}
+	return awsCfg, nil
+}
+
+// newEC2Client builds the AWS clients shared by every EC2 tier from the
+// default credential chain (the control VM's instance role). The region is
+// --aws-region when set, else the SDK's usual sources, falling back to IMDS.
+func newEC2Client(ctx context.Context, cfg *config.Config, log *slog.Logger) (*ec2.Client, error) {
+	awsCfg, err := loadAWSConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
 	log.Info("EC2 provisioner ready", "region", awsCfg.Region)
 	return ec2.NewClient(awsec2.NewFromConfig(awsCfg), awsssm.NewFromConfig(awsCfg), 0, log.With("component", "ec2")), nil

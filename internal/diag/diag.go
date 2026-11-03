@@ -467,11 +467,13 @@ func renderStatusText(r StatusReport, w io.Writer) {
 	}
 }
 
-// Doctor runs preflight health checks. When asJSON is set it emits a
-// DoctorReport as JSON; otherwise one PASS/WARN/FAIL line each. It returns a
-// non-nil error if any check FAILs, so the command exits non-zero either way.
-func Doctor(cfg *config.Config, version string, w io.Writer, asJSON bool) error {
-	r := runDoctor(cfg, version)
+// Doctor runs preflight health checks, followed by extra (the EC2 account's,
+// which need AWS clients this package does not build). When asJSON is set it
+// emits a DoctorReport as JSON; otherwise one PASS/WARN/FAIL line each. It
+// returns a non-nil error if any check FAILs, so the command exits non-zero
+// either way.
+func Doctor(cfg *config.Config, version string, w io.Writer, asJSON bool, extra ...Check) error {
+	r := runDoctor(cfg, version, extra...)
 	if asJSON {
 		if err := writeJSON(w, r); err != nil {
 			return err
@@ -489,7 +491,7 @@ func Doctor(cfg *config.Config, version string, w io.Writer, asJSON bool) error 
 }
 
 // runDoctor executes the preflight checks and folds them into a DoctorReport.
-func runDoctor(cfg *config.Config, version string) DoctorReport {
+func runDoctor(cfg *config.Config, version string, extra ...Check) DoctorReport {
 	fc := cfg.Firecracker
 	var checks []Check
 
@@ -505,6 +507,58 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 		checks = append(checks, pass("privileges", "uid %d (non-root; ok for direct mode)", euid))
 	}
 
+	// The work dir holds the health file status and doctor read, whatever
+	// the tiers; for microVMs it also should be reflink-capable, so rootfs
+	// clones are cheap.
+	checks = append(checks, workdirCheck(fc.WorkDir))
+	if cfg.UsesFirecracker() {
+		checks = append(checks, firecrackerHostChecks(cfg)...)
+	} else {
+		checks = append(checks, pass("host", "no Firecracker tier: KVM, firecracker, kernel, images and guest networking are not needed here"))
+	}
+
+	// GitHub auth: presence/parse first, then a live read-only verification.
+	apiBase := githubAPIBase(cfg.URL)
+	auth := authCheck(cfg)
+	checks = append(checks, auth)
+	if auth.Level == levelPass {
+		checks = append(checks, authVerify(cfg, apiBase)...)
+	}
+
+	// GitHub API reachability (best-effort; WARN offline, never FAIL).
+	checks = append(checks, apiReach(apiBase))
+
+	// Self-hosted dependency cache (only when configured).
+	if c := cacheCheck(fc); c != nil {
+		checks = append(checks, *c)
+	}
+
+	checks = append(checks, extra...)
+	checks = append(checks, listenerChecks(fc, time.Now())...)
+
+	failed := 0
+	for _, c := range checks {
+		if c.Level == levelFail {
+			failed++
+		}
+	}
+	return DoctorReport{
+		Version: version,
+		Checks:  checks,
+		Total:   len(checks),
+		Failed:  failed,
+		OK:      failed == 0,
+	}
+}
+
+// --- checks ---------------------------------------------------------------
+
+// firecrackerHostChecks are what a host booting microVMs needs: KVM, the
+// firecracker binaries, kernel and images, and the network guests egress
+// through. A host serving only EC2 tiers needs none of them.
+func firecrackerHostChecks(cfg *config.Config) []Check {
+	fc := cfg.Firecracker
+	var checks []Check
 	// KVM: the hard requirement. No /dev/kvm, no microVMs.
 	if f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0); err != nil {
 		checks = append(checks, fail("kvm", "/dev/kvm not usable: %v", err))
@@ -566,8 +620,6 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 		checks = append(checks, pass("nftables", "nft present"))
 	}
 
-	// Work dir: writable and, ideally, reflink-capable so rootfs clones are cheap.
-	checks = append(checks, workdirCheck(fc.WorkDir))
 	// Reflink only works within one filesystem, so a golden on a different
 	// device than the workdir silently defeats it however capable the workdir is.
 	checks = append(checks, reflinkLocalityCheck(fc.WorkDir, goldens))
@@ -575,41 +627,8 @@ func runDoctor(cfg *config.Config, version string) DoctorReport {
 	if fc.LogDir != "" {
 		checks = append(checks, logDirCheck(fc.LogDir))
 	}
-
-	// GitHub auth: presence/parse first, then a live read-only verification.
-	apiBase := githubAPIBase(cfg.URL)
-	auth := authCheck(cfg)
-	checks = append(checks, auth)
-	if auth.Level == levelPass {
-		checks = append(checks, authVerify(cfg, apiBase)...)
-	}
-
-	// GitHub API reachability (best-effort; WARN offline, never FAIL).
-	checks = append(checks, apiReach(apiBase))
-
-	// Self-hosted dependency cache (only when configured).
-	if c := cacheCheck(fc); c != nil {
-		checks = append(checks, *c)
-	}
-
-	checks = append(checks, listenerChecks(fc, time.Now())...)
-
-	failed := 0
-	for _, c := range checks {
-		if c.Level == levelFail {
-			failed++
-		}
-	}
-	return DoctorReport{
-		Version: version,
-		Checks:  checks,
-		Total:   len(checks),
-		Failed:  failed,
-		OK:      failed == 0,
-	}
+	return checks
 }
-
-// --- checks ---------------------------------------------------------------
 
 // listenerChecks reports each tier's listener health from the running
 // daemon's state file: FAIL for a tier that stopped on a fatal error, WARN for
@@ -660,6 +679,7 @@ const (
 	levelFail = "FAIL"
 )
 
+// Check is one doctor finding. Level is "PASS", "WARN" or "FAIL".
 type Check struct {
 	Level  string `json:"level"`
 	Name   string `json:"name"`

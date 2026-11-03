@@ -579,7 +579,10 @@ the runners get no role:
       "Action": ["ec2:RunInstances", "ec2:CreateTags"],
       "Resource": "*" },
     { "Effect": "Allow",
-      "Action": ["ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeSpotInstanceRequests"],
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeSpotInstanceRequests",
+                 "ec2:DescribeSubnets", "ec2:DescribeRouteTables", "ec2:DescribeSecurityGroups",
+                 "ec2:DescribeInstanceTypes", "servicequotas:GetServiceQuota",
+                 "servicequotas:GetAWSDefaultServiceQuota"],
       "Resource": "*" },
     { "Effect": "Allow",
       "Action": ["ec2:TerminateInstances", "ec2:StartInstances", "ec2:ModifyInstanceAttribute"],
@@ -596,7 +599,9 @@ the runners get no role:
 ```
 
 Scope `RunInstances` to your subnets, security groups and AMIs as tightly as
-your account allows.
+your account allows. The subnet, route table, security group, instance type
+and quota reads are only for `firerunner doctor`; without them its EC2 checks
+warn that they cannot run.
 
 **Security groups.** The runners' group needs no inbound rules. The control
 VM's group must allow TCP to the `--jit-addr` port **from the runners' group
@@ -667,12 +672,27 @@ firerunner doctor --json | jq -r '.checks[] | select(.level=="FAIL") | .name'
 images (path, size, mtime), the network wiring, and the microVMs currently on
 the host (cross-checked against firecracker processes and tap devices).
 
-`doctor` runs a checklist — `/dev/kvm`, the firecracker/jailer binaries, the
-kernel and golden images, the egress interface, `ip_forward`, `nftables`, a
-writable and reflink-capable work dir, GitHub auth (presence plus a live
-read-only credential check), and API reachability (against the derived API base,
-so GitHub Enterprise Server works too) — and prints one `PASS`/`WARN`/`FAIL`
-line each. It exits non-zero when any check fails, so it can gate a deploy.
+`doctor` runs a checklist and prints one `PASS`/`WARN`/`FAIL` line each, with
+what to do about it. It exits non-zero when any check fails, so it can gate a
+deploy. Every host gets a writable work dir, GitHub auth (presence plus a live
+read-only credential check) and API reachability (against the derived API base,
+so GitHub Enterprise Server works too). Then:
+
+- **Firecracker tiers:** `/dev/kvm`, the firecracker/jailer binaries, the
+  kernel and golden images, the egress interface, `ip_forward`, `nftables`,
+  and a reflink-capable work dir. A host with only EC2 tiers skips them.
+- **EC2 tiers**, read from the account with the daemon's credentials:
+  - `aws-identity`: whose credentials, in which region;
+  - `ami[tier]`: the image ID or SSM parameter resolves;
+  - `subnets[tier]`: each subnet reaches github.com over IPv4 (it has no
+    IPv6), through a NAT or through an internet gateway with a public IPv4
+    assigned on launch;
+  - `security-groups[tier]`: in the subnets' VPC, outbound allowed, no
+    inbound rule;
+  - `instance-metadata`: launches require IMDSv2 with hop limit 1;
+  - `vcpu-quota[group/market]`: the vCPUs every tier at its `max` would use,
+    per quota group (Standard, G and VT, …) and market, against Service
+    Quotas. It warns rather than fails: other instances share the quota.
 
 **Reconciling with GitHub.** Every message from GitHub carries the scale set's
 statistics: available, acquired, assigned, running, registered, busy and idle
