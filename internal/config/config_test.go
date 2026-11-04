@@ -651,6 +651,7 @@ func TestFromFlags_EC2TierErrors(t *testing.T) {
 		"iops on gp2":          {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"gp2","root_volume_iops":4000`},
 		"iops low":             {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_iops":2999`},
 		"iops over size":       {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_iops":20001`},
+		"iops without size":    {`"root_volume_gib":40`, `"root_volume_iops":4000`},
 		"throughput over iops": {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_throughput":800,"root_volume_iops":3000`},
 		"init rate low":        {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_init_rate":99`},
 		"init rate high":       {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_init_rate":301`},

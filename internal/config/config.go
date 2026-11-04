@@ -887,8 +887,11 @@ func validateVolumePerformance(tier string, e *EC2Tier) error {
 		return fmt.Errorf("tier %q: ec2.root_volume_throughput %d must be %d-%d MiB/s", tier, th, minGP3Throughput, maxGP3Throughput)
 	case iops != 0 && (iops < minGP3IOPS || iops > maxGP3IOPS):
 		return fmt.Errorf("tier %q: ec2.root_volume_iops %d must be %d-%d", tier, iops, minGP3IOPS, maxGP3IOPS)
-	// gp3's baseline holds at any size: the per-GiB limit bounds what is above it.
-	case iops > minGP3IOPS && e.RootVolumeGiB > 0 && iops > e.RootVolumeGiB*maxGP3IOPSPerGiB:
+	// gp3's baseline holds at any size: the per-GiB limit bounds what is above
+	// it, and without a size here the AMI's would decide at launch.
+	case iops > minGP3IOPS && e.RootVolumeGiB == 0:
+		return fmt.Errorf("tier %q: ec2.root_volume_iops %d needs root_volume_gib, to check it against %d per GiB", tier, iops, maxGP3IOPSPerGiB)
+	case iops > minGP3IOPS && iops > e.RootVolumeGiB*maxGP3IOPSPerGiB:
 		return fmt.Errorf("tier %q: ec2.root_volume_iops %d is over %d per GiB of root_volume_gib", tier, iops, maxGP3IOPSPerGiB)
 	case e.RootVolumeInitRate != 0 && (e.RootVolumeInitRate < minVolumeInitRate || e.RootVolumeInitRate > maxVolumeInitRate):
 		return fmt.Errorf("tier %q: ec2.root_volume_init_rate %d must be %d-%d MiB/s", tier, e.RootVolumeInitRate, minVolumeInitRate, maxVolumeInitRate)
