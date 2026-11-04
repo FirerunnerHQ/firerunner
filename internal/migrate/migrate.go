@@ -40,13 +40,13 @@ func (m Map) Validate() error {
 		if from == "" || !labelRE.MatchString(to) || !plainString(to) {
 			return fmt.Errorf("migrate: bad mapping %q=%q: a target must be a plain label", from, to)
 		}
-		if other, ok := seen[strings.ToLower(from)]; ok {
+		if other, ok := seen[asciiLower(from)]; ok {
 			return fmt.Errorf("migrate: labels %q and %q differ only in case; GitHub treats them as one", from, other)
 		}
-		seen[strings.ToLower(from)] = from
+		seen[asciiLower(from)] = from
 	}
 	for from, to := range m {
-		if next, ok := m.lookup(to); ok && !strings.EqualFold(next, to) {
+		if next, ok := m.lookup(to); ok && !foldEqual(next, to) {
 			return fmt.Errorf("migrate: %q maps to %q, which maps on to %q; map %q to %q directly", from, to, next, from, next)
 		}
 	}
@@ -68,17 +68,31 @@ func (m Map) lookup(label string) (string, bool) {
 		return to, true
 	}
 	for from, to := range m {
-		if strings.EqualFold(from, label) {
+		if foldEqual(from, label) {
 			return to, true
 		}
 	}
 	return "", false
 }
 
+// foldEqual compares labels as GitHub does, folding ASCII case only:
+// strings.EqualFold would also equate the long s (U+017F) with s.
+func foldEqual(a, b string) bool { return asciiLower(a) == asciiLower(b) }
+
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
 // target reports whether label is one the map writes.
 func (m Map) target(label string) bool {
 	for _, to := range m {
-		if strings.EqualFold(to, label) {
+		if foldEqual(to, label) {
 			return true
 		}
 	}
@@ -129,6 +143,10 @@ func Rewrite(src []byte, m Map) (Result, error) {
 		return res, nil
 	}
 	jobs := value(doc, "jobs")
+	if jobs != nil && jobs.Kind == yaml.AliasNode {
+		res.Skips = append(res.Skips, Skip{"", jobs.Line, "jobs is a YAML alias: change it by hand"})
+		return res, nil
+	}
 	if jobs == nil || jobs.Kind != yaml.MappingNode {
 		return res, nil
 	}
@@ -152,7 +170,7 @@ func Rewrite(src []byte, m Map) (Result, error) {
 		case value(job, "<<") != nil:
 			skip(job.Line, "the job takes keys from a YAML merge (<<): change it by hand")
 			continue
-		case duplicateKey(job) == "runs-on":
+		case keyCount(job, "runs-on") > 1:
 			skip(job.Line, "runs-on appears more than once")
 			continue
 		}
@@ -272,7 +290,7 @@ func mapRunsOn(src []byte, lines []lineSpan, job string, n *yaml.Node, m Map) ([
 	default:
 		return nil, nil, "runs-on is not a label or a list of labels"
 	}
-	if len(scalars) == 0 || (n.Kind == yaml.ScalarNode && n.Tag == "!!null") {
+	if len(scalars) == 0 || (n.Kind == yaml.ScalarNode && (n.Tag == "!!null" || n.Value == "")) {
 		return nil, nil, "runs-on is empty"
 	}
 	var edits []edit
@@ -282,10 +300,12 @@ func mapRunsOn(src []byte, lines []lineSpan, job string, n *yaml.Node, m Map) ([
 		switch {
 		case strings.Contains(label, "${{"):
 			return nil, nil, fmt.Sprintf("runs-on is an expression (%s): change the values it takes by hand", label)
-		case strings.EqualFold(label, "self-hosted"):
+		case foldEqual(label, "self-hosted"):
 			return nil, nil, "already runs on self-hosted runners"
 		case s.Style&yaml.TaggedStyle != 0:
 			return nil, nil, "a label carries a YAML tag: change it by hand"
+		case s.Tag != "!!str":
+			return nil, nil, fmt.Sprintf("label %s is not a string to YAML (%s): quote it, or change it by hand", label, s.Tag)
 		}
 		to, ok := m.lookup(label)
 		if !ok && m.target(label) {
@@ -415,6 +435,17 @@ func lineSpans(src []byte) []lineSpan {
 		start = i
 	}
 	return append(lines, lineSpan{start, len(src)})
+}
+
+// keyCount counts key in mapping node n.
+func keyCount(n *yaml.Node, key string) int {
+	c := 0
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key {
+			c++
+		}
+	}
+	return c
 }
 
 // duplicateKey returns a key that mapping node n holds more than once.

@@ -202,6 +202,26 @@ func TestRewriteEdges(t *testing.T) {
 			skip: "more than once",
 		},
 		{
+			name: "runs-on twice after another duplicate key",
+			in:   "jobs:\n  a:\n    steps: []\n    steps: []\n    runs-on: ubuntu-latest\n    runs-on: macos-latest\n",
+			skip: "more than once",
+		},
+		{
+			name: "label YAML reads as a number",
+			in:   "jobs:\n  a:\n    runs-on: 123\n",
+			skip: "not a string",
+		},
+		{
+			name: "empty quoted runs-on",
+			in:   "jobs:\n  a:\n    runs-on: \"\"\n",
+			skip: "runs-on is empty",
+		},
+		{
+			name: "jobs is an alias",
+			in:   "x: &j {a: {runs-on: ubuntu-latest}}\njobs: *j\n",
+			skip: "jobs is a YAML alias",
+		},
+		{
 			name: "merge key",
 			in:   "d: &d {runs-on: ubuntu-latest}\njobs:\n  a:\n    <<: *d\n",
 			skip: "YAML merge",
@@ -307,5 +327,26 @@ func TestVerifyRefusesMisplacedEdits(t *testing.T) {
 	stray, _ := apply(src, []edit{good, {wrong, wrong + len("ubuntu-latest"), "fr-small", nil}})
 	if err := verify(doc, stray, []edit{good}); err == nil {
 		t.Errorf("verify passed a stray change %q", stray)
+	}
+}
+
+// A label YAML reads as a number skips its job; the others still migrate.
+func TestRewriteNumericLabelSkipsOnlyItsJob(t *testing.T) {
+	res, err := Rewrite([]byte("jobs:\n  a:\n    runs-on: 123\n  b:\n    runs-on: ubuntu-latest\n"), Map{"123": "fr-x", "ubuntu-latest": "fr-small"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res.Out) != "jobs:\n  a:\n    runs-on: 123\n  b:\n    runs-on: fr-small\n" || len(res.Skips) != 1 {
+		t.Errorf("out %q, skips %+v", res.Out, res.Skips)
+	}
+}
+
+// Only ASCII case folds: the long s (U+017F) is not s.
+func TestMapFoldsASCIIOnly(t *testing.T) {
+	if _, ok := (Map{"s": "x"}).lookup("\u017f"); ok {
+		t.Error("the long s matched s")
+	}
+	if to, ok := (Map{"ubuntu-latest": "x"}).lookup("UBUNTU-LATEST"); !ok || to != "x" {
+		t.Error("ASCII case does not fold")
 	}
 }
