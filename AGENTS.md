@@ -187,6 +187,7 @@ The usual dev box is macOS with zsh; much of the code and CI is Linux.
 | `internal/ec2` | one EC2 instance per job; `internal/jitserver` serves its JIT config once over the VPC |
 | `internal/health` | per-tier listener state, published for `status`/`doctor` |
 | `internal/diag` | `status` and `doctor` |
+| `internal/migrate` | `firerunner migrate`: in-place `runs-on` rewrites, and the PR it opens as the user |
 | `images/` | guest images, boot scripts and their tests |
 | `scripts/e2e/` | helpers for end-to-end checks against a real deployment (your own control VM, owner inventory and cleanup, SSM exec, console, run watch and timing) |
 
