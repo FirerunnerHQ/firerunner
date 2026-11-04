@@ -8,14 +8,14 @@
 #
 # Usage: images/test-ec2-vm.sh [--workdir DIR] [--runner-version V] [--vcpus N]
 #                              [--mem-mib N] [--toolset standard|full|minimal] [--disk-gib N]
-#                              [--keep-image FILE]
+#                              [--keep-image FILE] [--docker-storage disk|memory]
 #
 # The image is what EC2 would snapshot, except for its kernel: this is Ubuntu's
 # generic kernel, where EC2 has the aws one. Timings here say nothing about EBS.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-workdir="${HOME}/.cache/firerunner-ec2-vm" runner_version="" vcpus=4 mem=8192 toolset=minimal disk=20 keep=""
+workdir="${HOME}/.cache/firerunner-ec2-vm" runner_version="" vcpus=4 mem=8192 toolset=minimal disk=20 keep="" docker_storage=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--workdir) workdir="${2:?}" && shift ;;
@@ -25,6 +25,7 @@ while [ $# -gt 0 ]; do
 	--toolset) toolset="${2:?}" && shift ;;
 	--disk-gib) disk="${2:?}" && shift ;;
 	--keep-image) keep="${2:?}" && shift ;;
+	--docker-storage) docker_storage="${2:?}" && shift ;;
 	*) echo "unknown argument: $1" >&2 && exit 2 ;;
 	esac
 	shift
@@ -82,6 +83,9 @@ s=$(date +%s.%N)
 timeout 120 docker run --rm hello-world >/dev/null 2>&1
 rc=$?
 say "docker_first_run: rc=$rc $(awk "BEGIN{print $(date +%s.%N)-$s}") s"
+for d in /var/lib/docker /var/lib/containerd; do
+	say "docker_dir: $d on $(findmnt -no SOURCE -T "$d")"
+done
 # A burst above physical memory must swap, not be killed. firerunner-tune
 # gives swap as large as memory, so this fits.
 timeout 180 python3 -c '
@@ -131,6 +135,7 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(("127.0.0.1", 18099), H).serve_forever()
 PY
 echo "FIRERUNNER_JIT_URL=$base_url/jit" >"$run/job-userdata"
+[ -z "$docker_storage" ] || echo "FIRERUNNER_DOCKER_STORAGE=$docker_storage" >>"$run/job-userdata"
 python3 -I "$run/server.py" "$run" "$base_url" &
 server_pid=$!
 
@@ -195,6 +200,12 @@ check "write barriers off" 'rootmount:.*nobarrier'
 check "zram swap is on" 'swap: /dev/zram0'
 check "swappiness is 100" 'swappiness: 100'
 check "docker runs on the tuned disk" 'docker_first_run: rc=0'
+if [ "$docker_storage" = memory ]; then
+	check "docker's data is in zram" 'docker_dir: /var/lib/docker on /dev/zram'
+	check "containerd's data is in zram" 'docker_dir: /var/lib/containerd on /dev/zram'
+else
+	check "docker's data is on the disk" 'docker_dir: /var/lib/docker on /dev/(root|vda)'
+fi
 check "huge pages are always on" 'thp: \[always\]'
 check "dpkg runs under eatmydata" 'apt:.*dpkg-eatmydata'
 check "apt prefers gzip indexes" 'apt:.*"gz"'

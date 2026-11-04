@@ -404,6 +404,7 @@ See [`examples/tiers-ec2.json`](examples/tiers-ec2.json):
 | `root_volume_throughput` | gp3 throughput in MiB/s, 125-2000. Default: 400 for a job's instance and gp3's baseline (125) for a pool instance, which would pay for the extra throughput while stopped. Needs 4 IOPS per MiB/s |
 | `root_volume_iops` | gp3 IOPS, 3000-80000. Above 3000, at most 500 per GiB, and it needs `root_volume_gib`. Default: gp3's baseline (3000) |
 | `root_volume_init_rate` | the rate, 100-300 MiB/s, at which EBS copies the volume from its snapshot. Default: off, so blocks arrive as they are first read. AWS bills it per launch |
+| `docker_storage` | where Docker keeps its data: `disk` (default) or `memory`, compressed RAM, which needs an image from this release or later; an older image stays on the disk. A large image build on m8a.xlarge took 395 s instead of 542 s. Its data compressed about 2.5 times, so 29 GiB left 16 GiB of memory nearly full: a build that outgrows memory fails with `cannot allocate memory`, where the disk would have held it. Choose it for builds you have seen fit. Docker starts empty, without images baked into the AMI. If the move fails at boot, Docker stays on the disk |
 | `pool` | how many pre-warmed, stopped instances to keep ready (default 0, every job cold-launches); see below |
 | `cache` | `true` sends the tier's `actions/cache` traffic to firerunner's cache-server at `--ec2-cache-addr` (default off). Each instance gets, once and with its JIT config, a certificate for GitHub's results host from a CA that never leaves the control VM and can sign no other name. Work in progress (#28): the runner AMI's proxy that uses it is not released yet |
 
@@ -417,7 +418,8 @@ user-data**:
 
 1. firerunner launches the instance with IMDSv2 required (hop limit 1, so
    job containers cannot reach IMDS), **no instance profile**, and user-data
-   holding one line, `FIRERUNNER_JIT_URL=http://<--jit-host or --jit-addr>/jit`.
+   holding `FIRERUNNER_JIT_URL=http://<--jit-host or --jit-addr>/jit`, and
+   `FIRERUNNER_DOCKER_STORAGE=memory` for a tier that sets it.
 2. It registers the config under the instance's private IP. The instance's
    boot service ([`images/assets/firerunner-ec2-run.sh`](images/assets/firerunner-ec2-run.sh))
    fetches it. The config is served **once**, to that IP only: another
@@ -657,7 +659,8 @@ and tier names, and cleans up only its own owner's resources.
    be green.
 4. Check that no secret is in user-data:
    `aws ec2 describe-instance-attribute --instance-id <id> --attribute userData`
-   decodes to the single `FIRERUNNER_JIT_URL=` line.
+   decodes to the `FIRERUNNER_JIT_URL=` line, plus
+   `FIRERUNNER_DOCKER_STORAGE=` for a tier that sets `docker_storage`.
 5. Check that nothing is left behind: the instance is `terminated`, and the
    runner no longer appears under the repository's runners.
 

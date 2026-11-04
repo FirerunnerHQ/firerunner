@@ -94,6 +94,12 @@ const (
 	ProvisionerEC2         = "ec2"
 )
 
+// Where an EC2 tier's instances keep Docker's data.
+const (
+	DockerStorageDisk   = "disk"
+	DockerStorageMemory = "memory"
+)
+
 // EC2 market policies.
 const (
 	MarketSpot               = "spot"
@@ -219,6 +225,11 @@ type EC2Tier struct {
 	// volume from its snapshot, so a job meets fewer cold blocks. 0 leaves it
 	// to fetch blocks as they are read. AWS bills it per launch.
 	RootVolumeInitRate int `json:"root_volume_init_rate,omitempty"`
+	// DockerStorage is where an instance keeps Docker's data: "disk", the
+	// default, or "memory", compressed RAM. An older image ignores it and
+	// stays on the disk. A build that outgrows memory fails there, where the
+	// disk would have held it.
+	DockerStorage string `json:"docker_storage,omitempty"`
 	// Pool is how many pre-warmed, stopped instances to keep ready. A job
 	// starts one in seconds instead of booting a new instance; spot pools use
 	// persistent requests and are still billed at the spot price. 0 disables
@@ -895,6 +906,8 @@ func validateVolumePerformance(tier string, e *EC2Tier) error {
 		return fmt.Errorf("tier %q: ec2.root_volume_iops %d is over %d per GiB of root_volume_gib", tier, iops, maxGP3IOPSPerGiB)
 	case e.RootVolumeInitRate != 0 && (e.RootVolumeInitRate < minVolumeInitRate || e.RootVolumeInitRate > maxVolumeInitRate):
 		return fmt.Errorf("tier %q: ec2.root_volume_init_rate %d must be %d-%d MiB/s", tier, e.RootVolumeInitRate, minVolumeInitRate, maxVolumeInitRate)
+	case e.DockerStorage != "" && e.DockerStorage != DockerStorageDisk && e.DockerStorage != DockerStorageMemory:
+		return fmt.Errorf("tier %q: ec2.docker_storage %q must be %q or %q", tier, e.DockerStorage, DockerStorageDisk, DockerStorageMemory)
 	}
 	if eff := max(iops, minGP3IOPS); th != 0 && eff < th*minGP3IOPSPerMiBps {
 		return fmt.Errorf("tier %q: ec2.root_volume_throughput %d needs root_volume_iops of at least %d", tier, th, th*minGP3IOPSPerMiBps)

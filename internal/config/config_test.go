@@ -655,6 +655,7 @@ func TestFromFlags_EC2TierErrors(t *testing.T) {
 		"throughput over iops": {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_throughput":800,"root_volume_iops":3000`},
 		"init rate low":        {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_init_rate":99`},
 		"init rate high":       {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_init_rate":301`},
+		"docker storage":       {`"root_volume_gib":40`, `"root_volume_gib":40,"docker_storage":"tmpfs"`},
 		"pool_for no pool":     {`"root_volume_gib":40`, `"root_volume_gib":40,"pool_for":{"events":["pull_request"]}}`},
 		"pool_for empty":       {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":2,"pool_for":{}`},
 		"pool_for dup event":   {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":2,"pool_for":{"events":["push","push"]}`},

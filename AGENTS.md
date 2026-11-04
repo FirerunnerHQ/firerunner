@@ -166,6 +166,9 @@ The usual dev box is macOS with zsh; much of the code and CI is Linux.
 - **BSD userland.** macOS has no `timeout`, and `sed -i` needs `''`. The
   shell tests under `images/` run on both macOS and Linux in `make check`, so
   keep them portable.
+- **`sh` on macOS is bash.** Ubuntu's is dash, which aborts on things bash
+  forgives, such as `return` with a non-number. The tests under `images/` run
+  scripts with `dash` when it is there, and macOS ships it; do the same by hand.
 - **Linux-only files** (`_linux.go`, `//go:build linux`) are skipped by a
   darwin build, so a green `go vet` there proves nothing about them: run
   `GOOS=linux go vet ./...` too.

@@ -50,9 +50,13 @@ const (
 	PhaseExited = "exited"
 )
 
-// UserDataKey names the only line firerunner writes into an instance's
-// user-data: the URL of this server's JIT endpoint.
+// UserDataKey names the line of an instance's user-data that holds the URL of
+// this server's JIT endpoint.
 const UserDataKey = "FIRERUNNER_JIT_URL"
+
+// DockerStorageKey names the line that tells the instance where Docker keeps
+// its data, for a tier that sets ec2.docker_storage.
+const DockerStorageKey = "FIRERUNNER_DOCKER_STORAGE"
 
 // DefaultTTL bounds how long a registered config waits to be fetched. A cold
 // instance fetches within about a minute of launch; a config nobody claimed
@@ -398,8 +402,12 @@ func URL(addr string) string {
 	return (&url.URL{Scheme: "http", Host: addr, Path: Path}).String()
 }
 
-// UserData returns the complete user-data for a runner instance: one line that
-// names the JIT endpoint, and nothing secret.
-func UserData(endpoint string) string {
-	return UserDataKey + "=" + strings.TrimSpace(endpoint) + "\n"
+// UserData returns the complete user-data for a runner instance: a line that
+// names the JIT endpoint, one for a tier's dockerStorage, and nothing secret.
+func UserData(endpoint, dockerStorage string) string {
+	s := UserDataKey + "=" + strings.TrimSpace(endpoint) + "\n"
+	if dockerStorage != "" {
+		s += DockerStorageKey + "=" + dockerStorage + "\n"
+	}
+	return s
 }

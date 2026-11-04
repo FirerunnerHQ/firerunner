@@ -96,9 +96,10 @@ An EC2 runner AMI runs [`assets/firerunner-ec2-run.sh`](assets/firerunner-ec2-ru
 from [`assets/firerunner-ec2-runner.service`](assets/firerunner-ec2-runner.service)
 instead. The JIT config never appears in user-data:
 
-1. Read user-data through IMDSv2. It holds one line,
+1. Read user-data through IMDSv2. It holds
    `FIRERUNNER_JIT_URL=http://<control-vm-vpc-ip>:<port>/jit` (firerunner's
-   `--jit-addr`). With no such line, for example during a warm-up or image-build
+   `--jit-addr`), and `FIRERUNNER_DOCKER_STORAGE` for a tier that sets
+   `docker_storage`. With no such URL, for example during a warm-up or image-build
    boot, the instance powers off.
 2. `GET` that URL until it answers. firerunner serves the config **once**, to
    this instance's private IP, then answers 404.
@@ -184,8 +185,9 @@ Because the disk lasts for one job, the image favours speed over durability:
 
 - `firerunner-ec2-tune` grows the root filesystem to the volume's size on each
   job boot, so `root_volume_gib` takes effect, adds zram swap as large as
-  memory, and reads Docker's and the runner's files in the background. Each
-  step is best effort, and the job starts either way.
+  memory, moves Docker's data to compressed RAM for a tier with
+  `docker_storage: memory`, and reads Docker's and the runner's files in the
+  background. Each step is best effort, and the job starts either way.
 - The root filesystem mounts with `data=writeback`, `journal_async_commit` and
   `nobarrier`. A pool instance stops cleanly, so these never risk a disk that
   boots again.

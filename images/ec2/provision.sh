@@ -14,7 +14,8 @@
 #   - an empty hostname and machine-id, so each instance gets its own.
 # And about making the job fast on a disk that lasts for one job:
 #   - ext4 without the guarantees that protect a disk across a crash;
-#   - firerunner-ec2-tune, which grows the disk and adds zram swap at boot.
+#   - firerunner-ec2-tune, which grows the disk, adds zram swap and moves
+#     Docker to memory for a tier that asks, at boot.
 #
 # Settings (set by build-ec2-ami.sh):
 #   RUNNER_VERSION  actions/runner version, e.g. 2.338.1

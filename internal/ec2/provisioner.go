@@ -791,8 +791,9 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 		MaxCount:         aws.Int32(1),
 		SubnetId:         aws.String(subnet),
 		SecurityGroupIds: p.o.EC2.SecurityGroups,
-		// The only user-data is the JIT endpoint: nothing secret.
-		UserData:        aws.String(base64.StdEncoding.EncodeToString([]byte(jitserver.UserData(p.o.JITURL)))),
+		// User-data names the JIT endpoint and the tier's Docker storage:
+		// nothing secret.
+		UserData:        aws.String(base64.StdEncoding.EncodeToString([]byte(jitserver.UserData(p.o.JITURL, p.o.EC2.DockerStorage)))),
 		MetadataOptions: launchMetadataOptions(),
 		TagSpecifications: []types.TagSpecification{
 			{ResourceType: types.ResourceTypeInstance, Tags: tags},

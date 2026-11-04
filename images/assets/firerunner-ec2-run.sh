@@ -4,8 +4,8 @@
 # instance's JIT config from the firerunner control VM over the VPC, runs
 # exactly one ephemeral GitHub Actions job, then powers off.
 #
-# User-data holds only the endpoint (FIRERUNNER_JIT_URL=http://<vpc-ip>:<port>/jit),
-# never the config itself: the control VM hands the config out once, to this
+# User-data holds the endpoint (FIRERUNNER_JIT_URL=http://<vpc-ip>:<port>/jit)
+# and a tier's docker_storage, never the config itself: the control VM hands the config out once, to this
 # instance's private IP, and answers 404 afterwards. So neither user-data nor
 # IMDS holds anything reusable. The job itself runs alongside the runner, as
 # root on a minimal image and as "runner" with sudo on a fuller one, so it can
@@ -47,10 +47,13 @@ JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
 REPORT_TIMEOUT="${FIRERUNNER_REPORT_TIMEOUT:-2}"
 ENVIRONMENT="${FIRERUNNER_ENVIRONMENT:-/etc/environment}"
 RUN_USER="${FIRERUNNER_RUN_USER-runner}"
-# Grows the disk and adds swap while the config is on its way (see below).
+# Grows the disk, adds swap and moves Docker if the tier asks, while the config
+# is on its way (see below).
 TUNE="${FIRERUNNER_TUNE:-/usr/local/libexec/firerunner-ec2-tune}"
 # Bounds the wait for it, in tenths of a second.
 TUNE_TICKS="${FIRERUNNER_TUNE_TICKS:-600}"
+# Bounds the wait for it to move Docker, in seconds.
+DOCKER_WAIT="${FIRERUNNER_DOCKER_WAIT:-300}"
 # Sets up the dependency cache from this instance's bundle (see below).
 CACHE_SETUP="${FIRERUNNER_CACHE_SETUP:-/usr/local/libexec/firerunner-cache-setup}"
 # Bounds the wait for the output reader after the runner exits, in tenths of
@@ -117,13 +120,17 @@ if [ -z "$url" ]; then
 fi
 # A job boot from here on: its disk is never booted again.
 poweroff_cmd="$POWEROFF_FAST"
+docker_storage="$(printf '%s\n' "$ud" | sed -n 's/^FIRERUNNER_DOCKER_STORAGE=//p' | head -n 1)"
 
 # In the background, so tuning costs no time beyond what the config's fetch
 # takes anyway. The runner waits for it, up to TUNE_TICKS, so a job normally
 # sees the full disk.
 tune_pid=""
+docker_pending=""
 if [ -x "$TUNE" ]; then
-	"$TUNE" &
+	# With nothing to wait on, nothing may move: Docker stays on the disk.
+	[ -z "$docker_storage" ] || docker_pending="$(mktemp "${TMPDIR:-/tmp}/firerunner-docker.XXXXXX")" || docker_storage=""
+	FIRERUNNER_DOCKER_STORAGE="$docker_storage" FIRERUNNER_DOCKER_PENDING="$docker_pending" "$TUNE" &
 	tune_pid=$!
 fi
 
@@ -185,8 +192,20 @@ if ! cd "$RUNNER_DIR" 2>/dev/null || [ ! -x ./run.sh ]; then
 	log "no runnable $RUNNER_DIR/run.sh; powering off"
 	exit 0
 fi
-# Bounded, unlike wait: a step stuck on a device must not hold the job back.
 if [ -n "$tune_pid" ]; then
+	# Moving Docker stops it, so a job must not start during the move. A move
+	# stuck past DOCKER_WAIT leaves Docker in an unknown state: fail the job
+	# rather than run it there.
+	start="$(date +%s)"
+	while [ -n "$docker_pending" ] && [ -e "$docker_pending" ] && kill -0 "$tune_pid" 2>/dev/null; do
+		if [ $(($(date +%s) - start)) -ge "$DOCKER_WAIT" ]; then
+			report exited 1 # before the log line, which may fail
+			log "Docker still moving after ${DOCKER_WAIT}s; powering off"
+			exit 0
+		fi
+		sleep 0.1
+	done
+	# Bounded, unlike wait: a step stuck on a device must not hold the job back.
 	waited=0
 	while kill -0 "$tune_pid" 2>/dev/null && [ "$waited" -lt "$TUNE_TICKS" ]; do
 		sleep 0.1

@@ -499,7 +499,7 @@ func (pl *Pool) prepare(ctx context.Context, in pooled, runner string) (tagged b
 	}
 	if _, err := api.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
 		InstanceId: aws.String(in.id),
-		UserData:   &types.SecureBlobAttributeValue{Value: []byte(jitserver.UserData(pl.p.o.JITURL))},
+		UserData:   &types.SecureBlobAttributeValue{Value: []byte(jitserver.UserData(pl.p.o.JITURL, pl.p.o.EC2.DockerStorage))},
 	}); err != nil {
 		return true, fmt.Errorf("set user-data: %w", err)
 	}
