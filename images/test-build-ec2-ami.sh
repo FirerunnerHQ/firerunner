@@ -142,14 +142,27 @@ PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --arch arm64 >"$S
 expect "render prints the user-data" "" grep -q '^RUNNER_ARCH=arm64$' "$STATE/out"
 expect "render touches no AWS" "" not_called "ec2"
 
-# 6. The toolset reaches the instance, and curated skips what full keeps.
+# 6. standard is the default, and full keeps what it skips.
 fresh toolset
-PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --toolset curated >"$STATE/out"
-expect "toolset reaches the user-data" "" grep -q '^TOOLSET=curated$' "$STATE/out"
-expect "curated skips Haskell" "" grep -q '^RI_SKIP=.*install-haskell.sh' "$STATE/out"
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 >"$STATE/out"
+expect "the default toolset is standard" "" grep -q '^TOOLSET=standard$' "$STATE/out"
+expect "standard skips Haskell" "" grep -q '^RI_SKIP=.*install-haskell.sh' "$STATE/out"
 PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --toolset full >"$STATE/out"
 expect "full keeps Haskell" "" bash -c "! grep -q '^RI_SKIP=.*install-haskell.sh' '$STATE/out'"
-expect "curated on arm64 is refused" "" bash -c "! PATH='$TMP/bin:$PATH' '$BUILD' --render --runner-version 1.2.3 --toolset curated --arch arm64 >/dev/null 2>&1"
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --arch arm64 >"$STATE/out"
+expect "arm64 defaults to minimal" "" grep -q '^TOOLSET=minimal$' "$STATE/out"
+expect "standard on arm64 is refused" "" bash -c "! PATH='$TMP/bin:$PATH' '$BUILD' --render --runner-version 1.2.3 --toolset standard --arch arm64 >/dev/null 2>&1"
+fresh toolset-defaults
+build
+expect "standard gets a build instance that fits" "$(cat "$STATE/calls")" called "--instance-type c7a.4xlarge"
+expect "standard gets a disk that fits" "$(cat "$STATE/calls")" called "VolumeSize=40,"
+fresh toolset-minimal
+build --toolset minimal
+expect "minimal stays small" "$(cat "$STATE/calls")" called "--instance-type c7a.large"
+fresh toolset-override
+build --instance-type m8a.large --volume-gib 25
+expect "an explicit type wins" "$(cat "$STATE/calls")" called "--instance-type m8a.large"
+expect "an explicit size wins" "$(cat "$STATE/calls")" called "VolumeSize=25,"
 expect "a bad toolset is refused" "" bash -c "! PATH='$TMP/bin:$PATH' '$BUILD' --render --runner-version 1.2.3 --toolset huge >/dev/null 2>&1"
 
 if [ "$fails" -ne 0 ]; then

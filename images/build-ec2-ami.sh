@@ -16,17 +16,18 @@
 #                         Ubuntu's mirrors and github.com
 #   --security-group ID   security group for the build instance (no inbound needed)
 #   --ssm-param NAME      SSM parameter that receives the AMI ID (a tier's "ami")
-#   --instance-type T     build instance type (default c7a.large; arm64: c7g.large)
+#   --instance-type T     build instance type (default c7a.4xlarge; minimal:
+#                         c7a.large; arm64: c7g.large)
 #   --arch A              x64 (default) or arm64
 #   --runner-version V    actions/runner version (default: latest release)
-#   --toolset T           minimal, curated or full (default minimal). curated and
-#                         full install GitHub's ubuntu-24.04 tools, in about 30
-#                         minutes; pass a larger --instance-type and --volume-gib,
-#                         and --timeout
-#   --runner-images-ref R actions/runner-images tag for curated and full
-#   --volume-gib N        root volume size (default 20)
+#   --toolset T           standard (default), full or minimal. standard and full
+#                         install GitHub's ubuntu-24.04 tools, x64 only, so arm64
+#                         defaults to minimal
+#   --runner-images-ref R actions/runner-images tag for standard and full
+#   --volume-gib N        root volume size (default 40; full: 80; minimal: 20)
 #   --tag K=V             extra tag on the instance, AMI and snapshot (repeatable)
-#   --timeout SECONDS     give up waiting for the build (default 1200)
+#   --timeout SECONDS     give up waiting for the build (default 3600; minimal:
+#                         1200)
 #   --render              print the build user-data and exit; touches no AWS
 #
 # Output: progress on stderr; on success one JSON line on stdout:
@@ -39,10 +40,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-region="" subnet="" sg="" param="" itype="" arch="x64" runner_version="" volume=20
-toolset=minimal ri_ref="ubuntu24/20261101.360"
+region="" subnet="" sg="" param="" itype="" arch="x64" runner_version="" volume=""
+toolset="" ri_ref="ubuntu24/20261101.360"
 ri_skip="configure-apt-mock.sh configure-system.sh cleanup.sh list-dpkg.sh post-build-validation.sh install-android-sdk.sh install-homebrew.sh configure-snap.sh"
-timeout_s=1200 render=0
+timeout_s="" render=0
 tags=()
 
 die() {
@@ -76,15 +77,24 @@ while [ $# -gt 0 ]; do
 done
 
 case "$arch" in
-x64) ubuntu_arch=amd64 default_type=c7a.large ;;
-arm64) ubuntu_arch=arm64 default_type=c7g.large ;;
+x64) ubuntu_arch=amd64 default_toolset=standard ;;
+arm64) ubuntu_arch=arm64 default_toolset=minimal ;;
 *) die "--arch must be x64 or arm64" ;;
 esac
+toolset="${toolset:-$default_toolset}"
+case "$arch/$toolset" in
+x64/minimal) default_type=c7a.large default_volume=20 default_timeout=1200 ;;
+arm64/minimal) default_type=c7g.large default_volume=20 default_timeout=1200 ;;
+*/standard) default_type=c7a.4xlarge default_volume=40 default_timeout=3600 ;;
+*/full) default_type=c7a.4xlarge default_volume=80 default_timeout=3600 ;;
+*) die "--toolset must be standard, full or minimal" ;;
+esac
 itype="${itype:-$default_type}"
+volume="${volume:-$default_volume}"
+timeout_s="${timeout_s:-$default_timeout}"
 [[ "$volume" =~ ^[0-9]+$ ]] || die "--volume-gib must be a number"
-case "$toolset" in minimal | curated | full) ;; *) die "--toolset must be minimal, curated or full" ;; esac
 [ "$toolset" = minimal ] || [ "$arch" = x64 ] || die "--toolset $toolset is x64 only: its installers come from GitHub's x64 toolset"
-[ "$toolset" != curated ] || ri_skip="$ri_skip install-haskell.sh install-swift.sh install-julia.sh install-firefox.sh install-microsoft-edge.sh install-google-cloud-cli.sh install-codeql-bundle.sh install-kotlin.sh install-bazel.sh install-pulumi.sh install-packer.sh install-vcpkg.sh install-azure-devops-cli.sh install-copilot-cli.sh install-awf.sh install-pypy.sh"
+[ "$toolset" != standard ] || ri_skip="$ri_skip install-haskell.sh install-swift.sh install-julia.sh install-firefox.sh install-microsoft-edge.sh install-google-cloud-cli.sh install-codeql-bundle.sh install-kotlin.sh install-bazel.sh install-pulumi.sh install-packer.sh install-vcpkg.sh install-azure-devops-cli.sh install-copilot-cli.sh install-awf.sh install-pypy.sh"
 [[ "$timeout_s" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
 for t in "${tags[@]+"${tags[@]}"}"; do
 	[[ "$t" == ?*=* ]] || die "--tag wants KEY=VALUE, got '$t'"

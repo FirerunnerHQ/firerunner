@@ -19,8 +19,8 @@
 # Settings (set by build-ec2-ami.sh):
 #   RUNNER_VERSION  actions/runner version, e.g. 2.338.1
 #   RUNNER_ARCH     x64 or arm64
-#   TOOLSET         minimal (Docker, git), curated (GitHub's ubuntu-24.04 tools
-#                   that jobs commonly use) or full (nearly all of them)
+#   TOOLSET         standard (GitHub's ubuntu-24.04 tools that jobs commonly
+#                   use), full (nearly all of them) or minimal (Docker, git)
 set -euxo pipefail
 
 : "${RUNNER_VERSION:?}" "${RUNNER_ARCH:?}" "${TOOLSET:?}"
