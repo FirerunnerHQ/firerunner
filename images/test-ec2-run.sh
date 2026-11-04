@@ -122,6 +122,8 @@ script() {
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
 		FIRERUNNER_CACHE_SETUP="$TMP/bin/fake-cache-setup" \
 		FIRERUNNER_TUNE="${TUNE:-$TMP/bin/no-tune}" \
+		FIRERUNNER_RUN_USER="${RUN_USER:-}" \
+		FIRERUNNER_ENVIRONMENT="${ENVIRONMENT_FILE:-$TMP/no-environment}" \
 		FIRERUNNER_TUNE_TICKS="${TUNE_TICKS:-600}" \
 		TUNE_EXIT="${TUNE_EXIT:-0}" \
 		TMPDIR="${SCRIPT_TMPDIR:-${TMPDIR:-/tmp}}" \
@@ -437,6 +439,52 @@ FAKE
 	expect "tune $t: the runner ran" "" has runner-argv
 done
 
+# GitHub's images keep tool paths in /etc/environment.
+fresh environment
+# shellcheck disable=SC2016 # the fake evaluates these
+printf 'AGENT_TOOLSDIRECTORY="/opt/hostedtoolcache"\nCARGO_PATH="$HOME/.cargo/bin"\n' > "$STATE/environment"
+printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+# shellcheck disable=SC2016 # the fake evaluates these
+runner 'echo "$AGENT_TOOLSDIRECTORY" > "$STATE/tools"; echo "$CARGO_PATH" > "$STATE/cargo"; echo "Exiting runner..."'
+ENVIRONMENT_FILE="$STATE/environment" run
+expect "environment: the job sees the image's tool paths" "$(cat "$STATE/tools" 2>/dev/null)" \
+	[ "$(cat "$STATE/tools" 2>/dev/null)" = /opt/hostedtoolcache ]
+expect "environment: paths built on HOME see the job's home" "$(cat "$STATE/cargo" 2>/dev/null)" \
+	[ "$(cat "$STATE/cargo" 2>/dev/null)" = /root/.cargo/bin ]
+# ENVIRONMENT holds directories a job can write: a job's curl or systemctl must
+# never run as root in this script.
+fresh environment-path
+mkdir -p "$STATE/jobbin"
+# shellcheck disable=SC2016 # the shim evaluates these
+printf '#!/bin/sh\n: > "$STATE/shim-ran"\nexit 0\n' > "$STATE/jobbin/curl"
+chmod +x "$STATE/jobbin/curl"
+# shellcheck disable=SC2016 # the script evaluates this
+printf 'PATH="%s:$PATH"\n' "$STATE/jobbin" > "$STATE/environment"
+printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+runner 'echo "Exiting runner..."'
+ENVIRONMENT_FILE="$STATE/environment" run
+expect "environment: the job's PATH stays out of this script" "" lacks shim-ran
+expect "environment: the exit is still reported" "$(cat "$STATE/reports" 2>/dev/null)" reported "phase=exited&rc=0"
+
+# With the "runner" user, the job runs as it, not as root.
+fresh run-user
+printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$TMP/bin/runuser"
+chmod +x "$TMP/bin/runuser"
+printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+# shellcheck disable=SC2016 # the fake evaluates these
+runner 'echo "$HOME" > "$STATE/home"; echo "${RUNNER_ALLOW_RUNASROOT:-unset}" > "$STATE/asroot"; echo "Exiting runner..."'
+RUN_USER="$(id -un)" run
+expect "run user: the runner gets its home" "$(cat "$STATE/home" 2>/dev/null)" \
+	[ "$(cat "$STATE/home" 2>/dev/null)" = "/home/$(id -un)" ]
+expect "run user: not told it may run as root" "$(cat "$STATE/asroot" 2>/dev/null)" \
+	[ "$(cat "$STATE/asroot" 2>/dev/null)" = unset ]
+
 # A step stuck on a device must not hold the job back.
 fresh tune-stuck
 cp "$TMP/bin/fake-tune" "$TMP/bin/fake-tune.quick"
@@ -449,6 +497,7 @@ TUNE="$TMP/bin/fake-tune" TUNE_TICKS=2 run
 expect "tune stuck: the runner runs anyway" "" has runner-argv
 expect "tune stuck: says so" "$(cat "$STATE/stderr")" grep -q "tuning is still running" "$STATE/stderr"
 cp "$TMP/bin/fake-tune.quick" "$TMP/bin/fake-tune"
+
 
 fresh tune-warmup
 : > "$STATE/userdata"

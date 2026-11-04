@@ -149,15 +149,42 @@ images/build-ec2-ami.sh \
 
 It launches a build instance with `images/ec2/provision.sh` as user-data,
 waits for it to power off, snapshots it, publishes the ID and terminates the
-build instance on every exit path. A build takes about 5 minutes.
+build instance on every exit path. A minimal build takes about 5 minutes.
 
-- The build instance needs egress to Ubuntu's mirrors and github.com, but no
-  inbound rules and no instance profile.
+- The build instance needs no inbound rules and no instance profile. A minimal
+  build needs egress to Ubuntu's mirrors and github.com. The other toolsets
+  need the wider internet, because GitHub's installers fetch from each tool's
+  own source.
 - `--render` prints the user-data without touching AWS.
 - `images/test-build-ec2-ami.sh` tests the script against a fake `aws`.
 - `images/test-ec2-vm.sh` tests the image with no AWS. On a Linux host with
   KVM, it builds the image from Ubuntu's cloud image in a VM, boots it on a
   larger disk against a fake IMDS and JIT endpoint, and checks what a job sees.
+
+`--toolset` picks what the image holds:
+
+| toolset | contents | disk | build |
+|---|---|---|---|
+| `minimal` (default) | the runner, Docker, git. Jobs run as root | 3 GiB | about 5 minutes |
+| `curated` | the tools of GitHub's `ubuntu-24.04` that jobs commonly use. Jobs run as `runner`, with sudo | 18 GiB | about 20 minutes |
+| `full` | nearly all of them, for the closest match with `ubuntu-latest` | 44 GiB | about 30 minutes |
+
+`curated` and `full` run the installers of an
+[actions/runner-images](https://github.com/actions/runner-images) release, in
+the order its Packer template lists them, so a new release needs only
+`--runner-images-ref`. Pass a larger `--instance-type`, `--volume-gib` and
+`--timeout`:
+
+```bash
+images/build-ec2-ami.sh --toolset curated --instance-type c7a.4xlarge \
+  --volume-gib 40 --timeout 3600 \
+  --subnet subnet-0aaa… --security-group sg-0bbb… --ssm-param /firerunner/ami/runner
+```
+
+`curated` keeps the latest version of most tools, plus defaults that system
+paths link to, such as Go's. `setup-*` actions fetch other versions. Language
+stacks few jobs use are left out, as are Android, Homebrew and preloaded Docker
+images. `images/test-runner-images.sh` tests the trimming.
 
 Because the disk lasts for one job, the image favours speed over durability:
 

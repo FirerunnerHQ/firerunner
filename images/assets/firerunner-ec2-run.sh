@@ -7,9 +7,10 @@
 # User-data holds only the endpoint (FIRERUNNER_JIT_URL=http://<vpc-ip>:<port>/jit),
 # never the config itself: the control VM hands the config out once, to this
 # instance's private IP, and answers 404 afterwards. So neither user-data nor
-# IMDS holds anything reusable. The job itself runs as root alongside the
-# runner and can read the config the runner was started with; it is single-use
-# and dies with the instance.
+# IMDS holds anything reusable. The job itself runs alongside the runner, as
+# root on a minimal image and as "runner" with sudo on a fuller one, so it can
+# read the config the runner was started with; it is single-use and dies with
+# the instance.
 #
 # Every wait below is a retry loop rather than a systemd ordering dependency, so
 # the fetch starts as soon as the NIC has an address instead of waiting for
@@ -44,6 +45,8 @@ RETRY_SLEEP="${FIRERUNNER_RETRY_SLEEP:-0.2}"
 JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
 # Bounds each progress report to the control VM.
 REPORT_TIMEOUT="${FIRERUNNER_REPORT_TIMEOUT:-2}"
+ENVIRONMENT="${FIRERUNNER_ENVIRONMENT:-/etc/environment}"
+RUN_USER="${FIRERUNNER_RUN_USER-runner}"
 # Grows the disk and adds swap while the config is on its way (see below).
 TUNE="${FIRERUNNER_TUNE:-/usr/local/libexec/firerunner-ec2-tune}"
 # Bounds the wait for it, in tenths of a second.
@@ -195,10 +198,15 @@ if [ -n "$tune_pid" ]; then
 		wait "$tune_pid" || log "tuning failed; running the job anyway"
 	fi
 fi
-# The instance is single-use and thrown away after the job.
-export RUNNER_ALLOW_RUNASROOT=1
-export HOME=/root
-export USER=root
+# The instance is single-use and thrown away after the job. A full image has
+# the "runner" user that GitHub's jobs run as; a minimal one runs them as root.
+run_as=""
+if [ -n "$RUN_USER" ] && id "$RUN_USER" >/dev/null 2>&1; then
+	run_as="runuser -u $RUN_USER --"
+	export HOME="/home/$RUN_USER" USER="$RUN_USER"
+else
+	export RUNNER_ALLOW_RUNASROOT=1 HOME=/root USER=root
+fi
 
 # The runner's output goes through a FIFO to a reader that passes it on to the
 # journal and reports the phases it shows. A FIFO, not a pipeline: this script
@@ -237,7 +245,20 @@ mkfifo "$fifo"
 reader=$!
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
 rc=0
-./run.sh --jitconfig "$jit" >"$fifo" 2>&1 || rc=$?
+# GitHub's images keep tool paths in ENVIRONMENT, which systemd does not read.
+# Its PATH holds entries such as $HOME/.cargo/bin, so HOME comes first, and
+# directories a job can write: only the runner's subshell may read it, or this
+# script, as root, would run a job's systemctl or sync when it powers off.
+(
+	if [ -r "$ENVIRONMENT" ]; then
+		set -a
+		# shellcheck disable=SC1090 # the image's own file
+		. "$ENVIRONMENT"
+		set +a
+	fi
+	# shellcheck disable=SC2086 # run_as is a command line.
+	exec $run_as ./run.sh --jitconfig "$jit"
+) >"$fifo" 2>&1 || rc=$?
 # Let the reader catch up with the runner's last lines, so the listener's
 # status is known and the phase reports precede the exit's. Bounded: a
 # process a job left behind may hold the FIFO open, so EOF may never come.

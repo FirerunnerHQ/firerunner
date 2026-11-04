@@ -19,9 +19,11 @@
 # Settings (set by build-ec2-ami.sh):
 #   RUNNER_VERSION  actions/runner version, e.g. 2.338.1
 #   RUNNER_ARCH     x64 or arm64
+#   TOOLSET         minimal (Docker, git), curated (GitHub's ubuntu-24.04 tools
+#                   that jobs commonly use) or full (nearly all of them)
 set -euxo pipefail
 
-: "${RUNNER_VERSION:?}" "${RUNNER_ARCH:?}"
+: "${RUNNER_VERSION:?}" "${RUNNER_ARCH:?}" "${TOOLSET:?}"
 
 mark() { echo "FIRERUNNER-BUILD $(date -u +%FT%TZ) $1" >/dev/console 2>/dev/null || true; }
 # Any failure powers the instance off without the "finished" mark, so the
@@ -44,10 +46,28 @@ export DEBIAN_FRONTEND=noninteractive
 apt_get() { apt-get -o DPkg::Lock::Timeout=600 "$@"; }
 apt_get update
 apt_get install -y --no-install-recommends \
-	docker.io zstd curl jq git ca-certificates \
-	nginx gcc libc6-dev cloud-guest-utils
+	zstd curl jq git ca-certificates nginx gcc libc6-dev cloud-guest-utils
+if [ "$TOOLSET" != minimal ]; then
+	install_runner_images
+	# As on GitHub's runners, jobs run as "runner", with sudo and Docker.
+	# A home from /etc/skel holds the tools runner-images put there.
+	id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner
+	usermod -aG docker runner
+	# Paths /etc/environment and setup-* actions install into. GitHub's
+	# configure-system.sh opens them; it does more that this image must not.
+	for dir in /opt/hostedtoolcache /opt/pipx /opt/pipx_bin /usr/share/dotnet /usr/share/miniconda; do
+		[ ! -e "$dir" ] || chown -R runner:runner "$dir"
+	done
+	printf 'runner ALL=(ALL) NOPASSWD:ALL\nDefaults:runner !requiretty, env_keep += "*"\n' >/etc/sudoers.d/runner
+	chmod 0440 /etc/sudoers.d/runner
+	# useradd copied these; the build's own caches are of no use to a job.
+	rm -rf /etc/skel/.rustup /etc/skel/.cargo /root/.npm /root/.cache /root/.local
+else
+	apt_get install -y --no-install-recommends docker.io
+fi
 # zram is in the kernel's extra modules on some Ubuntu kernels.
-apt_get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
+# The build may have upgraded the kernel, so not the running one's.
+apt_get install -y --no-install-recommends "linux-modules-extra-$(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V | tail -n 1)" || true
 
 # Docker with the containerd image store, as on GitHub-hosted runners.
 install -d /etc/docker
@@ -70,6 +90,7 @@ curl -fsSL -o runner.tgz \
 tar xzf runner.tgz
 rm runner.tgz
 ./bin/installdependencies.sh
+[ "$TOOLSET" = minimal ] || chown -R runner:runner /opt/runner
 
 # Boot unit and script: install_boot_unit is defined above, by build-ec2-ami.sh.
 install_boot_unit
@@ -94,7 +115,7 @@ for node in /opt/runner/externals/node*/bin/node; do
 	case "$node" in */node*_alpine/*) continue ;; esac
 	"$node" --version
 done
-apt_get purge -y --auto-remove gcc libc6-dev
+[ "$TOOLSET" != minimal ] || apt_get purge -y --auto-remove gcc libc6-dev
 
 # A netplan that matches any NIC. cloud-init's 50-cloud-init.yaml matches the
 # builder's MAC address, which leaves every instance from this image without
