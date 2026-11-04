@@ -1,0 +1,51 @@
+# A workflow with every runs-on shape the engine meets.
+name: ci
+on: [push, pull_request]
+
+env:
+  runs-on: ubuntu-latest # not a job's runs-on: left alone
+
+jobs:
+  plain:
+    runs-on: ubuntu-latest   # trailing comment stays
+    steps:
+      - run: echo ubuntu-latest
+  double:
+    runs-on: "ubuntu-latest"
+    steps: [{run: "true"}]
+  single:
+    runs-on: 'ubuntu-24.04'
+    steps: [{run: "true"}]
+  flow:
+    runs-on: [ubuntu-latest, "ubuntu-24.04"]
+    steps: [{run: "true"}]
+  block:
+    runs-on:
+      - ubuntu-latest # first
+      - 'ubuntu-24.04'
+    steps: [{run: "true"}]
+  matrix:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps: [{run: "true"}]
+  group:
+    runs-on:
+      group: big
+      labels: [ubuntu-latest]
+    steps: [{run: "true"}]
+  selfhosted:
+    runs-on: [self-hosted, linux]
+    steps: [{run: "true"}]
+  mac:
+    runs-on: macos-latest
+    steps: [{run: "true"}]
+  mixed:
+    runs-on: [ubuntu-latest, gpu]
+    steps: [{run: "true"}]
+  reusable:
+    uses: ./.github/workflows/build.yml
+  already:
+    runs-on: fr-small
+    steps: [{run: "true"}]
