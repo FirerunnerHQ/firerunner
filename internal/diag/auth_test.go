@@ -187,15 +187,20 @@ func TestAppPermissions(t *testing.T) {
 		repo    bool
 		level   string
 		detail  string
+		cache   bool
 	}{
-		{"org, minimal", map[string]string{"metadata": "read", "organization_self_hosted_runners": "write"}, false, levelPass, "least privilege"},
-		{"repo, minimal", map[string]string{"metadata": "read", "administration": "write"}, true, levelPass, "administration (write)"},
-		{"org, runners read only", map[string]string{"metadata": "read", "organization_self_hosted_runners": "read"}, false, levelFail, "needs write"},
-		{"repo given org permission", map[string]string{"organization_self_hosted_runners": "write"}, true, levelFail, "administration"},
+		{"cache, its reads", map[string]string{"metadata": "read", "organization_self_hosted_runners": "write", "actions": "read", "contents": "read", "pull_requests": "read"}, false, levelPass, "for the cache", true},
+		{"cache, a read missing", map[string]string{"metadata": "read", "organization_self_hosted_runners": "write", "actions": "read", "contents": "read"}, false, levelFail, "missing pull_requests", true},
+		{"cache, a write where read is enough", map[string]string{"organization_self_hosted_runners": "write", "actions": "read", "contents": "write", "pull_requests": "read"}, false, levelWarn, "contents: write", true},
+		{"no cache, the cache's reads are extra", map[string]string{"organization_self_hosted_runners": "write", "actions": "read", "contents": "read", "pull_requests": "read"}, false, levelWarn, "actions: read", false},
+		{"org, minimal", map[string]string{"metadata": "read", "organization_self_hosted_runners": "write"}, false, levelPass, "least privilege", false},
+		{"repo, minimal", map[string]string{"metadata": "read", "administration": "write"}, true, levelPass, "administration (write)", false},
+		{"org, runners read only", map[string]string{"metadata": "read", "organization_self_hosted_runners": "read"}, false, levelFail, "needs write", false},
+		{"repo given org permission", map[string]string{"organization_self_hosted_runners": "write"}, true, levelFail, "administration", false},
 		{"org, extras sorted", map[string]string{"organization_self_hosted_runners": "write", "packages": "read", "contents": "read", "zz_new": "read"}, false, levelWarn,
-			"contents: read (lets the key read (or write) repository source); packages: read (lets the key pull private packages and container images, which often hold source or dependencies); zz_new: read (lets the key access GitHub beyond managing runners)"},
+			"contents: read (lets the key read (or write) repository source); packages: read (lets the key pull private packages and container images, which often hold source or dependencies); zz_new: read (lets the key access GitHub beyond managing runners)", false},
 	} {
-		got := appPermissions(c.granted, c.repo)
+		got := appPermissions(c.granted, c.repo, c.cache)
 		if got.Level != c.level || !strings.Contains(got.Detail, c.detail) {
 			t.Errorf("%s: %s %q, want %s containing %q", c.name, got.Level, got.Detail, c.level, c.detail)
 		}
