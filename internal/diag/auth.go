@@ -87,7 +87,7 @@ func authVerify(cfg *config.Config, apiBase string) []Check {
 			if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&inst); err != nil {
 				checks = append(checks, warn("app-permissions", "could not read the installation's permissions: %v", err))
 			} else {
-				checks = append(checks, appPermissions(inst.Permissions, repoScoped(cfg.URL)))
+				checks = append(checks, appPermissions(inst.Permissions, repoScoped(cfg.URL), cfg.UsesEC2Cache() || cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != ""))
 			}
 		}
 		return checks
@@ -125,12 +125,17 @@ var permissionRisk = map[string]string{
 	"environments":                "read (or change) deployment environments and their secrets",
 }
 
+// cacheReads are the read permissions a cache's job identity resolution uses
+// (internal/jobidentity): the run, its jobs and the refs it may touch.
+var cacheReads = []string{"actions", "contents", "pull_requests"}
+
 // appPermissions compares an installation's granted permissions with what
 // firerunner uses: metadata (read, every App has it) and self-hosted runners
 // (write), granted as organization_self_hosted_runners for an org, or as
-// administration for a single repository. Anything less FAILs (the scale-set
-// calls will be refused); anything more WARNs, naming what it allows.
-func appPermissions(granted map[string]string, repo bool) Check {
+// administration for a single repository; with a cache, also cacheReads.
+// Anything less FAILs (the scale-set calls will be refused, or every job's
+// cache denied); anything more WARNs, naming what it allows.
+func appPermissions(granted map[string]string, repo, cache bool) Check {
 	need := "organization_self_hosted_runners"
 	if repo {
 		need = "administration"
@@ -138,9 +143,24 @@ func appPermissions(granted map[string]string, repo bool) Check {
 	if granted[need] != "write" {
 		return fail("app-permissions", "the installation has %s: %q; firerunner needs write to manage runners", need, granted[need])
 	}
+	used := map[string]bool{need: true, "metadata": true}
+	if cache {
+		var missing []string
+		for _, p := range cacheReads {
+			if granted[p] == "" {
+				missing = append(missing, p)
+			}
+			if granted[p] == "read" {
+				used[p] = true
+			}
+		}
+		if len(missing) > 0 {
+			return fail("app-permissions", "the cache resolves each job's identity with read on actions, contents and pull_requests; missing %s, so every job's cache is denied. Grant them in the App's settings (Repository permissions), then accept them on the installation", strings.Join(missing, ", "))
+		}
+	}
 	var extra []string
 	for name, level := range granted {
-		if name == need || name == "metadata" {
+		if used[name] {
 			continue
 		}
 		risk := permissionRisk[name]
@@ -150,6 +170,9 @@ func appPermissions(granted map[string]string, repo bool) Check {
 		extra = append(extra, fmt.Sprintf("%s: %s (lets the key %s)", name, level, risk))
 	}
 	if len(extra) == 0 {
+		if cache {
+			return pass("app-permissions", "least privilege: metadata (read), %s (write), and actions, contents, pull_requests (read) for the cache", need)
+		}
 		return pass("app-permissions", "least privilege: metadata (read), %s (write)", need)
 	}
 	sort.Strings(extra)
