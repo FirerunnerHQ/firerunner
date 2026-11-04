@@ -21,7 +21,9 @@ fresh() {
 	rm -rf "$STATE"
 	mkdir -p "$STATE"
 	stub findmnt 'echo /dev/nvme0n1p1'
-	stub lsblk 'case "$*" in *PARTN*) echo 1 ;; *) echo nvme0n1 ;; esac'
+	stub lsblk 'echo nvme0n1'
+	mkdir -p "$STATE/sys/nvme0n1p1"
+	echo 1 > "$STATE/sys/nvme0n1p1/partition"
 	stub sfdisk 'cat > /dev/null'
 	stub partx 'exit 0'
 	stub growpart 'exit 0'
@@ -35,7 +37,7 @@ fresh() {
 }
 run() {
 	rc=0
-	PATH="$TMP/bin:$PATH" FIRERUNNER_MEMINFO="$STATE/meminfo" FIRERUNNER_PREHEAT_PATHS="$TMP/absent" FIRERUNNER_ZRAM_TRIES=4 \
+	PATH="$TMP/bin:$PATH" FIRERUNNER_MEMINFO="$STATE/meminfo" FIRERUNNER_PREHEAT_PATHS="$TMP/absent" FIRERUNNER_ZRAM_TRIES=4 FIRERUNNER_SYS_BLOCK="$STATE/sys" \
 		sh "$SCRIPT" 2> "$STATE/stderr" || rc=$?
 }
 pass() { # DESC CMD...
@@ -105,12 +107,20 @@ run
 pass "busy zram device: retried until it is free" called "swapon --priority 100 /dev/zram0"
 pass "busy zram device: no complaint" [ ! -s "$STATE/stderr" ]
 
-# The partition comes from the device, not from digits in its name.
+# The partition comes from the kernel, not from digits in the device's name.
 fresh
-stub findmnt 'echo /dev/disk/by-uuid/1234'
-stub lsblk 'case "$*" in *PARTN*) echo 7 ;; *) echo nvme1n1 ;; esac'
+stub findmnt 'echo /dev/mapper/root2'
+stub lsblk 'echo nvme1n1'
+mkdir -p "$STATE/sys/root2"
+echo 7 > "$STATE/sys/root2/partition"
 run
-pass "partition number comes from lsblk" called "sfdisk --force --quiet --no-reread --no-tell-kernel -N 7 /dev/nvme1n1"
+pass "partition number comes from the kernel" called "sfdisk --force --quiet --no-reread --no-tell-kernel -N 7 /dev/nvme1n1"
+
+# growpart refuses a padded number, which lsblk's PARTN would give.
+fresh
+stub sfdisk 'cat > /dev/null; exit 1'
+run
+pass "the fallback gets a bare partition number" called "growpart /dev/nvme0n1 1"
 
 fresh
 stub findmnt 'exit 1'
@@ -124,7 +134,7 @@ mkdir -p "$TMP/warm"
 echo data > "$TMP/warm/file"
 # shellcheck disable=SC2016 # the stub evaluates these
 stub xargs 'cat > "$STATE/preheat-list"; : > "$STATE/preheated"'
-PATH="$TMP/bin:$PATH" FIRERUNNER_MEMINFO="$STATE/meminfo" FIRERUNNER_PREHEAT_PATHS="$TMP/warm" sh "$SCRIPT" 2> "$STATE/stderr"
+PATH="$TMP/bin:$PATH" FIRERUNNER_MEMINFO="$STATE/meminfo" FIRERUNNER_SYS_BLOCK="$STATE/sys" FIRERUNNER_PREHEAT_PATHS="$TMP/warm" sh "$SCRIPT" 2> "$STATE/stderr"
 for _ in $(seq 1 100); do
 	[ -f "$STATE/preheated" ] && break
 	sleep 0.05
