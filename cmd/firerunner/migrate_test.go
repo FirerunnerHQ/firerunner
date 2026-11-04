@@ -60,13 +60,15 @@ func TestMigrateDryRunJSON(t *testing.T) {
 		var v any
 		switch r.URL.Path {
 		case "/repos/acme/app":
-			v = map[string]string{"default_branch": "main"}
+			v = map[string]string{"full_name": "acme/app", "default_branch": "main"}
 		case "/repos/acme/app/commits/main":
 			v = map[string]any{"sha": "c1", "commit": map[string]any{"tree": map[string]string{"sha": "t1"}}}
 		case "/repos/acme/app/contents/.github":
 			v = []map[string]string{{"name": "workflows", "type": "dir", "sha": "wf"}}
 		case "/repos/acme/app/git/trees/wf":
 			v = map[string]any{"tree": []map[string]string{{"path": "ci.yml", "mode": "100644", "type": "blob", "sha": "b1"}}}
+		case "/repos/acme/app/pulls":
+			v = []any{}
 		case "/repos/acme/app/git/blobs/b1":
 			v = map[string]string{"content": base64.StdEncoding.EncodeToString([]byte(wf)), "encoding": "base64"}
 		default:
@@ -116,5 +118,43 @@ func TestMigrateDryRunJSON(t *testing.T) {
 	t.Setenv("GH_TOKEN", "wrong")
 	if code, _, errOut := runMigrate(t, "--repo", "acme/app", "--api-url", srv.URL, "--map", "ubuntu-latest=firerunner"); code != 1 || !strings.Contains(errOut, "401") {
 		t.Errorf("bad token: exit %d, %s", code, errOut)
+	}
+}
+
+// Under --json a failure is still JSON on stdout, even before any API call.
+func TestMigrateJSONFailures(t *testing.T) {
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("PATH", t.TempDir()) // no gh
+	code, out, _ := runMigrate(t, "--repo", "acme/app", "--map", "a=b", "--json")
+	var r struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if code != 1 || json.Unmarshal([]byte(out), &r) != nil || r.OK || !strings.Contains(r.Error, "no GitHub token") {
+		t.Errorf("exit %d, stdout %q", code, out)
+	}
+	// The token is never sent over plain http, except to loopback.
+	t.Setenv("GH_TOKEN", "tok")
+	if code, _, errOut := runMigrate(t, "--repo", "acme/app", "--map", "a=b", "--api-url", "http://example.com"); code != 2 || !strings.Contains(errOut, "https") {
+		t.Errorf("http api-url: exit %d, %s", code, errOut)
+	}
+}
+
+func TestAPIHost(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://api.github.com":         "github.com",
+		"https://API.GitHub.com/":        "github.com",
+		"https://ghe.example.com/api/v3": "ghe.example.com",
+		"http://127.0.0.1:8080":          "127.0.0.1:8080",
+	} {
+		if got, err := apiHost(in); err != nil || got != want {
+			t.Errorf("%s: %q, %v", in, got, err)
+		}
+	}
+	for _, in := range []string{"http://api.github.com", "ftp://x", "nonsense"} {
+		if _, err := apiHost(in); err == nil {
+			t.Errorf("%s accepted", in)
+		}
 	}
 }

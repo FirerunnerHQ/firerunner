@@ -7,6 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -100,10 +102,20 @@ func migrateCmd(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	token, err := userToken()
-	if err != nil {
-		fmt.Fprintln(stderr, err)
+	fail := func(err error) int {
+		if *asJSON {
+			_ = json.NewEncoder(stdout).Encode(map[string]any{"ok": false, "error": err.Error()})
+		}
+		fmt.Fprintln(stderr, "migrate:", err)
 		return 1
+	}
+	host, err := apiHost(*apiURL)
+	if err != nil {
+		return migrateUsageError(stderr, err.Error())
+	}
+	token, err := userToken(host)
+	if err != nil {
+		return fail(err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -114,11 +126,7 @@ func migrateCmd(args []string, stdout, stderr io.Writer) int {
 		if migrate.NeedsWorkflowScope(err) {
 			err = fmt.Errorf("%w\nthe token may not change workflows: run \"gh auth refresh -s workflow\", or give a fine-grained token Workflows: write", err)
 		}
-		if *asJSON {
-			_ = json.NewEncoder(stdout).Encode(map[string]any{"ok": false, "error": err.Error()})
-		}
-		fmt.Fprintln(stderr, "migrate:", err)
-		return 1
+		return fail(err)
 	}
 	if *asJSON {
 		enc := json.NewEncoder(stdout)
@@ -157,19 +165,37 @@ func checkTargets(path string, m migrate.Map) error {
 	return nil
 }
 
+// apiHost is the GitHub host whose API apiURL is: github.com for
+// api.github.com, else the URL's host (GHES serves its API at /api/v3).
+// The token goes there, so it must be https, or http on loopback (tests).
+func apiHost(apiURL string) (string, error) {
+	u, err := url.Parse(apiURL)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("--api-url %q is not a URL", apiURL)
+	}
+	loopback := u.Hostname() == "localhost" || net.ParseIP(u.Hostname()).IsLoopback()
+	if u.Scheme != "https" && !(u.Scheme == "http" && loopback) {
+		return "", fmt.Errorf("--api-url %q must use https: the token is sent to it", apiURL)
+	}
+	if strings.EqualFold(u.Host, "api.github.com") {
+		return "github.com", nil
+	}
+	return u.Host, nil
+}
+
 // userToken is the person's own GitHub token: GH_TOKEN, GITHUB_TOKEN, or
-// the gh CLI's.
-func userToken() (string, error) {
+// the gh CLI's for host.
+func userToken(host string) (string, error) {
 	for _, k := range []string{"GH_TOKEN", "GITHUB_TOKEN"} {
 		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
 			return v, nil
 		}
 	}
-	out, err := exec.Command("gh", "auth", "token").Output()
+	out, err := exec.Command("gh", "auth", "token", "--hostname", host).Output()
 	if t := strings.TrimSpace(string(out)); err == nil && t != "" {
 		return t, nil
 	}
-	return "", errors.New(`no GitHub token: set GH_TOKEN, or log in with "gh auth login"`)
+	return "", fmt.Errorf(`no GitHub token for %s: set GH_TOKEN, or log in with "gh auth login --hostname %s"`, host, host)
 }
 
 func printMigrate(w io.Writer, rep *migrate.Report) {
@@ -193,6 +219,11 @@ func printMigrate(w io.Writer, rep *migrate.Report) {
 	switch {
 	case rep.DryRun:
 		fmt.Fprintln(w, "dry run: nothing pushed")
+		if rep.PR == "open" {
+			fmt.Fprintf(w, "a pull request from an earlier run is open: %s\n", rep.PRURL)
+		}
+	case rep.PR == "stale":
+		fmt.Fprintf(w, "nothing to change, but a pull request from an earlier run is still open; close it: %s\n", rep.PRURL)
 	case rep.Changed() == 0:
 		fmt.Fprintln(w, "nothing to change")
 	default:
