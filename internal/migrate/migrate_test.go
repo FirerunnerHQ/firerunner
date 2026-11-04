@@ -52,7 +52,7 @@ func TestRewriteGolden(t *testing.T) {
 	}
 	for job, reason := range map[string]string{
 		"matrix":     "expression",
-		"group":      "runner group",
+		"group":      "group/labels object",
 		"selfhosted": "already runs on self-hosted",
 		"mac":        `no mapping for label "macos-latest"`,
 		"mixed":      `no mapping for label "gpu"`,
@@ -145,6 +145,73 @@ func TestRewriteEdges(t *testing.T) {
 			skip: "expression",
 		},
 		{
+			// yaml counts a lone CR, NEL, LS and PS as line breaks: a
+			// split on \n alone would edit the line below runs-on.
+			name: "lone CR in a comment",
+			in:   "jobs:\n  a:  # x\r\n    runs-on: ubuntu-latest\n    foo-bar: ubuntu-latest\n",
+			out:  "jobs:\n  a:  # x\r\n    runs-on: fr-small\n    foo-bar: ubuntu-latest\n",
+		},
+		{
+			name: "CR inside a quoted string",
+			in:   "jobs:\n  a:\n    name: \"x\ry\"\n    runs-on: ubuntu-latest\n    foo-bar: ubuntu-latest\n",
+			out:  "jobs:\n  a:\n    name: \"x\ry\"\n    runs-on: fr-small\n    foo-bar: ubuntu-latest\n",
+		},
+		{
+			name: "NEL, LS and PS",
+			in:   "jobs:\n  a:\n    name: 'x\u0085y\u2028z\u2029w'\n    runs-on: ubuntu-latest\n    foo-bar: ubuntu-latest\n",
+			out:  "jobs:\n  a:\n    name: 'x\u0085y\u2028z\u2029w'\n    runs-on: fr-small\n    foo-bar: ubuntu-latest\n",
+		},
+		{
+			name: "BOM with a flow mapping on line 1",
+			in:   "\ufeff{jobs: {a: {runs-on: ubuntu-latest}}}\n",
+			out:  "\ufeff{jobs: {a: {runs-on: fr-small}}}\n",
+		},
+		{
+			name: "labels match without regard to case",
+			in:   "jobs:\n  a:\n    runs-on: Ubuntu-Latest\n",
+			out:  "jobs:\n  a:\n    runs-on: fr-small\n",
+		},
+		{
+			name: "self-hosted in another case",
+			in:   "jobs:\n  a:\n    runs-on: [Self-Hosted, ubuntu-latest]\n",
+			skip: "already runs on self-hosted",
+		},
+		{
+			name: "tagged label",
+			in:   "jobs:\n  a:\n    runs-on: !!str ubuntu-latest\n",
+			skip: "YAML tag",
+		},
+		{
+			name: "labels-only object",
+			in:   "jobs:\n  a:\n    runs-on: {labels: [ubuntu-latest]}\n",
+			skip: "group/labels object",
+		},
+		{
+			name: "empty runs-on",
+			in:   "jobs:\n  a:\n    runs-on:\n",
+			skip: "runs-on is empty",
+		},
+		{
+			name: "empty list",
+			in:   "jobs:\n  a:\n    runs-on: []\n",
+			skip: "runs-on is empty",
+		},
+		{
+			name: "runs-on twice",
+			in:   "jobs:\n  a:\n    runs-on: ubuntu-latest\n    runs-on: macos-latest\n",
+			skip: "more than once",
+		},
+		{
+			name: "merge key",
+			in:   "d: &d {runs-on: ubuntu-latest}\njobs:\n  a:\n    <<: *d\n",
+			skip: "YAML merge",
+		},
+		{
+			name: "aliased job",
+			in:   "jobs:\n  a: &j\n    runs-on: ubuntu-latest\n  b: *j\n",
+			skip: "anchor",
+		},
+		{
 			name: "no jobs",
 			in:   "name: x\non: push\n",
 			out:  "name: x\non: push\n",
@@ -181,12 +248,64 @@ func TestRewriteEdges(t *testing.T) {
 }
 
 func TestRewriteErrors(t *testing.T) {
-	if _, err := Rewrite([]byte("jobs: [\n"), testMap); err == nil {
-		t.Error("an unparseable workflow is not an error")
+	for name, in := range map[string]string{
+		"unparseable":   "jobs: [\n",
+		"two documents": "jobs:\n  a:\n    runs-on: ubuntu-latest\n---\njobs: {}\n",
+		"duplicate job": "jobs:\n  a:\n    runs-on: ubuntu-latest\n  a:\n    runs-on: ubuntu-latest\n",
+	} {
+		if _, err := Rewrite([]byte(in), testMap); err == nil {
+			t.Errorf("%s: not an error", name)
+		}
 	}
-	for _, m := range []Map{nil, {"ubuntu-latest": ""}, {"ubuntu-latest": "a b"}, {"ubuntu-latest": "x\ny"}, {"ubuntu-latest": "'q'"}, {"": "fr"}} {
+	for _, m := range []Map{
+		nil, {"ubuntu-latest": ""}, {"ubuntu-latest": "a b"}, {"ubuntu-latest": "x\ny"}, {"ubuntu-latest": "'q'"}, {"": "fr"},
+		// YAML would read these as a bool, null or a number, not a label.
+		{"ubuntu-latest": "true"}, {"ubuntu-latest": "null"}, {"ubuntu-latest": "123"}, {"ubuntu-latest": "1.5"}, {"ubuntu-latest": "0x10"},
+		// A chain would make a second run change what the first wrote.
+		{"a": "b", "b": "c"},
+		// GitHub would see one label mapped two ways.
+		{"Ubuntu-Latest": "x", "ubuntu-latest": "y"},
+	} {
 		if _, err := Rewrite([]byte("jobs: {}\n"), m); err == nil {
 			t.Errorf("map %q accepted", m)
 		}
+	}
+}
+
+// verify is the backstop behind span: an edit that lands on other bytes than
+// its node's, or writes other text, is refused.
+func TestVerifyRefusesMisplacedEdits(t *testing.T) {
+	src := []byte("jobs:\n  a:\n    runs-on: ubuntu-latest\n    foo-bar: ubuntu-latest\n")
+	doc, err := parseOne(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runsOn := value(value(value(doc, "jobs"), "a"), "runs-on")
+	right := strings.Index(string(src), "ubuntu-latest")
+	wrong := strings.LastIndex(string(src), "ubuntu-latest")
+	for name, e := range map[string]edit{
+		"other bytes": {wrong, wrong + len("ubuntu-latest"), "fr-small", runsOn},
+		"other text":  {right, right + len("ubuntu-latest"), "fr-large", runsOn},
+	} {
+		out, err := apply(src, []edit{e})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name == "other text" {
+			e.text = "fr-small" // planned fr-small, wrote fr-large
+		}
+		if err := verify(doc, out, []edit{e}); err == nil {
+			t.Errorf("%s: verify passed %q", name, out)
+		}
+	}
+	good := edit{right, right + len("ubuntu-latest"), "fr-small", runsOn}
+	out, _ := apply(src, []edit{good})
+	if err := verify(doc, out, []edit{good}); err != nil {
+		t.Errorf("a correct edit refused: %v", err)
+	}
+	// The planned edit and a stray one: the stray change is refused.
+	stray, _ := apply(src, []edit{good, {wrong, wrong + len("ubuntu-latest"), "fr-small", nil}})
+	if err := verify(doc, stray, []edit{good}); err == nil {
+		t.Errorf("verify passed a stray change %q", stray)
 	}
 }
