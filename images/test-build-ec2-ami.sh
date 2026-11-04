@@ -149,6 +149,7 @@ expect "toolset reaches the user-data" "" grep -q '^TOOLSET=curated$' "$STATE/ou
 expect "curated skips Haskell" "" grep -q '^RI_SKIP=.*install-haskell.sh' "$STATE/out"
 PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --toolset full >"$STATE/out"
 expect "full keeps Haskell" "" bash -c "! grep -q '^RI_SKIP=.*install-haskell.sh' '$STATE/out'"
+expect "curated on arm64 is refused" "" bash -c "! PATH='$TMP/bin:$PATH' '$BUILD' --render --runner-version 1.2.3 --toolset curated --arch arm64 >/dev/null 2>&1"
 expect "a bad toolset is refused" "" bash -c "! PATH='$TMP/bin:$PATH' '$BUILD' --render --runner-version 1.2.3 --toolset huge >/dev/null 2>&1"
 
 if [ "$fails" -ne 0 ]; then

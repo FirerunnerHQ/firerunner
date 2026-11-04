@@ -53,7 +53,11 @@ if [ "$TOOLSET" != minimal ]; then
 	# A home from /etc/skel holds the tools runner-images put there.
 	id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner
 	usermod -aG docker runner
-	chown -R runner:runner /opt/hostedtoolcache
+	# Paths /etc/environment and setup-* actions install into. GitHub's
+	# configure-system.sh opens them; it does more that this image must not.
+	for dir in /opt/hostedtoolcache /opt/pipx /opt/pipx_bin /usr/share/dotnet /usr/share/miniconda; do
+		[ ! -e "$dir" ] || chown -R runner:runner "$dir"
+	done
 	printf 'runner ALL=(ALL) NOPASSWD:ALL\nDefaults:runner !requiretty, env_keep += "*"\n' >/etc/sudoers.d/runner
 	chmod 0440 /etc/sudoers.d/runner
 	# useradd copied these; the build's own caches are of no use to a job.
@@ -62,7 +66,8 @@ else
 	apt_get install -y --no-install-recommends docker.io
 fi
 # zram is in the kernel's extra modules on some Ubuntu kernels.
-apt_get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
+# The build may have upgraded the kernel, so not the running one's.
+apt_get install -y --no-install-recommends "linux-modules-extra-$(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V | tail -n 1)" || true
 
 # Docker with the containerd image store, as on GitHub-hosted runners.
 install -d /etc/docker

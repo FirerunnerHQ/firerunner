@@ -124,6 +124,7 @@ script() {
 		FIRERUNNER_TUNE="${TUNE:-$TMP/bin/no-tune}" \
 		FIRERUNNER_RUN_USER="" \
 		FIRERUNNER_ENVIRONMENT="${ENVIRONMENT_FILE:-$TMP/no-environment}" \
+		FIRERUNNER_TUNE_TICKS="${TUNE_TICKS:-600}" \
 		TMPDIR="${SCRIPT_TMPDIR:-${TMPDIR:-/tmp}}" \
 		"${SCRIPT_SH:-sh}" -c 'trap "" PIPE; exec "$0" "$1"' "${SCRIPT_SH:-sh}" "$SCRIPT"
 }
@@ -451,6 +452,34 @@ expect "environment: the job sees the image's tool paths" "$(cat "$STATE/tools" 
 	[ "$(cat "$STATE/tools" 2>/dev/null)" = /opt/hostedtoolcache ]
 expect "environment: paths built on HOME see the job's home" "$(cat "$STATE/cargo" 2>/dev/null)" \
 	[ "$(cat "$STATE/cargo" 2>/dev/null)" = /root/.cargo/bin ]
+# ENVIRONMENT holds directories a job can write: a job's curl or systemctl must
+# never run as root in this script.
+fresh environment-path
+mkdir -p "$STATE/jobbin"
+# shellcheck disable=SC2016 # the shim evaluates these
+printf '#!/bin/sh\n: > "$STATE/shim-ran"\nexit 0\n' > "$STATE/jobbin/curl"
+chmod +x "$STATE/jobbin/curl"
+# shellcheck disable=SC2016 # the script evaluates this
+printf 'PATH="%s:$PATH"\n' "$STATE/jobbin" > "$STATE/environment"
+printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+runner 'echo "Exiting runner..."'
+ENVIRONMENT_FILE="$STATE/environment" run
+expect "environment: the job's PATH stays out of this script" "" lacks shim-ran
+expect "environment: the exit is still reported" "$(cat "$STATE/reports" 2>/dev/null)" reported "phase=exited&rc=0"
+
+# A step stuck on a device must not hold the job back.
+fresh tune-stuck
+printf '#!/bin/sh\nexec sleep 5\n' > "$TMP/bin/fake-tune"
+printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+runner 'echo "Exiting runner..."'
+TUNE="$TMP/bin/fake-tune" TUNE_TICKS=2 run
+expect "tune stuck: the runner runs anyway" "" has runner-argv
+expect "tune stuck: says so" "$(cat "$STATE/stderr")" grep -q "tuning is still running" "$STATE/stderr"
+
 
 fresh tune-warmup
 : > "$STATE/userdata"

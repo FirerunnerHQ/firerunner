@@ -83,6 +83,7 @@ esac
 itype="${itype:-$default_type}"
 [[ "$volume" =~ ^[0-9]+$ ]] || die "--volume-gib must be a number"
 case "$toolset" in minimal | curated | full) ;; *) die "--toolset must be minimal, curated or full" ;; esac
+[ "$toolset" = minimal ] || [ "$arch" = x64 ] || die "--toolset $toolset is x64 only: its installers come from GitHub's x64 toolset"
 [ "$toolset" != curated ] || ri_skip="$ri_skip install-haskell.sh install-swift.sh install-julia.sh install-firefox.sh install-microsoft-edge.sh install-google-cloud-cli.sh install-codeql-bundle.sh install-kotlin.sh install-bazel.sh install-pulumi.sh install-packer.sh install-vcpkg.sh install-azure-devops-cli.sh install-copilot-cli.sh install-awf.sh install-pypy.sh"
 [[ "$timeout_s" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
 for t in "${tags[@]+"${tags[@]}"}"; do

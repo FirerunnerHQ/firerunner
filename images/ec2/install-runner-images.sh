@@ -90,7 +90,7 @@ install_runner_images() {
 		mark "cost $s seconds=$((SECONDS - began)) mib=$((($(df --output=used -k / | tail -1) - used) / 1024))"
 	done
 	du -xsm /opt/* /opt/hostedtoolcache/* /usr/local/* /usr/share/* /usr/lib/* /home/* /etc/skel/.[a-z]* /var/lib/* 2>/dev/null |
-		sort -rn | head -40 | while read -r mib path; do mark "du $path mib=$mib"; done
+		sort -rn | head -40 | while read -r mib path; do mark "du $path mib=$mib"; done || true
 	rm -rf "$src" /etc/apt/apt.conf.d/10-firerunner-assume-yes /etc/waagent.conf
 	apt-get -o DPkg::Lock::Timeout=600 clean
 	# A job needs none of the build's scripts.

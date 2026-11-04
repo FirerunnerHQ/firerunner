@@ -72,6 +72,10 @@ for t in gcc make unzip node npm python3 pip3 java go rustc cargo ruby gh aws az
 done
 say "toolcache: $(ls "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" 2>/dev/null | tr '\n' ' ')"
 sudo -n true 2>/dev/null && say "sudo: ok"
+for d in /opt/hostedtoolcache /opt/pipx /opt/pipx_bin /usr/share/dotnet; do
+	[ ! -e "$d" ] || [ -w "$d" ] || say "unwritable: $d"
+done
+timeout 120 pipx install --quiet cowsay >/dev/null 2>&1 && say "pipx: ok"
 s=$(date +%s.%N)
 timeout 120 docker run --rm hello-world >/dev/null 2>&1
 rc=$?
@@ -199,6 +203,11 @@ check "a job's OOM does not take the boot service with it" 'oom_rc: 137'
 if [ "$toolset" != minimal ]; then
 	check "jobs run as runner" 'user: runner home=/home/runner'
 	check "passwordless sudo" 'sudo: ok'
+	check "pipx installs a tool" 'pipx: ok'
+	if grep -q '^unwritable:' "$run/result"; then
+		echo "FAIL a job can write where setup actions install"
+		fails=$((fails + 1))
+	fi
 	check "the hosted tool cache is there" 'toolcache: .*Python.*node'
 	for t in gcc make unzip node python3 java go cargo ruby gh aws kubectl; do
 		check "$t is on PATH" "tool $t: /"
