@@ -122,7 +122,7 @@ script() {
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
 		FIRERUNNER_CACHE_SETUP="$TMP/bin/fake-cache-setup" \
 		FIRERUNNER_TUNE="${TUNE:-$TMP/bin/no-tune}" \
-		FIRERUNNER_RUN_USER="" \
+		FIRERUNNER_RUN_USER="${RUN_USER:-}" \
 		FIRERUNNER_ENVIRONMENT="${ENVIRONMENT_FILE:-$TMP/no-environment}" \
 		FIRERUNNER_TUNE_TICKS="${TUNE_TICKS:-600}" \
 		TUNE_EXIT="${TUNE_EXIT:-0}" \
@@ -469,6 +469,21 @@ runner 'echo "Exiting runner..."'
 ENVIRONMENT_FILE="$STATE/environment" run
 expect "environment: the job's PATH stays out of this script" "" lacks shim-ran
 expect "environment: the exit is still reported" "$(cat "$STATE/reports" 2>/dev/null)" reported "phase=exited&rc=0"
+
+# With the "runner" user, the job runs as it, not as root.
+fresh run-user
+printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$TMP/bin/runuser"
+chmod +x "$TMP/bin/runuser"
+printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+# shellcheck disable=SC2016 # the fake evaluates these
+runner 'echo "$HOME" > "$STATE/home"; echo "${RUNNER_ALLOW_RUNASROOT:-unset}" > "$STATE/asroot"; echo "Exiting runner..."'
+RUN_USER="$(id -un)" run
+expect "run user: the runner gets its home" "$(cat "$STATE/home" 2>/dev/null)" \
+	[ "$(cat "$STATE/home" 2>/dev/null)" = "/home/$(id -un)" ]
+expect "run user: not told it may run as root" "$(cat "$STATE/asroot" 2>/dev/null)" \
+	[ "$(cat "$STATE/asroot" 2>/dev/null)" = unset ]
 
 # A step stuck on a device must not hold the job back.
 fresh tune-stuck

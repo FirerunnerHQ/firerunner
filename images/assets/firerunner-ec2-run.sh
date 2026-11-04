@@ -7,9 +7,10 @@
 # User-data holds only the endpoint (FIRERUNNER_JIT_URL=http://<vpc-ip>:<port>/jit),
 # never the config itself: the control VM hands the config out once, to this
 # instance's private IP, and answers 404 afterwards. So neither user-data nor
-# IMDS holds anything reusable. The job itself runs as root alongside the
-# runner and can read the config the runner was started with; it is single-use
-# and dies with the instance.
+# IMDS holds anything reusable. The job itself runs alongside the runner, as
+# root on a minimal image and as "runner" with sudo on a fuller one, so it can
+# read the config the runner was started with; it is single-use and dies with
+# the instance.
 #
 # Every wait below is a retry loop rather than a systemd ordering dependency, so
 # the fetch starts as soon as the NIC has an address instead of waiting for
@@ -197,10 +198,6 @@ if [ -n "$tune_pid" ]; then
 		wait "$tune_pid" || log "tuning failed; running the job anyway"
 	fi
 fi
-# The instance is single-use and thrown away after the job.
-export RUNNER_ALLOW_RUNASROOT=1
-export HOME=/root
-export USER=root
 # The instance is single-use and thrown away after the job. A full image has
 # the "runner" user that GitHub's jobs run as; a minimal one runs them as root.
 run_as=""
