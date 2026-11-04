@@ -1102,6 +1102,14 @@ There is no global repository/default-ref override or anonymous fallback.
   are logged by the daemon; after three attempts/30 seconds the record is marked
   `unresolved` and stays denied for that job. Guest HTTP never triggers
   privileged REST retries.
+- **EC2 tiers find the job sooner.** On EC2, GitHub has been seen to deliver
+  `JobStarted` together with `JobCompleted`, after a short job ended (#28). So
+  the daemon keeps the runs GitHub offers its scale sets (`JobAvailable`,
+  `JobAssigned`) as candidates for 30 minutes. When an instance reports that
+  its runner started a job, the daemon asks the REST API which job of those
+  runs is in progress **on that runner's name**, and resolves it as above.
+  Nothing the instance says is trusted: its report only says when to ask.
+  Without a match, `JobStarted` still resolves it.
 - `JobStarted` reaches the daemon well after the guest has dequeued the job
   (tens of seconds is common), and a workflow's first `actions/cache` restore
   usually runs before that. A request from a **pending** lease therefore waits,

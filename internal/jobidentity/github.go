@@ -30,6 +30,10 @@ type GitHub struct {
 	resolveMu sync.Mutex
 	runs      map[string]runResult
 	pending   map[string]chan struct{}
+	// runJobs shares each run's jobs listing between concurrent RunnerJob
+	// calls for runJobsFresh: a burst of jobs lists a run once.
+	jobsMu  sync.Mutex
+	runJobs map[string]*runJobsEntry
 }
 
 type installationToken struct {
@@ -495,4 +499,103 @@ func escapeRefPath(ref string) string {
 		parts[n] = url.PathEscape(parts[n])
 	}
 	return strings.Join(parts, "/")
+}
+
+type runJob struct {
+	ID         int64  `json:"id"`
+	Status     string `json:"status"`
+	RunnerName string `json:"runner_name"`
+}
+
+type runJobsEntry struct {
+	ready chan struct{}
+	at    time.Time
+	jobs  []runJob
+	err   error
+}
+
+// runJobsFresh is how long a run's jobs listing is shared; runJobsPages
+// bounds one listing (100 jobs a page).
+const (
+	runJobsFresh = 2 * time.Second
+	runJobsPages = 10
+)
+
+// RunnerJob implements RunnerFinder: the job of run that GitHub records as in
+// progress on runner, if any.
+func (g *GitHub) RunnerJob(ctx context.Context, repository string, runID int64, runner string) (int64, bool, error) {
+	if !ValidRepository(repository) || runID <= 0 || runner == "" {
+		return 0, false, errors.New("invalid run or runner")
+	}
+	jobs, err := g.listRunJobs(ctx, repository, runID)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, j := range jobs {
+		if j.RunnerName == runner && j.Status == "in_progress" {
+			return j.ID, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// listRunJobs lists a run's latest jobs, sharing one listing between
+// concurrent callers for runJobsFresh.
+func (g *GitHub) listRunJobs(ctx context.Context, repository string, runID int64) ([]runJob, error) {
+	key := fmt.Sprintf("%s#%d", repository, runID)
+	g.jobsMu.Lock()
+	if g.runJobs == nil {
+		g.runJobs = map[string]*runJobsEntry{}
+	}
+	now := time.Now()
+	for k, e := range g.runJobs {
+		select {
+		case <-e.ready:
+			if now.Sub(e.at) > runJobsFresh {
+				delete(g.runJobs, k)
+			}
+		default:
+		}
+	}
+	e := g.runJobs[key]
+	if e == nil {
+		e = &runJobsEntry{ready: make(chan struct{})}
+		g.runJobs[key] = e
+		g.jobsMu.Unlock()
+		e.jobs, e.err = g.fetchRunJobs(ctx, repository, runID)
+		e.at = time.Now()
+		close(e.ready)
+		return e.jobs, e.err
+	}
+	g.jobsMu.Unlock()
+	select {
+	case <-e.ready:
+		return e.jobs, e.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (g *GitHub) fetchRunJobs(ctx context.Context, repository string, runID int64) ([]runJob, error) {
+	var all []runJob
+	for page := 1; page <= runJobsPages; page++ {
+		var out struct {
+			Jobs []runJob `json:"jobs"`
+		}
+		if err := g.get(ctx, fmt.Sprintf("/repos/%s/actions/runs/%d/jobs?filter=latest&per_page=100&page=%d", repository, runID, page), &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Jobs...)
+		if len(out.Jobs) < 100 {
+			break
+		}
+	}
+	return all, nil
+}
+
+// rateLimited reports a GitHub refusal that further calls would only make
+// worse: 403 (the secondary limit, or the primary one) or 429.
+func rateLimited(err error) bool {
+	var s statusError
+	return errors.As(err, &s) && (s.code == http.StatusForbidden || s.code == http.StatusTooManyRequests)
 }

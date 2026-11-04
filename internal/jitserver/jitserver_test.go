@@ -424,3 +424,36 @@ func TestCacheBundleDroppedWithAnExpiredConfig(t *testing.T) {
 		t.Fatal("an expired registration still holds its bundle's key")
 	}
 }
+
+// TestOnPhaseOncePerPhase: the hook hears a runner's first report of each
+// phase, not repeats.
+func TestOnPhaseOncePerPhase(t *testing.T) {
+	s := New(time.Minute, nil)
+	heard := make(chan string, 8)
+	s.OnPhase(func(runner, phase string) { heard <- runner + " " + phase })
+	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	fetch(t, s, http.MethodGet, Path, from(guest))
+	for _, q := range []string{"phase=job", "phase=job", "phase=exited&rc=0"} {
+		report(t, s, from(guest), q)
+	}
+	report(t, s, from(foreign), "phase=job") // forbidden: no hook
+	var got []string
+	for len(got) < 2 {
+		select {
+		case h := <-heard:
+			got = append(got, h)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("heard %v, want the first job and exited reports", got)
+		}
+	}
+	select {
+	case h := <-heard:
+		t.Fatalf("heard an extra %q", h)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !(got[0] == "runner-1 job" && got[1] == "runner-1 exited" || got[1] == "runner-1 job" && got[0] == "runner-1 exited") {
+		t.Fatalf("heard %v", got)
+	}
+}

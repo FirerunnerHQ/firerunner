@@ -97,6 +97,8 @@ type Report struct {
 // Server serves each registered config exactly once, to the address it was
 // registered for.
 type Server struct {
+	// onPhase, if set, is told each runner's first report of a phase.
+	onPhase func(runner, phase string)
 	mu      sync.Mutex
 	entries map[netip.Addr]*entry
 	ttl     time.Duration
@@ -138,6 +140,10 @@ func (s *Server) register(ip netip.Addr, runner, jit string, cache []byte) error
 	s.entries[ip] = &entry{runner: runner, jit: jit, expires: s.now().Add(s.ttl), cache: cache}
 	return nil
 }
+
+// OnPhase sets fn to be told, once per runner and phase, when its instance
+// first reports it (listening, job, exited). Call it before serving.
+func (s *Server) OnPhase(fn func(runner, phase string)) { s.onPhase = fn }
 
 // RegisterWithCache is Register with a cache bundle (the proxy's TLS
 // material and the cache-server address), set in the same step so the
@@ -340,6 +346,9 @@ func (s *Server) reportHTTP(w http.ResponseWriter, r *http.Request) {
 			attrs = append(attrs, "rc", rc)
 		}
 		s.log.Info("runner phase", attrs...)
+		if s.onPhase != nil {
+			go s.onPhase(runner, phase)
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
