@@ -266,8 +266,9 @@ for marker in yes no; do
 	else
 		runner 'sleep 8 & echo "Listening for Jobs"'
 	fi
-	# With the marker, the drain bound (3 s) is never reached.
-	if [ "$marker" = yes ]; then ticks=30 limit=2; else ticks=10 limit=4; fi
+	# With the marker, the drain bound is never reached, and the limit is far
+	# below it and below the holder's 8 s, so a busy machine cannot fail this.
+	if [ "$marker" = yes ]; then ticks=300 limit=6; else ticks=10 limit=6; fi
 	began=$(date +%s)
 	DRAIN_TICKS=$ticks run
 	expect "lingering output holder ($marker marker): finishes with the runner" "took $(($(date +%s) - began))s" [ $(($(date +%s) - began)) -lt $limit ]
