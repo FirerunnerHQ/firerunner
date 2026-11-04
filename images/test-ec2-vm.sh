@@ -197,6 +197,14 @@ check "the kernel skips the PS/2 probe" 'cmdline:.*i8042.nokbd'
 check "the probe finished" 'probe: done'
 check "more memory than the VM has does not kill the job" 'overcommit_rc: 0'
 check "a job's OOM does not take the boot service with it" 'oom_rc: 137'
-[ "$fails" = 0 ] || { echo "kept: $run" >&2; trap - EXIT; exit 1; }
+if [ "$fails" != 0 ]; then
+	# Keep the disks and logs, not the server, which a next run would meet on
+	# its port and report to.
+	kill "$server_pid" 2>/dev/null || true
+	wait "$server_pid" 2>/dev/null || true
+	echo "kept: $run" >&2
+	trap - EXIT
+	exit 1
+fi
 rm -rf "$run"
 echo "all passed"
