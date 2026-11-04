@@ -21,7 +21,7 @@ fresh() {
 	rm -rf "$STATE"
 	mkdir -p "$STATE"
 	stub findmnt 'echo /dev/nvme0n1p1'
-	stub lsblk 'echo nvme0n1'
+	stub lsblk 'case "$*" in *PARTN*) echo 1 ;; *) echo nvme0n1 ;; esac'
 	stub sfdisk 'cat > /dev/null'
 	stub partx 'exit 0'
 	stub growpart 'exit 0'
@@ -53,6 +53,7 @@ not_called() { ! grep -q -- "^$1" "$STATE/calls"; }
 fresh
 run
 pass "exits 0" [ "$rc" = 0 ]
+pass "asks for the canonical root device" called "findmnt -cno SOURCE /"
 pass "grows the root partition" called "sfdisk --force --quiet --no-reread --no-tell-kernel -N 1 /dev/nvme0n1"
 pass "tells the kernel its new size" called "partx --update --nr 1 /dev/nvme0n1"
 pass "does not need growpart" not_called growpart
@@ -103,6 +104,13 @@ stub zramctl 'n=$(cat "$STATE/busy" 2>/dev/null || echo 0); echo $((n + 1)) > "$
 run
 pass "busy zram device: retried until it is free" called "swapon --priority 100 /dev/zram0"
 pass "busy zram device: no complaint" [ ! -s "$STATE/stderr" ]
+
+# The partition comes from the device, not from digits in its name.
+fresh
+stub findmnt 'echo /dev/disk/by-uuid/1234'
+stub lsblk 'case "$*" in *PARTN*) echo 7 ;; *) echo nvme1n1 ;; esac'
+run
+pass "partition number comes from lsblk" called "sfdisk --force --quiet --no-reread --no-tell-kernel -N 7 /dev/nvme1n1"
 
 fresh
 stub findmnt 'exit 1'

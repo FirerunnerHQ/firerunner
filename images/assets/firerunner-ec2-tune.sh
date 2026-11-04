@@ -30,9 +30,10 @@ bounded() {
 # The image's filesystem is smaller than a tier's root_volume_gib, and
 # cloud-init, which would grow it, is off for a faster boot.
 grow_root() {
-	src="$(findmnt -no SOURCE /)" || return 1
+	# Canonical, because a kernel booted without an initramfs reports /dev/root.
+	src="$(findmnt -cno SOURCE /)" || return 1
 	disk="$(lsblk -no PKNAME "$src")" || return 1
-	part="${src##*[!0-9]}"
+	part="$(lsblk -no PARTN "$src")" || return 1
 	[ -n "$disk" ] && [ -n "$part" ] || return 1
 	# sfdisk also moves a GPT backup header to the disk's new end, and takes
 	# about 40 ms where growpart takes a second or two at boot.
