@@ -22,7 +22,7 @@ cat >"$TMP/toolset.json" <<'JSON'
     {"name": "Python", "versions": ["3.11.*", "3.12.*", "3.13.*", "3.14.*"]},
     {"name": "PyPy", "versions": ["3.9"]},
     {"name": "node", "versions": ["22.*", "24.*"]},
-    {"name": "go", "versions": ["1.24.*", "1.25.*", "1.26.*"], "default": "1.24.*"},
+    {"name": "go", "versions": ["1.24.*", "1.25.*", "1.26.*"], "default": "1.25.*"},
     {"name": "Ruby", "versions": ["3.2.*", "4.0.*"]},
     {"name": "CodeQL", "versions": ["*"]}
   ],
@@ -39,10 +39,10 @@ JSON
 curate_toolset "$TMP/toolset.json"
 
 tool() { echo ".toolcache[] | select(.name == \"$1\")"; }
-expect "go keeps its default, which /usr/bin/go links to" "$(tool go).versions | index(\"1.24.*\") != null"
+expect "go keeps its default, which /usr/bin/go links to" "$(tool go).versions | index(\"1.25.*\") != null"
 expect "go keeps its latest" "$(tool go).versions | index(\"1.26.*\") != null"
 expect "go drops the rest" "($(tool go).versions | length) == 2"
-expect "go's default stays" "($(tool go).default) == \"1.24.*\""
+expect "go's default stays" "($(tool go).default) == \"1.25.*\""
 expect "Python keeps two" "$(tool Python).versions == [\"3.13.*\", \"3.14.*\"]"
 expect "node keeps the latest" "$(tool node).versions == [\"24.*\"]"
 expect "Ruby keeps the latest" "$(tool Ruby).versions == [\"4.0.*\"]"

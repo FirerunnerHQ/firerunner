@@ -25,7 +25,7 @@ curate_toolset() {
 		.toolcache |= map(
 			if .name == "Python" then .versions |= .[-2:]
 			elif .name == "node" or .name == "Ruby" then last_only
-			elif .name == "go" then .versions |= ([.[0], .[-1]] | unique)
+			elif .name == "go" then .versions = ([.versions[-1], .default] | map(select(.)) | unique)
 			else . end) |
 		.java.versions = [.java.default] |
 		.clang |= (last_only | .default_version = .versions[-1]) |
