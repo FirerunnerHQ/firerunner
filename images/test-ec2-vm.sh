@@ -37,6 +37,8 @@ done
 [ -n "$runner_version" ] || runner_version="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')"
 
 mkdir -p "$workdir"
+# Absolute: qemu-img resolves a relative backing file against its overlay.
+workdir="$(cd "$workdir" && pwd)"
 run="$(mktemp -d "$workdir/run.XXXXXX")"
 server_pid=""
 qemu_pid=""
@@ -213,6 +215,14 @@ if [ "$toolset" != minimal ]; then
 		check "$t is on PATH" "tool $t: /"
 	done
 fi
-[ "$fails" = 0 ] || { echo "kept: $run" >&2; trap - EXIT; exit 1; }
+if [ "$fails" != 0 ]; then
+	# Keep the disks and logs, not the server, which a next run would meet on
+	# its port and report to.
+	kill "$server_pid" 2>/dev/null || true
+	wait "$server_pid" 2>/dev/null || true
+	echo "kept: $run" >&2
+	trap - EXIT
+	exit 1
+fi
 rm -rf "$run"
 echo "all passed"

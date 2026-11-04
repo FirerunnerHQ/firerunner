@@ -118,7 +118,8 @@ fi
 poweroff_cmd="$POWEROFF_FAST"
 
 # In the background, so tuning costs no time beyond what the config's fetch
-# takes anyway. The runner starts only after it, so a job sees the full disk.
+# takes anyway. The runner waits for it, up to TUNE_TICKS, so a job normally
+# sees the full disk.
 tune_pid=""
 if [ -x "$TUNE" ]; then
 	"$TUNE" &

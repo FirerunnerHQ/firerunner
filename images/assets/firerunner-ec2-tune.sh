@@ -13,6 +13,7 @@ MEMINFO="${FIRERUNNER_MEMINFO:-/proc/meminfo}"
 # Bounds a stuck disk or device, so the job still starts.
 STEP_TIMEOUT="${FIRERUNNER_TUNE_TIMEOUT:-30}"
 ZRAM_TRIES="${FIRERUNNER_ZRAM_TRIES:-15}"
+SYS_BLOCK="${FIRERUNNER_SYS_BLOCK:-/sys/class/block}"
 # Read in the background, so a job's first docker command does not pay for EBS
 # fetching their blocks from the snapshot.
 PREHEAT_PATHS="${FIRERUNNER_PREHEAT_PATHS:-/usr/bin/dockerd /usr/bin/containerd /usr/bin/docker /usr/bin/runc /usr/libexec/docker /opt/runner/bin /opt/runner/externals}"
@@ -30,9 +31,12 @@ bounded() {
 # The image's filesystem is smaller than a tier's root_volume_gib, and
 # cloud-init, which would grow it, is off for a faster boot.
 grow_root() {
-	src="$(findmnt -no SOURCE /)" || return 1
+	# Canonical, because a kernel booted without an initramfs reports /dev/root.
+	src="$(findmnt -cno SOURCE /)" || return 1
 	disk="$(lsblk -no PKNAME "$src")" || return 1
-	part="${src##*[!0-9]}"
+	# From the kernel: lsblk's PARTN needs udev's database, which may not be
+	# ready this early, and pads the number, which growpart refuses.
+	part="$(cat "$SYS_BLOCK/${src##*/}/partition")" || return 1
 	[ -n "$disk" ] && [ -n "$part" ] || return 1
 	# sfdisk also moves a GPT backup header to the disk's new end, and takes
 	# about 40 ms where growpart takes a second or two at boot.
