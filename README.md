@@ -191,8 +191,34 @@ All flags can also be set via `FR_*` environment variables (see
 
 Subcommands: `firerunner status` / `doctor` inspect a deployment (see below),
 `firerunner cache-server` runs the [self-hosted dependency
-cache](#self-hosted-dependency-cache---cache-port-opt-in), and `firerunner
-version` / `help` do the obvious.
+cache](#self-hosted-dependency-cache---cache-port-opt-in), `firerunner migrate`
+[moves a repository onto firerunner](#moving-a-repository-onto-firerunner), and
+`firerunner version` / `help` do the obvious.
+
+### Moving a repository onto firerunner
+
+Once the App is installed, `firerunner migrate` opens a pull request that
+changes the repository's workflows' `runs-on` labels to your tiers:
+
+```bash
+firerunner migrate --repo ORG/REPO --map ubuntu-latest=firerunner \
+  --catalog tiers.json --dry-run   # print the diff; push nothing
+firerunner migrate --repo ORG/REPO --map ubuntu-latest=firerunner --catalog tiers.json
+```
+
+Only the labels change; every other byte of each workflow is kept. A job it
+cannot map safely is left alone and listed in the pull request with why: a
+`${{ }}` expression (such as a matrix OS), a runner group, `self-hosted`, a
+label you gave no `--map` for, or a reusable workflow call. `--catalog` refuses
+a target no tier is named or labelled, so no job waits for a runner that never
+comes. Running it again rebuilds the branch (`firerunner/migrate`) from the
+default branch and updates the open pull request; to undo the move after
+merging, revert it. `--json` prints the report for scripts and agents.
+
+It runs as you, never as the runner App, which stays read-only: the token comes
+from `GH_TOKEN`, `GITHUB_TOKEN` or `gh auth token`, and needs the `workflow`
+scope (`gh auth refresh -s workflow`), or for a fine-grained token, Contents,
+Pull requests and Workflows: write.
 
 ### Onboarding: creating and installing the GitHub App
 

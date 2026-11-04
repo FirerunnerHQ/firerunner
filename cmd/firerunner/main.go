@@ -80,6 +80,8 @@ func main() {
 			return
 		case "config":
 			os.Exit(configCmd(args[1:], os.Stdout, os.Stderr))
+		case "migrate":
+			os.Exit(migrateCmd(args[1:], os.Stdout, os.Stderr))
 		case "cache-server":
 			if err := cacheServe(args[1:]); err != nil {
 				slog.Error("cache-server failed", "err", err)
@@ -313,6 +315,8 @@ Usage:
   firerunner config check validate the configuration or a tier catalog offline
                           (--catalog FILE; --json); see "firerunner config"
   firerunner cache-server run the self-hosted Actions dependency cache server
+  firerunner migrate      open a pull request that moves a repository's jobs onto
+                          firerunner (runs-on labels); see "firerunner migrate -h"
   firerunner version      print the version
   firerunner help         show this help
 
