@@ -375,6 +375,9 @@ See [`examples/tiers-ec2.json`](examples/tiers-ec2.json):
 | `security_groups` | for the instances; they need **no inbound rules** |
 | `market` | `spot`, `on-demand`, or `spot-then-on-demand` (every spot option before any on-demand one) |
 | `root_volume_gib`, `root_volume_type` | optional root EBS override (default: the AMI's size, type `gp3`) |
+| `root_volume_throughput` | gp3 throughput in MiB/s, 125-2000. Default: 400 for a job's instance and gp3's baseline (125) for a pool instance, which would pay for the extra throughput while stopped. Needs 4 IOPS per MiB/s |
+| `root_volume_iops` | gp3 IOPS, 3000-80000 and at most 500 per GiB of `root_volume_gib`. Default: gp3's baseline (3000) |
+| `root_volume_init_rate` | the rate, 100-300 MiB/s, at which EBS copies the volume from its snapshot. Default: off, so blocks arrive as they are first read. AWS bills it per launch |
 | `pool` | how many pre-warmed, stopped instances to keep ready (default 0, every job cold-launches); see below |
 | `cache` | `true` sends the tier's `actions/cache` traffic to firerunner's cache-server at `--ec2-cache-addr` (default off). Each instance gets, once and with its JIT config, a certificate for GitHub's results host from a CA that never leaves the control VM and can sign no other name. Work in progress (#28): the runner AMI's proxy that uses it is not released yet |
 

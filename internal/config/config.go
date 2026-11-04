@@ -101,6 +101,22 @@ const (
 	MarketOnDemand           = "on-demand"
 	defaultEC2RootVolumeType = "gp3"
 	ec2AMIIDPrefix           = "ami-"
+
+	// A job instance's gp3 throughput, in MiB/s, when its tier sets none:
+	// gp3's baseline is 125, slow enough to dominate a Docker build. It is
+	// billed only while the job's instance lives, so a stopped pool instance,
+	// which holds its volume for days, keeps the baseline unless asked.
+	defaultEC2RootThroughput = 400
+	// AWS's limits for gp3 root volumes.
+	minGP3Throughput = 125
+	maxGP3Throughput = 2000
+	minGP3IOPS       = 3000
+	maxGP3IOPS       = 80000
+	maxGP3IOPSPerGiB = 500
+	// gp3 allows at most 0.25 MiB/s per provisioned IOPS.
+	minGP3IOPSPerMiBps = 4
+	minVolumeInitRate  = 100
+	maxVolumeInitRate  = 300
 )
 
 // Tier is one runner tier: a named scale set with its own runner shape and
@@ -192,6 +208,17 @@ type EC2Tier struct {
 	RootVolumeGiB int `json:"root_volume_gib,omitempty"`
 	// RootVolumeType is the root EBS volume type; empty means gp3.
 	RootVolumeType string `json:"root_volume_type,omitempty"`
+	// RootVolumeThroughput is the gp3 root volume's throughput in MiB/s. 0
+	// means 400 for a job's instance and gp3's baseline (125) for a pool
+	// instance, which would pay for it while stopped.
+	RootVolumeThroughput int `json:"root_volume_throughput,omitempty"`
+	// RootVolumeIOPS is the gp3 root volume's IOPS; 0 keeps the baseline
+	// (3000).
+	RootVolumeIOPS int `json:"root_volume_iops,omitempty"`
+	// RootVolumeInitRate is the rate, in MiB/s, at which EBS copies the root
+	// volume from its snapshot, so a job meets fewer cold blocks. 0 leaves it
+	// to fetch blocks as they are read. AWS bills it per launch.
+	RootVolumeInitRate int `json:"root_volume_init_rate,omitempty"`
 	// Pool is how many pre-warmed, stopped instances to keep ready. A job
 	// starts one in seconds instead of booting a new instance; spot pools use
 	// persistent requests and are still billed at the spot price. 0 disables
@@ -225,6 +252,18 @@ func (e EC2Tier) VolumeType() string {
 		return defaultEC2RootVolumeType
 	}
 	return e.RootVolumeType
+}
+
+// VolumeThroughput returns the root volume's throughput in MiB/s for a job's
+// instance or a pool's; 0 leaves it to AWS.
+func (e EC2Tier) VolumeThroughput(pool bool) int {
+	switch {
+	case e.RootVolumeThroughput != 0:
+		return e.RootVolumeThroughput
+	case pool || e.VolumeType() != defaultEC2RootVolumeType:
+		return 0
+	}
+	return defaultEC2RootThroughput
 }
 
 // ProvisionerName returns the tier's provisioner, defaulting to firecracker.
@@ -832,6 +871,29 @@ func validateEC2Tier(t Tier) error {
 	case "gp2", "gp3":
 	default:
 		return fmt.Errorf("tier %q: ec2.root_volume_type %q must be gp2 or gp3", t.Name, e.RootVolumeType)
+	}
+	return validateVolumePerformance(t.Name, e)
+}
+
+// validateVolumePerformance checks a root volume's performance settings
+// against AWS's limits, so a bad tier fails `config check`, not every launch.
+func validateVolumePerformance(tier string, e *EC2Tier) error {
+	th, iops := e.RootVolumeThroughput, e.RootVolumeIOPS
+	if (th != 0 || iops != 0) && e.VolumeType() != defaultEC2RootVolumeType {
+		return fmt.Errorf("tier %q: ec2.root_volume_throughput and root_volume_iops need gp3", tier)
+	}
+	switch {
+	case th != 0 && (th < minGP3Throughput || th > maxGP3Throughput):
+		return fmt.Errorf("tier %q: ec2.root_volume_throughput %d must be %d-%d MiB/s", tier, th, minGP3Throughput, maxGP3Throughput)
+	case iops != 0 && (iops < minGP3IOPS || iops > maxGP3IOPS):
+		return fmt.Errorf("tier %q: ec2.root_volume_iops %d must be %d-%d", tier, iops, minGP3IOPS, maxGP3IOPS)
+	case iops != 0 && e.RootVolumeGiB > 0 && iops > e.RootVolumeGiB*maxGP3IOPSPerGiB:
+		return fmt.Errorf("tier %q: ec2.root_volume_iops %d is over %d per GiB of root_volume_gib", tier, iops, maxGP3IOPSPerGiB)
+	case e.RootVolumeInitRate != 0 && (e.RootVolumeInitRate < minVolumeInitRate || e.RootVolumeInitRate > maxVolumeInitRate):
+		return fmt.Errorf("tier %q: ec2.root_volume_init_rate %d must be %d-%d MiB/s", tier, e.RootVolumeInitRate, minVolumeInitRate, maxVolumeInitRate)
+	}
+	if eff := max(iops, minGP3IOPS); th != 0 && eff < th*minGP3IOPSPerMiBps {
+		return fmt.Errorf("tier %q: ec2.root_volume_throughput %d needs root_volume_iops of at least %d", tier, th, th*minGP3IOPSPerMiBps)
 	}
 	return nil
 }

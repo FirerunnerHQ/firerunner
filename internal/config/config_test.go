@@ -645,6 +645,15 @@ func TestFromFlags_EC2TierErrors(t *testing.T) {
 		"negative pool":        {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":-1`},
 		"bad volume type":      {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"st1"`},
 		"io2 needs iops":       {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"io2"`},
+		"throughput low":       {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_throughput":100`},
+		"throughput high":      {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_throughput":2001,"root_volume_iops":9000`},
+		"throughput on gp2":    {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"gp2","root_volume_throughput":400`},
+		"iops on gp2":          {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"gp2","root_volume_iops":4000`},
+		"iops low":             {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_iops":2999`},
+		"iops over size":       {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_iops":20001`},
+		"throughput over iops": {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_throughput":800,"root_volume_iops":3000`},
+		"init rate low":        {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_init_rate":99`},
+		"init rate high":       {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_init_rate":301`},
 		"pool_for no pool":     {`"root_volume_gib":40`, `"root_volume_gib":40,"pool_for":{"events":["pull_request"]}}`},
 		"pool_for empty":       {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":2,"pool_for":{}`},
 		"pool_for dup event":   {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":2,"pool_for":{"events":["push","push"]}`},
@@ -968,5 +977,26 @@ func TestTierSchedule(t *testing.T) {
 	if _, err := FromFlags(append(baseArgs(), "--tiers", writeTiers(t, fc), "--max-runners", "3")); err == nil ||
 		!strings.Contains(err.Error(), "warm pools sum to 4") {
 		t.Fatalf("budget: err = %v, want the window's min counted", err)
+	}
+}
+
+func TestEC2VolumeThroughput(t *testing.T) {
+	for name, tc := range map[string]struct {
+		e    EC2Tier
+		pool bool
+		want int
+	}{
+		"job default":   {EC2Tier{}, false, 400},
+		"pool default":  {EC2Tier{}, true, 0},
+		"gp2 has none":  {EC2Tier{RootVolumeType: "gp2"}, false, 0},
+		"explicit job":  {EC2Tier{RootVolumeThroughput: 600}, false, 600},
+		"explicit pool": {EC2Tier{RootVolumeThroughput: 600}, true, 600},
+		"explicit gp3":  {EC2Tier{RootVolumeType: "gp3"}, false, 400},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.e.VolumeThroughput(tc.pool); got != tc.want {
+				t.Fatalf("VolumeThroughput(%v) = %d, want %d", tc.pool, got, tc.want)
+			}
+		})
 	}
 }
