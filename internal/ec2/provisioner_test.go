@@ -223,14 +223,65 @@ func TestLaunch_RunInstancesInput(t *testing.T) {
 	}
 }
 
-func TestLaunch_NoRootVolumeOverrideByDefault(t *testing.T) {
+func TestLaunch_JobVolumeDefaultsToFasterThroughput(t *testing.T) {
 	h := newHarness(t, nil)
 	errc := h.launch(context.Background())
 	inst := h.instance(t)
 	h.f.setState(inst.id, types.InstanceStateNameTerminated)
 	waitErr(t, errc)
-	if m := h.f.runs[0].BlockDeviceMappings; m != nil {
-		t.Fatalf("BlockDeviceMappings = %+v, want the AMI's own volume", m)
+	m := h.f.runs[0].BlockDeviceMappings
+	if len(m) != 1 || m[0].Ebs == nil {
+		t.Fatalf("BlockDeviceMappings = %+v, want the root volume", m)
+	}
+	e := m[0].Ebs
+	if got := aws.ToInt32(e.Throughput); got != 400 {
+		t.Errorf("Throughput = %d, want 400", got)
+	}
+	if e.VolumeSize != nil || e.Iops != nil || e.VolumeInitializationRate != nil {
+		t.Errorf("Ebs = %+v, want only throughput set", e)
+	}
+	if !aws.ToBool(e.DeleteOnTermination) {
+		t.Error("DeleteOnTermination is false: the volume would outlive the job")
+	}
+}
+
+func TestLaunch_VolumePerformanceFromTier(t *testing.T) {
+	h := newHarness(t, func(o *Options) {
+		o.EC2.RootVolumeGiB = 80
+		o.EC2.RootVolumeThroughput = 600
+		o.EC2.RootVolumeIOPS = 6000
+		o.EC2.RootVolumeInitRate = 200
+	})
+	errc := h.launch(context.Background())
+	inst := h.instance(t)
+	h.f.setState(inst.id, types.InstanceStateNameTerminated)
+	waitErr(t, errc)
+	e := h.f.runs[0].BlockDeviceMappings[0].Ebs
+	if aws.ToInt32(e.VolumeSize) != 80 || aws.ToInt32(e.Throughput) != 600 ||
+		aws.ToInt32(e.Iops) != 6000 || aws.ToInt32(e.VolumeInitializationRate) != 200 {
+		t.Fatalf("Ebs = %+v, want the tier's settings", e)
+	}
+}
+
+func TestInput_PoolVolumeKeepsBaselineThroughput(t *testing.T) {
+	for name, tc := range map[string]struct {
+		explicit, want int
+	}{
+		"unset keeps the baseline, so a stopped instance is not billed for it": {0, 0},
+		"a tier's setting wins": {500, 500},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := &Provisioner{}
+			p.o.EC2 = config.EC2Tier{RootVolumeThroughput: tc.explicit}
+			in := p.input("r", image{rootDevice: "/dev/sda1"}, config.MarketOnDemand, "c8a.xlarge", "subnet-a", forPool)
+			var got int32
+			if len(in.BlockDeviceMappings) == 1 {
+				got = aws.ToInt32(in.BlockDeviceMappings[0].Ebs.Throughput)
+			}
+			if int(got) != tc.want {
+				t.Fatalf("Throughput = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 
