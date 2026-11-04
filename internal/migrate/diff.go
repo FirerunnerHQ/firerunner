@@ -57,16 +57,27 @@ func UnifiedDiff(path string, old, new []byte) string {
 	return out.String()
 }
 
-// splitLines splits text into lines, each keeping its newline.
+// splitLines splits text into lines, each keeping its newline; a last line
+// without one is marked as git marks it when written.
 func splitLines(s string) []string {
 	if s == "" {
 		return nil
 	}
-	return strings.SplitAfter(strings.TrimSuffix(s, "\n"), "\n")
+	return strings.SplitAfter(s, "\n")[:strings.Count(s, "\n")+boolInt(!strings.HasSuffix(s, "\n"))]
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func writeLine(out *strings.Builder, mark byte, line string) {
 	out.WriteByte(mark)
 	out.WriteString(strings.TrimSuffix(line, "\n"))
 	out.WriteByte('\n')
+	if !strings.HasSuffix(line, "\n") {
+		out.WriteString("\\ No newline at end of file\n")
+	}
 }

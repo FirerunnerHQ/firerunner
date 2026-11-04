@@ -20,6 +20,7 @@ import (
 type fakeGitHub struct {
 	mu            sync.Mutex
 	repo          string
+	oldName       string // a name the repository was transferred from: GitHub still answers at it
 	defaultBranch string
 	blobs         map[string][]byte
 	trees         map[string]map[string]fakeEntry
@@ -136,7 +137,20 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"Bad credentials"}`, http.StatusUnauthorized)
 		return
 	}
-	p := strings.TrimPrefix(r.URL.Path, "/repos/"+f.repo)
+	p, ok := strings.CutPrefix(r.URL.Path, "/repos/"+f.repo)
+	if !ok && f.oldName != "" {
+		p, ok = strings.CutPrefix(r.URL.Path, "/repos/"+f.oldName)
+		if ok && r.Method != "GET" {
+			// GitHub redirects the old name; a client may replay a write
+			// as a read. Writes must go to the current name.
+			http.Error(w, `{"message":"Moved Permanently"}`, http.StatusMovedPermanently)
+			return
+		}
+	}
+	if !ok || (p != "" && !strings.HasPrefix(p, "/")) {
+		http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		return
+	}
 	if r.Method != "GET" {
 		f.calls = append(f.calls, r.Method+" "+p)
 	}
@@ -151,7 +165,7 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 	fail := func(code int, msg string) { reply(code, map[string]string{"message": msg}) }
 	switch {
 	case r.Method == "GET" && p == "":
-		reply(200, map[string]any{"default_branch": f.defaultBranch})
+		reply(200, map[string]any{"full_name": f.repo, "default_branch": f.defaultBranch})
 	case r.Method == "GET" && strings.HasPrefix(p, "/commits/"):
 		c, ok := f.refs[strings.TrimPrefix(p, "/commits/")]
 		if !ok {
@@ -161,6 +175,10 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		reply(200, map[string]any{"sha": c, "commit": map[string]any{"tree": map[string]string{"sha": f.commits[c].tree}}})
 	case r.Method == "GET" && p == "/contents/.github":
 		tree := f.trees[f.commits[r.URL.Query().Get("ref")].tree]
+		if e, ok := tree[".github"]; ok {
+			reply(200, map[string]string{"name": ".github", "type": "file", "sha": e.sha})
+			return
+		}
 		sub := map[string]fakeEntry{}
 		for k, v := range tree {
 			if rest, ok := strings.CutPrefix(k, ".github/workflows/"); ok {
@@ -226,7 +244,8 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		for _, s := range in["parents"].([]any) {
 			parents = append(parents, s.(string))
 		}
-		c := fakeCommit{in["tree"].(string), in["message"].(string), parents}
+		// GitHub stores the message without its final newline.
+		c := fakeCommit{in["tree"].(string), strings.TrimRight(in["message"].(string), "\n"), parents}
 		sha := hash("commit", c.tree, c.message, strings.Join(parents, ","))
 		f.commits[sha] = c
 		reply(201, map[string]string{"sha": sha})

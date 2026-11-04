@@ -194,6 +194,8 @@ func TestMigrateRefusesBadInput(t *testing.T) {
 		{Repo: "../x/y", Map: repoMap},
 		{Repo: "acme/app"},
 		{Repo: "acme/app", Map: repoMap, Branch: "main"},
+		{Repo: "acme/app", Map: repoMap, Branch: "../heads/main"},
+		{Repo: "acme/..", Map: repoMap},
 	} {
 		if _, err := gh.Migrate(ctx, o); err == nil {
 			t.Errorf("%+v accepted", o)
@@ -248,5 +250,112 @@ func TestUnifiedDiff(t *testing.T) {
 	}
 	if UnifiedDiff("f", []byte("a\n"), []byte("a\n")) != "" {
 		t.Error("no change renders a diff")
+	}
+}
+
+// A transferred repository answers at its old name; migrate works at the
+// new one, so a rerun finds the PR instead of opening a second.
+func TestMigrateTransferredRepository(t *testing.T) {
+	f, gh := newFakeGitHub(t, repoFiles())
+	f.oldName = "oldorg/app"
+	ctx := context.Background()
+	for i, want := range []string{"created", "unchanged"} {
+		rep, err := gh.Migrate(ctx, Options{Repo: "oldorg/app", Map: repoMap})
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		if rep.PR != want || rep.Repo != "acme/app" {
+			t.Errorf("run %d: pr %s, repo %s", i, rep.PR, rep.Repo)
+		}
+	}
+	if len(f.pulls) != 1 {
+		t.Errorf("%d PRs", len(f.pulls))
+	}
+}
+
+// An open PR from an earlier run is reported when this run has nothing to
+// change, and on a dry run.
+func TestMigrateReportsOpenPR(t *testing.T) {
+	f, gh := newFakeGitHub(t, repoFiles())
+	ctx := context.Background()
+	if _, err := gh.Migrate(ctx, Options{Repo: "acme/app", Map: repoMap}); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := gh.Migrate(ctx, Options{Repo: "acme/app", Map: repoMap, DryRun: true})
+	if err != nil || rep.PR != "open" || rep.PRURL != f.pulls[0].HTMLURL {
+		t.Errorf("dry run: %+v, %v", rep, err)
+	}
+	// Someone moves the labels by hand on main: the PR is now stale.
+	f.commitFiles("main", map[string]string{
+		".github/workflows/ci.yml":    strings.ReplaceAll(ciYML, "ubuntu-latest", "fr-small"),
+		".github/workflows/lint.yaml": "jobs:\n  lint:\n    runs-on: [fr-small]\n",
+	}, "by hand")
+	before := len(f.writes())
+	rep, err = gh.Migrate(ctx, Options{Repo: "acme/app", Map: repoMap})
+	if err != nil || rep.PR != "stale" || rep.PRURL != f.pulls[0].HTMLURL || len(f.writes()) != before {
+		t.Errorf("stale: %+v, %v, writes %v", rep, err, f.writes()[before:])
+	}
+}
+
+// A branch head that is migrate's commit amended by hand (same message,
+// other tree) is someone's work: refused, and nothing written first.
+func TestMigrateRefusesAmendedBranch(t *testing.T) {
+	f, gh := newFakeGitHub(t, repoFiles())
+	ctx := context.Background()
+	if _, err := gh.Migrate(ctx, Options{Repo: "acme/app", Map: repoMap}); err != nil {
+		t.Fatal(err)
+	}
+	head := f.commits[f.refs[DefaultBranch]]
+	f.mu.Lock()
+	tree := map[string]fakeEntry{}
+	for k, v := range f.trees[head.tree] {
+		tree[k] = v
+	}
+	tree[".github/workflows/ci.yml"] = fakeEntry{"100644", f.putBlob([]byte("hand fixed\n"))}
+	amended := hash("amend")
+	f.commits[amended] = fakeCommit{f.putTree(tree), head.message, head.parents}
+	f.refs[DefaultBranch] = amended
+	f.mu.Unlock()
+	f.commitFiles("main", map[string]string{"README.md": "moved\n"}, "move main")
+
+	before := len(f.writes())
+	_, err := gh.Migrate(ctx, Options{Repo: "acme/app", Map: repoMap})
+	if err == nil || !strings.Contains(err.Error(), "did not make") {
+		t.Fatalf("err = %v", err)
+	}
+	if f.refs[DefaultBranch] != amended {
+		t.Error("the amended branch was overwritten")
+	}
+	if w := f.writes()[before:]; len(w) != 0 {
+		t.Errorf("a refused run wrote %v", w)
+	}
+}
+
+func TestValidBranch(t *testing.T) {
+	for _, b := range []string{"firerunner/migrate", "ci/fr-1", "a.b", "x_y"} {
+		if !validBranch(b) {
+			t.Errorf("%q refused", b)
+		}
+	}
+	for _, b := range []string{"", "a..b", "../heads/main", "a/../b", "/a", "a/", "-a", "refs/heads/x", "a//b", "a.lock", "a.", "@", "a@{1}", "a b", "a~1", "a^", "a:b", "a?", "a*", "a[", `a\b`, "a\x01", ".a", "a/.b"} {
+		if validBranch(b) {
+			t.Errorf("%q accepted", b)
+		}
+	}
+}
+
+func TestMigrateGithubIsAFile(t *testing.T) {
+	_, gh := newFakeGitHub(t, map[string]string{".github": "not a directory\n"})
+	rep, err := gh.Migrate(context.Background(), Options{Repo: "acme/app", Map: repoMap})
+	if err != nil || len(rep.Files) != 0 {
+		t.Errorf("%+v, %v", rep, err)
+	}
+}
+
+func TestUnifiedDiffNoTrailingNewline(t *testing.T) {
+	got := UnifiedDiff("x.yml", []byte("a\nruns-on: x"), []byte("a\nruns-on: y"))
+	want := "--- a/x.yml\n+++ b/x.yml\n@@ -1,2 +1,2 @@\n a\n-runs-on: x\n\\ No newline at end of file\n+runs-on: y\n\\ No newline at end of file\n"
+	if got != want {
+		t.Errorf("got %q\nwant %q", got, want)
 	}
 }

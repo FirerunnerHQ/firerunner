@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path"
@@ -14,13 +15,39 @@ import (
 // DefaultBranch is the branch migrate keeps its pull request on.
 const DefaultBranch = "firerunner/migrate"
 
-// commitMarker ends every commit migrate makes: a branch whose head lacks it
+// commitMarker and treeTrailer end every commit migrate makes; the trailer
+// names the commit's own tree. A branch head whose message lacks them, or
+// whose tree is not the one named (an amend, a rebase, a fix pushed on top),
 // holds someone else's work, and migrate refuses to overwrite it.
-const commitMarker = "Generated-by: firerunner migrate"
+const (
+	commitMarker = "Generated-by: firerunner migrate"
+	treeTrailer  = "Migrate-Tree: "
+)
 
 const workflowsDir = ".github/workflows"
 
 var repoRE = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
+
+// validBranch applies git's ref name rules (git check-ref-format), and
+// refuses a name that could reach another ref through the URL path.
+func validBranch(b string) bool {
+	if b == "" || strings.HasPrefix(b, "/") || strings.HasSuffix(b, "/") || strings.HasPrefix(b, "-") ||
+		strings.HasPrefix(b, "refs/") || strings.HasSuffix(b, ".") || strings.HasSuffix(b, ".lock") ||
+		strings.Contains(b, "..") || strings.Contains(b, "//") || strings.Contains(b, "@{") || b == "@" {
+		return false
+	}
+	for _, seg := range strings.Split(b, "/") {
+		if strings.HasPrefix(seg, ".") {
+			return false
+		}
+	}
+	for _, c := range b {
+		if c < 0x20 || c == 0x7f || strings.ContainsRune(" ~^:?*[\\", c) {
+			return false
+		}
+	}
+	return true
+}
 
 // Options is one repository's migration.
 type Options struct {
@@ -32,6 +59,7 @@ type Options struct {
 
 // Report is what a migration did, or would do.
 type Report struct {
+	OK            bool         `json:"ok"` // always true: a failure is {"ok": false, "error": …}
 	Repo          string       `json:"repo"`
 	DefaultBranch string       `json:"default_branch"`
 	Base          string       `json:"base"` // the default branch's commit the rewrite started from
@@ -39,8 +67,10 @@ type Report struct {
 	DryRun        bool         `json:"dry_run"`
 	Files         []FileReport `json:"files"`
 	Branch        string       `json:"branch,omitempty"`
-	// PR is "created", "updated", "unchanged" (an open PR already holds this
-	// rewrite) or "none" (nothing to change, or a dry run).
+	// PR is "created", "updated", "unchanged" (the open PR already holds
+	// this rewrite), "open" (a dry run, and a PR from an earlier run is
+	// open), "stale" (nothing to change, but a PR from an earlier run is
+	// still open: close it) or "none".
 	PR    string `json:"pr"`
 	PRURL string `json:"pr_url,omitempty"`
 }
@@ -82,14 +112,24 @@ func (g *GitHub) Migrate(ctx context.Context, o Options) (*Report, error) {
 	if branch == "" {
 		branch = DefaultBranch
 	}
-	rp := "/repos/" + o.Repo
+	if !validBranch(branch) {
+		return nil, fmt.Errorf("branch %q is not a valid branch name", branch)
+	}
 	var repo struct {
+		FullName      string `json:"full_name"`
 		DefaultBranch string `json:"default_branch"`
 		Archived      bool   `json:"archived"`
 	}
-	if err := g.do(ctx, "GET", rp, nil, &repo); err != nil {
+	if err := g.do(ctx, "GET", "/repos/"+o.Repo, nil, &repo); err != nil {
 		return nil, err
 	}
+	// A renamed or transferred repository answers at its old name through
+	// redirects; work at its current one, so the PR lookup by head owner
+	// finds the PR.
+	if !repoRE.MatchString(repo.FullName) {
+		return nil, fmt.Errorf("GitHub names the repository %q", repo.FullName)
+	}
+	rp := "/repos/" + repo.FullName
 	if repo.Archived {
 		return nil, fmt.Errorf("%s is archived", o.Repo)
 	}
@@ -107,7 +147,7 @@ func (g *GitHub) Migrate(ctx context.Context, o Options) (*Report, error) {
 	if err := g.do(ctx, "GET", rp+"/commits/"+url.PathEscape(repo.DefaultBranch), nil, &head); err != nil {
 		return nil, err
 	}
-	rep := &Report{Repo: o.Repo, DefaultBranch: repo.DefaultBranch, Base: head.SHA, Map: o.Map, DryRun: o.DryRun, PR: "none", Files: []FileReport{}}
+	rep := &Report{OK: true, Repo: repo.FullName, DefaultBranch: repo.DefaultBranch, Base: head.SHA, Map: o.Map, DryRun: o.DryRun, PR: "none", Files: []FileReport{}}
 
 	files, err := g.workflows(ctx, rp, head.SHA)
 	if err != nil {
@@ -139,10 +179,40 @@ func (g *GitHub) Migrate(ctx context.Context, o Options) (*Report, error) {
 		rep.Files = append(rep.Files, fr)
 	}
 	if o.DryRun || rep.Changed() == 0 {
+		pr, err := g.openPR(ctx, rp, rep.Repo, branch, rep.DefaultBranch)
+		if err != nil {
+			return nil, err
+		}
+		if pr != nil {
+			rep.Branch, rep.PRURL, rep.PR = branch, pr.HTMLURL, "open"
+			if !o.DryRun {
+				rep.PR = "stale"
+			}
+		}
 		return rep, nil
 	}
 	rep.Branch = branch
 	return rep, g.publish(ctx, rp, rep, head.SHA, head.Commit.Tree.SHA)
+}
+
+type pullRequest struct {
+	Number  int    `json:"number"`
+	HTMLURL string `json:"html_url"`
+	Body    string `json:"body"`
+}
+
+// openPR finds the open pull request from branch into base, if any.
+func (g *GitHub) openPR(ctx context.Context, rp, repo, branch, base string) (*pullRequest, error) {
+	owner, _, _ := strings.Cut(repo, "/")
+	var prs []pullRequest
+	q := url.Values{"head": {owner + ":" + branch}, "base": {base}, "state": {"open"}}
+	if err := g.do(ctx, "GET", rp+"/pulls?"+q.Encode(), nil, &prs); err != nil {
+		return nil, err
+	}
+	if len(prs) == 0 {
+		return nil, nil
+	}
+	return &prs[0], nil
 }
 
 type workflowFile struct{ path, mode, sha string }
@@ -150,17 +220,21 @@ type workflowFile struct{ path, mode, sha string }
 // workflows lists the workflow files GitHub reads: the regular .yml and
 // .yaml files directly in .github/workflows.
 func (g *GitHub) workflows(ctx context.Context, rp, commit string) ([]workflowFile, error) {
-	var dir []struct {
-		Name string `json:"name"`
-		Type string `json:"type"`
-		SHA  string `json:"sha"`
-	}
-	err := g.do(ctx, "GET", rp+"/contents/.github?ref="+commit, nil, &dir)
+	var raw json.RawMessage
+	err := g.do(ctx, "GET", rp+"/contents/.github?ref="+commit, nil, &raw)
 	if notFound(err) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	var dir []struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+		SHA  string `json:"sha"`
+	}
+	if json.Unmarshal(raw, &dir) != nil {
+		return nil, nil // .github is a file or a symlink: no workflows
 	}
 	treeSHA := ""
 	for _, e := range dir {
@@ -197,6 +271,36 @@ func (g *GitHub) workflows(ctx context.Context, rp, commit string) ([]workflowFi
 // publish commits the rewritten files on top of base to the branch and
 // opens or updates the pull request.
 func (g *GitHub) publish(ctx context.Context, rp string, rep *Report, base, baseTree string) error {
+	// Whose is the branch? Decided before anything is written.
+	refPath := rp + "/git/ref/heads/" + escapeRef(rep.Branch)
+	var ref struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	err := g.do(ctx, "GET", refPath, nil, &ref)
+	exists := err == nil
+	if err != nil && !notFound(err) {
+		return err
+	}
+	var cur struct {
+		Message string `json:"message"`
+		Tree    struct {
+			SHA string `json:"sha"`
+		} `json:"tree"`
+		Parents []struct {
+			SHA string `json:"sha"`
+		} `json:"parents"`
+	}
+	if exists {
+		if err := g.do(ctx, "GET", rp+"/git/commits/"+ref.Object.SHA, nil, &cur); err != nil {
+			return err
+		}
+		if !hasLine(cur.Message, commitMarker) || !hasLine(cur.Message, treeTrailer+cur.Tree.SHA) || len(cur.Parents) != 1 {
+			return fmt.Errorf("branch %s holds commits migrate did not make; delete it, or pass another --branch", rep.Branch)
+		}
+	}
+
 	type entry struct {
 		Path string `json:"path"`
 		Mode string `json:"mode"`
@@ -222,42 +326,12 @@ func (g *GitHub) publish(ctx context.Context, rp string, rep *Report, base, base
 	if err := g.do(ctx, "POST", rp+"/git/trees", map[string]any{"base_tree": baseTree, "tree": entries}, &tree); err != nil {
 		return err
 	}
-
-	refPath := rp + "/git/ref/heads/" + escapeRef(rep.Branch)
-	var ref struct {
-		Object struct {
-			SHA string `json:"sha"`
-		} `json:"object"`
-	}
-	err := g.do(ctx, "GET", refPath, nil, &ref)
-	exists := err == nil
-	if err != nil && !notFound(err) {
-		return err
-	}
-	update := true
-	if exists {
-		var cur struct {
-			Message string `json:"message"`
-			Tree    struct {
-				SHA string `json:"sha"`
-			} `json:"tree"`
-			Parents []struct {
-				SHA string `json:"sha"`
-			} `json:"parents"`
-		}
-		if err := g.do(ctx, "GET", rp+"/git/commits/"+ref.Object.SHA, nil, &cur); err != nil {
-			return err
-		}
-		if !strings.Contains(cur.Message, commitMarker) {
-			return fmt.Errorf("branch %s holds commits migrate did not make; delete it, or pass another --branch", rep.Branch)
-		}
-		update = cur.Tree.SHA != tree.SHA || len(cur.Parents) != 1 || cur.Parents[0].SHA != base
-	}
+	update := !exists || cur.Tree.SHA != tree.SHA || cur.Parents[0].SHA != base
 	if update {
 		var commit struct {
 			SHA string `json:"sha"`
 		}
-		if err := g.do(ctx, "POST", rp+"/git/commits", map[string]any{"message": commitMessage(rep), "tree": tree.SHA, "parents": []string{base}}, &commit); err != nil {
+		if err := g.do(ctx, "POST", rp+"/git/commits", map[string]any{"message": commitMessage(rep, tree.SHA), "tree": tree.SHA, "parents": []string{base}}, &commit); err != nil {
 			return err
 		}
 		if exists {
@@ -270,38 +344,41 @@ func (g *GitHub) publish(ctx context.Context, rp string, rep *Report, base, base
 		}
 	}
 
-	owner := strings.SplitN(rep.Repo, "/", 2)[0]
-	var prs []struct {
-		Number  int    `json:"number"`
-		HTMLURL string `json:"html_url"`
-		Body    string `json:"body"`
-	}
-	q := url.Values{"head": {owner + ":" + rep.Branch}, "base": {rep.DefaultBranch}, "state": {"open"}}
-	if err := g.do(ctx, "GET", rp+"/pulls?"+q.Encode(), nil, &prs); err != nil {
+	pr, err := g.openPR(ctx, rp, rep.Repo, rep.Branch, rep.DefaultBranch)
+	if err != nil {
 		return err
 	}
 	body := prBody(rep)
-	if len(prs) == 0 {
-		var pr struct {
-			HTMLURL string `json:"html_url"`
-		}
+	if pr == nil {
+		var created pullRequest
 		in := map[string]string{"title": "Run CI on firerunner", "head": rep.Branch, "base": rep.DefaultBranch, "body": body}
-		if err := g.do(ctx, "POST", rp+"/pulls", in, &pr); err != nil {
+		if err := g.do(ctx, "POST", rp+"/pulls", in, &created); err != nil {
 			return err
 		}
-		rep.PR, rep.PRURL = "created", pr.HTMLURL
+		rep.PR, rep.PRURL = "created", created.HTMLURL
 		return nil
 	}
-	rep.PRURL = prs[0].HTMLURL
-	if !update && prs[0].Body == body {
+	rep.PRURL = pr.HTMLURL
+	if !update && pr.Body == body {
 		rep.PR = "unchanged"
 		return nil
 	}
-	if err := g.do(ctx, "PATCH", fmt.Sprintf("%s/pulls/%d", rp, prs[0].Number), map[string]string{"body": body}, nil); err != nil {
+	if err := g.do(ctx, "PATCH", fmt.Sprintf("%s/pulls/%d", rp, pr.Number), map[string]string{"body": body}, nil); err != nil {
 		return err
 	}
 	rep.PR = "updated"
 	return nil
+}
+
+// hasLine reports whether msg has a line that is exactly line. GitHub
+// stores a commit message without its final newline.
+func hasLine(msg, line string) bool {
+	for _, l := range strings.Split(msg, "\n") {
+		if strings.TrimRight(l, "\r") == line {
+			return true
+		}
+	}
+	return false
 }
 
 // escapeRef escapes each segment of a branch name for a URL path.
@@ -313,13 +390,13 @@ func escapeRef(ref string) string {
 	return strings.Join(parts, "/")
 }
 
-func commitMessage(rep *Report) string {
+func commitMessage(rep *Report, tree string) string {
 	var b strings.Builder
 	b.WriteString("ci: run jobs on firerunner runners\n\n")
 	for _, from := range rep.Map.keys() {
 		fmt.Fprintf(&b, "runs-on %s -> %s\n", from, rep.Map[from])
 	}
-	b.WriteString("\n" + commitMarker + "\n")
+	b.WriteString("\n" + commitMarker + "\n" + treeTrailer + tree + "\n")
 	return b.String()
 }
 
