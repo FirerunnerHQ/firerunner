@@ -36,6 +36,8 @@ done
 [ -n "$runner_version" ] || runner_version="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')"
 
 mkdir -p "$workdir"
+# Absolute: qemu-img resolves a relative backing file against its overlay.
+workdir="$(cd "$workdir" && pwd)"
 run="$(mktemp -d "$workdir/run.XXXXXX")"
 server_pid=""
 qemu_pid=""
