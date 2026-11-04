@@ -835,13 +835,25 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 			}
 		}
 	}
-	if p.o.EC2.RootVolumeGiB > 0 || p.o.EC2.RootVolumeType != "" {
+	e := p.o.EC2
+	throughput := e.VolumeThroughput(kind == forPool)
+	if e.RootVolumeGiB > 0 || e.RootVolumeType != "" || throughput > 0 || e.RootVolumeIOPS > 0 || e.RootVolumeInitRate > 0 {
 		ebs := &types.EbsBlockDevice{
-			VolumeType:          types.VolumeType(p.o.EC2.VolumeType()),
+			VolumeType:          types.VolumeType(e.VolumeType()),
 			DeleteOnTermination: aws.Bool(true),
 		}
-		if p.o.EC2.RootVolumeGiB > 0 {
-			ebs.VolumeSize = aws.Int32(int32(p.o.EC2.RootVolumeGiB))
+		for _, f := range []struct {
+			field **int32
+			val   int
+		}{
+			{&ebs.VolumeSize, e.RootVolumeGiB},
+			{&ebs.Throughput, throughput},
+			{&ebs.Iops, e.RootVolumeIOPS},
+			{&ebs.VolumeInitializationRate, e.RootVolumeInitRate},
+		} {
+			if f.val > 0 {
+				*f.field = aws.Int32(int32(f.val))
+			}
 		}
 		in.BlockDeviceMappings = []types.BlockDeviceMapping{{DeviceName: aws.String(img.rootDevice), Ebs: ebs}}
 	}
