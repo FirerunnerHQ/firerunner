@@ -7,7 +7,7 @@
 # job would see. Needs a Linux host with /dev/kvm, qemu, python3 and socat.
 #
 # Usage: images/test-ec2-vm.sh [--workdir DIR] [--runner-version V] [--vcpus N]
-#                              [--mem-mib N] [--disk-gib N]
+#                              [--mem-mib N] [--toolset minimal|curated|full] [--disk-gib N]
 #                              [--keep-image FILE]
 #
 # The image is what EC2 would snapshot, except for its kernel: this is Ubuntu's
@@ -15,13 +15,14 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-workdir="${HOME}/.cache/firerunner-ec2-vm" runner_version="" vcpus=4 mem=8192 disk=20 keep=""
+workdir="${HOME}/.cache/firerunner-ec2-vm" runner_version="" vcpus=4 mem=8192 toolset=minimal disk=20 keep=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--workdir) workdir="${2:?}" && shift ;;
 	--runner-version) runner_version="${2:?}" && shift ;;
 	--vcpus) vcpus="${2:?}" && shift ;;
 	--mem-mib) mem="${2:?}" && shift ;;
+	--toolset) toolset="${2:?}" && shift ;;
 	--disk-gib) disk="${2:?}" && shift ;;
 	--keep-image) keep="${2:?}" && shift ;;
 	*) echo "unknown argument: $1" >&2 && exit 2 ;;
@@ -128,7 +129,7 @@ python3 -I "$run/server.py" "$run" "$base_url" &
 server_pid=$!
 
 # build-ec2-ami.sh's own user-data, plus the probe in the runner's place.
-"$HERE/build-ec2-ami.sh" --render --runner-version "$runner_version" >"$run/user-data.orig"
+"$HERE/build-ec2-ami.sh" --render --runner-version "$runner_version" --toolset "$toolset" >"$run/user-data.orig"
 python3 -I - "$run" "$base_url" <<'PY'
 import sys
 run, url = sys.argv[1], sys.argv[2]
@@ -161,7 +162,7 @@ boot() { # DISK LOG EXTRA...
 
 echo ">> building the image (runner $runner_version)"
 qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$run/image.qcow2" "${disk}G"
-boot "$run/image.qcow2" "$run/build.log" -smbios "type=1,serial=ds=nocloud;s=http://169.254.0.2:8099/"
+BOOT_DEADLINE="$([ "$toolset" != minimal ] && echo 14400 || echo 1500)" boot "$run/image.qcow2" "$run/build.log" -smbios "type=1,serial=ds=nocloud;s=http://169.254.0.2:8099/"
 grep -q 'FIRERUNNER-BUILD .* finished' "$run/build.log" || { echo "build failed, see $run/build.log" >&2; tail -30 "$run/build.log" >&2; exit 1; }
 
 [ -z "$keep" ] || qemu-img convert -O qcow2 "$run/image.qcow2" "$keep"
@@ -195,6 +196,14 @@ check "the kernel skips the PS/2 probe" 'cmdline:.*i8042.nokbd'
 check "the probe finished" 'probe: done'
 check "more memory than the VM has does not kill the job" 'overcommit_rc: 0'
 check "a job's OOM does not take the boot service with it" 'oom_rc: 137'
+if [ "$toolset" != minimal ]; then
+	check "jobs run as runner" 'user: runner home=/home/runner'
+	check "passwordless sudo" 'sudo: ok'
+	check "the hosted tool cache is there" 'toolcache: .*Python.*node'
+	for t in gcc make unzip node python3 java go cargo ruby gh aws kubectl; do
+		check "$t is on PATH" "tool $t: /"
+	done
+fi
 [ "$fails" = 0 ] || { echo "kept: $run" >&2; trap - EXIT; exit 1; }
 rm -rf "$run"
 echo "all passed"

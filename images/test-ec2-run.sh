@@ -122,6 +122,8 @@ script() {
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
 		FIRERUNNER_CACHE_SETUP="$TMP/bin/fake-cache-setup" \
 		FIRERUNNER_TUNE="${TUNE:-$TMP/bin/no-tune}" \
+		FIRERUNNER_RUN_USER="" \
+		FIRERUNNER_ENVIRONMENT="${ENVIRONMENT_FILE:-$TMP/no-environment}" \
 		TMPDIR="${SCRIPT_TMPDIR:-${TMPDIR:-/tmp}}" \
 		"${SCRIPT_SH:-sh}" -c 'trap "" PIPE; exec "$0" "$1"' "${SCRIPT_SH:-sh}" "$SCRIPT"
 }
@@ -434,6 +436,21 @@ FAKE
 	expect "tune $t: finished before the runner started" "" has tuned-first
 	expect "tune $t: the runner ran" "" has runner-argv
 done
+
+# GitHub's images keep tool paths in /etc/environment.
+fresh environment
+# shellcheck disable=SC2016 # the fake evaluates these
+printf 'AGENT_TOOLSDIRECTORY="/opt/hostedtoolcache"\nCARGO_PATH="$HOME/.cargo/bin"\n' > "$STATE/environment"
+printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+# shellcheck disable=SC2016 # the fake evaluates these
+runner 'echo "$AGENT_TOOLSDIRECTORY" > "$STATE/tools"; echo "$CARGO_PATH" > "$STATE/cargo"; echo "Exiting runner..."'
+ENVIRONMENT_FILE="$STATE/environment" run
+expect "environment: the job sees the image's tool paths" "$(cat "$STATE/tools" 2>/dev/null)" \
+	[ "$(cat "$STATE/tools" 2>/dev/null)" = /opt/hostedtoolcache ]
+expect "environment: paths built on HOME see the job's home" "$(cat "$STATE/cargo" 2>/dev/null)" \
+	[ "$(cat "$STATE/cargo" 2>/dev/null)" = /root/.cargo/bin ]
 
 fresh tune-warmup
 : > "$STATE/userdata"

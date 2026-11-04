@@ -44,6 +44,8 @@ RETRY_SLEEP="${FIRERUNNER_RETRY_SLEEP:-0.2}"
 JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
 # Bounds each progress report to the control VM.
 REPORT_TIMEOUT="${FIRERUNNER_REPORT_TIMEOUT:-2}"
+ENVIRONMENT="${FIRERUNNER_ENVIRONMENT:-/etc/environment}"
+RUN_USER="${FIRERUNNER_RUN_USER-runner}"
 # Grows the disk and adds swap while the config is on its way (see below).
 TUNE="${FIRERUNNER_TUNE:-/usr/local/libexec/firerunner-ec2-tune}"
 # Sets up the dependency cache from this instance's bundle (see below).
@@ -180,10 +182,23 @@ if ! cd "$RUNNER_DIR" 2>/dev/null || [ ! -x ./run.sh ]; then
 	exit 0
 fi
 [ -z "$tune_pid" ] || wait "$tune_pid" || log "tuning failed; running the job anyway"
-# The instance is single-use and thrown away after the job.
-export RUNNER_ALLOW_RUNASROOT=1
-export HOME=/root
-export USER=root
+# The instance is single-use and thrown away after the job. A full image has
+# the "runner" user that GitHub's jobs run as; a minimal one runs them as root.
+run_as=""
+if [ -n "$RUN_USER" ] && id "$RUN_USER" >/dev/null 2>&1; then
+	run_as="runuser -u $RUN_USER --"
+	export HOME="/home/$RUN_USER" USER="$RUN_USER"
+else
+	export RUNNER_ALLOW_RUNASROOT=1 HOME=/root USER=root
+fi
+# GitHub's images keep tool paths in ENVIRONMENT, which systemd does not read.
+# Its PATH holds entries such as $HOME/.cargo/bin, so HOME comes first.
+if [ -r "$ENVIRONMENT" ]; then
+	set -a
+	# shellcheck disable=SC1090 # the image's own file
+	. "$ENVIRONMENT"
+	set +a
+fi
 
 # The runner's output goes through a FIFO to a reader that passes it on to the
 # journal and reports the phases it shows. A FIFO, not a pipeline: this script
@@ -222,7 +237,8 @@ mkfifo "$fifo"
 reader=$!
 # Ephemeral JIT runner: registers, runs one job, then auto-deregisters.
 rc=0
-./run.sh --jitconfig "$jit" >"$fifo" 2>&1 || rc=$?
+# shellcheck disable=SC2086 # run_as is a command line.
+$run_as ./run.sh --jitconfig "$jit" >"$fifo" 2>&1 || rc=$?
 # Let the reader catch up with the runner's last lines, so the listener's
 # status is known and the phase reports precede the exit's. Bounded: a
 # process a job left behind may hold the FIFO open, so EOF may never come.

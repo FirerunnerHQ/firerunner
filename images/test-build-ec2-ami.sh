@@ -142,6 +142,15 @@ PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --arch arm64 >"$S
 expect "render prints the user-data" "" grep -q '^RUNNER_ARCH=arm64$' "$STATE/out"
 expect "render touches no AWS" "" not_called "ec2"
 
+# 6. The toolset reaches the instance, and curated skips what full keeps.
+fresh toolset
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --toolset curated >"$STATE/out"
+expect "toolset reaches the user-data" "" grep -q '^TOOLSET=curated$' "$STATE/out"
+expect "curated skips Haskell" "" grep -q '^RI_SKIP=.*install-haskell.sh' "$STATE/out"
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --toolset full >"$STATE/out"
+expect "full keeps Haskell" "" bash -c "! grep -q '^RI_SKIP=.*install-haskell.sh' '$STATE/out'"
+expect "a bad toolset is refused" "" bash -c "! PATH='$TMP/bin:$PATH' '$BUILD' --render --runner-version 1.2.3 --toolset huge >/dev/null 2>&1"
+
 if [ "$fails" -ne 0 ]; then
 	echo "$fails failure(s)"
 	exit 1

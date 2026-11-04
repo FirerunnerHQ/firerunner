@@ -19,6 +19,11 @@
 #   --instance-type T     build instance type (default c7a.large; arm64: c7g.large)
 #   --arch A              x64 (default) or arm64
 #   --runner-version V    actions/runner version (default: latest release)
+#   --toolset T           minimal, curated or full (default minimal). curated and
+#                         full install GitHub's ubuntu-24.04 tools, in about 30
+#                         minutes; pass a larger --instance-type and --volume-gib,
+#                         and --timeout
+#   --runner-images-ref R actions/runner-images tag for curated and full
 #   --volume-gib N        root volume size (default 20)
 #   --tag K=V             extra tag on the instance, AMI and snapshot (repeatable)
 #   --timeout SECONDS     give up waiting for the build (default 1200)
@@ -35,6 +40,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 region="" subnet="" sg="" param="" itype="" arch="x64" runner_version="" volume=20
+toolset=minimal ri_ref="ubuntu24/20261101.360"
+ri_skip="configure-apt-mock.sh configure-system.sh cleanup.sh list-dpkg.sh post-build-validation.sh install-android-sdk.sh install-homebrew.sh configure-snap.sh"
 timeout_s=1200 render=0
 tags=()
 
@@ -54,6 +61,8 @@ while [ $# -gt 0 ]; do
 	--arch) arch="${2:?}"; shift ;;
 	--runner-version) runner_version="${2:?}"; shift ;;
 	--volume-gib) volume="${2:?}"; shift ;;
+	--toolset) toolset="${2:?}"; shift ;;
+	--runner-images-ref) ri_ref="${2:?}"; shift ;;
 	--tag) tags+=("${2:?}"); shift ;;
 	--timeout) timeout_s="${2:?}"; shift ;;
 	--render) render=1 ;;
@@ -73,6 +82,8 @@ arm64) ubuntu_arch=arm64 default_type=c7g.large ;;
 esac
 itype="${itype:-$default_type}"
 [[ "$volume" =~ ^[0-9]+$ ]] || die "--volume-gib must be a number"
+case "$toolset" in minimal | curated | full) ;; *) die "--toolset must be minimal, curated or full" ;; esac
+[ "$toolset" != curated ] || ri_skip="$ri_skip install-haskell.sh install-swift.sh install-julia.sh install-firefox.sh install-microsoft-edge.sh install-google-cloud-cli.sh install-codeql-bundle.sh install-kotlin.sh install-bazel.sh install-pulumi.sh install-packer.sh install-vcpkg.sh install-azure-devops-cli.sh install-copilot-cli.sh install-awf.sh install-pypy.sh"
 [[ "$timeout_s" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
 for t in "${tags[@]+"${tags[@]}"}"; do
 	[[ "$t" == ?*=* ]] || die "--tag wants KEY=VALUE, got '$t'"
@@ -90,7 +101,9 @@ fi
 # installs the boot script and unit, then provision.sh's body.
 render_userdata() {
 	echo '#!/bin/bash'
-	printf 'RUNNER_VERSION=%q\nRUNNER_ARCH=%q\nexport RUNNER_VERSION RUNNER_ARCH\n' "$runner_version" "$arch"
+	printf 'RUNNER_VERSION=%q\nRUNNER_ARCH=%q\nTOOLSET=%q\nRI_REF=%q\nRI_SKIP=%q\nexport RUNNER_VERSION RUNNER_ARCH TOOLSET RI_REF RI_SKIP\n' \
+		"$runner_version" "$arch" "$toolset" "$ri_ref" "$ri_skip"
+	cat "$HERE/ec2/install-runner-images.sh"
 	echo 'install_boot_unit() {'
 	echo "cat >/usr/local/bin/firerunner-ec2-run.sh <<'FIRERUNNER_RUN_SH'"
 	cat "$HERE/assets/firerunner-ec2-run.sh"
