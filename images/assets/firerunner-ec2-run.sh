@@ -44,6 +44,8 @@ RETRY_SLEEP="${FIRERUNNER_RETRY_SLEEP:-0.2}"
 JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
 # Bounds each progress report to the control VM.
 REPORT_TIMEOUT="${FIRERUNNER_REPORT_TIMEOUT:-2}"
+# Grows the disk and adds swap while the config is on its way (see below).
+TUNE="${FIRERUNNER_TUNE:-/usr/local/libexec/firerunner-ec2-tune}"
 # Sets up the dependency cache from this instance's bundle (see below).
 CACHE_SETUP="${FIRERUNNER_CACHE_SETUP:-/usr/local/libexec/firerunner-cache-setup}"
 # Bounds the wait for the output reader after the runner exits, in tenths of
@@ -111,6 +113,14 @@ fi
 # A job boot from here on: its disk is never booted again.
 poweroff_cmd="$POWEROFF_FAST"
 
+# In the background, so tuning costs no time beyond what the config's fetch
+# takes anyway. The runner starts only after it, so a job sees the full disk.
+tune_pid=""
+if [ -x "$TUNE" ]; then
+	"$TUNE" &
+	tune_pid=$!
+fi
+
 body="$(mktemp)"
 trap 'rc=$?; rm -f "$body"; finish "$rc"' EXIT
 start="$(date +%s)"
@@ -169,6 +179,7 @@ if ! cd "$RUNNER_DIR" 2>/dev/null || [ ! -x ./run.sh ]; then
 	log "no runnable $RUNNER_DIR/run.sh; powering off"
 	exit 0
 fi
+[ -z "$tune_pid" ] || wait "$tune_pid" || log "tuning failed; running the job anyway"
 # The instance is single-use and thrown away after the job.
 export RUNNER_ALLOW_RUNASROOT=1
 export HOME=/root
