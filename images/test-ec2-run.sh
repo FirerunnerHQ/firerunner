@@ -416,8 +416,8 @@ run
 expect "no bundle: no setup" "" lacks setup-got
 expect "no bundle: the runner runs" "" has runner-argv
 
-# Tuning runs on a job boot and finishes before the runner starts, so the job
-# sees the grown disk; a failure must not cost the job.
+# Tuning runs on a job boot, and the runner waits for it, up to a bound, so the
+# job sees the grown disk; a failure must not cost the job.
 for t in ok fail; do
 	fresh "tune-$t"
 	cat > "$TMP/bin/fake-tune" <<'FAKE'
