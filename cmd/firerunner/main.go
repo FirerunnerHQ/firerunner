@@ -622,8 +622,15 @@ func publishHealth(path string, trackers []*health.Tracker, fill func(*health.Fi
 // serveJIT starts the endpoint EC2 instances fetch their JIT configs from, on
 // the control VM's VPC address. Binding fails fast if the address is not this
 // host's. The returned func shuts it down.
-func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitserver.Server, func(), error) {
+func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger, onRunnerJob func(runner string)) (*jitserver.Server, func(), error) {
 	jit := jitserver.New(cfg.JITTTL, log.With("component", "jitserver"))
+	if onRunnerJob != nil {
+		jit.OnPhase(func(runner, phase string) {
+			if phase == jitserver.PhaseJob {
+				onRunnerJob(runner)
+			}
+		})
+	}
 	ln, err := net.Listen("tcp", cfg.JITAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("--jit-addr: %w", err)
@@ -746,6 +753,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	var onJobStarted func(context.Context, jobidentity.Job)
 	var cacheJobs *jobidentity.Registry
+	var onJobOffered func(jobidentity.Job)
+	var onRunnerJob func(runner string)
 	if firecrackerCache(cfg) || cfg.UsesEC2Cache() {
 		jobs, err := jobidentity.NewRegistry(cfg.CacheJobsDir, log)
 		if err != nil {
@@ -763,6 +772,14 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		cacheJobs = jobs
 		onJobStarted = func(ctx context.Context, j jobidentity.Job) { jobs.Start(ctx, j, resolver) }
+		if cfg.UsesEC2Cache() {
+			// GitHub may deliver JobStarted only once the job is over: an EC2
+			// instance's own report that its job started, matched against
+			// the runs GitHub offered, finds it within seconds (#28).
+			cands := &jobidentity.Candidates{}
+			onJobOffered = cands.Offer
+			onRunnerJob = func(runner string) { jobs.Discover(ctx, runner, cands, resolver, resolver) }
+		}
 	}
 	var ec2Cache *ec2.CacheOptions
 	if cfg.UsesEC2Cache() {
@@ -794,7 +811,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		ec2Client *ec2.Client
 	)
 	if cfg.UsesEC2() {
-		jit, stopJIT, err := serveJIT(ctx, cfg, log)
+		jit, stopJIT, err := serveJIT(ctx, cfg, log, onRunnerJob)
 		if err != nil {
 			return err
 		}
@@ -866,6 +883,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		lis, err := listener.New(ctx, listener.Config{
 			URL:          cfg.URL,
 			OnJobStarted: onJobStarted,
+			OnJobOffered: onJobOffered,
 			Health:       tracker,
 			Pending:      tierJobs[t.Name],
 			Name:         t.Name,
