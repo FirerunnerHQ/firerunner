@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -190,5 +192,114 @@ func TestGitHubRunnerJob(t *testing.T) {
 	}
 	if _, _, err := g.RunnerJob(context.Background(), "../etc", 42, "runner-1"); err == nil {
 		t.Fatal("an invalid repository was asked about")
+	}
+}
+
+// TestDiscoverSkipsAnotherRunnersJob: a newer run whose in-progress job is on
+// another runner is passed over for the older run that has this runner's.
+func TestDiscoverSkipsAnotherRunnersJob(t *testing.T) {
+	r, reader := discoverRegistry(t)
+	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_000_000, 0)
+	cands := &Candidates{now: func() time.Time { return now }}
+	cands.Offer(Job{Repository: "owner/mine", RunID: 1, Event: "push"})
+	now = now.Add(time.Second)
+	cands.Offer(Job{Repository: "owner/theirs", RunID: 2, Event: "push"})
+	finder := &fakeFinder{on: map[string]string{"owner/theirs#2": "runner-2", "owner/mine#1": "runner-1"}}
+	var got Job
+	r.Discover(context.Background(), "runner-1", cands, finder, resolveFunc(func(_ context.Context, j Job) (Identity, error) {
+		got = j
+		return identity(), nil
+	}))
+	awaitIdentity(t, reader, "172.16.0.2")
+	if got.Repository != "owner/mine" {
+		t.Fatalf("resolved %s, want the run with this runner's job", got.Repository)
+	}
+}
+
+type limitedFinder struct{ calls int }
+
+func (f *limitedFinder) RunnerJob(context.Context, string, int64, string) (int64, bool, error) {
+	f.calls++
+	return 0, false, statusError{"GET", "/repos/o/r/actions/runs/1/jobs", http.StatusForbidden}
+}
+
+// TestDiscoverStopsWhenGitHubRefuses: resolution shares the credential, so a
+// rate limit ends the search at once instead of spending more of it.
+func TestDiscoverStopsWhenGitHubRefuses(t *testing.T) {
+	r, _ := discoverRegistry(t)
+	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	cands := &Candidates{}
+	for i := range 5 {
+		cands.Offer(Job{Repository: "owner/repo", RunID: int64(i + 1)})
+	}
+	f := &limitedFinder{}
+	r.Discover(context.Background(), "runner-1", cands, f, resolveFunc(func(context.Context, Job) (Identity, error) { return identity(), nil }))
+	if f.calls != 1 {
+		t.Fatalf("%d lookups after a 403, want 1", f.calls)
+	}
+}
+
+// TestStartRefusesADifferentJobForTheSameRunner: if Discover and JobStarted
+// ever name different jobs for one runner, neither is trusted.
+func TestStartRefusesADifferentJobForTheSameRunner(t *testing.T) {
+	r, reader := discoverRegistry(t)
+	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	ok := resolveFunc(func(context.Context, Job) (Identity, error) { return identity(), nil })
+	r.Start(context.Background(), Job{Runner: "runner-1", Repository: "owner/repo", RunID: 42, JobID: "j"}, ok)
+	awaitIdentity(t, reader, "172.16.0.2")
+	r.Start(context.Background(), Job{Runner: "runner-1", Repository: "owner/repo", RunID: 42, JobID: "j"}, ok) // the same: fine
+	if _, err := reader.Lookup("172.16.0.2"); err != nil {
+		t.Fatalf("the same job named twice: %v", err)
+	}
+	r.Start(context.Background(), Job{Runner: "runner-1", Repository: "owner/other", RunID: 7, JobID: "k"}, ok)
+	if _, err := reader.Lookup("172.16.0.2"); err == nil {
+		t.Fatal("still authorized after two sources named different jobs")
+	}
+}
+
+// TestGitHubRunnerJobSharesAListingAndPages: a burst of lookups lists a run
+// once, and a run of more than 100 jobs is read past its first page.
+func TestGitHubRunnerJobSharesAListingAndPages(t *testing.T) {
+	var lists, pages atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages.Add(1)
+		page := r.URL.Query().Get("page")
+		if page == "1" {
+			lists.Add(1)
+			time.Sleep(20 * time.Millisecond) // let the burst pile up behind it
+		}
+		var jobs []string
+		switch page {
+		case "1":
+			for i := range 100 {
+				jobs = append(jobs, fmt.Sprintf(`{"id":%d,"status":"in_progress","runner_name":"r-%d"}`, i, i))
+			}
+		case "2":
+			jobs = append(jobs, `{"id":150,"status":"in_progress","runner_name":"late"}`)
+		}
+		fmt.Fprintf(w, `{"jobs":[%s]}`, strings.Join(jobs, ","))
+	}))
+	defer srv.Close()
+	g := &GitHub{base: srv.URL, pat: "pat", client: srv.Client()}
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if id, ok, err := g.RunnerJob(context.Background(), "owner/repo", 42, "late"); err != nil || !ok || id != 150 {
+				t.Errorf("late: %d %v %v, want job 150 from page 2", id, ok, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if lists.Load() != 1 || pages.Load() != 2 {
+		t.Fatalf("%d listings over %d pages for 10 lookups, want 1 listing of 2 pages", lists.Load(), pages.Load())
 	}
 }

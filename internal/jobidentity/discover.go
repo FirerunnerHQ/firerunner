@@ -114,7 +114,15 @@ func (r *Registry) Discover(ctx context.Context, runner string, cands *Candidate
 			return
 		}
 		for _, j := range cands.recent() {
+			if !r.awaitsIdentity(runner) {
+				return // released, or JobStarted got there first
+			}
 			id, found, err := finder.RunnerJob(ctx, j.Repository, j.RunID, runner)
+			if rateLimited(err) {
+				// Resolution shares the credential: spend no more of it here.
+				r.log.Warn("cache identity: GitHub refused the lookup; waiting for JobStarted", "runner", runner, "err", err)
+				return
+			}
 			if err != nil {
 				r.log.Debug("look up a candidate run's jobs", "runner", runner, "repository", j.Repository, "run", j.RunID, "err", err)
 				continue

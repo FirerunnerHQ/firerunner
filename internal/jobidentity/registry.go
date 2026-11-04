@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -24,6 +25,8 @@ type Resolver interface {
 type lease struct {
 	identity Identity
 	cancel   context.CancelFunc
+	// started is the job the identity is resolved from: the first Start's.
+	started Job
 }
 
 // Registry owns a dedicated directory exclusively. A lock prevents two daemons
@@ -179,12 +182,25 @@ func (r *Registry) Release(runner string) error {
 func (r *Registry) Start(ctx context.Context, j Job, resolver Resolver) {
 	r.mu.Lock()
 	l := r.leases[j.Runner]
+	if l != nil && l.cancel != nil && (l.started.RunID != j.RunID || !strings.EqualFold(l.started.Repository, j.Repository)) {
+		// Two sources (Discover, JobStarted) disagree on the runner's job:
+		// trust neither, and say so.
+		r.log.Warn("cache identity: the runner's job was found twice, differently; denying it", "runner", j.Runner,
+			"had", fmt.Sprintf("%s#%d", l.started.Repository, l.started.RunID), "now", fmt.Sprintf("%s#%d", j.Repository, j.RunID))
+		l.identity.Unresolved = true
+		if err := r.write(l.identity); err != nil {
+			r.log.Warn("publish unresolved cache identity", "runner", j.Runner, "err", err)
+		}
+		r.mu.Unlock()
+		return
+	}
 	if l == nil || l.cancel != nil {
 		r.mu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	l.cancel = cancel
+	l.started = j
 	// Persist authenticated JobStarted provenance before making any REST call.
 	l.identity.Repository, l.identity.Event = j.Repository, j.Event
 	l.identity.RunID, l.identity.JobID = j.RunID, j.JobID
