@@ -18,6 +18,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
 )
 
@@ -479,6 +480,28 @@ func TestTrackedSessionKeepsPendingJobs(t *testing.T) {
 	}
 	if p := tr.Snapshot().Pending; p != nil {
 		t.Fatalf("pending after start and completion = %+v, want none", p)
+	}
+}
+
+// TestTrackedSessionOffersJobs: the jobs GitHub offers and assigns are the
+// cache's candidate runs, handed on as each message arrives.
+func TestTrackedSessionOffersJobs(t *testing.T) {
+	f := newFakeSession(0, false)
+	var offered []jobidentity.Job
+	ts := trackedSession{session: f, offered: func(j jobidentity.Job) { offered = append(offered, j) }}
+	base := func(run int64) scaleset.JobMessageBase {
+		return scaleset.JobMessageBase{OwnerName: "owner", RepositoryName: "repo", WorkflowRunID: run, EventName: "push", JobID: "j", JobWorkflowRef: "owner/repo/.github/workflows/ci.yml@refs/heads/main"}
+	}
+	f.msgs <- &scaleset.RunnerScaleSetMessage{
+		JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: base(1)}},
+		JobAssignedMessages:  []*scaleset.JobAssigned{{JobMessageBase: base(2)}},
+		JobStartedMessages:   []*scaleset.JobStarted{{JobMessageBase: base(3)}}}
+	if _, err := ts.GetMessage(context.Background(), 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(offered) != 2 || offered[0].RunID != 1 || offered[1].RunID != 2 ||
+		offered[0].Repository != "owner/repo" || offered[0].Event != "push" || offered[0].WorkflowRef == "" {
+		t.Fatalf("offered = %+v, want runs 1 and 2 (not the started one) with their repository and event", offered)
 	}
 }
 

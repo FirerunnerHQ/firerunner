@@ -43,6 +43,10 @@ type Config struct {
 	CommitSHA string
 
 	OnJobStarted func(context.Context, jobidentity.Job)
+	// OnJobOffered, if set, is told each job GitHub offers or assigns to the
+	// scale set (JobAvailable, JobAssigned), as it arrives: the cache's
+	// identity discovery takes its candidate runs from them.
+	OnJobOffered func(jobidentity.Job)
 	// Pending, if set, keeps the tier's assigned-but-not-started jobs, read
 	// from each message before the library acts on it.
 	Pending *assigned.Jobs
@@ -359,7 +363,7 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		s.recycle = nil
 		s.mu.Unlock()
 	}()
-	l, err := sslistener.New(trackedSession{session: sess, health: s.health, pending: s.cfg.Pending, log: s.log, chaos: chaosExitAfterDelete()}, sslistener.Config{
+	l, err := sslistener.New(trackedSession{session: sess, health: s.health, pending: s.cfg.Pending, offered: s.cfg.OnJobOffered, log: s.log, chaos: chaosExitAfterDelete()}, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
@@ -454,6 +458,7 @@ type trackedSession struct {
 	session
 	health  *health.Tracker
 	pending *assigned.Jobs
+	offered func(jobidentity.Job)
 	log     *slog.Logger
 	// chaos exits the process after DeleteMessage (see chaosExitAfterDelete).
 	chaos bool
@@ -491,11 +496,29 @@ func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapaci
 			}
 		}
 	}
+	if err == nil && m != nil && t.offered != nil {
+		for _, a := range m.JobAvailableMessages {
+			if a != nil {
+				t.offered(offeredJob(a.JobMessageBase))
+			}
+		}
+		for _, a := range m.JobAssignedMessages {
+			if a != nil {
+				t.offered(offeredJob(a.JobMessageBase))
+			}
+		}
+	}
 	if err == nil && t.pending.Message(m) && t.health != nil {
 		mix := t.pending.Mix()
 		t.health.SetPending(&health.Pending{Jobs: mix.Jobs, ByEvent: mix.ByEvent, Kept: mix.Kept})
 	}
 	return m, err
+}
+
+// offeredJob is what an offered job tells the cache's identity discovery.
+func offeredJob(b scaleset.JobMessageBase) jobidentity.Job {
+	return jobidentity.Job{WorkflowRef: b.JobWorkflowRef, Repository: b.OwnerName + "/" + b.RepositoryName,
+		Event: b.EventName, RunID: b.WorkflowRunID, JobID: b.JobID}
 }
 
 // jobAssignedAttrs are a JobAssigned message's log attributes. GitHub's
