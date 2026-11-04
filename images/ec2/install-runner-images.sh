@@ -50,7 +50,7 @@ install_runner_images() {
 	cp -a "$src/images/ubuntu/scripts/tests" "$ig/tests"
 	# "netcat" is a virtual package here, which apt cannot install by that name.
 	sed 's/"netcat"/"netcat-openbsd"/' "$src/images/ubuntu/toolsets/toolset-2404.json" >"$ig/installers/toolset.json"
-	if [ "$TOOLSET" = curated ]; then
+	if [ "$TOOLSET" = standard ]; then
 		curate_toolset "$ig/installers/toolset.json"
 		# install-docker.sh pulls images that a job can pull when it needs them.
 		sed -i 's/^\( *\)docker pull /\1: docker pull /' "$ig/installers/install-docker.sh"

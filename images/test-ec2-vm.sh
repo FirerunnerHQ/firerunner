@@ -7,7 +7,7 @@
 # job would see. Needs a Linux host with /dev/kvm, qemu, python3 and socat.
 #
 # Usage: images/test-ec2-vm.sh [--workdir DIR] [--runner-version V] [--vcpus N]
-#                              [--mem-mib N] [--toolset minimal|curated|full] [--disk-gib N]
+#                              [--mem-mib N] [--toolset standard|full|minimal] [--disk-gib N]
 #                              [--keep-image FILE]
 #
 # The image is what EC2 would snapshot, except for its kernel: this is Ubuntu's
