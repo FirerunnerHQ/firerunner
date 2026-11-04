@@ -36,6 +36,8 @@ type Registry struct {
 	stop   chan struct{}
 	done   chan struct{}
 	log    *slog.Logger
+	// discoverPause is discoverPause, shortened by tests.
+	discoverPause time.Duration
 }
 
 func NewRegistry(dir string, log *slog.Logger) (*Registry, error) {
