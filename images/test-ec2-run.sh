@@ -122,6 +122,7 @@ script() {
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
 		FIRERUNNER_CACHE_SETUP="$TMP/bin/fake-cache-setup" \
 		FIRERUNNER_TUNE="${TUNE:-$TMP/bin/no-tune}" \
+		FIRERUNNER_TUNE_TICKS="${TUNE_TICKS:-600}" \
 		TMPDIR="${SCRIPT_TMPDIR:-${TMPDIR:-/tmp}}" \
 		"${SCRIPT_SH:-sh}" -c 'trap "" PIPE; exec "$0" "$1"' "${SCRIPT_SH:-sh}" "$SCRIPT"
 }
@@ -434,6 +435,17 @@ FAKE
 	expect "tune $t: finished before the runner started" "" has tuned-first
 	expect "tune $t: the runner ran" "" has runner-argv
 done
+
+# A step stuck on a device must not hold the job back.
+fresh tune-stuck
+printf '#!/bin/sh\nexec sleep 5\n' > "$TMP/bin/fake-tune"
+printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+runner 'echo "Exiting runner..."'
+TUNE="$TMP/bin/fake-tune" TUNE_TICKS=2 run
+expect "tune stuck: the runner runs anyway" "" has runner-argv
+expect "tune stuck: says so" "$(cat "$STATE/stderr")" grep -q "tuning is still running" "$STATE/stderr"
 
 fresh tune-warmup
 : > "$STATE/userdata"

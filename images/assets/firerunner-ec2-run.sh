@@ -46,6 +46,8 @@ JIT_WAIT="${FIRERUNNER_JIT_WAIT:-600}"
 REPORT_TIMEOUT="${FIRERUNNER_REPORT_TIMEOUT:-2}"
 # Grows the disk and adds swap while the config is on its way (see below).
 TUNE="${FIRERUNNER_TUNE:-/usr/local/libexec/firerunner-ec2-tune}"
+# Bounds the wait for it, in tenths of a second.
+TUNE_TICKS="${FIRERUNNER_TUNE_TICKS:-600}"
 # Sets up the dependency cache from this instance's bundle (see below).
 CACHE_SETUP="${FIRERUNNER_CACHE_SETUP:-/usr/local/libexec/firerunner-cache-setup}"
 # Bounds the wait for the output reader after the runner exits, in tenths of
@@ -179,7 +181,19 @@ if ! cd "$RUNNER_DIR" 2>/dev/null || [ ! -x ./run.sh ]; then
 	log "no runnable $RUNNER_DIR/run.sh; powering off"
 	exit 0
 fi
-[ -z "$tune_pid" ] || wait "$tune_pid" || log "tuning failed; running the job anyway"
+# Bounded, unlike wait: a step stuck on a device must not hold the job back.
+if [ -n "$tune_pid" ]; then
+	waited=0
+	while kill -0 "$tune_pid" 2>/dev/null && [ "$waited" -lt "$TUNE_TICKS" ]; do
+		sleep 0.1
+		waited=$((waited + 1))
+	done
+	if kill -0 "$tune_pid" 2>/dev/null; then
+		log "tuning is still running; running the job anyway"
+	else
+		wait "$tune_pid" || log "tuning failed; running the job anyway"
+	fi
+fi
 # The instance is single-use and thrown away after the job.
 export RUNNER_ALLOW_RUNASROOT=1
 export HOME=/root
