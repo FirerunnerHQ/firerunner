@@ -121,6 +121,9 @@ script() {
 		FIRERUNNER_DRAIN_TICKS="${DRAIN_TICKS:-50}" \
 		FIRERUNNER_JIT_WAIT="${JIT_WAIT:-30}" \
 		FIRERUNNER_CACHE_SETUP="$TMP/bin/fake-cache-setup" \
+		FIRERUNNER_TUNE="${TUNE:-$TMP/bin/no-tune}" \
+		FIRERUNNER_TUNE_TICKS="${TUNE_TICKS:-600}" \
+		TUNE_EXIT="${TUNE_EXIT:-0}" \
 		TMPDIR="${SCRIPT_TMPDIR:-${TMPDIR:-/tmp}}" \
 		"${SCRIPT_SH:-sh}" -c 'trap "" PIPE; exec "$0" "$1"' "${SCRIPT_SH:-sh}" "$SCRIPT"
 }
@@ -412,6 +415,45 @@ runner 'echo "Exiting runner..."'
 run
 expect "no bundle: no setup" "" lacks setup-got
 expect "no bundle: the runner runs" "" has runner-argv
+
+# Tuning runs on a job boot, and the runner waits for it, up to a bound, so the
+# job sees the grown disk; a failure must not cost the job.
+for t in ok fail; do
+	fresh "tune-$t"
+	cat > "$TMP/bin/fake-tune" <<'FAKE'
+#!/bin/sh
+sleep 0.2
+: > "$STATE/tuned"
+exit "${TUNE_EXIT:-0}"
+FAKE
+	chmod +x "$TMP/bin/fake-tune"
+	printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+	echo 200 > "$STATE/jit-codes"
+	printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+	# shellcheck disable=SC2016 # the fake evaluates these
+	runner '[ -f "$STATE/tuned" ] && : > "$STATE/tuned-first"; echo "Exiting runner..."'
+	TUNE_EXIT="$([ "$t" = ok ] && echo 0 || echo 1)" TUNE="$TMP/bin/fake-tune" run
+	expect "tune $t: finished before the runner started" "" has tuned-first
+	expect "tune $t: the runner ran" "" has runner-argv
+done
+
+# A step stuck on a device must not hold the job back.
+fresh tune-stuck
+cp "$TMP/bin/fake-tune" "$TMP/bin/fake-tune.quick"
+printf '#!/bin/sh\nexec sleep 5\n' > "$TMP/bin/fake-tune"
+printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+runner 'echo "Exiting runner..."'
+TUNE="$TMP/bin/fake-tune" TUNE_TICKS=2 run
+expect "tune stuck: the runner runs anyway" "" has runner-argv
+expect "tune stuck: says so" "$(cat "$STATE/stderr")" grep -q "tuning is still running" "$STATE/stderr"
+cp "$TMP/bin/fake-tune.quick" "$TMP/bin/fake-tune"
+
+fresh tune-warmup
+: > "$STATE/userdata"
+TUNE="$TMP/bin/fake-tune" run
+expect "warm-up boot: no tuning (the disk may boot again unchanged)" "" lacks tuned
 
 for st in "$TMP"/state-*; do
 	expect "$(basename "$st"): finished" "hung" [ ! -f "$st/hung" ]

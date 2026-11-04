@@ -12,6 +12,9 @@
 #   - no cloud-init or snapd, and no timers that wake up during a job;
 #   - a netplan that matches any NIC (cloud-init's matches the builder's MAC);
 #   - an empty hostname and machine-id, so each instance gets its own.
+# And about making the job fast on a disk that lasts for one job:
+#   - ext4 without the guarantees that protect a disk across a crash;
+#   - firerunner-ec2-tune, which grows the disk and adds zram swap at boot.
 #
 # Settings (set by build-ec2-ami.sh):
 #   RUNNER_VERSION  actions/runner version, e.g. 2.338.1
@@ -42,13 +45,16 @@ apt_get() { apt-get -o DPkg::Lock::Timeout=600 "$@"; }
 apt_get update
 apt_get install -y --no-install-recommends \
 	docker.io zstd curl jq git ca-certificates \
-	nginx gcc libc6-dev
+	nginx gcc libc6-dev cloud-guest-utils
+# zram is in the kernel's extra modules on some Ubuntu kernels.
+apt_get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
 
 # Docker with the containerd image store, as on GitHub-hosted runners.
 install -d /etc/docker
 cat >/etc/docker/daemon.json <<'JSON'
 {
   "features": { "containerd-snapshotter": true },
+  "max-concurrent-downloads": 10,
   "log-driver": "json-file",
   "log-opts": { "max-size": "50m", "max-file": "2" }
 }
@@ -115,6 +121,26 @@ for unit in apt-daily.timer apt-daily-upgrade.timer man-db.timer motd-news.timer
 	ModemManager.service multipathd.service multipathd.socket; do
 	systemctl disable "$unit" 2>/dev/null || true
 done
+
+# Writes need not survive a crash: the disk is thrown away with the instance,
+# and a pool instance stops cleanly. data= cannot change on a remount, so
+# these go on the kernel command line.
+cat >/etc/default/grub.d/90-firerunner.cfg <<'GRUB'
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT rootflags=data=writeback,journal_async_commit,nobarrier quiet transparent_hugepage=always i8042.nokbd i8042.noaux i8042.nopnp"
+GRUB
+update-grub
+
+# As in runs-on/runner-images-for-aws (MIT). dpkg's fsyncs take most of an
+# install's time on EBS, and need not survive a crash here. xz, apt's default
+# for its indexes, decompresses several times slower than gzip.
+apt_get install -y --no-install-recommends eatmydata
+cat >/usr/local/sbin/dpkg-eatmydata <<'DPKG'
+#!/bin/sh
+exec /usr/bin/eatmydata /usr/bin/dpkg "$@"
+DPKG
+chmod 0755 /usr/local/sbin/dpkg-eatmydata
+echo 'Dir::Bin::dpkg "/usr/local/sbin/dpkg-eatmydata";' >/etc/apt/apt.conf.d/10dpkg-eatmydata
+echo 'Acquire::CompressionTypes::Order:: "gz";' >/etc/apt/apt.conf.d/10apt-gzip-indexes
 
 # Per-instance identity: an empty hostname is set from DHCP at boot, and an
 # empty machine-id is regenerated, so instances do not share the builder's.

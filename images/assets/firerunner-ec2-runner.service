@@ -14,6 +14,10 @@ TimeoutStartSec=0
 # journal stream fails writes (EPIPE) instead of killing the script before it
 # reports the runner's exit and powers off.
 IgnoreSIGPIPE=yes
+# A job's process killed for memory fails its step. It must not stop this
+# unit, the default: the script would take SIGTERM for the instance going away
+# and leave it running, billed, with nothing to power it off.
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

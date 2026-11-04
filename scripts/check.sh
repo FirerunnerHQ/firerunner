@@ -108,6 +108,7 @@ else
 	skip docker-shim "needs Linux (/proc)"
 fi
 step ec2-boot-script images/test-ec2-run.sh
+step ec2-boot-tuning images/test-ec2-tune.sh
 step ec2-cache-setup images/test-cache-setup.sh
 if [ "$(uname -s)" = Linux ] && command -v cc >/dev/null; then
 	step nodewrap images/test-nodewrap.sh
@@ -142,7 +143,7 @@ else
 	skip cfn-lint "neither cfn-lint, uvx nor pipx installed"
 fi
 if command -v shellcheck >/dev/null; then
-	step shellcheck shellcheck images/assets/firerunner-ec2-run.sh images/test-ec2-run.sh \
+	step shellcheck shellcheck images/assets/firerunner-ec2-run.sh images/test-ec2-run.sh images/assets/firerunner-ec2-tune.sh images/test-ec2-tune.sh images/test-ec2-vm.sh \
 		images/assets/firerunner-cache-setup.sh images/test-cache-setup.sh images/test-nodewrap.sh \
 		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh scripts/check.sh \
 		scripts/mutate.sh scripts/test-mutate.sh \

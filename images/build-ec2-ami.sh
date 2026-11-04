@@ -96,6 +96,11 @@ render_userdata() {
 	cat "$HERE/assets/firerunner-ec2-run.sh"
 	echo 'FIRERUNNER_RUN_SH'
 	echo 'chmod 0755 /usr/local/bin/firerunner-ec2-run.sh'
+	echo 'install -d /usr/local/libexec'
+	echo "cat >/usr/local/libexec/firerunner-ec2-tune <<'FIRERUNNER_TUNE'"
+	cat "$HERE/assets/firerunner-ec2-tune.sh"
+	echo 'FIRERUNNER_TUNE'
+	echo 'chmod 0755 /usr/local/libexec/firerunner-ec2-tune'
 	echo "cat >/etc/systemd/system/firerunner-ec2-runner.service <<'FIRERUNNER_UNIT'"
 	cat "$HERE/assets/firerunner-ec2-runner.service"
 	echo 'FIRERUNNER_UNIT'

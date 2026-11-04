@@ -155,6 +155,24 @@ build instance on every exit path. A build takes about 5 minutes.
   inbound rules and no instance profile.
 - `--render` prints the user-data without touching AWS.
 - `images/test-build-ec2-ami.sh` tests the script against a fake `aws`.
+- `images/test-ec2-vm.sh` tests the image with no AWS. On a Linux host with
+  KVM, it builds the image from Ubuntu's cloud image in a VM, boots it on a
+  larger disk against a fake IMDS and JIT endpoint, and checks what a job sees.
+
+Because the disk lasts for one job, the image favours speed over durability:
+
+- `firerunner-ec2-tune` grows the root filesystem to the volume's size on each
+  job boot, so `root_volume_gib` takes effect, adds zram swap as large as
+  memory, and reads Docker's and the runner's files in the background. Each
+  step is best effort, and the job starts either way.
+- The root filesystem mounts with `data=writeback`, `journal_async_commit` and
+  `nobarrier`. A pool instance stops cleanly, so these never risk a disk that
+  boots again.
+- Transparent huge pages are always on, `dpkg` runs under `eatmydata` and `apt`
+  fetches gzip indexes. The last two follow
+  [runner-images-for-aws](https://github.com/runs-on/runner-images-for-aws).
+- The boot service keeps `OOMPolicy=continue`: a job's process killed for
+  memory fails its step, and must not stop the service that powers off.
 
 The image contains:
 
