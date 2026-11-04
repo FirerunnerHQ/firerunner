@@ -980,6 +980,15 @@ func TestTierSchedule(t *testing.T) {
 	}
 }
 
+func TestFromFlags_EC2BaselineIOPSOnASmallVolume(t *testing.T) {
+	// 3000 is over 500 per GiB here, and gp3 still gives it at any size.
+	p := writeTiers(t, `[`+strings.Replace(ec2TierJSON, `"root_volume_gib":40`,
+		`"root_volume_gib":5,"root_volume_iops":3000`, 1)+`]`)
+	if _, err := FromFlags(append(append(baseArgs(), jitAddr...), "--tiers", p)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEC2VolumeThroughput(t *testing.T) {
 	for name, tc := range map[string]struct {
 		e    EC2Tier
