@@ -52,9 +52,11 @@ fresh() {
 	echo '{"features":{"containerd-snapshotter":true}}' >"$R/etc/docker/daemon.json"
 	jq -n --arg up "$2" '{ca: "CA-PEM", cert: "LEAF-PEM", key: "KEY-PEM", upstream: $up}' >"$STATE/bundle.json"
 }
+# The instance's /bin/sh is dash; macOS's sh is bash.
+POSIX_SH="$(command -v dash || echo sh)"
 setup() {
 	PATH="${FAKE_PATH:-$TMP/bin}:$JQ_DIR:/usr/bin:/bin" FIRERUNNER_CACHE_ROOT="$R" FIRERUNNER_RUNNER_DIR="$STATE/runner" \
-		sh "$SCRIPT" "$STATE/bundle.json" >"$STATE/out" 2>&1
+		"$POSIX_SH" "$SCRIPT" "$STATE/bundle.json" >"$STATE/out" 2>&1
 }
 refused() { ! setup; }
 mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
