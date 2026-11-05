@@ -165,6 +165,13 @@ DPKG
 chmod 0755 /usr/local/sbin/dpkg-eatmydata
 echo 'Dir::Bin::dpkg "/usr/local/sbin/dpkg-eatmydata";' >/etc/apt/apt.conf.d/10dpkg-eatmydata
 echo 'Acquire::CompressionTypes::Order:: "gz";' >/etc/apt/apt.conf.d/10apt-gzip-indexes
+# A job's apt-get update fetches only what apt itself needs: on EC2 this took it
+# from 4.7 to 2.4 s. These files also hold hooks that run after each update, and
+# would start Python from a disk that loads on first read.
+echo 'Acquire::Languages "none";' >/etc/apt/apt.conf.d/10apt-no-languages
+rm -f /etc/apt/apt.conf.d/50appstream /etc/apt/apt.conf.d/50command-not-found \
+	/etc/apt/apt.conf.d/20apt-esm-hook.conf /etc/apt/apt.conf.d/20packagekit \
+	/etc/apt/apt.conf.d/99update-notifier
 
 # Per-instance identity: an empty hostname is set from DHCP at boot, and an
 # empty machine-id is regenerated, so instances do not share the builder's.
