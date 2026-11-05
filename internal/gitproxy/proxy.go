@@ -15,11 +15,14 @@
 //
 // # Failure
 //
-// The cache must never fail a checkout that GitHub would have served, and not
+// A cache fault must not fail a checkout that GitHub would have served, and not
 // every client retries. So an entry is downloaded and checked before its first
 // byte goes out, and any failure until then goes to GitHub. An entry can pass
 // that and still hold the wrong objects, if a job wrote it so: git refuses it,
 // and as a key is served from the cache once per proxy, a retry reaches GitHub.
+//
+// The one thing this cannot cover is this process dying: a fetch in flight
+// fails. The unit then points git back at GitHub for the ones that follow.
 package gitproxy
 
 import (
@@ -36,6 +39,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +82,10 @@ const (
 	// disk. A pack is on disk twice while it is being stored, and the disk is
 	// the job's.
 	DefaultMinFree = 5 << 30
+
+	// recheckEvery is how much a response may grow between looks at the free
+	// space, which the job and other fetches are using too.
+	recheckEvery = 64 << 20
 )
 
 // ErrMiss is what Cache.Open returns when it holds no entry for a key.
@@ -150,18 +158,50 @@ func New(cfg Config) *Proxy {
 	}
 }
 
-// tempFile returns a file for a response, or nil when the disk is short of
-// room: the job's writes matter more than this proxy's.
-func (p *Proxy) tempFile() *os.File {
-	dir := p.cfg.TempDir
+// tempPattern names this package's temporary files.
+const tempPattern = "gitproxy-*"
+
+// ClearTemp removes files a killed proxy left in dir, or in the system's
+// temporary directory when dir is empty.
+func ClearTemp(dir string) error {
 	if dir == "" {
 		dir = os.TempDir()
 	}
-	if free, err := p.free(dir); err != nil || free < p.cfg.MinFree {
+	old, err := filepath.Glob(filepath.Join(dir, tempPattern))
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, path := range old {
+		errs = append(errs, os.Remove(path))
+	}
+	return errors.Join(errs...)
+}
+
+func (p *Proxy) tempDir() string {
+	if p.cfg.TempDir != "" {
+		return p.cfg.TempDir
+	}
+	return os.TempDir()
+}
+
+// roomOnDisk reports whether there is room to keep a response: the job's
+// writes matter more than this proxy's.
+func (p *Proxy) roomOnDisk() bool {
+	free, err := p.free(p.tempDir())
+	if err != nil || free < p.cfg.MinFree {
 		p.cfg.Log.Warn("git cache: disk short of room; keeping nothing", "err", err, "free", free)
+		return false
+	}
+	return true
+}
+
+// tempFile returns a file for a response, or nil when it should not keep one.
+func (p *Proxy) tempFile() *os.File {
+	if !p.roomOnDisk() {
 		return nil
 	}
-	f, err := os.CreateTemp(dir, "gitproxy-*")
+	f, err := os.CreateTemp(p.tempDir(), tempPattern)
 	if err != nil {
 		p.cfg.Log.Warn("git cache: no temporary file", "err", err)
 		return nil
@@ -444,6 +484,10 @@ func (s *pendingSave) write(b []byte) {
 	s.size += int64(len(b))
 	_, _ = s.check.Write(b)
 	if s.size > s.p.cfg.MaxSave {
+		s.discard()
+		return
+	}
+	if s.size/recheckEvery != (s.size-int64(len(b)))/recheckEvery && !s.p.roomOnDisk() {
 		s.discard()
 		return
 	}

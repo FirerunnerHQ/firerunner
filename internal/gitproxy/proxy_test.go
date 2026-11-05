@@ -626,7 +626,6 @@ func TestLowDisk_KeepsNothingAndStillServes(t *testing.T) {
 	h.requireNothingStored()
 
 	// A hit needs the same room, and GitHub answers instead.
-	h.cache.entries["any"] = goodPack
 	other := newHarness(t, func(c *Config) { c.Cache = readerCache{strings.NewReader(goodPack)} })
 	other.p.free = h.p.free
 	other.refs("t")
@@ -635,6 +634,51 @@ func TestLowDisk_KeepsNothingAndStillServes(t *testing.T) {
 	}
 	if other.gh.fetches.Load() != 1 {
 		t.Fatal("a hit spooled to a full disk")
+	}
+}
+
+// The disk can fill while a large response is on its way, by the job or by
+// another fetch: the proxy must give way before the job's writes fail.
+func TestDiskFillsDuringASave_StopsKeepingIt(t *testing.T) {
+	h := newHarness(t, nil)
+	var looks atomic.Int32
+	h.p.free = func(string) (int64, error) {
+		if looks.Add(1) > 1 {
+			return 0, nil
+		}
+		return DefaultMinFree, nil
+	}
+	large := pkt("packfile\n") + strings.Repeat(pkt("\x01"+strings.Repeat("x", 60000)), recheckEvery/60000+2) + "0000"
+	h.gh.body = strings.NewReader(large)
+	h.refs("t")
+	if got, err := h.fetch("t"); err != nil || got != large {
+		t.Fatalf("fetch: %d bytes, %v", len(got), err)
+	}
+	if looks.Load() < 2 {
+		t.Fatal("the space was never looked at again")
+	}
+	h.requireNothingStored()
+	if h.tempFiles() != 0 {
+		t.Fatal("the temporary file stayed")
+	}
+}
+
+func TestClearTemp_RemovesOnlyItsOwnFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"gitproxy-1", "gitproxy-2", "keep"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ClearTemp(dir); err != nil {
+		t.Fatal(err)
+	}
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 || left[0].Name() != "keep" {
+		t.Fatalf("left %v", left)
 	}
 }
 
