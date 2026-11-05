@@ -355,27 +355,38 @@ func TestLookupFailure_FallsThroughToGitHub(t *testing.T) {
 	if h.gh.fetches.Load() != 1 {
 		t.Fatal("GitHub was not asked")
 	}
+	if h.cache.opens != 1 {
+		t.Fatal("the cache was never asked, so this proved nothing")
+	}
 }
 
 // A lookup stuck past its limit must not hold the checkout.
 func TestLookupStuck_FallsThroughToGitHub(t *testing.T) {
+	stuck := &stuckCache{}
 	h := newHarness(t, func(c *Config) {
-		c.Cache = stuckCache{}
+		c.Cache = stuck
 		c.LookupTimeout = 50 * time.Millisecond
 	})
 	h.refs("t")
 	if got, err := h.fetch("t"); err != nil || got != goodPack {
 		t.Fatalf("fetch = %q, %v", got, err)
 	}
+	if !stuck.opened.Load() {
+		t.Fatal("the cache was never asked, so this proved nothing")
+	}
 }
 
-type stuckCache struct{ Cache }
+type stuckCache struct {
+	Cache
+	opened atomic.Bool
+}
 
-func (stuckCache) Open(ctx context.Context, _ string) (io.ReadCloser, error) {
+func (s *stuckCache) Open(ctx context.Context, _ string) (io.ReadCloser, error) {
+	s.opened.Store(true)
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
-func (stuckCache) Save(context.Context, string, string, int64) error { return nil }
+func (*stuckCache) Save(context.Context, string, string, int64) error { return nil }
 
 // The lookup's limit must not reach the stream that follows it.
 func TestHit_OutlivesTheLookupLimit(t *testing.T) {

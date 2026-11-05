@@ -81,6 +81,7 @@ type realGit struct {
 	proxy   string
 	caFile  string
 	head    string
+	parent  string
 	fetches atomic.Int32
 	cert    tls.Certificate
 	dial    string
@@ -104,6 +105,11 @@ func newRealGit(t *testing.T) *realGit {
 	}
 	gitCmd(t, work, "add", "file")
 	gitCmd(t, work, "commit", "-q", "-m", "first")
+	parent := gitCmd(t, work, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(work, "file"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, work, "commit", "-q", "-am", "second")
 	bare := filepath.Join(root, "o", "r.git")
 	if err := os.MkdirAll(filepath.Dir(bare), 0o755); err != nil {
 		t.Fatal(err)
@@ -111,7 +117,7 @@ func newRealGit(t *testing.T) *realGit {
 	gitCmd(t, root, "clone", "-q", "--bare", work, bare)
 	gitCmd(t, bare, "config", "uploadpack.allowAnySHA1InWant", "true")
 
-	g := &realGit{t: t, head: gitCmd(t, work, "rev-parse", "HEAD")}
+	g := &realGit{t: t, head: gitCmd(t, work, "rev-parse", "HEAD"), parent: parent}
 	cgiHandler := &cgi.Handler{
 		Path: backend,
 		Dir:  root,
@@ -249,5 +255,50 @@ func TestRealGit_CacheDownIsInvisible(t *testing.T) {
 	g.startProxy(c)
 	if got, err := g.fetch(); err != nil || got != g.head {
 		t.Fatalf("fetch = %q, %v", got, err)
+	}
+	if c.opens == 0 {
+		t.Fatal("the cache was never asked, so this proved nothing")
+	}
+}
+
+// An entry can be a whole, valid response for the wrong commit, if a job wrote
+// it. Only git can tell, and its retry must not meet the same entry.
+func TestRealGit_RefusesTheWrongCommitAndRecoversOnRetry(t *testing.T) {
+	g := newRealGit(t)
+	c := newFakeCache()
+	p := g.startProxy(c)
+	if _, err := g.fetch(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, p)
+	wanted := g.head
+	var key string
+	for k := range c.entries {
+		key = k
+	}
+	g.head = g.parent
+	p = g.startProxy(c)
+	if _, err := g.fetch(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, p)
+	for k, v := range c.entries {
+		if k != key {
+			c.entries[key] = v // the parent's response under the head's key
+		}
+	}
+
+	g.head = wanted
+	g.startProxy(c)
+	before := g.fetches.Load()
+	if got, err := g.fetch(); err == nil {
+		t.Fatalf("git accepted the wrong commit: %s", got)
+	}
+	got, err := g.fetch()
+	if err != nil || got != wanted {
+		t.Fatalf("retry = %q, %v", got, err)
+	}
+	if g.fetches.Load() == before {
+		t.Fatal("the retry did not reach the upstream")
 	}
 }
