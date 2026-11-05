@@ -64,7 +64,7 @@ func Parse(body []byte) (Fetch, error) {
 	command := false
 	for _, l := range caps {
 		switch {
-		case l == "command=fetch":
+		case l == "command=fetch" && !command:
 			command = true
 		case strings.HasPrefix(l, "command="):
 			return Fetch{}, notCacheable("%s", l)

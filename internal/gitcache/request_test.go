@@ -110,6 +110,7 @@ func TestParse_Refuses(t *testing.T) {
 		"bad blob limit":  request(fetchCaps, []string{"want " + oidA, "filter blob:limit=HEAD:x", "done"}),
 		"empty filter":    request(fetchCaps, []string{"want " + oidA, "filter", "done"}),
 		"include-tag":     request(fetchCaps, []string{"want " + oidA, "include-tag", "done"}),
+		"fetch twice":     request(append(fetchCaps[:3:3], "command=fetch"), []string{"want " + oidA, "done"}),
 		"empty":           nil,
 		"not pkt-line":    []byte("zzzz"),
 		"truncated":       []byte("0014command=fe"),
