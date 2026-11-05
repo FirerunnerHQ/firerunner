@@ -143,6 +143,7 @@ PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --arch arm64 >"$S
 expect "render prints the user-data" "" grep -q '^RUNNER_ARCH=arm64$' "$STATE/out"
 expect "render touches no AWS" "" not_called "ec2"
 expect "render ships the SYN rule" "" grep -q 'masquerade fully-random' "$STATE/out"
+expect "the SYN rule leaves the local cache proxy alone" "" grep -q 'daddr != {.*127.0.0.0/8' "$STATE/out"
 expect "render enables its units" "" grep -q '^systemctl enable firerunner-syn-reroll.service firerunner-syn-reroll-stop.timer$' "$STATE/out"
 expect "render drops the boot script's comments" "" not_grep 'Powering off ends the instance' "$STATE/out"
 expect "render keeps the boot script's commands" "" grep -q 'POWEROFF_FAST:-systemctl poweroff --force' "$STATE/out"

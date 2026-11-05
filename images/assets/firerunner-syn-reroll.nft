@@ -12,7 +12,8 @@
 # waiting on the dead one. The firerunner-syn-reroll units load this, and flush
 # it, never delete it: connections opened meanwhile keep their NAT binding.
 #
-# Private addresses are left out: the control VM, a cache, containers.
+# Private and loopback addresses are left out: the control VM, the local cache
+# proxy, containers.
 #
 # Adapted from runs-on/runner-images-for-aws, MIT License,
 # Copyright (c) 2023 Cyril Rohr.
@@ -23,6 +24,6 @@ table ip firerunner_syn {
 	}
 	chain post {
 		type nat hook postrouting priority srcnat - 1; policy accept;
-		tcp dport 443 ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } ct timeout set "syn1s" masquerade fully-random
+		tcp dport 443 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } ct timeout set "syn1s" masquerade fully-random
 	}
 }
