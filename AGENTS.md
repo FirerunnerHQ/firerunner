@@ -188,6 +188,7 @@ The usual dev box is macOS with zsh; much of the code and CI is Linux.
 | `internal/listener` | GitHub scale-set sessions, with per-tier reconnect |
 | `internal/provisioner` | Firecracker microVMs, Linux only |
 | `internal/ec2` | one EC2 instance per job; `internal/jitserver` serves its JIT config once over the VPC |
+| `internal/gitcache` | which git fetches can be served from a cache, and under what key |
 | `internal/health` | per-tier listener state, published for `status`/`doctor` |
 | `internal/diag` | `status` and `doctor` |
 | `internal/migrate` | `firerunner migrate`: in-place `runs-on` rewrites, and the PR it opens as the user |
