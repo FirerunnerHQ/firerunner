@@ -38,6 +38,28 @@ func TestFromFlags_Valid(t *testing.T) {
 	}
 }
 
+func TestUsesEC2GitCache(t *testing.T) {
+	tier := func(cache, git bool) Tier {
+		return Tier{Name: "t", Provisioner: ProvisionerEC2, EC2: &EC2Tier{Cache: cache, GitCache: git}}
+	}
+	for name, tc := range map[string]struct {
+		tiers []Tier
+		want  bool
+	}{
+		"none":        {nil, false},
+		"cache alone": {[]Tier{tier(true, false)}, false},
+		"git cache":   {[]Tier{tier(true, true)}, true},
+		"one of two":  {[]Tier{tier(true, false), tier(true, true)}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := &Config{Tiers: tc.tiers}
+			if got := c.UsesEC2GitCache(); got != tc.want {
+				t.Fatalf("UsesEC2GitCache = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestFromFlags_CacheConfig(t *testing.T) {
 	c, err := FromFlags(append(baseArgs(), "--cache-port", "8099"))
 	if err != nil {

@@ -12,7 +12,10 @@
 // A tier with a git cache gets a second CA, for github.com, with its own leaf.
 // It stays apart because it is trusted differently: the results host's CA goes
 // into the instance's system store, which would make every tool there accept a
-// leaf for github.com. The git CA is trusted by git alone, through sslCAInfo.
+// leaf for github.com. The git CA is trusted by git alone, through sslCAInfo,
+// for https://github.com/. A name constraint also admits subdomains, so this one
+// could sign for api.github.com, but its key stays here and leaves name only
+// github.com.
 package cachetls
 
 import (
