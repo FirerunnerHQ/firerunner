@@ -151,7 +151,8 @@ func (p *Proxy) Wait(ctx context.Context) {
 // ServeHTTP answers CONNECT github.com:443 and refuses everything else, so the
 // proxy cannot be used to reach any other host.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodConnect || r.Host != Host+":443" {
+	// git matches a URL's host without regard to case, so GitHub.com arrives.
+	if r.Method != http.MethodConnect || !strings.EqualFold(r.Host, Host+":443") {
 		http.Error(w, "only CONNECT "+Host+":443", http.StatusForbidden)
 		return
 	}

@@ -752,6 +752,24 @@ func TestGitHubUnreachable_IsABadGateway(t *testing.T) {
 	}
 }
 
+func TestServeHTTP_AcceptsGitHubInAnyCase(t *testing.T) {
+	srv := httptest.NewServer(New(Config{Cache: newFakeCache()}))
+	defer srv.Close()
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprint(conn, "CONNECT GitHub.com:443 HTTP/1.1\r\nHost: GitHub.com:443\r\n\r\n")
+	res, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT = %d", res.StatusCode)
+	}
+}
+
 func TestServeHTTP_RefusesAnythingButGitHub(t *testing.T) {
 	srv := httptest.NewServer(New(Config{Cache: newFakeCache()}))
 	defer srv.Close()
