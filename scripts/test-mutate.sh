@@ -187,7 +187,7 @@ expect "exec failing baseline: untouched" "" restored
 # behind: not the test, not what it started.
 fresh_sh exec-hang
 rm -f "$PIDFILE"
-MUTATE_TIMEOUT=1s mutate guard.sh '[ "$1" -gt 10 ]' 'sleep 300 & echo $! >"$PIDFILE"; wait' --exec ./test-guard.sh
+MUTATE_BASELINE=0 MUTATE_TIMEOUT=1s mutate guard.sh '[ "$1" -gt 10 ]' 'sleep 300 & echo $! >"$PIDFILE"; wait' --exec ./test-guard.sh
 expect "exec hang: CAUGHT by the deadline" "$(cat "$OUT")" verdict_is CAUGHT
 expect "exec hang: exit 124 reported" "$LAST" grep -q 'exit 124' <<<"$LAST"
 expect "exec hang: says it timed out" "" grep -q 'passed its 1s deadline' "$OUT"

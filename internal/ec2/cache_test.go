@@ -105,6 +105,48 @@ func TestLaunch_CachedTierGetsABundleAndAnIdentity(t *testing.T) {
 	}
 }
 
+func TestLaunch_GitCacheTierGetsAGitIdentity(t *testing.T) {
+	git, err := cachetls.LoadOrCreateFor(t.TempDir(), cachetls.GitHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Cache, o.EC2.GitCache = true, true
+		o.Cache = cacheOpts(t, nil)
+		o.Cache.GitCA = git
+	})
+	errc := h.launch(context.Background())
+	inst := h.instance(t)
+	code, b := h.cacheBundle(t, inst.ip)
+	h.f.setState(inst.id, types.InstanceStateNameTerminated)
+	waitErr(t, errc)
+	if code != http.StatusOK || b.Git == nil || b.Git.CA != string(git.CertPEM()) {
+		t.Fatalf("bundle = %d, git identity %+v", code, b.Git)
+	}
+}
+
+// A deployment may have the git CA while this tier does not ask for it: the
+// identity for github.com goes only where a tier chose it.
+func TestLaunch_CachedTierWithoutGitCacheGetsNoGitIdentity(t *testing.T) {
+	git, err := cachetls.LoadOrCreateFor(t.TempDir(), cachetls.GitHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Cache = true
+		o.Cache = cacheOpts(t, nil)
+		o.Cache.GitCA = git
+	})
+	errc := h.launch(context.Background())
+	inst := h.instance(t)
+	code, b := h.cacheBundle(t, inst.ip)
+	h.f.setState(inst.id, types.InstanceStateNameTerminated)
+	waitErr(t, errc)
+	if code != http.StatusOK || b.Git != nil {
+		t.Fatalf("bundle = %d, git identity %+v", code, b.Git)
+	}
+}
+
 func TestLaunch_UncachedTierGetsNoBundle(t *testing.T) {
 	jobs := &fakeJobs{bound: map[string]string{}}
 	h := newHarness(t, func(o *Options) { o.Cache = cacheOpts(t, jobs) }) // ec2.cache off

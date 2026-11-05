@@ -660,6 +660,22 @@ func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger, onRunne
 	}, nil
 }
 
+// loadCacheCAs returns the results host's CA and, when a tier has a git cache,
+// the CA for github.com. A CA nothing needs is not created.
+func loadCacheCAs(cfg *config.Config) (ca, git *cachetls.CA, err error) {
+	ca, err = cachetls.LoadOrCreate(filepath.Join(cfg.Firecracker.WorkDir, "cache-tls"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("cache CA: %w", err)
+	}
+	if cfg.UsesEC2GitCache() {
+		git, err = cachetls.LoadOrCreateFor(filepath.Join(cfg.Firecracker.WorkDir, "git-tls"), cachetls.GitHost)
+		if err != nil {
+			return nil, nil, fmt.Errorf("git cache CA: %w", err)
+		}
+	}
+	return ca, git, nil
+}
+
 // firecrackerCache reports whether microVMs use a local cache-server.
 func firecrackerCache(cfg *config.Config) bool {
 	return cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != ""
@@ -794,11 +810,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	var ec2Cache *ec2.CacheOptions
 	if cfg.UsesEC2Cache() {
-		ca, err := cachetls.LoadOrCreate(filepath.Join(cfg.Firecracker.WorkDir, "cache-tls"))
+		ca, gitCA, err := loadCacheCAs(cfg)
 		if err != nil {
-			return fmt.Errorf("cache CA: %w", err)
+			return err
 		}
-		ec2Cache = &ec2.CacheOptions{CA: ca, Upstream: cfg.EC2CacheAddr, Jobs: cacheJobs, LeafTTL: leafTTL(cfg)}
+		ec2Cache = &ec2.CacheOptions{CA: ca, GitCA: gitCA, Upstream: cfg.EC2CacheAddr, Jobs: cacheJobs, LeafTTL: leafTTL(cfg)}
 		log.Info("EC2 cache proxy enabled", "upstream", cfg.EC2CacheAddr, "leafTTL", ec2Cache.LeafTTL)
 	}
 	var fc *provisioner.Firecracker

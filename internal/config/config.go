@@ -250,6 +250,10 @@ type EC2Tier struct {
 	// answers as GitHub's results host (see internal/cachetls). Off by
 	// default.
 	Cache bool `json:"cache,omitempty"`
+	// GitCache serves a fresh checkout's fetch through cache-server, by an
+	// instance proxy that git alone is pointed at (see internal/gitproxy). It
+	// needs Cache. Off by default: repository contents enter the cache.
+	GitCache bool `json:"git_cache,omitempty"`
 }
 
 // PoolFor matches pending jobs by event (e.g. "pull_request") or by job
@@ -839,6 +843,16 @@ func (c *Config) UsesEC2Cache() bool {
 	return false
 }
 
+// UsesEC2GitCache reports whether a tier asks for the git checkout cache.
+func (c *Config) UsesEC2GitCache() bool {
+	for _, t := range c.EffectiveTiers() {
+		if t.IsEC2() && t.EC2 != nil && t.EC2.GitCache {
+			return true
+		}
+	}
+	return false
+}
+
 // validateEC2Cache requires a cache-server address instances can reach when
 // a tier sends its cache there: an IP or DNS name, and a port.
 func (c *Config) validateEC2Cache() error {
@@ -957,6 +971,8 @@ func validateVolumePerformance(tier string, e *EC2Tier) error {
 		return fmt.Errorf("tier %q: ec2.root_volume_iops %d is over %d per GiB of root_volume_gib", tier, iops, maxGP3IOPSPerGiB)
 	case e.RootVolumeInitRate != 0 && (e.RootVolumeInitRate < minVolumeInitRate || e.RootVolumeInitRate > maxVolumeInitRate):
 		return fmt.Errorf("tier %q: ec2.root_volume_init_rate %d must be %d-%d MiB/s", tier, e.RootVolumeInitRate, minVolumeInitRate, maxVolumeInitRate)
+	case e.GitCache && !e.Cache:
+		return fmt.Errorf("tier %q: ec2.git_cache needs ec2.cache: it stores through cache-server", tier)
 	case e.DockerStorage != "" && e.DockerStorage != DockerStorageDisk && e.DockerStorage != DockerStorageMemory:
 		return fmt.Errorf("tier %q: ec2.docker_storage %q must be %q or %q", tier, e.DockerStorage, DockerStorageDisk, DockerStorageMemory)
 	}

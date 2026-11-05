@@ -152,6 +152,9 @@ const (
 type CacheOptions struct {
 	// CA issues each instance's leaf for the results host.
 	CA *cachetls.CA
+	// GitCA issues each instance's leaf for github.com, for a tier with a git
+	// cache.
+	GitCA *cachetls.CA
 	// Upstream is cache-server's host:port as instances reach it.
 	Upstream string
 	// Jobs binds an instance's address to its runner, as cache-server reads
@@ -183,7 +186,11 @@ func (p *Provisioner) register(ip netip.Addr, name, jit string) (release func(),
 		}
 		return func() { p.o.JIT.Revoke(ip) }, nil
 	}
-	bundle, err := c.CA.Bundle(c.LeafTTL, c.Upstream)
+	var git *cachetls.CA
+	if p.o.EC2.GitCache {
+		git = c.GitCA
+	}
+	bundle, err := c.CA.Bundle(c.LeafTTL, c.Upstream, git)
 	if err != nil {
 		p.log.Warn("no cache bundle; the job runs without the cache", "runner", name, "err", err)
 		if err := p.o.JIT.Register(ip, name, jit); err != nil {
