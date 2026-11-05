@@ -444,6 +444,29 @@ func (c readerCache) Open(context.Context, string) (io.ReadCloser, error) {
 }
 func (readerCache) Save(context.Context, string, string, int64) error { return nil }
 
+// failsWithData returns its data and an error from the same Read, and then
+// looks like a clean end.
+type failsWithData struct {
+	data string
+	done bool
+}
+
+func (f *failsWithData) Read(p []byte) (int, error) {
+	if f.done {
+		return 0, io.EOF
+	}
+	f.done = true
+	return copy(p, f.data), errors.New("connection reset")
+}
+
+func TestHit_ErrorWithItsLastDataAborts(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.Cache = readerCache{&failsWithData{data: goodPack}} })
+	h.refs("t")
+	if _, err := h.fetch("t"); err == nil {
+		t.Fatal("a read error was taken for a clean end")
+	}
+}
+
 // A read that returns data and an error together must not lose the data.
 func TestHit_ServesDataThatArrivesWithEOF(t *testing.T) {
 	h := newHarness(t, func(c *Config) { c.Cache = readerCache{iotest.DataErrReader(strings.NewReader(goodPack))} })
@@ -676,20 +699,25 @@ func TestForward_StaysOnGitHub(t *testing.T) {
 		hosts = append(hosts, r.URL.Host)
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}, Request: r}, nil
 	})
-	for _, target := range []string{
-		"https:@example.com/path",
-		"http://example.com/path",
-		"//example.com/path",
-		"*",
-	} {
+	send := func(target string) {
+		t.Helper()
 		conn, err := net.Dial("tcp", h.srv.Listener.Addr().String())
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer conn.Close()
 		fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: github.com\r\nAuthorization: secret\r\nConnection: close\r\n\r\n", target)
 		_, _ = io.ReadAll(conn)
-		conn.Close()
 	}
+	for _, target := range []string{"https:@example.com/path", "http://example.com/path", "*"} {
+		send(target)
+		if len(hosts) != 0 {
+			t.Fatalf("%q was forwarded, to %v", target, hosts)
+		}
+	}
+	// An odd path is only a path, and stays on github.com.
+	send("//example.com/path")
+	send("/@example.com/path")
 	for _, host := range hosts {
 		if host != Host {
 			t.Errorf("forwarded to %q", host)

@@ -303,7 +303,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, key string) boo
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body io.Reader, saveKey *string) int {
 	// Built from parts: a request target can hold anything, and pasted after
 	// the host, "@example.com/" would send the job's token to example.com.
-	if r.URL.Opaque != "" || r.URL.Host != "" || !strings.HasPrefix(r.URL.Path, "/") {
+	if r.URL.Host != "" || !strings.HasPrefix(r.URL.Path, "/") {
 		http.Error(w, "bad request target", http.StatusBadRequest)
 		return http.StatusBadRequest
 	}
