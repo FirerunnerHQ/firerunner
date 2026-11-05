@@ -108,6 +108,12 @@ if [ -z "$runner_version" ]; then
 fi
 [[ "$runner_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "bad runner version '$runner_version'"
 
+# strip prints an asset without its comment lines, keeping the first line: the
+# comments are for this repository, and EC2 caps compressed user-data at 16 KiB.
+strip() {
+	sed '1!{/^[[:space:]]*#/d;}' "$1"
+}
+
 # render prints the build instance's user-data: the settings, a function that
 # installs the boot script and unit, then provision.sh's body.
 render_userdata() {
@@ -117,18 +123,29 @@ render_userdata() {
 	cat "$HERE/ec2/install-runner-images.sh"
 	echo 'install_boot_unit() {'
 	echo "cat >/usr/local/bin/firerunner-ec2-run.sh <<'FIRERUNNER_RUN_SH'"
-	cat "$HERE/assets/firerunner-ec2-run.sh"
+	strip "$HERE/assets/firerunner-ec2-run.sh"
 	echo 'FIRERUNNER_RUN_SH'
 	echo 'chmod 0755 /usr/local/bin/firerunner-ec2-run.sh'
 	echo 'install -d /usr/local/libexec'
 	echo "cat >/usr/local/libexec/firerunner-ec2-tune <<'FIRERUNNER_TUNE'"
-	cat "$HERE/assets/firerunner-ec2-tune.sh"
+	strip "$HERE/assets/firerunner-ec2-tune.sh"
 	echo 'FIRERUNNER_TUNE'
 	echo 'chmod 0755 /usr/local/libexec/firerunner-ec2-tune'
 	echo "cat >/etc/systemd/system/firerunner-ec2-runner.service <<'FIRERUNNER_UNIT'"
-	cat "$HERE/assets/firerunner-ec2-runner.service"
+	strip "$HERE/assets/firerunner-ec2-runner.service"
 	echo 'FIRERUNNER_UNIT'
 	echo 'systemctl enable firerunner-ec2-runner.service'
+	echo 'install -d /etc/firerunner'
+	echo "cat >/etc/firerunner/syn-reroll.nft <<'FIRERUNNER_SYN'"
+	strip "$HERE/assets/firerunner-syn-reroll.nft"
+	echo 'FIRERUNNER_SYN'
+	local unit
+	for unit in firerunner-syn-reroll.service firerunner-syn-reroll-stop.service firerunner-syn-reroll-stop.timer; do
+		echo "cat >/etc/systemd/system/$unit <<'FIRERUNNER_SYN_UNIT'"
+		strip "$HERE/assets/$unit"
+		echo 'FIRERUNNER_SYN_UNIT'
+	done
+	echo 'systemctl enable firerunner-syn-reroll.service firerunner-syn-reroll-stop.timer'
 	echo '}'
 	# The dependency cache proxy (#28): inactive until a bundle arrives.
 	echo 'install_cache_proxy() {'

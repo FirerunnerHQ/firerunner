@@ -1,0 +1,20 @@
+[Unit]
+Description=Retry stalled SYNs on a new source port during early boot
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Nothing waits for this to succeed; it must not hang the boot.
+TimeoutStartSec=10s
+ExecStart=/usr/sbin/nft -f /etc/firerunner/syn-reroll.nft
+# Retransmit every second, not at 1, 3, 7, 15 s. Conntrack marks some packets
+# of fast transfers out of window; those skip NAT and draw a reset, so it must
+# accept them for a connection NATed here.
+ExecStartPost=/bin/sh -c 'echo 10 > /proc/sys/net/ipv4/tcp_syn_linear_timeouts; echo 1 > /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal'
+
+[Install]
+WantedBy=sysinit.target

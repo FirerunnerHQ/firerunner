@@ -1,0 +1,9 @@
+[Unit]
+Description=Stop retrying stalled SYNs two minutes after boot
+
+[Timer]
+OnBootSec=120
+AccuracySec=1s
+
+[Install]
+WantedBy=multi-user.target

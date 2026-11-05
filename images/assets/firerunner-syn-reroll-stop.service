@@ -1,0 +1,9 @@
+[Unit]
+Description=Stop retrying stalled SYNs on a new source port
+After=firerunner-syn-reroll.service
+
+[Service]
+Type=oneshot
+# Flushed, never deleted: connections opened until now keep their NAT binding.
+ExecStart=/usr/sbin/nft flush chain ip firerunner_syn post
+ExecStartPost=/bin/sh -c 'echo 4 > /proc/sys/net/ipv4/tcp_syn_linear_timeouts'

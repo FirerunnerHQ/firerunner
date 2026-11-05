@@ -70,6 +70,26 @@ say "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
 say "apt: $(apt-config dump | grep -E 'Dir::Bin::dpkg|CompressionTypes::Order' | tr '\n' ' ')"
 say "memtotal_kib: $(awk '/MemTotal/{print $2}' /proc/meminfo)"
 say "boot: $(systemd-analyze time 2>&1 | head -1)"
+# Before anything slow: the rule lasts two minutes.
+# A path that loses every even source port, past conntrack, as AWS's does. A
+# retry on the same port never arrives, so each connection needs both the rule's
+# random port and its 1 s conntrack entry. Half take no retry at all. A working
+# rule fails this with odds of about 2^-14 per connection: 14 tries fit in 30 s.
+SUDO=""
+[ "$(id -u)" = 0 ] || SUDO="sudo -n"
+say "syn_rule: $($SUDO nft list chain ip firerunner_syn post 2>&1 | grep -c masquerade)"
+say "syn_retry_gap: $(cat /proc/sys/net/ipv4/tcp_syn_linear_timeouts)"
+nic="$(ip -o route get 1.1.1.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')"
+$SUDO tc qdisc add dev "$nic" clsact
+$SUDO tc filter add dev "$nic" egress protocol ip prio 1 u32 match ip dport 443 0xffff match ip sport 0 1 action drop
+say "syn_loss: $($SUDO tc filter show dev "$nic" egress | grep -c 'match')"
+ok=0 worst=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+	t="$(curl -s -o /dev/null -m 30 -w '%{time_connect}' https://github.com/ 2>/dev/null)" && ok=$((ok + 1))
+	worst="$(awk "BEGIN{print ($t + 0 > $worst) ? $t : $worst}")"
+done
+say "syn_lossy: $ok of 12 connected, worst ${worst}s"
+$SUDO tc qdisc del dev "$nic" clsact
 for t in gcc make unzip node npm python3 pip3 java go rustc cargo ruby gh aws az kubectl yq; do
 	say "tool $t: $(command -v "$t" || echo MISSING)"
 done
@@ -83,6 +103,11 @@ s=$(date +%s.%N)
 timeout 120 docker run --rm hello-world >/dev/null 2>&1
 rc=$?
 say "docker_first_run: rc=$rc $(awk "BEGIN{print $(date +%s.%N)-$s}") s"
+while [ "$(cut -d. -f1 /proc/uptime)" -lt 125 ]; do sleep 2; done
+say "syn_rule_after: $($SUDO nft list chain ip firerunner_syn post 2>&1 | grep -c masquerade)"
+say "syn_retry_gap_after: $(cat /proc/sys/net/ipv4/tcp_syn_linear_timeouts)"
+say "boot_settled: $(systemd-analyze time 2>&1 | head -1)"
+say "boot_units: $(systemd-analyze blame --no-pager 2>/dev/null | grep -E 'syn-reroll|network|docker.service' | tr -s ' ' | tr '\n' ';')"
 for d in /var/lib/docker /var/lib/containerd; do
 	say "docker_dir: $d on $(findmnt -no SOURCE -T "$d")"
 done
@@ -206,6 +231,12 @@ if [ "$docker_storage" = memory ]; then
 else
 	check "docker's data is on the disk" 'docker_dir: /var/lib/docker on /dev/(root|vda)'
 fi
+check "the SYN rule is on at boot" 'syn_rule: 1'
+check "SYNs retry every second at boot" 'syn_retry_gap: 10'
+check "the lossy path is in place" 'syn_loss: [1-9]'
+check "a retry takes a new port through a lossy path" 'syn_lossy: 12 of 12'
+check "the SYN rule is gone after two minutes" 'syn_rule_after: 0'
+check "SYN retries return to the default" 'syn_retry_gap_after: 4'
 check "huge pages are always on" 'thp: \[always\]'
 check "dpkg runs under eatmydata" 'apt:.*dpkg-eatmydata'
 check "apt prefers gzip indexes" 'apt:.*"gz"'

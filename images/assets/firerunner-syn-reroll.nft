@@ -1,0 +1,29 @@
+#!/usr/sbin/nft -f
+#
+# In us-east-1, a new instance loses the SYNs of some outbound connections in
+# its first half minute: 6 of 20 instances, each for 1-38 s, while other
+# connections from the same instance went through at once. A stalled connection
+# stays dead on its 5-tuple.
+#
+# So for the first two minutes after boot, HTTPS to public addresses leaves
+# through masquerade on a random source port, and its conntrack entry lasts 1 s
+# after the SYN, which a retransmission does not renew. Each retransmission
+# then makes a new entry and a new port, a new flow every second instead of
+# waiting on the dead one. The firerunner-syn-reroll units load this, and flush
+# it, never delete it: connections opened meanwhile keep their NAT binding.
+#
+# Private and loopback addresses are left out: the control VM, the local cache
+# proxy, containers.
+#
+# Adapted from runs-on/runner-images-for-aws, MIT License,
+# Copyright (c) 2023 Cyril Rohr.
+table ip firerunner_syn {
+	ct timeout syn1s {
+		protocol tcp; l3proto ip;
+		policy = { syn_sent : 1 };
+	}
+	chain post {
+		type nat hook postrouting priority srcnat - 1; policy accept;
+		tcp dport 443 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } ct timeout set "syn1s" masquerade fully-random
+	}
+}
