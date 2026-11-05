@@ -73,15 +73,21 @@ run off
 # A lock another git left must not keep git pointed at a dead port.
 run on
 : >"$GIT_CONFIG_SYSTEM.lock"
-TRIES=2 run off
+began=$SECONDS
+run off
+took=$((SECONDS - began))
 pass "stale lock: exits 0" [ "$rc" = 0 ]
 pass "stale lock: github.com goes direct" [ -z "$(get http.proxy https://github.com/o/r.git)" ]
+# systemd kills this past the unit's budget, which would leave the lock and the
+# proxy in place, so recovery has to finish well inside it.
+budget="$(sed -n 's/^TimeoutStopSec=//p' "$HERE/assets/firerunner-git-proxy.service")"
+pass "stale lock: recovers inside the unit's stop budget ($took s of $budget s)" [ "$took" -lt "$budget" ]
 
 # A file it cannot change at all must be reported, not assumed.
 run on
 mkdir "$TMP/ro" && cp "$GIT_CONFIG_SYSTEM" "$TMP/ro/gitconfig"
 chmod 0555 "$TMP/ro"
-GIT_CONFIG_SYSTEM="$TMP/ro/gitconfig" TRIES=2 run off
+GIT_CONFIG_SYSTEM="$TMP/ro/gitconfig" run off
 pass "cannot remove it: reported" [ "$rc" != 0 ]
 chmod 0755 "$TMP/ro"
 run off

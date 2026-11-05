@@ -33,19 +33,17 @@ on)
 	;;
 off)
 	# This must work: a config left behind sends every fetch to a dead port for
-	# the rest of the job. The usual obstacle is a lock another git left.
+	# the rest of the job. The usual obstacle is a lock another git left, and
+	# git waits about a second on one, so few tries fit the unit's stop budget.
 	tries=0
 	while git config --system "$SECTION.proxy" >/dev/null 2>&1; do
 		git config --system --remove-section "$SECTION" 2>/dev/null && exit 0
 		tries=$((tries + 1))
-		if [ "$tries" -ge "$TRIES" ]; then
-			rm -f "$CONFIG.lock"
-		fi
-		if [ "$tries" -gt "$TRIES" ]; then
+		if [ "$tries" -gt 2 ]; then
 			echo "firerunner-git-config: could not remove the proxy from $CONFIG" >&2
 			exit 1
 		fi
-		sleep 0.1
+		[ "$tries" -lt 2 ] || rm -f "$CONFIG.lock"
 	done
 	# The CA alone is harmless, but leaves nothing behind either.
 	git config --system --remove-section "$SECTION" 2>/dev/null || true

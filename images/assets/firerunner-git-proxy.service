@@ -17,4 +17,5 @@ ExecStartPost=+/usr/local/libexec/firerunner-git-config on
 ExecStopPost=+/usr/local/libexec/firerunner-git-config off
 Restart=always
 RestartSec=1
-TimeoutStopSec=5
+# Covers the proxy's drain and the stop hook, which clears a stale lock.
+TimeoutStopSec=10
