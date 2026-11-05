@@ -11,6 +11,9 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/bin" "$TMP/runner"
+# The instance's /bin/sh is dash; macOS's sh is bash, which forgives what dash
+# does not.
+POSIX_SH="$(command -v dash || echo sh)"
 
 # Fake curl. State lives in $STATE:
 #   token-fails  how many token requests fail before IMDS answers
@@ -66,6 +69,10 @@ case "$url" in
 esac
 FAKE
 chmod +x "$TMP/bin/curl"
+# The boot script syncs before powering off: real, that takes the whole
+# machine's writes, a second or more each time.
+printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/sync"
+chmod +x "$TMP/bin/sync"
 
 # runner BODY: the fake run.sh records its argv, then runs BODY.
 runner() {
@@ -125,9 +132,10 @@ script() {
 		FIRERUNNER_RUN_USER="${RUN_USER:-}" \
 		FIRERUNNER_ENVIRONMENT="${ENVIRONMENT_FILE:-$TMP/no-environment}" \
 		FIRERUNNER_TUNE_TICKS="${TUNE_TICKS:-600}" \
+		FIRERUNNER_DOCKER_WAIT="${DOCKER_WAIT:-30}" \
 		TUNE_EXIT="${TUNE_EXIT:-0}" \
 		TMPDIR="${SCRIPT_TMPDIR:-${TMPDIR:-/tmp}}" \
-		"${SCRIPT_SH:-sh}" -c 'trap "" PIPE; exec "$0" "$1"' "${SCRIPT_SH:-sh}" "$SCRIPT"
+		"${SCRIPT_SH:-$POSIX_SH}" -c 'trap "" PIPE; exec "$0" "$1"' "${SCRIPT_SH:-$POSIX_SH}" "$SCRIPT"
 }
 
 # run: run the script against the $STATE prepared by the caller, killing it
@@ -261,17 +269,21 @@ for marker in yes no; do
 	echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit" > "$STATE/userdata"
 	echo "200" > "$STATE/jit-codes"
 	printf 'cfg' > "$STATE/jit-body"
+	# The holder outlives the script until this test releases it, so a script
+	# that waits for it is killed as hung, with no clock to guess at.
+	# shellcheck disable=SC2016 # expanded by the fake run.sh
+	holder='(until [ -e "$STATE/release" ]; do sleep 0.1; done) & echo $! > "$STATE/holder"'
 	if [ "$marker" = yes ]; then
-		runner 'sleep 8 & echo "Listening for Jobs"; echo "Exiting runner..."'
+		runner "$holder; echo 'Listening for Jobs'; echo 'Exiting runner...'"
 	else
-		runner 'sleep 8 & echo "Listening for Jobs"'
+		runner "$holder; echo 'Listening for Jobs'"
 	fi
-	# With the marker, the drain bound is never reached, and the limit is far
-	# below it and below the holder's 8 s, so a busy machine cannot fail this.
-	if [ "$marker" = yes ]; then ticks=300 limit=6; else ticks=10 limit=6; fi
-	began=$(date +%s)
+	# With the marker the drain bound is never reached: longer than the 20 s a
+	# hung script gets.
+	if [ "$marker" = yes ]; then ticks=300; else ticks=10; fi
 	DRAIN_TICKS=$ticks run
-	expect "lingering output holder ($marker marker): finishes with the runner" "took $(($(date +%s) - began))s" [ $(($(date +%s) - began)) -lt $limit ]
+	expect "lingering output holder ($marker marker): finishes before it does" "" kill -0 "$(cat "$STATE/holder")"
+	: > "$STATE/release"
 	expect "lingering output holder ($marker marker): reports the exit" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=0'
 done
 runner :
@@ -427,6 +439,7 @@ for t in ok fail; do
 #!/bin/sh
 sleep 0.2
 : > "$STATE/tuned"
+echo "${FIRERUNNER_DOCKER_STORAGE:-}" > "$STATE/tune-docker"
 exit "${TUNE_EXIT:-0}"
 FAKE
 	chmod +x "$TMP/bin/fake-tune"
@@ -439,6 +452,93 @@ FAKE
 	expect "tune $t: finished before the runner started" "" has tuned-first
 	expect "tune $t: the runner ran" "" has runner-argv
 done
+
+# A tier's docker_storage reaches the tuning step, and only then.
+for want in memory ""; do
+	fresh tune
+	{
+		echo "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit"
+		[ -z "$want" ] || echo "FIRERUNNER_DOCKER_STORAGE=$want"
+	} > "$STATE/userdata"
+	echo 200 > "$STATE/jit-codes"
+	printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+	runner 'echo "Exiting runner..."'
+	TUNE="$TMP/bin/fake-tune" run
+	expect "docker_storage '$want' reaches tuning" "$(cat "$STATE/tune-docker" 2>/dev/null)" [ "$(cat "$STATE/tune-docker" 2>/dev/null)" = "$want" ]
+done
+
+# Moving Docker stops it, so the runner waits for it past TUNE_TICKS. Without
+# docker_storage, nothing holds the runner past them.
+fresh tune-late
+cat > "$TMP/bin/fake-tune" <<'FAKE'
+#!/bin/sh
+sleep 0.6
+: > "$STATE/docker-settled"
+rm -f "$FIRERUNNER_DOCKER_PENDING"
+sleep 2
+FAKE
+chmod +x "$TMP/bin/fake-tune"
+printf 'FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\nFIRERUNNER_DOCKER_STORAGE=memory\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+# shellcheck disable=SC2016 # the fake evaluates this
+runner '[ -f "$STATE/docker-settled" ] && : > "$STATE/settled-first"; echo "Exiting runner..."'
+TUNE="$TMP/bin/fake-tune" TUNE_TICKS=1 run
+expect "a late move: the runner waits for Docker" "" has settled-first
+
+# Nothing to wait on: nothing may move, or a job could meet the move.
+fresh tune-no-tmp
+real_mktemp="$(command -v mktemp)"
+cat > "$TMP/bin/mktemp" <<FAKE
+#!/bin/sh
+case "\$*" in *firerunner-docker*) exit 1 ;; esac
+exec "$real_mktemp" "\$@"
+FAKE
+chmod +x "$TMP/bin/mktemp"
+cat > "$TMP/bin/fake-tune" <<'FAKE'
+#!/bin/sh
+echo "${FIRERUNNER_DOCKER_STORAGE:-}" > "$STATE/tune-docker"
+FAKE
+chmod +x "$TMP/bin/fake-tune"
+printf 'FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\nFIRERUNNER_DOCKER_STORAGE=memory\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+runner 'echo "Exiting runner..."'
+TUNE="$TMP/bin/fake-tune" run
+rm -f "$TMP/bin/mktemp"
+expect "no pending file: tuning still runs" "" has tune-docker
+expect "no pending file: Docker is not moved" "$(cat "$STATE/tune-docker" 2>/dev/null)" [ -z "$(cat "$STATE/tune-docker" 2>/dev/null)" ]
+expect "no pending file: the runner ran" "" has runner-argv
+
+# Tuning ended and left the file: Docker's state is unknown.
+fresh docker-unsettled
+printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/fake-tune"
+printf 'FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\nFIRERUNNER_DOCKER_STORAGE=memory\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+runner 'echo "Exiting runner..."'
+TUNE="$TMP/bin/fake-tune" run
+expect "Docker unsettled: the runner never starts" "" lacks runner-argv
+expect "Docker unsettled: says why" "$(cat "$STATE/stderr")" grep -q "Docker did not settle" "$STATE/stderr"
+expect "Docker unsettled: powers off fast" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
+expect "Docker unsettled: reports a failure" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=1'
+
+# A move that never ends must not run the job on a Docker in an unknown state.
+fresh docker-stuck
+cat > "$TMP/bin/fake-tune" <<'FAKE'
+#!/bin/sh
+sleep 5
+FAKE
+chmod +x "$TMP/bin/fake-tune"
+printf 'FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\nFIRERUNNER_DOCKER_STORAGE=memory\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+runner 'echo "Exiting runner..."'
+TUNE="$TMP/bin/fake-tune" DOCKER_WAIT=1 run
+expect "a stuck move: the runner never starts" "" lacks runner-argv
+expect "a stuck move: says why" "$(cat "$STATE/stderr")" grep -q "Docker still moving after 1s" "$STATE/stderr"
+expect "a stuck move: powers off fast" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
+expect "a stuck move: reports a failure" "$(cat "$STATE/reports" 2>/dev/null)" grep -q 'phase=exited&rc=1' "$STATE/reports"
 
 # GitHub's images keep tool paths in /etc/environment.
 fresh environment
@@ -487,8 +587,7 @@ expect "run user: not told it may run as root" "$(cat "$STATE/asroot" 2>/dev/nul
 	[ "$(cat "$STATE/asroot" 2>/dev/null)" = unset ]
 
 # A step stuck on a device must not hold the job back.
-fresh tune-stuck
-cp "$TMP/bin/fake-tune" "$TMP/bin/fake-tune.quick"
+fresh tune-slow
 printf '#!/bin/sh\nexec sleep 5\n' > "$TMP/bin/fake-tune"
 printf '#!/bin/sh\nFIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n' > "$STATE/userdata"
 echo 200 > "$STATE/jit-codes"
@@ -497,10 +596,10 @@ runner 'echo "Exiting runner..."'
 TUNE="$TMP/bin/fake-tune" TUNE_TICKS=2 run
 expect "tune stuck: the runner runs anyway" "" has runner-argv
 expect "tune stuck: says so" "$(cat "$STATE/stderr")" grep -q "tuning is still running" "$STATE/stderr"
-cp "$TMP/bin/fake-tune.quick" "$TMP/bin/fake-tune"
-
 
 fresh tune-warmup
+# shellcheck disable=SC2016 # the fake evaluates this
+printf '#!/bin/sh\n: > "$STATE/tuned"\n' > "$TMP/bin/fake-tune"
 : > "$STATE/userdata"
 TUNE="$TMP/bin/fake-tune" run
 expect "warm-up boot: no tuning (the disk may boot again unchanged)" "" lacks tuned

@@ -236,14 +236,18 @@ func TestOverRealListener(t *testing.T) {
 	}
 }
 
-func TestUserDataCarriesOnlyTheEndpoint(t *testing.T) {
+func TestUserDataCarriesNoConfig(t *testing.T) {
 	u := URL("10.0.0.5:8098")
 	if u != "http://10.0.0.5:8098/jit" {
 		t.Fatalf("URL = %q", u)
 	}
-	ud := UserData(u)
+	ud := UserData(u, "")
 	if ud != "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\n" {
 		t.Fatalf("UserData = %q, want exactly one key=url line", ud)
+	}
+	ud = UserData(u, "memory")
+	if ud != "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\nFIRERUNNER_DOCKER_STORAGE=memory\n" {
+		t.Fatalf("UserData = %q, want the url line, then the storage line", ud)
 	}
 }
 

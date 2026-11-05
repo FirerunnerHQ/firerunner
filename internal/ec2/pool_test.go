@@ -93,6 +93,7 @@ func TestPool_WarmsToTarget(t *testing.T) {
 
 func TestLaunch_ClaimsFromPool(t *testing.T) {
 	h := poolHarness(t, 1, config.MarketSpot)
+	h.p.o.EC2.DockerStorage = config.DockerStorageMemory
 	h.runPool(t)
 	eventually(t, "a warming instance", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
 	h.stopWarming()
@@ -111,7 +112,7 @@ func TestLaunch_ClaimsFromPool(t *testing.T) {
 	if in.tags[TagPool] != PoolClaimed || in.tags[TagRunner] != "runner-1" {
 		t.Fatalf("claimed tags = %v", in.tags)
 	}
-	if !strings.HasPrefix(in.userData, "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit") {
+	if in.userData != "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\nFIRERUNNER_DOCKER_STORAGE=memory\n" {
 		t.Fatalf("claimed user-data = %q", in.userData)
 	}
 	eventually(t, "the spot request cancelled after the start", func() bool { return len(h.f.openSpotRequests()) == 0 })

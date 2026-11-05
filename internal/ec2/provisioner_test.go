@@ -245,6 +245,21 @@ func TestLaunch_JobVolumeDefaultsToFasterThroughput(t *testing.T) {
 	}
 }
 
+func TestLaunch_DockerStorageReachesUserData(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.EC2.DockerStorage = config.DockerStorageMemory })
+	errc := h.launch(context.Background())
+	inst := h.instance(t)
+	h.f.setState(inst.id, types.InstanceStateNameTerminated)
+	waitErr(t, errc)
+	ud, err := base64.StdEncoding.DecodeString(aws.ToString(h.f.runs[0].UserData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ud), "FIRERUNNER_DOCKER_STORAGE=memory\n") {
+		t.Fatalf("user-data = %q", ud)
+	}
+}
+
 func TestLaunch_VolumePerformanceFromTier(t *testing.T) {
 	h := newHarness(t, func(o *Options) {
 		o.EC2.RootVolumeGiB = 80

@@ -3,7 +3,7 @@
 // It implements provisioner.Provisioner alongside the Firecracker microVM
 // provisioner: Launch starts an instance for one JIT runner and blocks until
 // that instance is gone. The instance gets its JIT config from the control
-// VM's jitserver over the VPC; user-data names only the endpoint.
+// VM's jitserver over the VPC; user-data holds no secret, only where to fetch it.
 package ec2
 
 import (
