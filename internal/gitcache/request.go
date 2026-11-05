@@ -178,7 +178,10 @@ func fixedFilter(s string) bool {
 		return isNumber(n)
 	}
 	if n, ok := strings.CutPrefix(s, "blob:limit="); ok {
-		return isNumber(strings.TrimRight(n, "kmgKMG"))
+		if n != "" && strings.ContainsRune("kmgKMG", rune(n[len(n)-1])) {
+			n = n[:len(n)-1]
+		}
+		return isNumber(n)
 	}
 	return false
 }

@@ -115,6 +115,7 @@ func TestParse_Refuses(t *testing.T) {
 		"flag with value": request(fetchCaps, []string{"want " + oidA, "thin-pack extra", "done"}),
 		"trailing space":  request(fetchCaps, []string{"want " + oidA, "ofs-delta ", "done"}),
 		"progress value":  request(fetchCaps, []string{"want " + oidA, "no-progress 1", "done"}),
+		"two limit units": request(fetchCaps, []string{"want " + oidA, "filter blob:limit=1kk", "done"}),
 		"empty":           nil,
 		"not pkt-line":    []byte("zzzz"),
 		"truncated":       []byte("0014command=fe"),
