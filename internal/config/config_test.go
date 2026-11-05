@@ -1021,6 +1021,17 @@ func TestValidateReplaces(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("a valid catalog refused: %v", err)
 	}
+	// GitHub folds ASCII case only: the Kelvin sign is not K, ſ is not s.
+	if err := validateReplaces([]Tier{
+		tier("a", []string{"kube"}, nil), tier("b", nil, []string{"\u212aube", "macoſ-latest"}), tier("c", nil, []string{"macos-latest"}),
+		tier("\u212a-tier", nil, nil), tier("d", nil, []string{"k-tier"}),
+	}); err != nil {
+		t.Errorf("non-ASCII folding: %v", err)
+	}
+	// A tier that replaces nothing may have any name.
+	if err := validateReplaces([]Tier{tier("fr small", nil, nil)}); err != nil {
+		t.Errorf("a name is checked without replaces: %v", err)
+	}
 	for name, tiers := range map[string][]Tier{
 		"empty":                {tier("a", nil, []string{""})},
 		"spaces":               {tier("a", nil, []string{" ubuntu-latest"})},
@@ -1030,6 +1041,10 @@ func TestValidateReplaces(t *testing.T) {
 		"its own name":         {tier("a", nil, []string{"a"})},
 		"another tier's label": {tier("a", nil, []string{"Small"}), tier("b", []string{"small"}, nil)},
 		"two tiers":            {tier("a", nil, []string{"ubuntu-latest"}), tier("b", nil, []string{"Ubuntu-Latest"})},
+		"twice in one tier":    {tier("a", nil, []string{"ubuntu-latest", "ubuntu-latest"})},
+		// migrate could not write these names as runs-on labels.
+		"name YAML reads as a bool": {tier("true", nil, []string{"ubuntu-latest"})},
+		"name with a space":         {tier("fr small", nil, []string{"ubuntu-latest"})},
 	} {
 		if err := validateReplaces(tiers); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -1060,5 +1075,15 @@ func TestCheckCatalogReplaces(t *testing.T) {
 	}
 	if _, err := CheckCatalog(bad, 16); err == nil || !strings.Contains(err.Error(), "replaces") {
 		t.Errorf("an invalid replaces passes CheckCatalog: %v", err)
+	}
+	// The daemon's own validation ignores replaces: a mistake there, which
+	// only migrate reads, cannot stop a deployment from starting.
+	tiers, err = loadTiers(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Tiers: tiers, MaxRunners: 16, offline: true}
+	if err := c.validateTiers(); err != nil {
+		t.Errorf("the daemon refuses a catalog over replaces: %v", err)
 	}
 }

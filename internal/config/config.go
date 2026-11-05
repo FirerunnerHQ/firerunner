@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/migrate"
 	"github.com/firerunnerhq/firerunner/internal/provisioner"
 	"github.com/firerunnerhq/firerunner/internal/schedule"
 )
@@ -133,7 +134,8 @@ type Tier struct {
 	Labels []string `json:"labels,omitempty"`
 	// Replaces lists the runs-on labels this tier takes over from
 	// GitHub-hosted runners (ubuntu-latest): "firerunner migrate --catalog"
-	// maps each to the tier's name. The daemon does not use it.
+	// maps each to the tier's name. The daemon neither uses nor validates
+	// it, so a mistake in it cannot stop a deployment; CheckCatalog does.
 	Replaces []string `json:"replaces,omitempty"`
 	// Provisioner selects how this tier's runners are launched: "firecracker"
 	// (the default when empty) or "ec2".
@@ -470,6 +472,9 @@ func CheckCatalog(path string, maxRunners int) ([]Tier, error) {
 	if err := c.validateTiers(); err != nil {
 		return nil, err
 	}
+	if err := validateReplaces(tiers); err != nil {
+		return nil, err
+	}
 	return tiers, nil
 }
 
@@ -674,25 +679,31 @@ func (c *Config) validateTiers() error {
 	if totalMin > c.MaxRunners {
 		return fmt.Errorf("tiers' warm pools sum to %d but --max-runners (the shared slot budget) is %d", totalMin, c.MaxRunners)
 	}
-	return validateReplaces(c.Tiers)
+	return nil
 }
 
-// validateReplaces checks the tiers' replaces lists: each label a plain
-// runs-on label, replaced by one tier only, and never a label a tier itself
-// answers to, which would map a migrated job on again. Labels compare without
-// regard to ASCII case, as GitHub matches them.
+// validateReplaces checks the tiers' replaces lists, for firerunner
+// migrate: each label a plain runs-on label, replaced by one tier only, and
+// never a label a tier itself answers to, which would map a migrated job on
+// again; and a tier that replaces labels must have a name migrate can write.
+// Labels compare as GitHub matches them, folding ASCII case only.
 func validateReplaces(tiers []Tier) error {
 	own := map[string]string{}
 	for _, t := range tiers {
-		own[strings.ToLower(t.Name)] = t.Name
+		own[migrate.FoldLabel(t.Name)] = t.Name
 		for _, l := range t.Labels {
-			own[strings.ToLower(l)] = t.Name
+			own[migrate.FoldLabel(l)] = t.Name
 		}
 	}
 	by := map[string]string{}
 	for _, t := range tiers {
+		if len(t.Replaces) > 0 {
+			if err := migrate.ValidTarget(t.Name); err != nil {
+				return fmt.Errorf("tier %q: replaces labels, but firerunner migrate cannot write its name: %v", t.Name, err)
+			}
+		}
 		for _, l := range t.Replaces {
-			k := strings.ToLower(l)
+			k := migrate.FoldLabel(l)
 			switch {
 			case l == "" || strings.TrimSpace(l) != l || strings.ContainsAny(l, " \t\n,"):
 				return fmt.Errorf("tier %q: replaces %q is not a runs-on label", t.Name, l)
@@ -702,6 +713,8 @@ func validateReplaces(tiers []Tier) error {
 				return fmt.Errorf("tier %q: replaces self-hosted, which names no GitHub-hosted runner", t.Name)
 			case own[k] != "":
 				return fmt.Errorf("tier %q: replaces %q, which tier %q answers to", t.Name, l, own[k])
+			case by[k] == t.Name:
+				return fmt.Errorf("tier %q: replaces %q twice", t.Name, l)
 			case by[k] != "":
 				return fmt.Errorf("tier %q: replaces %q, which tier %q replaces too", t.Name, l, by[k])
 			}
