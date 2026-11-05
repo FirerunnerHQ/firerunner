@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -265,7 +266,7 @@ func TestBundleCarriesAWorkingLeafAndTheUpstream(t *testing.T) {
 	}
 }
 
-func TestGitCAIsConstrainedToGitHubAlone(t *testing.T) {
+func TestGitCAIsConstrainedToGitHub(t *testing.T) {
 	dir := t.TempDir()
 	ca, err := LoadOrCreateFor(dir, GitHost)
 	if err != nil {
@@ -285,8 +286,27 @@ func TestGitCAIsConstrainedToGitHubAlone(t *testing.T) {
 	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: GitHost}); err != nil {
 		t.Fatalf("the leaf does not verify for %s: %v", GitHost, err)
 	}
-	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: ResultsHost}); err == nil {
-		t.Fatal("the git leaf verified for the results host")
+
+	// The CA's key itself cannot sign for another name.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := &x509.Certificate{
+		SerialNumber: big.NewInt(9), Subject: pkix.Name{CommonName: "example.org"}, DNSNames: []string{"example.org"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, forged, ca.cert, &key.PublicKey, ca.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{Roots: roots, DNSName: "example.org"}); err == nil {
+		t.Fatal("the CA signed for another name")
 	}
 
 	again, err := LoadOrCreateFor(dir, GitHost)
@@ -299,6 +319,36 @@ func TestGitCAIsConstrainedToGitHubAlone(t *testing.T) {
 	// A directory holds one CA: one for another host must not sign for this one.
 	if _, err := LoadOrCreate(dir); err == nil {
 		t.Fatal("a CA for github.com loaded as the results host's")
+	}
+}
+
+func TestLoadRefusesAnUnconstrainedCA(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "anything"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(365 * 24 * time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, caCertFile), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, caKeyFile), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreateFor(dir, GitHost); err == nil {
+		t.Fatal("an unconstrained CA was loaded")
 	}
 }
 
@@ -324,6 +374,17 @@ func TestBundleWithGitCarriesASeparateIdentity(t *testing.T) {
 	}
 	if _, err := tls.X509KeyPair([]byte(b.Git.Cert), []byte(b.Git.Key)); err != nil {
 		t.Fatalf("the git certificate and key do not pair: %v", err)
+	}
+	// The proxy's leaf must chain to the one CA git trusts, for the name git asks.
+	block, _ := pem.Decode([]byte(b.Git.Cert))
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM([]byte(b.Git.CA))
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: GitHost}); err != nil {
+		t.Fatalf("the git leaf does not verify as git would check it: %v", err)
 	}
 
 	raw, err = ca.Bundle(time.Hour, "10.0.0.5:8099", nil)

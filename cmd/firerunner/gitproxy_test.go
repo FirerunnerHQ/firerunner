@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/firerunnerhq/firerunner/internal/config"
 )
 
 func TestRequireLoopback(t *testing.T) {
@@ -33,5 +38,30 @@ func TestRunGitProxy_RefusesBadFlags(t *testing.T) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadCacheCAs(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{Tiers: []config.Tier{{Name: "t", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{Cache: true}}}}
+	cfg.Firecracker.WorkDir = dir
+	ca, git, err := loadCacheCAs(cfg)
+	if err != nil || ca == nil {
+		t.Fatalf("loadCacheCAs = %v, %v", ca, err)
+	}
+	if git != nil {
+		t.Fatal("a CA for github.com with no tier asking")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "git-tls")); err == nil {
+		t.Fatal("a directory for a CA nothing needs")
+	}
+
+	cfg.Tiers[0].EC2.GitCache = true
+	ca, git, err = loadCacheCAs(cfg)
+	if err != nil || ca == nil || git == nil {
+		t.Fatalf("loadCacheCAs = %v, %v, %v", ca, git, err)
+	}
+	if bytes.Equal(ca.CertPEM(), git.CertPEM()) {
+		t.Fatal("one CA for both")
 	}
 }
