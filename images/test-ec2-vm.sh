@@ -70,19 +70,7 @@ say "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
 say "apt: $(apt-config dump | grep -E 'Dir::Bin::dpkg|CompressionTypes::Order' | tr '\n' ' ')"
 say "memtotal_kib: $(awk '/MemTotal/{print $2}' /proc/meminfo)"
 say "boot: $(systemd-analyze time 2>&1 | head -1)"
-for t in gcc make unzip node npm python3 pip3 java go rustc cargo ruby gh aws az kubectl yq; do
-	say "tool $t: $(command -v "$t" || echo MISSING)"
-done
-say "toolcache: $(ls "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" 2>/dev/null | tr '\n' ' ')"
-sudo -n true 2>/dev/null && say "sudo: ok"
-for d in /opt/hostedtoolcache /opt/pipx /opt/pipx_bin /usr/share/dotnet; do
-	[ ! -e "$d" ] || [ -w "$d" ] || say "unwritable: $d"
-done
-timeout 120 pipx install --quiet cowsay >/dev/null 2>&1 && say "pipx: ok"
-s=$(date +%s.%N)
-timeout 120 docker run --rm hello-world >/dev/null 2>&1
-rc=$?
-say "docker_first_run: rc=$rc $(awk "BEGIN{print $(date +%s.%N)-$s}") s"
+# Before anything slow: the rule lasts two minutes.
 # A path that loses every even source port: without a new port on each retry,
 # half of these connections would never complete.
 SUDO=""
@@ -104,6 +92,19 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
 done
 say "syn_lossy: $ok of 12 connected, worst ${worst}s"
 $SUDO nft delete table ip syn_test
+for t in gcc make unzip node npm python3 pip3 java go rustc cargo ruby gh aws az kubectl yq; do
+	say "tool $t: $(command -v "$t" || echo MISSING)"
+done
+say "toolcache: $(ls "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" 2>/dev/null | tr '\n' ' ')"
+sudo -n true 2>/dev/null && say "sudo: ok"
+for d in /opt/hostedtoolcache /opt/pipx /opt/pipx_bin /usr/share/dotnet; do
+	[ ! -e "$d" ] || [ -w "$d" ] || say "unwritable: $d"
+done
+timeout 120 pipx install --quiet cowsay >/dev/null 2>&1 && say "pipx: ok"
+s=$(date +%s.%N)
+timeout 120 docker run --rm hello-world >/dev/null 2>&1
+rc=$?
+say "docker_first_run: rc=$rc $(awk "BEGIN{print $(date +%s.%N)-$s}") s"
 while [ "$(cut -d. -f1 /proc/uptime)" -lt 125 ]; do sleep 2; done
 say "syn_rule_after: $($SUDO nft list chain ip firerunner_syn post 2>&1 | grep -c masquerade)"
 say "syn_retry_gap_after: $(cat /proc/sys/net/ipv4/tcp_syn_linear_timeouts)"
