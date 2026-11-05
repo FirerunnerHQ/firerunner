@@ -84,7 +84,13 @@ func Parse(body []byte) (Fetch, error) {
 	}
 	done := false
 	for _, l := range args {
-		name, value, _ := strings.Cut(l, " ")
+		name, value, hasValue := strings.Cut(l, " ")
+		switch name {
+		case "done", "no-progress", "thin-pack", "ofs-delta":
+			if hasValue {
+				return Fetch{}, notCacheable("argument %q", l)
+			}
+		}
 		switch name {
 		case "want":
 			if !isOID(value, hexLen) {
