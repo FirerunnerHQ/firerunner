@@ -28,7 +28,7 @@ func runGitProxy(args []string) error {
 	cert := fs.String("cert", "", "certificate for github.com (required)")
 	key := fs.String("key", "", "the certificate's key (required)")
 	cacheURL := fs.String("cache-url", "http://127.0.0.1", "the instance's cache proxy")
-	tempDir := fs.String("temp-dir", "", "directory for responses being stored (default: the system's)")
+	tempDir := fs.String("temp-dir", "", "directory for responses on their way (default: the system's)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil

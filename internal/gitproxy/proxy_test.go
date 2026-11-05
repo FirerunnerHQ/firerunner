@@ -443,6 +443,7 @@ func TestUnusableHit_FallsThroughToGitHub(t *testing.T) {
 			if h.gh.fetches.Load() != 1 {
 				t.Fatal("GitHub was not asked")
 			}
+			h.requireSettled()
 			if h.tempFiles() != 0 {
 				t.Fatal("the temporary file stayed")
 			}
@@ -749,6 +750,9 @@ func TestForward_StaysOnGitHub(t *testing.T) {
 	// An odd path is only a path, and stays on github.com.
 	send("//example.com/path")
 	send("/@example.com/path")
+	if len(hosts) != 2 {
+		t.Fatalf("forwarded to %v, want the two plain paths", hosts)
+	}
 	for _, host := range hosts {
 		if host != Host {
 			t.Errorf("forwarded to %q", host)

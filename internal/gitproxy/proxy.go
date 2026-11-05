@@ -90,7 +90,7 @@ type Config struct {
 	Certificate tls.Certificate // for github.com, trusted through git's sslCAInfo
 	Cache       Cache
 	Transport   http.RoundTripper // to GitHub; nil means http.DefaultTransport
-	TempDir     string            // for responses being stored; empty means the system's
+	TempDir     string            // for responses on their way; empty means the system's
 
 	LookupTimeout time.Duration
 	HitTimeout    time.Duration
@@ -426,7 +426,8 @@ func (s *pendingSave) discard() {
 }
 
 // finish stores the response in the background, as the client has all of it. A
-// response that is not whole is never stored: it would fail every later fetch.
+// response that is not whole is never stored: every later job would download it
+// only to refuse it.
 func (s *pendingSave) finish() {
 	if s == nil || s.file == nil {
 		return
