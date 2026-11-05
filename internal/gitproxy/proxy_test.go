@@ -195,12 +195,21 @@ func (h *harness) waitSaved() string {
 	}
 }
 
-// settled waits for background stores, then checks nothing was stored.
-func (h *harness) requireNothingStored() {
+// requireSettled waits for background stores, cleanup included.
+func (h *harness) requireSettled() {
 	h.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	h.p.Wait(ctx)
+	if ctx.Err() != nil {
+		h.t.Fatal("stores did not finish")
+	}
+}
+
+// requireNothingStored waits for background stores, then checks there were none.
+func (h *harness) requireNothingStored() {
+	h.t.Helper()
+	h.requireSettled()
 	if n := h.cache.count(); n != 0 {
 		h.t.Fatalf("%d entries stored", n)
 	}
@@ -222,6 +231,7 @@ func TestMiss_StoresThenAnotherInstanceHits(t *testing.T) {
 		t.Fatalf("miss = %q, %v", got, err)
 	}
 	h.waitSaved()
+	h.requireSettled()
 	if h.tempFiles() != 0 {
 		t.Fatal("the temporary file stayed")
 	}
@@ -558,9 +568,7 @@ func TestSaveFailure_CostsOnlyTheEntry(t *testing.T) {
 		t.Fatalf("fetch = %q, %v", got, err)
 	}
 	h.waitSaved()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	h.p.Wait(ctx)
+	h.requireSettled()
 	if h.tempFiles() != 0 {
 		t.Fatal("the temporary file stayed")
 	}
