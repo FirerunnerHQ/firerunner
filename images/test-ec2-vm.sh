@@ -68,6 +68,8 @@ say "swap: $(swapon --noheadings --show=NAME,SIZE | tr -s ' ')"
 say "swappiness: $(cat /proc/sys/vm/swappiness)"
 say "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
 say "apt: $(apt-config dump | grep -E 'Dir::Bin::dpkg|CompressionTypes::Order' | tr '\n' ' ')"
+say "apt_languages: $(apt-config dump | grep -E '^Acquire::Languages' | tr '\n' ' ')"
+say "apt_extras: $(apt-config dump | grep -c -E 'IndexTargets::deb::(DEP-11|CNF)|appstream|cnf-update|update-notifier|esm|packagekit')"
 say "memtotal_kib: $(awk '/MemTotal/{print $2}' /proc/meminfo)"
 say "boot: $(systemd-analyze time 2>&1 | head -1)"
 # Before anything slow: the rule lasts two minutes.
@@ -240,6 +242,8 @@ check "SYN retries return to the default" 'syn_retry_gap_after: 4'
 check "huge pages are always on" 'thp: \[always\]'
 check "dpkg runs under eatmydata" 'apt:.*dpkg-eatmydata'
 check "apt prefers gzip indexes" 'apt:.*"gz"'
+check "apt skips translations" 'apt_languages: .*"none"'
+check "apt skips indexes and hooks that CI never needs" 'apt_extras: 0'
 check "the kernel skips the PS/2 probe" 'cmdline:.*i8042.nokbd'
 check "the probe finished" 'probe: done'
 check "more memory than the VM has does not kill the job" 'overcommit_rc: 0'
