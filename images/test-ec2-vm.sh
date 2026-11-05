@@ -83,6 +83,32 @@ s=$(date +%s.%N)
 timeout 120 docker run --rm hello-world >/dev/null 2>&1
 rc=$?
 say "docker_first_run: rc=$rc $(awk "BEGIN{print $(date +%s.%N)-$s}") s"
+# A path that loses every even source port: without a new port on each retry,
+# half of these connections would never complete.
+SUDO=""
+[ "$(id -u)" = 0 ] || SUDO="sudo -n"
+say "syn_rule: $($SUDO nft list chain ip firerunner_syn post 2>&1 | grep -c masquerade)"
+say "syn_retry_gap: $(cat /proc/sys/net/ipv4/tcp_syn_linear_timeouts)"
+$SUDO nft -f - <<'NFT'
+table ip syn_test {
+	chain post {
+		type filter hook postrouting priority srcnat + 10; policy accept;
+		tcp dport 443 tcp sport & 1 == 0 drop
+	}
+}
+NFT
+ok=0 worst=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+	t="$(curl -s -o /dev/null -m 8 -w '%{time_connect}' https://github.com/ 2>/dev/null)" && ok=$((ok + 1))
+	worst="$(awk "BEGIN{print ($t + 0 > $worst) ? $t : $worst}")"
+done
+say "syn_lossy: $ok of 12 connected, worst ${worst}s"
+$SUDO nft delete table ip syn_test
+while [ "$(cut -d. -f1 /proc/uptime)" -lt 125 ]; do sleep 2; done
+say "syn_rule_after: $($SUDO nft list chain ip firerunner_syn post 2>&1 | grep -c masquerade)"
+say "syn_retry_gap_after: $(cat /proc/sys/net/ipv4/tcp_syn_linear_timeouts)"
+say "boot_settled: $(systemd-analyze time 2>&1 | head -1)"
+say "boot_units: $(systemd-analyze blame --no-pager 2>/dev/null | grep -E 'syn-reroll|network|docker.service' | tr -s ' ' | tr '\n' ';')"
 for d in /var/lib/docker /var/lib/containerd; do
 	say "docker_dir: $d on $(findmnt -no SOURCE -T "$d")"
 done
@@ -206,6 +232,11 @@ if [ "$docker_storage" = memory ]; then
 else
 	check "docker's data is on the disk" 'docker_dir: /var/lib/docker on /dev/(root|vda)'
 fi
+check "the SYN rule is on at boot" 'syn_rule: 1'
+check "SYNs retry every second at boot" 'syn_retry_gap: 10'
+check "a retry takes a new port through a lossy path" 'syn_lossy: 12 of 12'
+check "the SYN rule is gone after two minutes" 'syn_rule_after: 0'
+check "SYN retries return to the default" 'syn_retry_gap_after: 4'
 check "huge pages are always on" 'thp: \[always\]'
 check "dpkg runs under eatmydata" 'apt:.*dpkg-eatmydata'
 check "apt prefers gzip indexes" 'apt:.*"gz"'

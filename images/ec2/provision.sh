@@ -14,6 +14,8 @@
 #   - an empty hostname and machine-id, so each instance gets its own.
 # And about making the job fast on a disk that lasts for one job:
 #   - ext4 without the guarantees that protect a disk across a crash;
+#   - firerunner-syn-reroll, which retries stalled SYNs on a new source port
+#     for the first two minutes;
 #   - firerunner-ec2-tune, which grows the disk, adds zram swap and moves
 #     Docker to memory for a tier that asks, at boot.
 #
@@ -47,7 +49,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt_get() { apt-get -o DPkg::Lock::Timeout=600 "$@"; }
 apt_get update
 apt_get install -y --no-install-recommends \
-	zstd curl jq git ca-certificates nginx gcc libc6-dev cloud-guest-utils
+	zstd curl jq git ca-certificates nginx gcc libc6-dev cloud-guest-utils nftables
 if [ "$TOOLSET" != minimal ]; then
 	install_runner_images
 	# As on GitHub's runners, jobs run as "runner", with sudo and Docker.
@@ -138,7 +140,7 @@ netplan generate
 # Nothing should run at boot or during a job except the runner.
 touch /etc/cloud/cloud-init.disabled
 systemctl disable --now snapd.service snapd.socket snapd.seeded.service || true
-for unit in apt-daily.timer apt-daily-upgrade.timer man-db.timer motd-news.timer \
+for unit in nftables.service apt-daily.timer apt-daily-upgrade.timer man-db.timer motd-news.timer \
 	fstrim.timer e2scrub_all.timer unattended-upgrades.service \
 	ModemManager.service multipathd.service multipathd.socket; do
 	systemctl disable "$unit" 2>/dev/null || true

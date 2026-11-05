@@ -183,6 +183,10 @@ images. `images/test-runner-images.sh` tests the trimming.
 
 Because the disk lasts for one job, the image favours speed over durability:
 
+- `firerunner-syn-reroll` retries a stalled SYN to a public address on a new
+  source port for the first two minutes, because a new instance in us-east-1
+  can lose an outbound connection's SYNs for 1-38 s. See
+  [`assets/firerunner-syn-reroll.nft`](assets/firerunner-syn-reroll.nft).
 - `firerunner-ec2-tune` grows the root filesystem to the volume's size on each
   job boot, so `root_volume_gib` takes effect, adds zram swap as large as
   memory, moves Docker's data to compressed RAM for a tier with
