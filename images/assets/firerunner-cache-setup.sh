@@ -55,3 +55,16 @@ nginx -t -q
 systemctl start nginx
 
 printf '127.0.0.1 %s\n' "$HOST" >>"$ROOT/etc/hosts"
+
+# A tier with a git cache. The job's actions/cache works by now, so a failure
+# here costs only the git cache: git stays pointed at GitHub until the proxy
+# is up. Its CA goes to git alone, never into the system store, and outside
+# the directory above, as git runs as the job's user.
+if jq -e .git "$bundle" >/dev/null; then
+	jq -er .git.ca "$bundle" >"$ROOT/etc/ssl/firerunner-git-ca.pem" &&
+		chmod 0644 "$ROOT/etc/ssl/firerunner-git-ca.pem" &&
+		jq -er .git.cert "$bundle" >"$dir/git.pem" &&
+		jq -er .git.key "$bundle" >"$dir/git.key" &&
+		systemctl start firerunner-git-proxy.service ||
+		echo "firerunner-cache-setup: no git cache; git goes to GitHub" >&2
+fi
