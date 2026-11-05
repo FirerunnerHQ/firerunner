@@ -269,13 +269,29 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, key string) boo
 		return false
 	}
 	defer entry.Close()
+	// Nothing has gone out until the first bytes do, so until they are in hand
+	// GitHub can still answer.
+	first := make([]byte, 32<<10)
+	n, err := entry.Read(first)
+	if n == 0 {
+		p.cfg.Log.Warn("git cache entry unreadable", "err", err, "key", key)
+		return false
+	}
 	p.mu.Lock()
 	p.served[key] = true
 	p.mu.Unlock()
 	w.Header().Set("Content-Type", resultType)
 	w.Header().Set("Cache-Control", "no-cache")
 	check := &responseCheck{}
-	if _, err := io.Copy(io.MultiWriter(w, check), entry); err != nil || !check.complete() {
+	out := io.MultiWriter(w, check)
+	_, werr := out.Write(first[:n])
+	if werr == nil && err == nil {
+		_, err = io.Copy(out, entry)
+	}
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	if err = errors.Join(werr, err); err != nil || !check.complete() {
 		p.cfg.Log.Warn("git cache entry broke; the client will retry", "err", err, "key", key)
 		panic(http.ErrAbortHandler)
 	}

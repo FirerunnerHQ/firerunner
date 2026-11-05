@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -379,7 +380,6 @@ func TestBrokenHit_AbortsThenTheRetryGoesToGitHub(t *testing.T) {
 	cases := map[string]string{
 		"truncated":  goodPack[:len(goodPack)-8],
 		"not a pack": "not a git response at all",
-		"empty":      "",
 	}
 	for name, entry := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -404,6 +404,45 @@ func TestBrokenHit_AbortsThenTheRetryGoesToGitHub(t *testing.T) {
 				t.Fatal("the retry did not go to GitHub")
 			}
 		})
+	}
+}
+
+// Until the first byte goes out, GitHub can still answer, so the client never
+// sees the failure.
+func TestUnreadableHit_FallsThroughToGitHub(t *testing.T) {
+	for name, entry := range map[string]io.Reader{
+		"empty":        strings.NewReader(""),
+		"read failure": &brokenBody{data: strings.NewReader("")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, func(c *Config) { c.Cache = readerCache{entry} })
+			h.refs("t")
+			if got, err := h.fetch("t"); err != nil || got != goodPack {
+				t.Fatalf("fetch = %q, %v", got, err)
+			}
+			if h.gh.fetches.Load() != 1 {
+				t.Fatal("GitHub was not asked")
+			}
+		})
+	}
+}
+
+type readerCache struct{ r io.Reader }
+
+func (c readerCache) Open(context.Context, string) (io.ReadCloser, error) {
+	return io.NopCloser(c.r), nil
+}
+func (readerCache) Save(context.Context, string, string, int64) error { return nil }
+
+// A read that returns data and an error together must not lose the data.
+func TestHit_ServesDataThatArrivesWithEOF(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.Cache = readerCache{iotest.DataErrReader(strings.NewReader(goodPack))} })
+	h.refs("t")
+	if got, err := h.fetch("t"); err != nil || got != goodPack {
+		t.Fatalf("fetch = %q, %v", got, err)
+	}
+	if h.gh.fetches.Load() != 0 {
+		t.Fatal("GitHub was asked")
 	}
 }
 
