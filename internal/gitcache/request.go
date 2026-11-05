@@ -9,7 +9,8 @@
 //
 // Parse accepts only requests it fully understands. Anything else is not
 // cacheable and goes to GitHub: an unknown line may change the response, and
-// a request naming a ref, as want-ref does, has an answer that moves.
+// a request naming a ref, as want-ref does, has an answer that moves. So does
+// include-tag, which adds whatever annotated tags point at the wants today.
 package gitcache
 
 import (
@@ -51,7 +52,6 @@ type Fetch struct {
 	Filter       string
 	ThinPack     bool
 	OfsDelta     bool
-	IncludeTag   bool
 }
 
 // Parse reads the body of a git-upload-pack POST, already decompressed.
@@ -109,8 +109,6 @@ func Parse(body []byte) (Fetch, error) {
 			f.ThinPack = true
 		case "ofs-delta":
 			f.OfsDelta = true
-		case "include-tag":
-			f.IncludeTag = true
 		default:
 			return Fetch{}, notCacheable("argument %q", name)
 		}
@@ -208,7 +206,7 @@ func (f Fetch) Key(repository string) string {
 	h := sha256.New()
 	for _, part := range [][]string{
 		{keyVersion, repository, f.ObjectFormat, strconv.Itoa(f.Deepen), f.Filter},
-		{strconv.FormatBool(f.ThinPack), strconv.FormatBool(f.OfsDelta), strconv.FormatBool(f.IncludeTag)},
+		{strconv.FormatBool(f.ThinPack), strconv.FormatBool(f.OfsDelta)},
 		f.Wants,
 	} {
 		for _, s := range part {

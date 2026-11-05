@@ -45,7 +45,7 @@ func mustParse(t *testing.T, caps, args []string) Fetch {
 
 func TestParse_ShallowFetchFromRealGit(t *testing.T) {
 	f := mustParse(t, fetchCaps, shallowArgs)
-	if f.Deepen != 1 || !f.ThinPack || !f.OfsDelta || f.IncludeTag || f.Filter != "" ||
+	if f.Deepen != 1 || !f.ThinPack || !f.OfsDelta || f.Filter != "" ||
 		f.ObjectFormat != "sha1" || len(f.Wants) != 1 || f.Wants[0] != oidA {
 		t.Fatalf("Fetch = %+v", f)
 	}
@@ -109,6 +109,7 @@ func TestParse_Refuses(t *testing.T) {
 		"bad tree filter": request(fetchCaps, []string{"want " + oidA, "filter tree:x", "done"}),
 		"bad blob limit":  request(fetchCaps, []string{"want " + oidA, "filter blob:limit=HEAD:x", "done"}),
 		"empty filter":    request(fetchCaps, []string{"want " + oidA, "filter", "done"}),
+		"include-tag":     request(fetchCaps, []string{"want " + oidA, "include-tag", "done"}),
 		"empty":           nil,
 		"not pkt-line":    []byte("zzzz"),
 		"truncated":       []byte("0014command=fe"),
@@ -166,7 +167,6 @@ func TestKey_DependsOnWhatChangesTheObjects(t *testing.T) {
 		"more wants": mustParse(t, fetchCaps, wants(oidA, oidB)).Key("o/r"),
 		"depth":      mustParse(t, fetchCaps, []string{"thin-pack", "ofs-delta", "deepen 2", "want " + oidA, "done"}).Key("o/r"),
 		"filter":     mustParse(t, fetchCaps, append(shallowArgs[:5:5], "filter blob:none", "done")).Key("o/r"),
-		"tags":       mustParse(t, fetchCaps, append(shallowArgs[:5:5], "include-tag", "done")).Key("o/r"),
 		"no thin":    mustParse(t, fetchCaps, []string{"ofs-delta", "deepen 1", "want " + oidA, "done"}).Key("o/r"),
 		"no ofs":     mustParse(t, fetchCaps, []string{"thin-pack", "deepen 1", "want " + oidA, "done"}).Key("o/r"),
 	}
