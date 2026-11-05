@@ -88,6 +88,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "git-proxy":
+			if err := runGitProxy(args[1:]); err != nil {
+				slog.Error("git-proxy failed", "err", err)
+				os.Exit(1)
+			}
+			return
 		case "version", "--version", "-version":
 			fmt.Println("firerunner", version)
 			return
@@ -315,6 +321,7 @@ Usage:
   firerunner config check validate the configuration or a tier catalog offline
                           (--catalog FILE; --json); see "firerunner config"
   firerunner cache-server run the self-hosted Actions dependency cache server
+  firerunner git-proxy    run an EC2 instance's git checkout cache proxy
   firerunner migrate      open a pull request that moves a repository's jobs onto
                           firerunner (runs-on labels); see "firerunner migrate -h"
   firerunner version      print the version
