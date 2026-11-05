@@ -34,6 +34,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -284,7 +285,14 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, key string) boo
 // forward sends r to GitHub and streams the answer back. With saveKey set, it
 // also stores a complete answer. It returns GitHub's status.
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body io.Reader, saveKey *string) int {
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, "https://"+Host+r.URL.RequestURI(), body)
+	// Built from parts: a request target can hold anything, and pasted after
+	// the host, "@example.com/" would send the job's token to example.com.
+	if r.URL.Opaque != "" || r.URL.Host != "" || !strings.HasPrefix(r.URL.Path, "/") {
+		http.Error(w, "bad request target", http.StatusBadRequest)
+		return http.StatusBadRequest
+	}
+	target := url.URL{Scheme: "https", Host: Host, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), body)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return http.StatusBadRequest

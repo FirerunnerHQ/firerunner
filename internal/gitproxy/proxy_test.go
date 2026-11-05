@@ -620,6 +620,49 @@ func TestProxyCredentialsStopHere(t *testing.T) {
 	}
 }
 
+// A request target is the client's to choose. None may leave github.com, where
+// the job's token would follow it.
+func TestForward_StaysOnGitHub(t *testing.T) {
+	h := newHarness(t, nil)
+	var hosts []string
+	h.p.cfg.Transport = roundTrip(func(r *http.Request) (*http.Response, error) {
+		hosts = append(hosts, r.URL.Host)
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}, Request: r}, nil
+	})
+	for _, target := range []string{
+		"https:@example.com/path",
+		"http://example.com/path",
+		"//example.com/path",
+		"*",
+	} {
+		conn, err := net.Dial("tcp", h.srv.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: github.com\r\nAuthorization: secret\r\nConnection: close\r\n\r\n", target)
+		_, _ = io.ReadAll(conn)
+		conn.Close()
+	}
+	for _, host := range hosts {
+		if host != Host {
+			t.Errorf("forwarded to %q", host)
+		}
+	}
+}
+
+func TestForward_KeepsThePathAndQuery(t *testing.T) {
+	h := newHarness(t, nil)
+	var got string
+	h.p.cfg.Transport = roundTrip(func(r *http.Request) (*http.Response, error) {
+		got = r.URL.String()
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}, Request: r}, nil
+	})
+	h.refs("t")
+	if want := "https://github.com/O/R.git/info/refs?service=git-upload-pack"; got != want {
+		t.Fatalf("forwarded %q, want %q", got, want)
+	}
+}
+
 func TestGitHubUnreachable_IsABadGateway(t *testing.T) {
 	h := newHarness(t, func(c *Config) {
 		c.Transport = roundTrip(func(*http.Request) (*http.Response, error) { return nil, errors.New("down") })
