@@ -1,6 +1,8 @@
 [Unit]
 Description=firerunner git checkout cache proxy
 After=nginx.service
+# Keep trying for the whole job: while this is down, git simply goes direct.
+StartLimitIntervalSec=0
 
 [Service]
 # It carries job tokens, so it holds as little as it can.

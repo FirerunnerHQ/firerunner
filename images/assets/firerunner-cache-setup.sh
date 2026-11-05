@@ -61,6 +61,7 @@ printf '127.0.0.1 %s\n' "$HOST" >>"$ROOT/etc/hosts"
 # is up. Its CA goes to git alone, never into the system store, and outside
 # the directory above, as git runs as the job's user.
 if jq -e .git "$bundle" >/dev/null; then
+	[ -x "${FIRERUNNER_BIN:-/usr/local/bin/firerunner}" ] &&
 	jq -er .git.ca "$bundle" >"$ROOT/etc/ssl/firerunner-git-ca.pem" &&
 		chmod 0644 "$ROOT/etc/ssl/firerunner-git-ca.pem" &&
 		jq -er .git.cert "$bundle" >"$dir/git.pem" &&

@@ -56,6 +56,36 @@ pass "off: the CA is gone too" [ -z "$(get http.sslCAInfo https://github.com/o/r
 run off
 pass "off twice: exits 0" [ "$rc" = 0 ]
 
+# The CA goes first, as the proxy alone is a fetch that trusts nothing. A fake
+# git on PATH records the order, then does the work.
+mkdir -p "$TMP/order"
+cat >"$TMP/order/git" <<FAKE
+#!/bin/sh
+echo "\$*" >>"$TMP/calls"
+exec "$(command -v git)" "\$@"
+FAKE
+chmod +x "$TMP/order/git"
+: >"$TMP/calls"
+PATH="$TMP/order:$PATH" run on
+pass "on: the CA is written before the proxy" [ "$(grep -n sslCAInfo "$TMP/calls" | head -1 | cut -d: -f1)" -lt "$(grep -n '\.proxy' "$TMP/calls" | head -1 | cut -d: -f1)" ]
+run off
+
+# A lock another git left must not keep git pointed at a dead port.
+run on
+: >"$GIT_CONFIG_SYSTEM.lock"
+TRIES=2 run off
+pass "stale lock: exits 0" [ "$rc" = 0 ]
+pass "stale lock: github.com goes direct" [ -z "$(get http.proxy https://github.com/o/r.git)" ]
+
+# A file it cannot change at all must be reported, not assumed.
+run on
+mkdir "$TMP/ro" && cp "$GIT_CONFIG_SYSTEM" "$TMP/ro/gitconfig"
+chmod 0555 "$TMP/ro"
+GIT_CONFIG_SYSTEM="$TMP/ro/gitconfig" TRIES=2 run off
+pass "cannot remove it: reported" [ "$rc" != 0 ]
+chmod 0755 "$TMP/ro"
+run off
+
 # A proxy still starting: wait for it, as the first fetch must not fail.
 CURL_FAILS=3 run on
 pass "slow proxy: waits, then sets" [ "$rc" = 0 ]
