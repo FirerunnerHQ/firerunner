@@ -1010,3 +1010,55 @@ func TestEC2VolumeThroughput(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateReplaces(t *testing.T) {
+	tier := func(name string, labels, replaces []string) Tier {
+		return Tier{Name: name, Labels: labels, Replaces: replaces}
+	}
+	if err := validateReplaces([]Tier{
+		tier("fr-small", []string{"small"}, []string{"ubuntu-latest", "ubuntu-24.04"}),
+		tier("fr-arm", nil, []string{"ubuntu-24.04-arm"}),
+	}); err != nil {
+		t.Fatalf("a valid catalog refused: %v", err)
+	}
+	for name, tiers := range map[string][]Tier{
+		"empty":                {tier("a", nil, []string{""})},
+		"spaces":               {tier("a", nil, []string{" ubuntu-latest"})},
+		"comma":                {tier("a", nil, []string{"ubuntu-latest,x"})},
+		"expression":           {tier("a", nil, []string{"${{matrix.os}}"})},
+		"self-hosted":          {tier("a", nil, []string{"Self-Hosted"})},
+		"its own name":         {tier("a", nil, []string{"a"})},
+		"another tier's label": {tier("a", nil, []string{"Small"}), tier("b", []string{"small"}, nil)},
+		"two tiers":            {tier("a", nil, []string{"ubuntu-latest"}), tier("b", nil, []string{"Ubuntu-Latest"})},
+	} {
+		if err := validateReplaces(tiers); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// The example catalog's replaces pass the daemon's own validation.
+func TestCheckCatalogReplaces(t *testing.T) {
+	tiers, err := CheckCatalog("../../examples/tiers.json", 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range tiers {
+		if tr.Name == "firerunner-ubuntu" && len(tr.Replaces) == 0 {
+			t.Error("firerunner-ubuntu lost its replaces")
+		}
+	}
+	// The daemon's validation applies them: a tier replacing another's
+	// name is refused.
+	b, err := os.ReadFile("../../examples/tiers.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(t.TempDir(), "tiers.json")
+	if err := os.WriteFile(bad, []byte(strings.Replace(string(b), `"ubuntu-24.04"]`, `"firerunner-node"]`, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckCatalog(bad, 16); err == nil || !strings.Contains(err.Error(), "replaces") {
+		t.Errorf("an invalid replaces passes CheckCatalog: %v", err)
+	}
+}

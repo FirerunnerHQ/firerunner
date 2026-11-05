@@ -30,6 +30,7 @@ type checkTier struct {
 	Name          string   `json:"name"`
 	Provisioner   string   `json:"provisioner"`
 	Labels        []string `json:"labels,omitempty"`
+	Replaces      []string `json:"replaces,omitempty"`
 	Min           int      `json:"min"`
 	Max           int      `json:"max"`
 	VCPU          int      `json:"vcpu,omitempty"`
@@ -170,7 +171,7 @@ func configCmd(args []string, stdout, stderr io.Writer) int {
 func checkTiers(tiers []config.Tier) []checkTier {
 	out := make([]checkTier, 0, len(tiers))
 	for _, t := range tiers {
-		ct := checkTier{Name: t.Name, Provisioner: t.ProvisionerName(), Labels: t.Labels, Min: t.Min, Max: t.Max}
+		ct := checkTier{Name: t.Name, Provisioner: t.ProvisionerName(), Labels: t.Labels, Replaces: t.Replaces, Min: t.Min, Max: t.Max}
 		if t.IsEC2() {
 			ct.InstanceTypes, ct.Market = t.EC2.InstanceTypes, t.EC2.Market
 		} else {
@@ -200,6 +201,11 @@ func renderCheck(w io.Writer, r checkReport) {
 		fmt.Fprintf(tw, "  %s\t%s\t%d\t%d\t%s\n", t.Name, t.Provisioner, t.Min, t.Max, shape)
 	}
 	tw.Flush()
+	for _, t := range r.Tiers {
+		if len(t.Replaces) > 0 {
+			fmt.Fprintf(w, "  %s replaces %s (firerunner migrate --catalog)\n", t.Name, strings.Join(t.Replaces, ", "))
+		}
+	}
 	for _, n := range r.Notes {
 		fmt.Fprintf(w, "note: %s\n", n)
 	}

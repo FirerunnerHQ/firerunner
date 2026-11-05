@@ -131,6 +131,10 @@ const (
 type Tier struct {
 	Name   string   `json:"name"`
 	Labels []string `json:"labels,omitempty"`
+	// Replaces lists the runs-on labels this tier takes over from
+	// GitHub-hosted runners (ubuntu-latest): "firerunner migrate --catalog"
+	// maps each to the tier's name. The daemon does not use it.
+	Replaces []string `json:"replaces,omitempty"`
 	// Provisioner selects how this tier's runners are launched: "firecracker"
 	// (the default when empty) or "ec2".
 	Provisioner string `json:"provisioner,omitempty"`
@@ -669,6 +673,40 @@ func (c *Config) validateTiers() error {
 	}
 	if totalMin > c.MaxRunners {
 		return fmt.Errorf("tiers' warm pools sum to %d but --max-runners (the shared slot budget) is %d", totalMin, c.MaxRunners)
+	}
+	return validateReplaces(c.Tiers)
+}
+
+// validateReplaces checks the tiers' replaces lists: each label a plain
+// runs-on label, replaced by one tier only, and never a label a tier itself
+// answers to, which would map a migrated job on again. Labels compare without
+// regard to ASCII case, as GitHub matches them.
+func validateReplaces(tiers []Tier) error {
+	own := map[string]string{}
+	for _, t := range tiers {
+		own[strings.ToLower(t.Name)] = t.Name
+		for _, l := range t.Labels {
+			own[strings.ToLower(l)] = t.Name
+		}
+	}
+	by := map[string]string{}
+	for _, t := range tiers {
+		for _, l := range t.Replaces {
+			k := strings.ToLower(l)
+			switch {
+			case l == "" || strings.TrimSpace(l) != l || strings.ContainsAny(l, " \t\n,"):
+				return fmt.Errorf("tier %q: replaces %q is not a runs-on label", t.Name, l)
+			case strings.Contains(l, "${{"):
+				return fmt.Errorf("tier %q: replaces %q is an expression, not a label", t.Name, l)
+			case k == "self-hosted":
+				return fmt.Errorf("tier %q: replaces self-hosted, which names no GitHub-hosted runner", t.Name)
+			case own[k] != "":
+				return fmt.Errorf("tier %q: replaces %q, which tier %q answers to", t.Name, l, own[k])
+			case by[k] != "":
+				return fmt.Errorf("tier %q: replaces %q, which tier %q replaces too", t.Name, l, by[k])
+			}
+			by[k] = t.Name
+		}
 	}
 	return nil
 }

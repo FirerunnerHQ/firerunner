@@ -26,6 +26,7 @@
   },
   {
     "name": "firerunner-ubuntu",
+    "replaces": ["ubuntu-latest", "ubuntu-24.04"],
     "vcpu": 4,
     "mem_mib": 8192,
     "golden": "/var/lib/firerunner/ubuntu-rootfs-full.ext4",
