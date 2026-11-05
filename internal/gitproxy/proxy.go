@@ -15,11 +15,11 @@
 //
 // # Failure
 //
-// The cache must never fail a checkout that GitHub would have served. Any
-// cache error falls through to GitHub. A hit that breaks part way cannot fall
-// through, as bytes have gone out, so the connection is aborted, git reports
-// the fetch failed, and the retry goes to GitHub: a key is served from the
-// cache once per proxy, which also gets a job past a poisoned entry.
+// The cache must never fail a checkout that GitHub would have served, and not
+// every client retries. So an entry is downloaded and checked before its first
+// byte goes out, and any failure until then goes to GitHub. An entry can pass
+// that and still hold the wrong objects, if a job wrote it so: git refuses it,
+// and as a key is served from the cache once per proxy, a retry reaches GitHub.
 package gitproxy
 
 import (
@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,10 @@ const (
 	// cache-server waits for the job's identity, and a checkout is usually a
 	// job's first step: a shorter wait would turn most of them into misses.
 	DefaultLookupTimeout = 15 * time.Second
+
+	// DefaultHitTimeout bounds downloading an entry, lookup included. Past it
+	// GitHub will likely do better.
+	DefaultHitTimeout = 2 * time.Minute
 
 	// DefaultSaveTimeout bounds storing one response.
 	DefaultSaveTimeout = 5 * time.Minute
@@ -88,6 +93,7 @@ type Config struct {
 	TempDir     string            // for responses being stored; empty means the system's
 
 	LookupTimeout time.Duration
+	HitTimeout    time.Duration
 	SaveTimeout   time.Duration
 	MaxSave       int64
 	Log           *slog.Logger
@@ -111,6 +117,9 @@ func New(cfg Config) *Proxy {
 	}
 	if cfg.LookupTimeout <= 0 {
 		cfg.LookupTimeout = DefaultLookupTimeout
+	}
+	if cfg.HitTimeout <= 0 {
+		cfg.HitTimeout = DefaultHitTimeout
 	}
 	if cfg.SaveTimeout <= 0 {
 		cfg.SaveTimeout = DefaultSaveTimeout
@@ -213,54 +222,60 @@ func (p *Proxy) serveFetch(w http.ResponseWriter, r *http.Request) {
 		p.forward(w, r, io.MultiReader(bytes.NewReader(body), r.Body), nil)
 		return
 	}
-	key, ok := p.cacheKey(r, body)
+	entry, ok := p.cacheEntry(r, body)
 	if !ok {
 		p.forward(w, r, bytes.NewReader(body), nil)
 		return
 	}
-	if p.serveHit(w, r, key) {
+	if p.serveHit(w, r, entry) {
 		return
 	}
-	p.forward(w, r, bytes.NewReader(body), &key)
+	p.forward(w, r, bytes.NewReader(body), &entry)
 }
 
-// cacheKey returns the key of a fetch this proxy may answer from the cache.
-func (p *Proxy) cacheKey(r *http.Request, body []byte) (string, bool) {
+// cacheEntry names a fetch this proxy may answer from the cache.
+type cacheEntry struct {
+	key          string
+	objectFormat string
+}
+
+func (p *Proxy) cacheEntry(r *http.Request, body []byte) (cacheEntry, bool) {
+	none := cacheEntry{}
 	repo, ok := gitcache.Repository(r.URL.Path)
 	if !ok {
-		return "", false
+		return none, false
 	}
 	plain, err := decode(r, body)
 	if err != nil {
-		return "", false
+		return none, false
 	}
 	f, err := gitcache.Parse(plain)
 	if err != nil {
-		return "", false
+		return none, false
 	}
 	key := f.Key(repo)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	seen, ok := p.authorized[credentials(r, repo)]
 	if !ok || p.now().Sub(seen) > authorizedFor {
-		return "", false
+		return none, false
 	}
 	// A second request for a key is a retry, or a job fetching a commit twice.
 	// GitHub is right for both, and it gets a retry past a bad entry.
 	if p.served[key] {
-		return "", false
+		return none, false
 	}
-	return key, true
+	return cacheEntry{key: key, objectFormat: f.ObjectFormat}, true
 }
 
-// serveHit reports whether the request was answered. It falls through while no
-// byte has been sent, and aborts the connection after that.
-func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, key string) bool {
-	ctx, cancel := context.WithCancel(r.Context())
+// serveHit reports whether the request was answered. The entry comes down and
+// is checked before the first byte goes out: until then GitHub can still answer,
+// which is the only recovery a client that does not retry has.
+func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, e cacheEntry) bool {
+	ctx, cancel := context.WithTimeout(r.Context(), p.cfg.HitTimeout)
 	defer cancel()
-	// The limit is on the lookup alone: a large entry may take longer to stream.
 	lookup := time.AfterFunc(p.cfg.LookupTimeout, cancel)
-	entry, err := p.cfg.Cache.Open(ctx, key)
+	entry, err := p.cfg.Cache.Open(ctx, e.key)
 	lookup.Stop()
 	if err != nil {
 		if !errors.Is(err, ErrMiss) {
@@ -269,38 +284,37 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, key string) boo
 		return false
 	}
 	defer entry.Close()
-	// Nothing has gone out until the first bytes do, so until they are in hand
-	// GitHub can still answer.
-	first := make([]byte, 32<<10)
-	n, err := entry.Read(first)
-	if n == 0 {
-		p.cfg.Log.Warn("git cache entry unreadable", "err", err, "key", key)
+	f, err := os.CreateTemp(p.cfg.TempDir, "gitproxy-*")
+	if err != nil {
+		p.cfg.Log.Warn("git cache: no temporary file", "err", err)
+		return false
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	check := newResponseCheck(e.objectFormat)
+	size, err := io.Copy(f, io.TeeReader(io.LimitReader(entry, p.cfg.MaxSave+1), check))
+	if err != nil || size > p.cfg.MaxSave || !check.complete() {
+		p.cfg.Log.Warn("git cache entry unusable; asking GitHub", "err", err, "key", e.key, "bytes", size)
+		return false
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return false
 	}
 	p.mu.Lock()
-	p.served[key] = true
+	p.served[e.key] = true
 	p.mu.Unlock()
 	w.Header().Set("Content-Type", resultType)
 	w.Header().Set("Cache-Control", "no-cache")
-	check := &responseCheck{}
-	out := io.MultiWriter(w, check)
-	_, werr := out.Write(first[:n])
-	if werr == nil && err == nil {
-		_, err = io.Copy(out, entry)
-	}
-	if errors.Is(err, io.EOF) {
-		err = nil
-	}
-	if err = errors.Join(werr, err); err != nil || !check.complete() {
-		p.cfg.Log.Warn("git cache entry broke; the client will retry", "err", err, "key", key)
-		panic(http.ErrAbortHandler)
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	if _, err := io.Copy(w, f); err != nil {
+		panic(http.ErrAbortHandler) // the client has gone
 	}
 	return true
 }
 
-// forward sends r to GitHub and streams the answer back. With saveKey set, it
+// forward sends r to GitHub and streams the answer back. With saveAs set, it
 // also stores a complete answer. It returns GitHub's status.
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body io.Reader, saveKey *string) int {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body io.Reader, saveAs *cacheEntry) int {
 	// Built from parts: a request target can hold anything, and pasted after
 	// the host, "@example.com/" would send the job's token to example.com.
 	if r.URL.Host != "" || !strings.HasPrefix(r.URL.Path, "/") {
@@ -334,8 +348,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body io.Reader, 
 	w.WriteHeader(res.StatusCode)
 
 	var save *pendingSave
-	if saveKey != nil && res.StatusCode == http.StatusOK && res.Header.Get("Content-Type") == resultType {
-		save = p.newSave(*saveKey)
+	if saveAs != nil && res.StatusCode == http.StatusOK && res.Header.Get("Content-Type") == resultType {
+		save = p.newSave(*saveAs)
 	}
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 64<<10)
@@ -370,17 +384,17 @@ type pendingSave struct {
 	p     *Proxy
 	key   string
 	file  *os.File
-	check responseCheck
+	check *responseCheck
 	size  int64
 }
 
-func (p *Proxy) newSave(key string) *pendingSave {
+func (p *Proxy) newSave(e cacheEntry) *pendingSave {
 	f, err := os.CreateTemp(p.cfg.TempDir, "gitproxy-*")
 	if err != nil {
 		p.cfg.Log.Warn("git cache: no temporary file", "err", err)
 		return nil
 	}
-	return &pendingSave{p: p, key: key, file: f}
+	return &pendingSave{p: p, key: e.key, file: f, check: newResponseCheck(e.objectFormat)}
 }
 
 func (s *pendingSave) write(b []byte) {

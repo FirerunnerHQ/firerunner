@@ -211,7 +211,8 @@ func TestRealGit_MissThenHit(t *testing.T) {
 	}
 }
 
-func TestRealGit_RefusesATamperedEntryAndRecoversOnRetry(t *testing.T) {
+// A damaged entry never reaches git, so a client that does not retry is safe.
+func TestRealGit_DamagedEntryIsInvisible(t *testing.T) {
 	g := newRealGit(t)
 	c := newFakeCache()
 	p := g.startProxy(c)
@@ -231,16 +232,12 @@ func TestRealGit_RefusesATamperedEntryAndRecoversOnRetry(t *testing.T) {
 	before := g.fetches.Load()
 
 	g.startProxy(c)
-	if got, err := g.fetch(); err == nil {
-		t.Fatalf("git accepted a tampered pack: %s", got)
-	}
-	// actions/checkout retries a failed fetch.
 	got, err := g.fetch()
 	if err != nil || got != g.head {
-		t.Fatalf("retry = %q, %v", got, err)
+		t.Fatalf("fetch = %q, %v", got, err)
 	}
 	if g.fetches.Load() == before {
-		t.Fatal("the retry did not reach the upstream")
+		t.Fatal("the fetch did not reach the upstream")
 	}
 }
 

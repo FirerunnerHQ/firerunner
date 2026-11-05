@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha1" //nolint:gosec // a pack's own checksum
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -28,9 +30,19 @@ func pkt(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
 var fetchBody = "" + pkt("command=fetch\n") + pkt("agent=git/2.56.0\n") + pkt("object-format=sha1\n") +
 	"0001" + pkt("thin-pack\n") + pkt("ofs-delta\n") + pkt("deepen 1\n") + pkt("want "+oid+"\n") + pkt("done\n") + "0000"
 
-// goodPack is a whole response: a shallow section, then a pack on sideband 1.
-var goodPack = pkt("shallow-info\n") + pkt("shallow "+oid+"\n") + "0001" + pkt("packfile\n") +
-	pkt("\x02Counting objects\n") + pkt("\x01PACK-data") + "0000"
+// fakePack has a pack's magic and a correct trailer.
+func fakePack(body string) string {
+	sum := sha1.Sum([]byte("PACK" + body)) //nolint:gosec // as git does
+	return "PACK" + body + string(sum[:])
+}
+
+// goodPack is a whole response: a shallow section, then a pack on sideband 1,
+// in two packets, with progress between them.
+var goodPack = func() string {
+	p := fakePack("-pack-data-")
+	return pkt("shallow-info\n") + pkt("shallow "+oid+"\n") + "0001" + pkt("packfile\n") +
+		pkt("\x02Counting objects\n") + pkt("\x01"+p[:6]) + pkt("\x02more\n") + pkt("\x01"+p[6:]) + "0000"
+}()
 
 type fakeCache struct {
 	mu      sync.Mutex
@@ -386,46 +398,18 @@ func (s slowEntry) Open(ctx context.Context, _ string) (io.ReadCloser, error) {
 }
 func (slowEntry) Save(context.Context, string, string, int64) error { return nil }
 
-func TestBrokenHit_AbortsThenTheRetryGoesToGitHub(t *testing.T) {
-	cases := map[string]string{
-		"truncated":  goodPack[:len(goodPack)-8],
-		"not a pack": "not a git response at all",
-	}
-	for name, entry := range cases {
-		t.Run(name, func(t *testing.T) {
-			seedCache := newFakeCache()
-			h := newHarness(t, func(c *Config) { c.Cache = seedCache })
-			h.refs("t")
-			if _, err := h.fetch("t"); err != nil {
-				t.Fatal(err)
-			}
-			key := h.waitSaved()
-			other := newHarness(t, func(c *Config) { c.Cache = seedCache })
-			seedCache.entries[key] = entry
-			other.refs("t")
-			if _, err := other.fetch("t"); err == nil {
-				t.Fatal("a broken entry ended cleanly, so git would not know to retry")
-			}
-			got, err := other.fetch("t")
-			if err != nil || got != goodPack {
-				t.Fatalf("retry = %q, %v", got, err)
-			}
-			if other.gh.fetches.Load() != 1 {
-				t.Fatal("the retry did not go to GitHub")
-			}
-		})
-	}
-}
-
-// Until the first byte goes out, GitHub can still answer, so the client never
-// sees the failure.
-func TestUnreadableHit_FallsThroughToGitHub(t *testing.T) {
-	for name, entry := range map[string]io.Reader{
-		"empty":        strings.NewReader(""),
-		"read failure": &brokenBody{data: strings.NewReader("")},
+// A client may not retry, so nothing broken reaches it.
+func TestUnusableHit_FallsThroughToGitHub(t *testing.T) {
+	for name, entry := range map[string]func() io.Reader{
+		"empty":               func() io.Reader { return strings.NewReader("") },
+		"read failure":        func() io.Reader { return &brokenBody{data: strings.NewReader("")} },
+		"breaks midway":       func() io.Reader { return &brokenBody{data: strings.NewReader(goodPack[:20])} },
+		"error with its data": func() io.Reader { return &failsWithData{data: goodPack} },
+		"truncated":           func() io.Reader { return strings.NewReader(goodPack[:len(goodPack)-8]) },
+		"not a pack":          func() io.Reader { return strings.NewReader("not a git response at all") },
 	} {
 		t.Run(name, func(t *testing.T) {
-			h := newHarness(t, func(c *Config) { c.Cache = readerCache{entry} })
+			h := newHarness(t, func(c *Config) { c.Cache = readerCache{entry()} })
 			h.refs("t")
 			if got, err := h.fetch("t"); err != nil || got != goodPack {
 				t.Fatalf("fetch = %q, %v", got, err)
@@ -433,7 +417,36 @@ func TestUnreadableHit_FallsThroughToGitHub(t *testing.T) {
 			if h.gh.fetches.Load() != 1 {
 				t.Fatal("GitHub was not asked")
 			}
+			if h.tempFiles() != 0 {
+				t.Fatal("the temporary file stayed")
+			}
 		})
+	}
+}
+
+// A hit stuck mid-stream must not hold the checkout either.
+func TestHitStuck_FallsThroughToGitHub(t *testing.T) {
+	h := newHarness(t, func(c *Config) {
+		c.Cache = slowEntry{step: time.Hour}
+		c.HitTimeout = 50 * time.Millisecond
+	})
+	h.refs("t")
+	if got, err := h.fetch("t"); err != nil || got != goodPack {
+		t.Fatalf("fetch = %q, %v", got, err)
+	}
+}
+
+func TestOversizedEntry_FallsThroughToGitHub(t *testing.T) {
+	h := newHarness(t, func(c *Config) {
+		c.Cache = readerCache{strings.NewReader(goodPack)}
+		c.MaxSave = 8
+	})
+	h.refs("t")
+	if got, err := h.fetch("t"); err != nil || got != goodPack {
+		t.Fatalf("fetch = %q, %v", got, err)
+	}
+	if h.gh.fetches.Load() != 1 {
+		t.Fatal("GitHub was not asked")
 	}
 }
 
@@ -444,8 +457,7 @@ func (c readerCache) Open(context.Context, string) (io.ReadCloser, error) {
 }
 func (readerCache) Save(context.Context, string, string, int64) error { return nil }
 
-// failsWithData returns its data and an error from the same Read, and then
-// looks like a clean end.
+// failsWithData returns its data and an error from the same Read.
 type failsWithData struct {
 	data string
 	done bool
@@ -457,14 +469,6 @@ func (f *failsWithData) Read(p []byte) (int, error) {
 	}
 	f.done = true
 	return copy(p, f.data), errors.New("connection reset")
-}
-
-func TestHit_ErrorWithItsLastDataAborts(t *testing.T) {
-	h := newHarness(t, func(c *Config) { c.Cache = readerCache{&failsWithData{data: goodPack}} })
-	h.refs("t")
-	if _, err := h.fetch("t"); err == nil {
-		t.Fatal("a read error was taken for a clean end")
-	}
 }
 
 // A read that returns data and an error together must not lose the data.
@@ -506,6 +510,7 @@ func TestNotStored(t *testing.T) {
 		"truncated":        goodPack[:len(goodPack)-4],
 		"error line":       pkt("ERR upload-pack: not our ref\n"),
 		"sideband failure": pkt("packfile\n") + pkt("\x03fatal: pack failed\n") + "0000",
+		"bad checksum":     pkt("packfile\n") + pkt("\x01PACK-and-no-trailer-at-all") + "0000",
 		"no packfile":      pkt("acknowledgments\n") + pkt("NAK\n") + "0000",
 		"trailing bytes":   goodPack + "0000",
 		"not pkt-lines":    "<html>rate limited</html>",
@@ -776,20 +781,31 @@ func TestServeHTTP_RefusesAnythingButGitHub(t *testing.T) {
 }
 
 func TestResponseCheck(t *testing.T) {
+	pack := fakePack("data")
+	corrupt := []byte(pack)
+	corrupt[6] ^= 0xff
 	cases := []struct {
 		name string
 		body string
 		want bool
 	}{
 		{"whole", goodPack, true},
-		{"no shallow section", pkt("packfile\n") + pkt("\x01x") + "0000", true},
-		{"packfile without newline", pkt("packfile") + pkt("\x01x") + "0000", true},
+		{"no shallow section", pkt("packfile\n") + pkt("\x01"+pack) + "0000", true},
+		{"packfile without newline", pkt("packfile") + pkt("\x01"+pack) + "0000", true},
+		{"a keepalive", pkt("packfile\n") + "0005\x01" + pkt("\x01"+pack) + "0000", true},
 		{"no flush", goodPack[:len(goodPack)-4], false},
 		{"cut inside a packet", goodPack[:len(goodPack)-7], false},
 		{"cut inside a header", goodPack + "00"[:1], false},
 		{"error before the pack", pkt("ERR no\n"), false},
-		{"sideband error", pkt("packfile\n") + pkt("\x03boom") + "0000", false},
-		{"no pack", pkt("acknowledgments\n") + "0000", false},
+		{"error in the pack section", pkt("packfile\n") + pkt("\x01"+pack) + pkt("ERR boom\n") + "0000", false},
+		{"sideband error", pkt("packfile\n") + pkt("\x01"+pack) + pkt("\x03boom") + "0000", false},
+		{"unknown sideband", pkt("packfile\n") + pkt("\x09"+pack) + "0000", false},
+		{"no pack section", pkt("acknowledgments\n") + "0000", false},
+		{"no pack data", pkt("packfile\n") + "0000", false},
+		{"only progress", pkt("packfile\n") + pkt("\x02hello\n") + "0000", false},
+		{"not a pack", pkt("packfile\n") + pkt("\x01"+"NOPE"+pack[4:]) + "0000", false},
+		{"corrupt pack", pkt("packfile\n") + pkt("\x01"+string(corrupt)) + "0000", false},
+		{"short of its trailer", pkt("packfile\n") + pkt("\x01"+pack[:len(pack)-1]) + "0000", false},
 		{"bad length", "zzzz", false},
 		{"short length", "0003", false},
 		{"bytes after the flush", goodPack + "x", false},
@@ -797,14 +813,14 @@ func TestResponseCheck(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			whole := &responseCheck{}
+			whole := newResponseCheck("sha1")
 			_, _ = whole.Write([]byte(tc.body))
 			if whole.complete() != tc.want {
 				t.Fatalf("complete = %v, want %v", whole.complete(), tc.want)
 			}
 			// However the network splits it, the answer is the same.
 			for size := 1; size < 8; size++ {
-				c := &responseCheck{}
+				c := newResponseCheck("sha1")
 				for rest := []byte(tc.body); len(rest) > 0; {
 					n := min(size, len(rest))
 					_, _ = c.Write(rest[:n])
@@ -815,5 +831,21 @@ func TestResponseCheck(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestResponseCheck_SHA256(t *testing.T) {
+	body := "PACKdata"
+	sum := sha256.Sum256([]byte(body))
+	response := pkt("packfile\n") + pkt("\x01"+body+string(sum[:])) + "0000"
+	c := newResponseCheck("sha256")
+	_, _ = c.Write([]byte(response))
+	if !c.complete() {
+		t.Fatal("a sha256 pack was refused")
+	}
+	c = newResponseCheck("sha1")
+	_, _ = c.Write([]byte(response))
+	if c.complete() {
+		t.Fatal("a sha256 pack passed as sha1")
 	}
 }
