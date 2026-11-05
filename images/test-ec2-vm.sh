@@ -71,27 +71,25 @@ say "apt: $(apt-config dump | grep -E 'Dir::Bin::dpkg|CompressionTypes::Order' |
 say "memtotal_kib: $(awk '/MemTotal/{print $2}' /proc/meminfo)"
 say "boot: $(systemd-analyze time 2>&1 | head -1)"
 # Before anything slow: the rule lasts two minutes.
-# A path that loses every even source port: without a new port on each retry,
-# half of these connections would never complete.
+# A path that loses every even source port, past conntrack, as AWS's does. A
+# retry on the same port never arrives, so each connection needs both the rule's
+# random port and its 1 s conntrack entry. Half take no retry at all. A working
+# rule fails this with odds of about 2^-14 per connection: 14 tries fit in 30 s.
 SUDO=""
 [ "$(id -u)" = 0 ] || SUDO="sudo -n"
 say "syn_rule: $($SUDO nft list chain ip firerunner_syn post 2>&1 | grep -c masquerade)"
 say "syn_retry_gap: $(cat /proc/sys/net/ipv4/tcp_syn_linear_timeouts)"
-$SUDO nft -f - <<'NFT'
-table ip syn_test {
-	chain post {
-		type filter hook postrouting priority srcnat + 10; policy accept;
-		tcp dport 443 tcp sport & 1 == 0 drop
-	}
-}
-NFT
+nic="$(ip -o route get 1.1.1.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')"
+$SUDO tc qdisc add dev "$nic" clsact
+$SUDO tc filter add dev "$nic" egress protocol ip prio 1 u32 match ip dport 443 0xffff match ip sport 0 1 action drop
+say "syn_loss: $($SUDO tc filter show dev "$nic" egress | grep -c 'match')"
 ok=0 worst=0
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-	t="$(curl -s -o /dev/null -m 8 -w '%{time_connect}' https://github.com/ 2>/dev/null)" && ok=$((ok + 1))
+	t="$(curl -s -o /dev/null -m 30 -w '%{time_connect}' https://github.com/ 2>/dev/null)" && ok=$((ok + 1))
 	worst="$(awk "BEGIN{print ($t + 0 > $worst) ? $t : $worst}")"
 done
 say "syn_lossy: $ok of 12 connected, worst ${worst}s"
-$SUDO nft delete table ip syn_test
+$SUDO tc qdisc del dev "$nic" clsact
 for t in gcc make unzip node npm python3 pip3 java go rustc cargo ruby gh aws az kubectl yq; do
 	say "tool $t: $(command -v "$t" || echo MISSING)"
 done
@@ -235,6 +233,7 @@ else
 fi
 check "the SYN rule is on at boot" 'syn_rule: 1'
 check "SYNs retry every second at boot" 'syn_retry_gap: 10'
+check "the lossy path is in place" 'syn_loss: [1-9]'
 check "a retry takes a new port through a lossy path" 'syn_lossy: 12 of 12'
 check "the SYN rule is gone after two minutes" 'syn_rule_after: 0'
 check "SYN retries return to the default" 'syn_retry_gap_after: 4'
