@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -328,6 +330,19 @@ func TestHit_NeedsGitHubToHaveAcceptedTheCredentials(t *testing.T) {
 			t.Fatal("a stale listing authorised a read")
 		}
 	})
+}
+
+func TestLogs_LeaveOutSignedURLs(t *testing.T) {
+	var logged bytes.Buffer
+	h := newHarness(t, func(c *Config) { c.Log = slog.New(slog.NewTextHandler(&logged, nil)) })
+	h.cache.openErr = &url.Error{Op: "Get", URL: "http://127.0.0.1/download/1?sig=secret", Err: errors.New("refused")}
+	h.refs("t")
+	if _, err := h.fetch("t"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logged.String(), "refused") || strings.Contains(logged.String(), "secret") {
+		t.Fatalf("logged %q", logged.String())
+	}
 }
 
 func TestLookupFailure_FallsThroughToGitHub(t *testing.T) {

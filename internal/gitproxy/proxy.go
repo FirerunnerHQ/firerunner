@@ -280,7 +280,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, e cacheEntry) b
 	lookup.Stop()
 	if err != nil {
 		if !errors.Is(err, ErrMiss) {
-			p.cfg.Log.Warn("git cache lookup failed", "err", err)
+			p.cfg.Log.Warn("git cache lookup failed", "err", plainError(err))
 		}
 		return false
 	}
@@ -295,7 +295,7 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, e cacheEntry) b
 	check := newResponseCheck(e.objectFormat)
 	size, err := io.Copy(f, io.TeeReader(io.LimitReader(entry, p.cfg.MaxSave+1), check))
 	if err != nil || size > p.cfg.MaxSave || !check.complete() {
-		p.cfg.Log.Warn("git cache entry unusable; asking GitHub", "err", err, "key", e.key, "bytes", size)
+		p.cfg.Log.Warn("git cache entry unusable; asking GitHub", "err", plainError(err), "key", e.key, "bytes", size)
 		return false
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -339,6 +339,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body io.Reader, 
 	}
 	res, err := p.cfg.Transport.RoundTrip(req)
 	if err != nil {
+		p.cfg.Log.Warn("reaching GitHub failed", "err", plainError(err))
 		http.Error(w, "reaching "+Host, http.StatusBadGateway)
 		return http.StatusBadGateway
 	}
@@ -446,9 +447,18 @@ func (s *pendingSave) finish() {
 		ctx, cancel := context.WithTimeout(context.Background(), s.p.cfg.SaveTimeout)
 		defer cancel()
 		if err := s.p.cfg.Cache.Save(ctx, s.key, path, s.size); err != nil {
-			s.p.cfg.Log.Warn("git cache: store failed", "err", err)
+			s.p.cfg.Log.Warn("git cache: store failed", "err", plainError(err))
 		}
 	}()
+}
+
+// plainError leaves out a failed request's URL, which holds a blob's signature.
+func plainError(err error) error {
+	var u *url.Error
+	if errors.As(err, &u) {
+		return u.Err
+	}
+	return err
 }
 
 // credentials names a repository and the credentials used on it, without
