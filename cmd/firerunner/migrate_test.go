@@ -29,6 +29,9 @@ func TestMigrateUsage(t *testing.T) {
 		{"--repo", "acme/app"},
 		{"--repo", "acme/app", "--map", "nonsense"},
 		{"--repo", "acme/app", "--map", "a=b", "--map", "a=c"},
+		// One label to GitHub, mapped two ways, with or without a catalog.
+		{"--repo", "acme/app", "--map", "Ubuntu-22.04=firerunner", "--map", "ubuntu-22.04=node"},
+		{"--repo", "acme/app", "--catalog", "../../examples/tiers.json", "--map", "Ubuntu-22.04=firerunner", "--map", "ubuntu-22.04=node"},
 		{"--repo", "acme/app", "--map", "a=b", "--map", "b=c"},
 		{"--repo", "acme/app", "--map", "a=true"},
 		{"--repo", "acme/app", "--map", "a=b", "extra"},
@@ -159,6 +162,17 @@ func TestCatalogMap(t *testing.T) {
 	got, err = catalogMap(p, migrate.Map{"Ubuntu-24.04": "big", "macos-latest": "fr-big"})
 	if err != nil || !reflect.DeepEqual(got, migrate.Map{"ubuntu-latest": "fr-small", "Ubuntu-24.04": "big", "macos-latest": "fr-big"}) {
 		t.Errorf("with --map: %v, %v", got, err)
+	}
+	// --map X=X keeps X where it runs, even when the catalog replaces it.
+	got, err = catalogMap(p, migrate.Map{"UBUNTU-LATEST": "ubuntu-latest"})
+	if err != nil || !reflect.DeepEqual(got, migrate.Map{"ubuntu-24.04": "fr-small"}) {
+		t.Errorf("opt out: %v, %v", got, err)
+	}
+	// Only ASCII case folds: --map ubuntſ-latest (long s) does not override
+	// the catalog's ubuntu-latest.
+	got, err = catalogMap(p, migrate.Map{"ubuntſ-latest": "fr-big"})
+	if err != nil || got["ubuntu-latest"] != "fr-small" || got["ubuntſ-latest"] != "fr-big" {
+		t.Errorf("non-ASCII fold: %v, %v", got, err)
 	}
 	if _, err := catalogMap(p, migrate.Map{"ubuntu-latest": "fr-nope"}); err == nil {
 		t.Error("a target no tier answers to is accepted")

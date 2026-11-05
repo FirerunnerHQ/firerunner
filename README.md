@@ -200,8 +200,9 @@ cache](#self-hosted-dependency-cache---cache-port-opt-in), `firerunner migrate`
 Once the App is installed, `firerunner migrate` opens a pull request that
 changes the repository's workflows' `runs-on` labels to your tiers. The map
 comes from the tier catalog: each label a tier lists in `"replaces"` moves to
-that tier (see [`examples/tiers.json`](examples/tiers.json)), and `--map
-FROM=TO` adds to it or overrides it, label by label:
+that tier (see [`examples/tiers.json`](examples/tiers.json)). `--map
+FROM=TO` adds to it or overrides it, label by label, and `--map X=X` keeps label
+`X` where it runs:
 
 ```bash
 firerunner migrate --repo ORG/REPO --catalog tiers.json --dry-run   # print the diff; push nothing
@@ -328,8 +329,9 @@ too), e.g. `"labels": ["node"]` lets a job target the tier with either
 names the GitHub-hosted labels the tier takes over, e.g. `["ubuntu-latest",
 "ubuntu-24.04"]`: [`firerunner migrate
 --catalog`](#moving-a-repository-onto-firerunner) moves jobs on those labels to
-the tier. The daemon ignores it. A label is replaced by one tier at most, and
-never one a tier answers to itself.
+the tier. The daemon neither uses nor checks it, so a mistake there cannot stop
+a deployment; `config check --catalog` and `migrate` refuse one: a label is
+replaced by one tier at most, and never one a tier answers to itself.
 
 The `firerunner-ubuntu` tier above points at the **faithful `ubuntu-latest`
 full image** — an Ubuntu 24.04 (glibc 2.39) rootfs with the hosted tool cache

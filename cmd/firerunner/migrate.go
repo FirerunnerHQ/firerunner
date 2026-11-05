@@ -22,7 +22,8 @@ import (
 const migrateUsage = `usage:
   firerunner migrate --repo OWNER/NAME --catalog FILE [--map FROM=TO ...]
                      [--branch NAME] [--dry-run] [--json]
-  firerunner migrate --repo OWNER/NAME --map FROM=TO [--map FROM=TO ...] ...
+  firerunner migrate --repo OWNER/NAME --map FROM=TO [--map FROM=TO ...]
+                     [--branch NAME] [--dry-run] [--json]
 
 Move a repository's GitHub Actions jobs onto firerunner: rewrite the runs-on
 labels in .github/workflows at the head of its default branch, commit them to
@@ -40,9 +41,10 @@ flags:
   --repo OWNER/NAME   the repository to migrate
   --map FROM=TO       replace runs-on label FROM with TO (repeatable)
   --catalog FILE      the tier catalog: each label a tier lists in "replaces"
-                      maps to that tier (--map overrides it, label by label),
-                      and a TO that no tier is named or labelled is refused,
-                      so no job waits for a runner that never comes
+                      maps to that tier. --map overrides it, label by label,
+                      and --map X=X keeps label X where it runs. A TO that no
+                      tier is named or labelled is refused, so no job waits
+                      for a runner that never comes
   --branch NAME       the pull request's branch (default firerunner/migrate)
   --dry-run           change nothing: print the diff (with --json, the report)
   --json              print the report as JSON
@@ -159,29 +161,36 @@ func catalogMap(path string, explicit migrate.Map) (migrate.Map, error) {
 		return nil, fmt.Errorf("--catalog: %w", err)
 	}
 	known := map[string]bool{}
+	byFold := map[string]string{} // folded label -> the catalog's spelling
 	m := migrate.Map{}
 	for _, t := range tiers {
-		known[strings.ToLower(t.Name)] = true
+		known[migrate.FoldLabel(t.Name)] = true
 		for _, l := range t.Labels {
-			known[strings.ToLower(l)] = true
+			known[migrate.FoldLabel(l)] = true
 		}
 		for _, l := range t.Replaces {
 			m[l] = t.Name
+			byFold[migrate.FoldLabel(l)] = l
+		}
+	}
+	// The explicit map overrides the catalog's entries only; --map X=X
+	// keeps label X where it runs.
+	for from, to := range explicit {
+		delete(m, byFold[migrate.FoldLabel(from)])
+		if migrate.FoldLabel(from) == migrate.FoldLabel(to) {
+			continue
+		}
+		if !known[migrate.FoldLabel(to)] {
+			return nil, fmt.Errorf("--map %s=%s: no tier in %s is named or labelled %q", from, to, path, to)
 		}
 	}
 	for from, to := range explicit {
-		if !known[strings.ToLower(to)] {
-			return nil, fmt.Errorf("--map %s=%s: no tier in %s is named or labelled %q", from, to, path, to)
+		if migrate.FoldLabel(from) != migrate.FoldLabel(to) {
+			m[from] = to
 		}
-		for k := range m {
-			if strings.EqualFold(k, from) {
-				delete(m, k)
-			}
-		}
-		m[from] = to
 	}
 	if len(m) == 0 {
-		return nil, fmt.Errorf("--catalog %s: no tier sets replaces; give --map FROM=TO", path)
+		return nil, fmt.Errorf("--catalog %s: no label to move: no tier sets replaces, and --map adds none", path)
 	}
 	return m, nil
 }
