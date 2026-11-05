@@ -140,6 +140,24 @@ pass "half moved: undoes the mount" called "umount $STATE/mem"
 pass "half moved: Docker comes back after the undo" ordered "umount $STATE/mem" "systemctl start"
 pass "half moved: says so" grep -q "stays on the disk" "$STATE/stderr"
 
+# Undone in full, Docker is on the disk, and the job can run on it.
+fresh
+: > "$STATE/pending"
+# shellcheck disable=SC2016 # the stub evaluates this
+stub mount 'case "$*" in *containerd*) exit 1 ;; esac; exit 0'
+DOCKER_PENDING="$STATE/pending" run
+pass "half moved, undone: the boot service may run the job" [ ! -e "$STATE/pending" ]
+
+# Not undone, dockerd and containerd are on different filesystems.
+fresh
+: > "$STATE/pending"
+# shellcheck disable=SC2016 # the stub evaluates this
+stub mount 'case "$*" in *containerd*) exit 1 ;; esac; exit 0'
+stub umount 'exit 1'
+DOCKER_PENDING="$STATE/pending" run
+pass "half moved, not undone: exits 0" [ "$rc" = 0 ]
+pass "half moved, not undone: the boot service must not run the job" [ -e "$STATE/pending" ]
+
 fresh
 # shellcheck disable=SC2016 # the stub evaluates this
 stub systemctl 'case "$1" in stop) exit 1 ;; esac; exit 0'
@@ -156,6 +174,14 @@ run
 pass "Docker will not start: exits 0" [ "$rc" = 0 ]
 pass "Docker will not start: says that, not that it stayed" grep -q "could not start Docker" "$STATE/stderr"
 pass "Docker will not start: does not claim the disk" not grep -q "stays on the disk" "$STATE/stderr"
+
+fresh
+: > "$STATE/pending"
+# shellcheck disable=SC2016 # the stub evaluates this
+stub systemctl 'case "$1" in start) exit 1 ;; esac; exit 0'
+DOCKER_PENDING="$STATE/pending" run
+pass "Docker will not start: the boot service must not run the job" [ -e "$STATE/pending" ]
+pass "Docker will not start: the disk still grows" called "resize2fs /dev/nvme0n1p1"
 DOCKER_STORAGE=
 
 fresh

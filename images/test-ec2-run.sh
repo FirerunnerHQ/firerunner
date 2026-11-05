@@ -510,6 +510,19 @@ expect "no pending file: tuning still runs" "" has tune-docker
 expect "no pending file: Docker is not moved" "$(cat "$STATE/tune-docker" 2>/dev/null)" [ -z "$(cat "$STATE/tune-docker" 2>/dev/null)" ]
 expect "no pending file: the runner ran" "" has runner-argv
 
+# Tuning ended and left the file: Docker's state is unknown.
+fresh docker-unsettled
+printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/fake-tune"
+printf 'FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\nFIRERUNNER_DOCKER_STORAGE=memory\n' > "$STATE/userdata"
+echo 200 > "$STATE/jit-codes"
+printf 'eyJqaXQiOiJ4In0=' > "$STATE/jit-body"
+runner 'echo "Exiting runner..."'
+TUNE="$TMP/bin/fake-tune" run
+expect "Docker unsettled: the runner never starts" "" lacks runner-argv
+expect "Docker unsettled: says why" "$(cat "$STATE/stderr")" grep -q "Docker did not settle" "$STATE/stderr"
+expect "Docker unsettled: powers off fast" "poweroff=$(cat "$STATE/poweroff" 2>/dev/null)" powered_off fast
+expect "Docker unsettled: reports a failure" "$(cat "$STATE/reports" 2>/dev/null)" reported 'phase=exited&rc=1'
+
 # A move that never ends must not run the job on a Docker in an unknown state.
 fresh docker-stuck
 cat > "$TMP/bin/fake-tune" <<'FAKE'

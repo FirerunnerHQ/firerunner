@@ -194,8 +194,8 @@ if ! cd "$RUNNER_DIR" 2>/dev/null || [ ! -x ./run.sh ]; then
 fi
 if [ -n "$tune_pid" ]; then
 	# Moving Docker stops it, so a job must not start during the move. A move
-	# stuck past DOCKER_WAIT leaves Docker in an unknown state: fail the job
-	# rather than run it there.
+	# stuck past DOCKER_WAIT, or one that ended without settling Docker, leaves
+	# it in an unknown state: fail the job rather than run it there.
 	start="$(date +%s)"
 	while [ -n "$docker_pending" ] && [ -e "$docker_pending" ] && kill -0 "$tune_pid" 2>/dev/null; do
 		if [ $(($(date +%s) - start)) -ge "$DOCKER_WAIT" ]; then
@@ -205,6 +205,11 @@ if [ -n "$tune_pid" ]; then
 		fi
 		sleep 0.1
 	done
+	if [ -n "$docker_pending" ] && [ -e "$docker_pending" ]; then
+		report exited 1 # before the log line, which may fail
+		log "Docker did not settle after the move; powering off"
+		exit 0
+	fi
 	# Bounded, unlike wait: a step stuck on a device must not hold the job back.
 	waited=0
 	while kill -0 "$tune_pid" 2>/dev/null && [ "$waited" -lt "$TUNE_TICKS" ]; do

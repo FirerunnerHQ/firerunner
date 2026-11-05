@@ -22,7 +22,8 @@ PREHEAT_PATHS="${FIRERUNNER_PREHEAT_PATHS:-/usr/bin/dockerd /usr/bin/containerd 
 DOCKER_STORAGE="${FIRERUNNER_DOCKER_STORAGE:-}"
 DOCKER_DIRS="${FIRERUNNER_DOCKER_DIRS:-/var/lib/docker /var/lib/containerd}"
 DOCKER_MEM_DIR="${FIRERUNNER_DOCKER_MEM_DIR:-/run/firerunner-docker}"
-# Removed once Docker is settled, for the boot service to wait on.
+# Removed once Docker is back in a known state, for the boot service to wait
+# on. Left in place, it tells the boot service not to run the job.
 DOCKER_PENDING="${FIRERUNNER_DOCKER_PENDING:-}"
 
 log() { echo "firerunner-tune: $*" >&2; }
@@ -98,7 +99,10 @@ docker_memory() {
 		docker_memory_mount "$kib" && moved=0
 	fi
 	# Whatever happened: a stop that failed or timed out may still stop them.
-	bounded systemctl start containerd.service docker.service || log "could not start Docker"
+	if ! bounded systemctl start containerd.service docker.service; then
+		log "could not start Docker"
+		docker_unsettled=1
+	fi
 	return "$moved"
 }
 
@@ -113,7 +117,7 @@ docker_memory_mount() {
 			! bounded mount --bind "$DOCKER_MEM_DIR/${dir##*/}" "$dir"; then
 			# Half moved would split containerd's data from dockerd's.
 			for undo in $bound; do
-				bounded umount "$undo" || true
+				bounded umount "$undo" || docker_unsettled=1
 			done
 			bounded umount "$DOCKER_MEM_DIR" || true
 			return 1
@@ -128,12 +132,13 @@ preheat() {
 	nohup sh -c "find $PREHEAT_PATHS -xdev -type f -print0 2>/dev/null | xargs -0 -r cat >/dev/null 2>&1" >/dev/null 2>&1 &
 }
 
+docker_unsettled=""
 preheat
 zram_swap || log "could not set up zram swap; the job runs without swap"
 # Before the disk, which can stall: the job waits for this step, not for that.
 if [ "$DOCKER_STORAGE" = memory ]; then
 	docker_memory || log "could not move Docker to memory; its data stays on the disk"
 fi
-[ -z "$DOCKER_PENDING" ] || rm -f "$DOCKER_PENDING"
+[ -n "$docker_unsettled" ] || [ -z "$DOCKER_PENDING" ] || rm -f "$DOCKER_PENDING"
 grow_root || log "could not grow the root filesystem; the job keeps the image's size"
 exit 0
