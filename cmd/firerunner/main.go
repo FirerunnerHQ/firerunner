@@ -799,6 +799,12 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			return fmt.Errorf("cache CA: %w", err)
 		}
 		ec2Cache = &ec2.CacheOptions{CA: ca, Upstream: cfg.EC2CacheAddr, Jobs: cacheJobs, LeafTTL: leafTTL(cfg)}
+		if cfg.UsesEC2GitCache() {
+			ec2Cache.GitCA, err = cachetls.LoadOrCreateFor(filepath.Join(cfg.Firecracker.WorkDir, "git-tls"), cachetls.GitHost)
+			if err != nil {
+				return fmt.Errorf("git cache CA: %w", err)
+			}
+		}
 		log.Info("EC2 cache proxy enabled", "upstream", cfg.EC2CacheAddr, "leafTTL", ec2Cache.LeafTTL)
 	}
 	var fc *provisioner.Firecracker

@@ -8,6 +8,11 @@
 // OpenSSL and Node do). Each instance gets its own leaf for that one name,
 // valid for the instance's lifetime, in its one-time handoff: a job that reads
 // its leaf key holds a certificate for one host that expires with the VM.
+//
+// A tier with a git cache gets a second CA, for github.com, with its own leaf.
+// It stays apart because it is trusted differently: the results host's CA goes
+// into the instance's system store, which would make every tool there accept a
+// leaf for github.com. The git CA is trusted by git alone, through sslCAInfo.
 package cachetls
 
 import (
@@ -30,6 +35,9 @@ import (
 // ACTIONS_RESULTS_URL's host.
 const ResultsHost = "results-receiver.actions.githubusercontent.com"
 
+// GitHost is the name git reaches, and the git proxy answers as.
+const GitHost = "github.com"
+
 // File names in the CA's directory.
 const (
 	caCertFile = "cache-ca.pem"
@@ -44,8 +52,9 @@ const (
 	caRenew    = 30 * 24 * time.Hour
 )
 
-// CA signs leaf certificates for ResultsHost.
+// CA signs leaf certificates for one host.
 type CA struct {
+	host    string
 	cert    *x509.Certificate
 	certPEM []byte
 	key     *ecdsa.PrivateKey
@@ -58,7 +67,12 @@ type CA struct {
 // plant a CA of their own. A lone certificate or key, as a crash between the
 // two writes leaves, or a CA near its expiry, is replaced; a certificate and
 // key that do not belong together are refused.
-func LoadOrCreate(dir string) (*CA, error) {
+func LoadOrCreate(dir string) (*CA, error) { return LoadOrCreateFor(dir, ResultsHost) }
+
+// LoadOrCreateFor is LoadOrCreate for a CA constrained to host. A CA in dir
+// constrained to anything else is refused, as it would sign leaves for the
+// wrong name.
+func LoadOrCreateFor(dir, host string) (*CA, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -70,7 +84,7 @@ func LoadOrCreate(dir string) (*CA, error) {
 	keyPEM, keyErr := readKey(keyPath)
 	switch {
 	case certErr == nil && keyErr == nil:
-		ca, err := parse(certPEM, keyPEM)
+		ca, err := parse(certPEM, keyPEM, host)
 		if err != nil {
 			return nil, err
 		}
@@ -82,7 +96,7 @@ func LoadOrCreate(dir string) (*CA, error) {
 	case keyErr != nil && !errors.Is(keyErr, os.ErrNotExist):
 		return nil, keyErr
 	}
-	ca, keyDER, err := create(time.Now())
+	ca, keyDER, err := create(time.Now(), host)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +144,7 @@ func readKey(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-func create(now time.Time) (*CA, []byte, error) {
+func create(now time.Time, host string) (*CA, []byte, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, err
@@ -145,7 +159,7 @@ func create(now time.Time) (*CA, []byte, error) {
 		IsCA:                        true,
 		MaxPathLenZero:              true,
 		PermittedDNSDomainsCritical: true,
-		PermittedDNSDomains:         []string{ResultsHost},
+		PermittedDNSDomains:         []string{host},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -156,10 +170,10 @@ func create(now time.Time) (*CA, []byte, error) {
 		return nil, nil, err
 	}
 	cert, _ := x509.ParseCertificate(der)
-	return &CA{cert: cert, certPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), key: key, now: time.Now}, keyDER, nil
+	return &CA{host: host, cert: cert, certPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), key: key, now: time.Now}, keyDER, nil
 }
 
-func parse(certPEM, keyPEM []byte) (*CA, error) {
+func parse(certPEM, keyPEM []byte, host string) (*CA, error) {
 	cb, _ := pem.Decode(certPEM)
 	kb, _ := pem.Decode(keyPEM)
 	if cb == nil || kb == nil {
@@ -176,13 +190,16 @@ func parse(certPEM, keyPEM []byte) (*CA, error) {
 	if !cert.IsCA || !key.PublicKey.Equal(cert.PublicKey) {
 		return nil, errors.New("cachetls: CA certificate and key do not belong together")
 	}
-	return &CA{cert: cert, certPEM: certPEM, key: key, now: time.Now}, nil
+	if len(cert.PermittedDNSDomains) != 1 || cert.PermittedDNSDomains[0] != host {
+		return nil, fmt.Errorf("cachetls: CA is constrained to %v, not %s", cert.PermittedDNSDomains, host)
+	}
+	return &CA{host: host, cert: cert, certPEM: certPEM, key: key, now: time.Now}, nil
 }
 
 // CertPEM is the CA certificate instances add to their trust.
 func (c *CA) CertPEM() []byte { return c.certPEM }
 
-// Leaf issues a certificate and key for ResultsHost, valid for ttl from now
+// Leaf issues a certificate and key for the CA's host, valid for ttl from now
 // (and never past the CA).
 func (c *CA) Leaf(ttl time.Duration) (certPEM, keyPEM []byte, err error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -197,8 +214,8 @@ func (c *CA) Leaf(ttl time.Duration) (certPEM, keyPEM []byte, err error) {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: serial(),
-		Subject:      pkix.Name{CommonName: ResultsHost},
-		DNSNames:     []string{ResultsHost},
+		Subject:      pkix.Name{CommonName: c.host},
+		DNSNames:     []string{c.host},
 		NotBefore:    now.Add(-5 * time.Minute), // the instance's clock may lag
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -217,18 +234,29 @@ func (c *CA) Leaf(ttl time.Duration) (certPEM, keyPEM []byte, err error) {
 }
 
 // Bundle is what an instance's cache proxy needs, handed to it once with its
-// config (jitserver.CachePath): the CA to trust, its own leaf, and where
-// cache-server listens.
+// config (jitserver.CachePath): the CA to trust, its own leaf, where
+// cache-server listens and, for a tier with a git cache, the git proxy's
+// identity.
 type Bundle struct {
-	CA       string `json:"ca"`
-	Cert     string `json:"cert"`
-	Key      string `json:"key"`
-	Upstream string `json:"upstream"` // host:port of cache-server
+	CA       string       `json:"ca"`
+	Cert     string       `json:"cert"`
+	Key      string       `json:"key"`
+	Upstream string       `json:"upstream"` // host:port of cache-server
+	Git      *GitIdentity `json:"git,omitempty"`
+}
+
+// GitIdentity is the git proxy's certificate for GitHost, and the CA git is
+// told to trust for it.
+type GitIdentity struct {
+	CA   string `json:"ca"`
+	Cert string `json:"cert"`
+	Key  string `json:"key"`
 }
 
 // Bundle issues a leaf for one instance, valid for ttl, and packs it with the
-// CA and cache-server's address as JSON.
-func (c *CA) Bundle(ttl time.Duration, upstream string) ([]byte, error) {
+// CA and cache-server's address as JSON. With git set, it adds a leaf from that
+// CA for the instance's git proxy.
+func (c *CA) Bundle(ttl time.Duration, upstream string, git *CA) ([]byte, error) {
 	if upstream == "" {
 		return nil, errors.New("cachetls: a bundle needs the cache-server address")
 	}
@@ -236,7 +264,15 @@ func (c *CA) Bundle(ttl time.Duration, upstream string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(Bundle{CA: string(c.certPEM), Cert: string(cert), Key: string(key), Upstream: upstream})
+	b := Bundle{CA: string(c.certPEM), Cert: string(cert), Key: string(key), Upstream: upstream}
+	if git != nil {
+		gitCert, gitKey, err := git.Leaf(ttl)
+		if err != nil {
+			return nil, err
+		}
+		b.Git = &GitIdentity{CA: string(git.certPEM), Cert: string(gitCert), Key: string(gitKey)}
+	}
+	return json.Marshal(b)
 }
 
 func serial() *big.Int {

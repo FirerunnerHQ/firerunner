@@ -1,6 +1,7 @@
 package cachetls
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -127,7 +128,7 @@ func TestLoadOrCreateGuardsTheDirectoryAndKey(t *testing.T) {
 
 func TestLoadOrCreateReplacesACANearExpiry(t *testing.T) {
 	dir := t.TempDir()
-	old, keyDER, err := create(time.Now().Add(-caLifetime + 10*24*time.Hour)) // 10 days left
+	old, keyDER, err := create(time.Now().Add(-caLifetime+10*24*time.Hour), ResultsHost) // 10 days left
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +246,7 @@ func TestBundleCarriesAWorkingLeafAndTheUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := ca.Bundle(time.Hour, "10.0.0.5:8099")
+	raw, err := ca.Bundle(time.Hour, "10.0.0.5:8099", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +260,77 @@ func TestBundleCarriesAWorkingLeafAndTheUpstream(t *testing.T) {
 	if _, err := tls.X509KeyPair([]byte(b.Cert), []byte(b.Key)); err != nil {
 		t.Fatalf("bundle's leaf and key do not pair: %v", err)
 	}
-	if _, err := ca.Bundle(time.Hour, ""); err == nil {
+	if _, err := ca.Bundle(time.Hour, "", nil); err == nil {
 		t.Fatal("a bundle without an upstream")
+	}
+}
+
+func TestGitCAIsConstrainedToGitHubAlone(t *testing.T) {
+	dir := t.TempDir()
+	ca, err := LoadOrCreateFor(dir, GitHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, _, err := ca.Leaf(time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(certPEM)
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(ca.CertPEM())
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: GitHost}); err != nil {
+		t.Fatalf("the leaf does not verify for %s: %v", GitHost, err)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: ResultsHost}); err == nil {
+		t.Fatal("the git leaf verified for the results host")
+	}
+
+	again, err := LoadOrCreateFor(dir, GitHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again.CertPEM(), ca.CertPEM()) {
+		t.Fatal("reloading made a new CA")
+	}
+	// A directory holds one CA: one for another host must not sign for this one.
+	if _, err := LoadOrCreate(dir); err == nil {
+		t.Fatal("a CA for github.com loaded as the results host's")
+	}
+}
+
+func TestBundleWithGitCarriesASeparateIdentity(t *testing.T) {
+	ca, err := LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	git, err := LoadOrCreateFor(t.TempDir(), GitHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := ca.Bundle(time.Hour, "10.0.0.5:8099", git)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b Bundle
+	if err := json.Unmarshal(raw, &b); err != nil {
+		t.Fatal(err)
+	}
+	if b.Git == nil || b.Git.CA != string(git.CertPEM()) || b.Git.CA == b.CA || b.Git.Cert == b.Cert || b.Git.Key == b.Key {
+		t.Fatalf("git identity = %+v", b.Git)
+	}
+	if _, err := tls.X509KeyPair([]byte(b.Git.Cert), []byte(b.Git.Key)); err != nil {
+		t.Fatalf("the git certificate and key do not pair: %v", err)
+	}
+
+	raw, err = ca.Bundle(time.Hour, "10.0.0.5:8099", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"git"`) {
+		t.Fatalf("a bundle without a git cache mentions git: %s", raw)
 	}
 }
