@@ -58,6 +58,14 @@ func TestParse_BloblessFetch(t *testing.T) {
 	}
 }
 
+func TestParse_FixedFilters(t *testing.T) {
+	for _, filter := range []string{"blob:none", "tree:0", "tree:3", "blob:limit=100", "blob:limit=1m", "blob:limit=2K"} {
+		if f := mustParse(t, fetchCaps, []string{"filter " + filter, "want " + oidA, "done"}); f.Filter != filter {
+			t.Errorf("Filter = %q, want %q", f.Filter, filter)
+		}
+	}
+}
+
 func TestParse_SHA256(t *testing.T) {
 	oid := strings.Repeat("ab", 32)
 	f := mustParse(t, []string{"command=fetch", "object-format=sha256"}, []string{"want " + oid, "done"})
@@ -93,8 +101,14 @@ func TestParse_Refuses(t *testing.T) {
 		"upper want":      request(fetchCaps, []string{"want " + strings.ToUpper(oidA), "done"}),
 		"bad deepen":      request(fetchCaps, []string{"want " + oidA, "deepen 0", "done"}),
 		"two deepens":     request(fetchCaps, []string{"want " + oidA, "deepen 1", "deepen 2", "done"}),
-		"two filters":     request(fetchCaps, []string{"want " + oidA, "filter a", "filter b", "done"}),
+		"two filters":     request(fetchCaps, []string{"want " + oidA, "filter blob:none", "filter tree:0", "done"}),
 		"bad format":      request([]string{"command=fetch", "object-format=md5"}, []string{"want " + oidA, "done"}),
+		"sparse filter":   request(fetchCaps, []string{"want " + oidA, "filter sparse:oid=HEAD:patterns", "done"}),
+		"combined filter": request(fetchCaps, []string{"want " + oidA, "filter combine:blob:none+sparse:oid=main:p", "done"}),
+		"unknown filter":  request(fetchCaps, []string{"want " + oidA, "filter object:type=blob", "done"}),
+		"bad tree filter": request(fetchCaps, []string{"want " + oidA, "filter tree:x", "done"}),
+		"bad blob limit":  request(fetchCaps, []string{"want " + oidA, "filter blob:limit=HEAD:x", "done"}),
+		"empty filter":    request(fetchCaps, []string{"want " + oidA, "filter", "done"}),
 		"empty":           nil,
 		"not pkt-line":    []byte("zzzz"),
 		"truncated":       []byte("0014command=fe"),

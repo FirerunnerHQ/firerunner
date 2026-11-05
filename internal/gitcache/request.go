@@ -98,7 +98,7 @@ func Parse(body []byte) (Fetch, error) {
 			}
 			f.Deepen = n
 		case "filter":
-			if value == "" || f.Filter != "" {
+			if !fixedFilter(value) || f.Filter != "" {
 				return Fetch{}, notCacheable("filter %q", value)
 			}
 			f.Filter = value
@@ -161,6 +161,34 @@ func split(body []byte) (caps, args []string, err error) {
 		}
 		rest = rest[n:]
 	}
+}
+
+// fixedFilter reports whether a partial clone filter selects objects by what
+// they are. sparse:oid can name its pattern through a ref, as in HEAD:patterns,
+// so its answer moves, and combine: can hide one inside it.
+func fixedFilter(s string) bool {
+	if s == "blob:none" {
+		return true
+	}
+	if n, ok := strings.CutPrefix(s, "tree:"); ok {
+		return isNumber(n)
+	}
+	if n, ok := strings.CutPrefix(s, "blob:limit="); ok {
+		return isNumber(strings.TrimRight(n, "kmgKMG"))
+	}
+	return false
+}
+
+func isNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range []byte(s) {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func isOID(s string, n int) bool {
