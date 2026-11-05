@@ -198,20 +198,24 @@ cache](#self-hosted-dependency-cache---cache-port-opt-in), `firerunner migrate`
 ### Moving a repository onto firerunner
 
 Once the App is installed, `firerunner migrate` opens a pull request that
-changes the repository's workflows' `runs-on` labels to your tiers:
+changes the repository's workflows' `runs-on` labels to your tiers. The map
+comes from the tier catalog: each label a tier lists in `"replaces"` moves to
+that tier (see [`examples/tiers.json`](examples/tiers.json)). `--map
+FROM=TO` adds to it or overrides it, label by label, and `--map X=X` keeps label
+`X` where it runs:
 
 ```bash
-firerunner migrate --repo ORG/REPO --map ubuntu-latest=firerunner \
-  --catalog tiers.json --dry-run   # print the diff; push nothing
-firerunner migrate --repo ORG/REPO --map ubuntu-latest=firerunner --catalog tiers.json
+firerunner migrate --repo ORG/REPO --catalog tiers.json --dry-run   # print the diff; push nothing
+firerunner migrate --repo ORG/REPO --catalog tiers.json
+firerunner migrate --repo ORG/REPO --map ubuntu-latest=firerunner   # no catalog: the map alone
 ```
 
 Only the labels change; every other byte of each workflow is kept. A job it
 cannot map safely is left alone and listed in the pull request with why: a
 `${{ }}` expression (such as a matrix OS), a runner group, `self-hosted`, a
-label you gave no `--map` for, or a reusable workflow call. `--catalog` refuses
-a target no tier is named or labelled, so no job waits for a runner that never
-comes. Running it again rebuilds the branch (`firerunner/migrate`) from the
+label the map does not cover, or a reusable workflow call. With `--catalog`, a
+target no tier is named or labelled is refused, so no job waits for a runner
+that never comes. Running it again rebuilds the branch (`firerunner/migrate`) from the
 default branch and updates the open pull request; to undo the move after
 merging, revert it. `--json` prints the report for scripts and agents.
 
@@ -321,7 +325,13 @@ existing deployments are unchanged.
 Each tier is reachable with `runs-on: <name>`. An optional `"labels"` array
 adds **extra** `runs-on` aliases for a tier (the tier name is always advertised
 too), e.g. `"labels": ["node"]` lets a job target the tier with either
-`runs-on: firerunner-node` or `runs-on: node`.
+`runs-on: firerunner-node` or `runs-on: node`. An optional `"replaces"` array
+names the GitHub-hosted labels the tier takes over, e.g. `["ubuntu-latest",
+"ubuntu-24.04"]`: [`firerunner migrate
+--catalog`](#moving-a-repository-onto-firerunner) moves jobs on those labels to
+the tier. The daemon neither uses nor checks it, so a mistake there cannot stop
+a deployment; `config check --catalog` and `migrate` refuse one: a label is
+replaced by one tier at most, and never one a tier answers to itself.
 
 The `firerunner-ubuntu` tier above points at the **faithful `ubuntu-latest`
 full image** — an Ubuntu 24.04 (glibc 2.39) rootfs with the hosted tool cache

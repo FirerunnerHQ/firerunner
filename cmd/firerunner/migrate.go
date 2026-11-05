@@ -20,8 +20,10 @@ import (
 )
 
 const migrateUsage = `usage:
+  firerunner migrate --repo OWNER/NAME --catalog FILE [--map FROM=TO ...]
+                     [--branch NAME] [--dry-run] [--json]
   firerunner migrate --repo OWNER/NAME --map FROM=TO [--map FROM=TO ...]
-                     [--catalog FILE] [--branch NAME] [--dry-run] [--json]
+                     [--branch NAME] [--dry-run] [--json]
 
 Move a repository's GitHub Actions jobs onto firerunner: rewrite the runs-on
 labels in .github/workflows at the head of its default branch, commit them to
@@ -38,8 +40,11 @@ Contents, Pull requests and Workflows: write.
 flags:
   --repo OWNER/NAME   the repository to migrate
   --map FROM=TO       replace runs-on label FROM with TO (repeatable)
-  --catalog FILE      refuse a TO that is no tier name or label in this
-                      tier catalog, so no job waits for a runner that never comes
+  --catalog FILE      the tier catalog: each label a tier lists in "replaces"
+                      maps to that tier. --map overrides it, label by label,
+                      and --map X=X keeps label X where it runs. A TO that no
+                      tier is named or labelled is refused, so no job waits
+                      for a runner that never comes
   --branch NAME       the pull request's branch (default firerunner/migrate)
   --dry-run           change nothing: print the diff (with --json, the report)
   --json              print the report as JSON
@@ -89,18 +94,20 @@ func migrateCmd(args []string, stdout, stderr io.Writer) int {
 		return migrateUsageError(stderr, fmt.Sprintf("unexpected argument %q", fs.Arg(0)))
 	case *repo == "":
 		return migrateUsageError(stderr, "--repo is required")
-	case len(m) == 0:
-		return migrateUsageError(stderr, "at least one --map FROM=TO is required")
+	case len(m) == 0 && *catalog == "":
+		return migrateUsageError(stderr, "give --map FROM=TO, or --catalog FILE whose tiers set replaces")
 	}
-	if err := migrate.Map(m).Validate(); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 2
-	}
+	labels := migrate.Map(m)
 	if *catalog != "" {
-		if err := checkTargets(*catalog, migrate.Map(m)); err != nil {
+		var err error
+		if labels, err = catalogMap(*catalog, labels); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 2
 		}
+	}
+	if err := labels.Validate(); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
 	}
 	fail := func(err error) int {
 		if *asJSON {
@@ -121,7 +128,7 @@ func migrateCmd(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	gh := &migrate.GitHub{Base: *apiURL, Token: token}
-	rep, err := gh.Migrate(ctx, migrate.Options{Repo: *repo, Map: migrate.Map(m), Branch: *branch, DryRun: *dryRun})
+	rep, err := gh.Migrate(ctx, migrate.Options{Repo: *repo, Map: labels, Branch: *branch, DryRun: *dryRun})
 	if err != nil {
 		if migrate.NeedsWorkflowScope(err) {
 			err = fmt.Errorf("%w\nthe token may not change workflows: run \"gh auth refresh -s workflow\", or give a fine-grained token Workflows: write", err)
@@ -143,26 +150,49 @@ func migrateUsageError(stderr io.Writer, msg string) int {
 	return 2
 }
 
-// checkTargets refuses a target that no tier of the catalog answers to.
-func checkTargets(path string, m migrate.Map) error {
+// catalogMap is the label map a tier catalog implies: each label a tier
+// replaces maps to the tier's name. The explicit map overrides it, label by
+// label, and every target must be a tier's name or label, so no job waits
+// for a runner that never comes.
+func catalogMap(path string, explicit migrate.Map) (migrate.Map, error) {
 	// Only the names matter here, so the slot budget is no constraint.
 	tiers, err := config.CheckCatalog(path, 1<<16)
 	if err != nil {
-		return fmt.Errorf("--catalog: %w", err)
+		return nil, fmt.Errorf("--catalog: %w", err)
 	}
 	known := map[string]bool{}
+	byFold := map[string]string{} // folded label -> the catalog's spelling
+	m := migrate.Map{}
 	for _, t := range tiers {
-		known[strings.ToLower(t.Name)] = true
+		known[migrate.FoldLabel(t.Name)] = true
 		for _, l := range t.Labels {
-			known[strings.ToLower(l)] = true
+			known[migrate.FoldLabel(l)] = true
+		}
+		for _, l := range t.Replaces {
+			m[l] = t.Name
+			byFold[migrate.FoldLabel(l)] = l
 		}
 	}
-	for from, to := range m {
-		if !known[strings.ToLower(to)] {
-			return fmt.Errorf("--map %s=%s: no tier in %s is named or labelled %q", from, to, path, to)
+	// The explicit map overrides the catalog's entries only; --map X=X
+	// keeps label X where it runs.
+	for from, to := range explicit {
+		delete(m, byFold[migrate.FoldLabel(from)])
+		if migrate.FoldLabel(from) == migrate.FoldLabel(to) {
+			continue
+		}
+		if !known[migrate.FoldLabel(to)] {
+			return nil, fmt.Errorf("--map %s=%s: no tier in %s is named or labelled %q", from, to, path, to)
 		}
 	}
-	return nil
+	for from, to := range explicit {
+		if migrate.FoldLabel(from) != migrate.FoldLabel(to) {
+			m[from] = to
+		}
+	}
+	if len(m) == 0 {
+		return nil, fmt.Errorf("--catalog %s: no label to move: no tier sets replaces, and --map adds none", path)
+	}
+	return m, nil
 }
 
 // apiHost is the GitHub host whose API apiURL is: github.com for

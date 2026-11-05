@@ -28,6 +28,15 @@ type Map map[string]string
 // labelRE is what a target label may be: it is written into YAML as is.
 var labelRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
+// ValidTarget reports why label cannot be written as a migration target, or
+// nil: it must be a plain label YAML reads as that string.
+func ValidTarget(label string) error {
+	if !labelRE.MatchString(label) || !plainString(label) {
+		return fmt.Errorf("%q is not a plain label", label)
+	}
+	return nil
+}
+
 // Validate refuses a map whose targets could not be written as a plain
 // label, or that would map a label twice (a -> b, b -> c): a second run
 // must change nothing.
@@ -40,10 +49,10 @@ func (m Map) Validate() error {
 		if from == "" || !labelRE.MatchString(to) || !plainString(to) {
 			return fmt.Errorf("migrate: bad mapping %q=%q: a target must be a plain label", from, to)
 		}
-		if other, ok := seen[asciiLower(from)]; ok {
+		if other, ok := seen[FoldLabel(from)]; ok {
 			return fmt.Errorf("migrate: labels %q and %q differ only in case; GitHub treats them as one", from, other)
 		}
-		seen[asciiLower(from)] = from
+		seen[FoldLabel(from)] = from
 	}
 	for from, to := range m {
 		if next, ok := m.lookup(to); ok && !foldEqual(next, to) {
@@ -77,9 +86,11 @@ func (m Map) lookup(label string) (string, bool) {
 
 // foldEqual compares labels as GitHub does, folding ASCII case only:
 // strings.EqualFold would also equate the long s (U+017F) with s.
-func foldEqual(a, b string) bool { return asciiLower(a) == asciiLower(b) }
+func foldEqual(a, b string) bool { return FoldLabel(a) == FoldLabel(b) }
 
-func asciiLower(s string) string {
+// FoldLabel is the key two runs-on labels share when GitHub treats them as
+// one: ASCII case folded, nothing else.
+func FoldLabel(s string) string {
 	b := []byte(s)
 	for i, c := range b {
 		if 'A' <= c && c <= 'Z' {
