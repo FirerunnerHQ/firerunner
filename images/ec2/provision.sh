@@ -24,6 +24,9 @@
 #   RUNNER_ARCH     x64 or arm64
 #   TOOLSET         standard (GitHub's ubuntu-24.04 tools that jobs commonly
 #                   use), full (nearly all of them) or minimal (Docker, git)
+#   FR_VERSION      firerunner release for the git cache's proxy; empty means
+#                   the latest
+#   FR_URL          take the binary from here instead, checked against FR_SHA256
 set -euxo pipefail
 
 : "${RUNNER_VERSION:?}" "${RUNNER_ARCH:?}" "${TOOLSET:?}"
@@ -106,23 +109,6 @@ systemctl disable nginx.service
 
 # The git cache's proxy, started only for a tier that has one. Best effort: an
 # image without it runs every job, with git going to GitHub.
-install_firerunner() {
-	local name dir
-	name="firerunner_linux_$([ "$RUNNER_ARCH" = arm64 ] && echo arm64 || echo amd64)"
-	dir="$(mktemp -d)"
-	if [ -n "$FR_URL" ]; then
-		curl -fsSL --retry 3 -o "$dir/$name" "$FR_URL"
-		echo "$FR_SHA256  $dir/$name" | sha256sum -c - >/dev/null
-	else
-		base="https://github.com/FirerunnerHQ/firerunner/releases"
-		base="$base/$([ -n "$FR_VERSION" ] && echo "download/$FR_VERSION" || echo latest/download)"
-		curl -fsSL --retry 3 -o "$dir/$name" "$base/$name"
-		curl -fsSL --retry 3 -o "$dir/SHA256SUMS" "$base/SHA256SUMS"
-		(cd "$dir" && grep " $name\$" SHA256SUMS | sha256sum -c - >/dev/null)
-	fi
-	install -m 0755 "$dir/$name" /usr/local/bin/firerunner
-	rm -rf "$dir"
-}
 install_firerunner || mark "no firerunner binary; no git cache on this image"
 gcc -O2 -static -o /usr/local/libexec/nodewrap /tmp/nodewrap.c
 rm -f /tmp/nodewrap.c

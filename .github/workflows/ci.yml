@@ -101,7 +101,7 @@ jobs:
       - name: Test EC2 runner boot script
         run: images/test-ec2-run.sh && images/test-ec2-tune.sh && images/test-runner-images.sh && shellcheck images/assets/firerunner-ec2-tune.sh images/test-ec2-tune.sh
       - name: Test EC2 cache proxy setup and nodewrap
-        run: images/test-cache-setup.sh && images/test-git-config.sh && images/test-nodewrap.sh && shellcheck images/assets/firerunner-cache-setup.sh images/test-cache-setup.sh images/assets/firerunner-git-config.sh images/test-git-config.sh images/test-nodewrap.sh
+        run: images/test-cache-setup.sh && images/test-git-config.sh && images/test-install-firerunner.sh && images/test-nodewrap.sh && shellcheck images/assets/firerunner-cache-setup.sh images/test-cache-setup.sh images/assets/firerunner-git-config.sh images/test-git-config.sh images/ec2/install-firerunner.sh images/test-install-firerunner.sh images/test-nodewrap.sh
       - name: Test EC2 AMI build script
         run: images/test-build-ec2-ami.sh
       - name: Test control plane deploy scripts

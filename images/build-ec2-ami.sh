@@ -132,6 +132,7 @@ render_userdata() {
 	printf 'RUNNER_VERSION=%q\nRUNNER_ARCH=%q\nTOOLSET=%q\nRI_REF=%q\nRI_SKIP=%q\nFR_VERSION=%q\nFR_URL=%q\nFR_SHA256=%q\nexport RUNNER_VERSION RUNNER_ARCH TOOLSET RI_REF RI_SKIP FR_VERSION FR_URL FR_SHA256\n' \
 		"$runner_version" "$arch" "$toolset" "$ri_ref" "$ri_skip" "$fr_version" "$fr_url" "$fr_sha256"
 	cat "$HERE/ec2/install-runner-images.sh"
+	strip "$HERE/ec2/install-firerunner.sh"
 	echo 'install_boot_unit() {'
 	echo "cat >/usr/local/bin/firerunner-ec2-run.sh <<'FIRERUNNER_RUN_SH'"
 	strip "$HERE/assets/firerunner-ec2-run.sh"
