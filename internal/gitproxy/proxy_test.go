@@ -828,6 +828,8 @@ func TestResponseCheck(t *testing.T) {
 	pack := fakePack("data")
 	corrupt := []byte(pack)
 	corrupt[6] ^= 0xff
+	notPackSum := sha1.Sum([]byte("NOPEdata")) //nolint:gosec // as git does
+	notPack := "NOPEdata" + string(notPackSum[:])
 	cases := []struct {
 		name string
 		body string
@@ -847,7 +849,7 @@ func TestResponseCheck(t *testing.T) {
 		{"no pack section", pkt("acknowledgments\n") + "0000", false},
 		{"no pack data", pkt("packfile\n") + "0000", false},
 		{"only progress", pkt("packfile\n") + pkt("\x02hello\n") + "0000", false},
-		{"not a pack", pkt("packfile\n") + pkt("\x01"+"NOPE"+pack[4:]) + "0000", false},
+		{"not a pack", pkt("packfile\n") + pkt("\x01"+notPack) + "0000", false},
 		{"corrupt pack", pkt("packfile\n") + pkt("\x01"+string(corrupt)) + "0000", false},
 		{"short of its trailer", pkt("packfile\n") + pkt("\x01"+pack[:len(pack)-1]) + "0000", false},
 		{"bad length", "zzzz", false},

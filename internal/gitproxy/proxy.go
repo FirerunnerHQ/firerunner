@@ -294,7 +294,8 @@ func (p *Proxy) serveHit(w http.ResponseWriter, r *http.Request, e cacheEntry) b
 	defer f.Close()
 	check := newResponseCheck(e.objectFormat)
 	size, err := io.Copy(f, io.TeeReader(io.LimitReader(entry, p.cfg.MaxSave+1), check))
-	if err != nil || size > p.cfg.MaxSave || !check.complete() {
+	// An entry past the limit is cut off here, which fails the check.
+	if err != nil || !check.complete() {
 		p.cfg.Log.Warn("git cache entry unusable; asking GitHub", "err", plainError(err), "key", e.key, "bytes", size)
 		return false
 	}
