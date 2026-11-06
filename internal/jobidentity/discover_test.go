@@ -271,9 +271,18 @@ func TestDiscoverWarnsOnceWhenGitHubRefusesAToken(t *testing.T) {
 	cands := &Candidates{}
 	cands.Offer(Job{Repository: "owner/repo", RunID: 1})
 	f := &refusingFinder{}
-	r.Discover(context.Background(), "runner-1", cands, f, resolveFunc(func(context.Context, Job) (Identity, error) { return identity(), nil }))
+	ok := resolveFunc(func(context.Context, Job) (Identity, error) { return identity(), nil })
+	r.Discover(context.Background(), "runner-1", cands, f, ok)
 	if f.calls != discoverTries {
 		t.Fatalf("%d lookups, want %d", f.calls, discoverTries)
+	}
+	// Candidates are shared: a second runner sees the same repository.
+	if err := r.Register("runner-2", "172.16.0.3"); err != nil {
+		t.Fatal(err)
+	}
+	r.Discover(context.Background(), "runner-2", cands, f, ok)
+	if f.calls != 2*discoverTries {
+		t.Fatalf("%d lookups, want %d", f.calls, 2*discoverTries)
 	}
 	if n := strings.Count(out.String(), "is the App installed on it"); n != 1 {
 		t.Fatalf("%d warnings, want 1:\n%s", n, out.String())

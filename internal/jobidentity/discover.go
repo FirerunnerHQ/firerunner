@@ -97,6 +97,9 @@ const (
 	discoverPause = 2 * time.Second
 )
 
+// refusalWarnEvery spaces warnings about one repository.
+const refusalWarnEvery = time.Hour
+
 // Discover finds the job runner started among the candidates, by asking
 // GitHub which job of each candidate run is in progress on that runner, and
 // resolves its identity as JobStarted would (Start). It does nothing when the
@@ -110,7 +113,6 @@ func (r *Registry) Discover(ctx context.Context, runner string, cands *Candidate
 	if pause == 0 {
 		pause = discoverPause
 	}
-	refused := make(map[string]bool) // a repository is worth one warning, not one per try
 	for try := 0; try < discoverTries; try++ {
 		if !r.awaitsIdentity(runner) || ctx.Err() != nil {
 			return
@@ -125,9 +127,10 @@ func (r *Registry) Discover(ctx context.Context, runner string, cands *Candidate
 				r.log.Warn("cache identity: GitHub refused the lookup; waiting for JobStarted", "runner", runner, "err", err)
 				return
 			}
-			if errors.Is(err, errTokenRefused) && !refused[j.Repository] {
-				refused[j.Repository] = true
-				r.log.Warn("cache identity: cannot read a candidate run's jobs", "runner", runner, "repository", j.Repository, "err", err)
+			if errors.Is(err, errTokenRefused) && r.firstRefusal(j.Repository) {
+				// Candidates are shared, so this runner may have nothing to
+				// do with the repository: the line names only the repository.
+				r.log.Warn("cache identity: cannot read a candidate run's jobs", "repository", j.Repository, "err", err)
 				continue
 			}
 			if err != nil {
@@ -148,6 +151,21 @@ func (r *Registry) Discover(ctx context.Context, runner string, cands *Candidate
 		}
 	}
 	r.log.Info("cache identity: no candidate run has the runner's job; waiting for JobStarted", "runner", runner)
+}
+
+// firstRefusal reports whether a refusal for repo is due a warning. Every runner
+// that sees its candidates would otherwise repeat it.
+func (r *Registry) firstRefusal(repo string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if last, ok := r.refused[repo]; ok && time.Since(last) < refusalWarnEvery {
+		return false
+	}
+	if r.refused == nil {
+		r.refused = make(map[string]time.Time)
+	}
+	r.refused[repo] = time.Now()
+	return true
 }
 
 // awaitsIdentity reports whether runner has a lease whose identity nothing
