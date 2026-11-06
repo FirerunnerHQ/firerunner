@@ -602,7 +602,6 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			now := p.now()
 			switch {
 			case w.terminating && now.Sub(w.termSince) >= p.termWait:
-				w.record(jobevent.Event{Kind: jobevent.InstanceGone, Reason: "did not terminate"})
 				return errors.Join(result, fmt.Errorf("instance %s did not terminate within %s; terminate it by hand", w.id, p.termWait))
 			case w.terminating && now.Sub(w.termLast) >= p.termRetry:
 				// The request may have been throttled or lost; repeat it.
