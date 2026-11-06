@@ -79,7 +79,7 @@ if [ "$TOOLSET" != minimal ]; then
 	printf 'runner ALL=(ALL) NOPASSWD:ALL\nDefaults:runner !requiretty, env_keep += "*"\n' >/etc/sudoers.d/runner
 	chmod 0440 /etc/sudoers.d/runner
 	# useradd copied these; the build's own caches are of no use to a job.
-	rm -rf /etc/skel/.rustup /etc/skel/.cargo /root/.npm /root/.cache /root/.local
+	rm -rf /etc/skel/.rustup /etc/skel/.cargo /root/.npm /root/.local
 else
 	apt_get install -y --no-install-recommends docker.io
 fi
