@@ -213,6 +213,19 @@ func TestLossesAreLoggedDuringAnOutage(t *testing.T) {
 	}
 }
 
+// What a close loses is logged before Close returns: the process exits next.
+func TestCloseLogsItsLosses(t *testing.T) {
+	var out syncBuffer
+	s := fake(t, func(context.Context, []jobevent.Event) error { return errors.New("connection refused") })
+	s.log = slog.New(slog.NewTextHandler(&out, nil))
+	go s.run()
+	s.Record(ev("a"))
+	s.Close(context.Background())
+	if !strings.Contains(out.String(), "events lost") {
+		t.Fatalf("log = %q", out.String())
+	}
+}
+
 type syncBuffer struct {
 	mu sync.Mutex
 	b  strings.Builder

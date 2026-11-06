@@ -44,13 +44,14 @@ var (
 
 // Store writes events to Postgres.
 type Store struct {
-	pool    *pgxpool.Pool
-	log     *slog.Logger
-	queue   chan jobevent.Event
-	dropped atomic.Int64
-	stop    chan struct{}
-	done    chan struct{}
-	once    sync.Once
+	pool     *pgxpool.Pool
+	log      *slog.Logger
+	queue    chan jobevent.Event
+	dropped  atomic.Int64
+	reported atomic.Int64
+	stop     chan struct{}
+	done     chan struct{}
+	once     sync.Once
 	// lossEvery is how often lost events are reported.
 	lossEvery time.Duration
 	// write and prepare are the database's side, replaced in tests.
@@ -191,6 +192,7 @@ func ensurePartition(ctx context.Context, tx pgx.Tx, from time.Time) error {
 // run owns the database's side. Until set-up succeeds, events wait in the queue.
 func (s *Store) run() {
 	defer close(s.done)
+	defer s.reportLoss() // before done, so a closing daemon logs it
 	go s.reportLosses()
 	if !s.retry(s.prepare, "set up") {
 		s.dropQueued()
@@ -240,25 +242,25 @@ func (s *Store) drain(batch []jobevent.Event) {
 }
 
 // reportLosses logs lost events on its own clock, as the writer may be busy
-// waiting for the database, and once more as the store ends.
+// waiting for the database.
 func (s *Store) reportLosses() {
 	tick := time.NewTicker(s.lossEvery)
 	defer tick.Stop()
-	var reported int64
-	report := func() {
-		if n := s.dropped.Load(); n != reported {
-			s.log.Warn("job store: events lost", "total", n)
-			reported = n
-		}
-	}
 	for {
 		select {
 		case <-tick.C:
-			report()
+			s.reportLoss()
 		case <-s.done:
-			report()
 			return
 		}
+	}
+}
+
+// reportLoss logs the total when it has grown since the last report.
+func (s *Store) reportLoss() {
+	n := s.dropped.Load()
+	if s.reported.Swap(n) != n {
+		s.log.Warn("job store: events lost", "total", n)
 	}
 }
 
