@@ -384,7 +384,7 @@ func TestInstallationTokenRefresh(t *testing.T) {
 }
 
 // A job in a repository outside the App's installation has no cache, and this
-// error, in the control VM's log, is the only place that says why.
+// error, in the control VM's log, says why.
 func TestInstallationTokenRefusalNamesTheRepository(t *testing.T) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -398,7 +398,7 @@ func TestInstallationTokenRefusalNamesTheRepository(t *testing.T) {
 	defer srv.Close()
 	g := &GitHub{base: srv.URL, client: srv.Client(), app: scaleset.GitHubAppAuth{ClientID: "client", InstallationID: 7, PrivateKey: string(raw)}}
 	_, err = g.auth(context.Background(), "owner/repo")
-	if err == nil || !strings.Contains(err.Error(), "is the App installed on it") || !strings.Contains(err.Error(), "owner/repo") {
+	if !errors.Is(err, errTokenRefused) || !strings.Contains(err.Error(), "owner/repo") {
 		t.Fatalf("422: %v", err)
 	}
 	var status statusError
@@ -406,7 +406,7 @@ func TestInstallationTokenRefusalNamesTheRepository(t *testing.T) {
 		t.Fatalf("the status was lost: %v", err)
 	}
 	code = http.StatusInternalServerError
-	if _, err := g.auth(context.Background(), "owner/repo"); err == nil || strings.Contains(err.Error(), "is the App installed") {
+	if _, err := g.auth(context.Background(), "owner/repo"); err == nil || errors.Is(err, errTokenRefused) {
 		t.Fatalf("500 blamed on the installation: %v", err)
 	}
 }

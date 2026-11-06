@@ -2,6 +2,7 @@ package jobidentity
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -109,6 +110,7 @@ func (r *Registry) Discover(ctx context.Context, runner string, cands *Candidate
 	if pause == 0 {
 		pause = discoverPause
 	}
+	refused := make(map[string]bool) // a repository is worth one warning, not one per try
 	for try := 0; try < discoverTries; try++ {
 		if !r.awaitsIdentity(runner) || ctx.Err() != nil {
 			return
@@ -122,6 +124,11 @@ func (r *Registry) Discover(ctx context.Context, runner string, cands *Candidate
 				// Resolution shares the credential: spend no more of it here.
 				r.log.Warn("cache identity: GitHub refused the lookup; waiting for JobStarted", "runner", runner, "err", err)
 				return
+			}
+			if errors.Is(err, errTokenRefused) && !refused[j.Repository] {
+				refused[j.Repository] = true
+				r.log.Warn("cache identity: cannot read a candidate run's jobs", "runner", runner, "repository", j.Repository, "err", err)
+				continue
 			}
 			if err != nil {
 				r.log.Debug("look up a candidate run's jobs", "runner", runner, "repository", j.Repository, "run", j.RunID, "err", err)

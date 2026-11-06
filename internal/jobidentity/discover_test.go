@@ -1,8 +1,10 @@
 package jobidentity
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -241,6 +243,43 @@ func TestDiscoverStopsWhenGitHubRefuses(t *testing.T) {
 	r.Discover(context.Background(), "runner-1", cands, f, resolveFunc(func(context.Context, Job) (Identity, error) { return identity(), nil }))
 	if f.calls != 1 {
 		t.Fatalf("%d lookups after a 403, want 1", f.calls)
+	}
+}
+
+type refusingFinder struct{ calls int }
+
+func (f *refusingFinder) RunnerJob(context.Context, string, int64, string) (int64, bool, error) {
+	f.calls++
+	return 0, false, fmt.Errorf("%w (owner/repo): HTTP 422", errTokenRefused)
+}
+
+// TestDiscoverWarnsOnceWhenGitHubRefusesAToken: on EC2 this is the path a job
+// outside the App's installation takes, and JobStarted may come after the job
+// ended, so Discover must say why at a level a default log keeps. It carries on,
+// because another candidate may be the runner's.
+func TestDiscoverWarnsOnceWhenGitHubRefusesAToken(t *testing.T) {
+	var out bytes.Buffer
+	r, err := NewRegistry(privateDir(t), slog.New(slog.NewTextHandler(&out, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(r.Close)
+	r.discoverPause = time.Millisecond
+	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	cands := &Candidates{}
+	cands.Offer(Job{Repository: "owner/repo", RunID: 1})
+	f := &refusingFinder{}
+	r.Discover(context.Background(), "runner-1", cands, f, resolveFunc(func(context.Context, Job) (Identity, error) { return identity(), nil }))
+	if f.calls != discoverTries {
+		t.Fatalf("%d lookups, want %d", f.calls, discoverTries)
+	}
+	if n := strings.Count(out.String(), "is the App installed on it"); n != 1 {
+		t.Fatalf("%d warnings, want 1:\n%s", n, out.String())
+	}
+	if !strings.Contains(out.String(), "level=WARN") {
+		t.Fatalf("not a warning:\n%s", out.String())
 	}
 }
 
