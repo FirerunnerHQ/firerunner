@@ -167,6 +167,7 @@ expect "firerunner version: reaches the build" "" grep -q '^FR_VERSION=v0.1.1$' 
 fresh toolset
 PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 >"$STATE/out"
 expect "the default toolset is standard" "" grep -q '^TOOLSET=standard$' "$STATE/out"
+expect "the build keeps its scratch out of the snapshot" "" grep -q 'mount -t tmpfs' "$STATE/out"
 expect "standard skips Haskell" "" grep -q '^RI_SKIP=.*install-haskell.sh' "$STATE/out"
 expect "standard installs PowerShell's modules itself" "" grep -q '^RI_SKIP=.*Install-PowerShellModules.ps1' "$STATE/out"
 PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --toolset full >"$STATE/out"
