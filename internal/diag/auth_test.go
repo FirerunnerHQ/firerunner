@@ -180,6 +180,96 @@ func TestAuthVerify_AppPermissions(t *testing.T) {
 	}
 }
 
+func TestAuthVerify_AppRepositories(t *testing.T) {
+	pemStr, _ := testRSAKeyPEM(t)
+	const repos = `{"total_count":2,"repositories":[{"full_name":"acme/api"},{"full_name":"acme/web"}]}`
+	const truncated = `{"total_count":250,"repositories":[{"full_name":"acme/api"},{"full_name":"acme/web"}]}`
+	const empty = `{"total_count":0,"repositories":[]}`
+	for _, c := range []struct {
+		name      string
+		url       string
+		selection string
+		noCache   bool
+		tokenCode int
+		listCode  int
+		list      string
+		level     string // "" means the check does not run
+		detail    string
+	}{
+		{name: "all repositories", url: "https://github.com/acme/api", selection: "all"},
+		{name: "no cache", url: "https://github.com/acme/api", selection: "selected", noCache: true},
+		{name: "repo present", url: "https://github.com/acme/api", selection: "selected", list: repos, level: levelPass, detail: "acme/api"},
+		{name: "repo present, other case", url: "https://github.com/Acme/API.git", selection: "selected", list: repos, level: levelPass},
+		{name: "repo absent", url: "https://github.com/acme/billing", selection: "selected", list: repos, level: levelFail, detail: "not installed on acme/billing, so its jobs get no cache; it is on: acme/api, acme/web"},
+		{name: "no repositories", url: "https://github.com/acme/billing", selection: "selected", list: empty, level: levelFail, detail: "it is on: none"},
+		{name: "repo beyond the page", url: "https://github.com/acme/billing", selection: "selected", list: truncated, level: levelWarn, detail: "first 2 of the App's 250"},
+		{name: "repo on a short page", url: "https://github.com/acme/api", selection: "selected", list: truncated, level: levelPass},
+		{name: "organization", url: "https://github.com/acme", selection: "selected", list: repos, level: levelWarn, detail: "(acme/api, acme/web)"},
+		{name: "organization, many", url: "https://github.com/acme", selection: "selected", list: truncated, level: levelWarn, detail: "acme/web and 248 more"},
+		{name: "token refused", url: "https://github.com/acme/api", selection: "selected", tokenCode: http.StatusForbidden, list: repos, level: levelWarn, detail: "HTTP 403"},
+		{name: "list refused", url: "https://github.com/acme/api", selection: "selected", listCode: http.StatusBadGateway, list: repos, level: levelWarn, detail: "HTTP 502"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				auth := r.Header.Get("Authorization")
+				switch r.URL.Path {
+				case "/app/installations/123":
+					fmt.Fprintf(w, `{"id":123,"repository_selection":%q,"permissions":{}}`, c.selection)
+				case "/app/installations/123/access_tokens":
+					var body struct {
+						Permissions map[string]string `json:"permissions"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					if r.Method != http.MethodPost || strings.Count(auth, ".") != 2 || len(body.Permissions) != 1 || body.Permissions["metadata"] != "read" {
+						t.Errorf("token request: %s auth=%q permissions=%v", r.Method, auth, body.Permissions)
+					}
+					if c.tokenCode != 0 {
+						w.WriteHeader(c.tokenCode)
+						return
+					}
+					w.WriteHeader(http.StatusCreated)
+					fmt.Fprint(w, `{"token":"ghs_listing"}`)
+				case "/installation/repositories":
+					if auth != "Bearer ghs_listing" || r.URL.Query().Get("per_page") != "100" {
+						t.Errorf("list request: auth=%q query=%q", auth, r.URL.RawQuery)
+					}
+					if c.listCode != 0 {
+						w.WriteHeader(c.listCode)
+						return
+					}
+					fmt.Fprint(w, c.list)
+				default:
+					t.Errorf("unexpected path %q", r.URL.Path)
+				}
+			}))
+			defer srv.Close()
+			cfg := &config.Config{URL: c.url, AppClientID: "Iv1.client", AppInstallID: 123, AppPrivateKey: pemStr}
+			if !c.noCache {
+				cfg.Firecracker.CachePort = 8081
+			}
+			checks := authVerify(cfg, srv.URL)
+			var got *Check
+			for i := range checks {
+				if checks[i].Name == "app-repositories" {
+					got = &checks[i]
+				}
+			}
+			if c.level == "" {
+				if got != nil {
+					t.Fatalf("the check ran: %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("no app-repositories check in %+v", checks)
+			}
+			if got.Level != c.level || !strings.Contains(got.Detail, c.detail) {
+				t.Fatalf("got %s %q, want %s containing %q", got.Level, got.Detail, c.level, c.detail)
+			}
+		})
+	}
+}
+
 func TestAppPermissions(t *testing.T) {
 	for _, c := range []struct {
 		name    string

@@ -43,7 +43,8 @@ func githubAPIBase(rawURL string) string {
 // configured credentials are actually accepted by GitHub — the presence checks
 // in authCheck only prove the values are set and parseable. It never mutates
 // anything (a PAT hits /rate_limit; a GitHub App hits GET /app/installations/ID
-// with a short-lived JWT). It is best-effort: a transport error WARNs (the host
+// with a short-lived JWT, and, for a cache on selected repositories, lists them
+// with a read-only token). It is best-effort: a transport error WARNs (the host
 // may simply be offline), an explicit 401/403 FAILs, anything else WARNs.
 //
 // For a GitHub App it also returns the app-permissions check: what the
@@ -83,11 +84,16 @@ func authVerify(cfg *config.Config, apiBase string) []Check {
 		if cfg.Token == "" {
 			var inst struct {
 				Permissions map[string]string `json:"permissions"`
+				Selection   string            `json:"repository_selection"`
 			}
 			if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&inst); err != nil {
 				checks = append(checks, warn("app-permissions", "could not read the installation's permissions: %v", err))
 			} else {
-				checks = append(checks, appPermissions(inst.Permissions, repoScoped(cfg.URL), cfg.UsesEC2Cache() || cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != ""))
+				cache := cfg.UsesEC2Cache() || cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != ""
+				checks = append(checks, appPermissions(inst.Permissions, repoScoped(cfg.URL), cache))
+				if cache && inst.Selection == "selected" {
+					checks = append(checks, appRepositories(ctx, cfg, apiBase, req.Header.Get("Authorization")))
+				}
 			}
 		}
 		return checks
@@ -96,6 +102,91 @@ func authVerify(cfg *config.Config, apiBase string) []Check {
 	default:
 		return []Check{warn("auth-verify", "unexpected HTTP %d verifying credentials", resp.StatusCode)}
 	}
+}
+
+// maxListedRepositories bounds what a check names, and what it reads.
+const maxListedRepositories = 100
+
+// appRepositories checks a cache against an App installed on selected
+// repositories. Resolving a job's identity needs a token for its repository,
+// which GitHub refuses for one outside the installation. Its jobs then run with
+// no cache, and their first step waits out the lookup, with nothing to see but
+// a log line on the control VM. A runner for one repository can be checked; for
+// an organization, only the operator knows which repositories it serves.
+//
+// auth is the App's JWT. It asks for a token with metadata read alone, which is
+// all that listing repositories takes.
+func appRepositories(ctx context.Context, cfg *config.Config, apiBase, auth string) Check {
+	body := strings.NewReader(`{"permissions":{"metadata":"read"}}`)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		fmt.Sprintf("%s/app/installations/%d/access_tokens", apiBase, cfg.AppInstallID), body)
+	req.Header.Set("Authorization", auth)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	var token struct {
+		Token string `json:"token"`
+	}
+	if err := appJSON(req, &token); err != nil {
+		return warn("app-repositories", "could not read the installation's repositories: %v", err)
+	}
+	req, _ = http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("%s/installation/repositories?per_page=%d", apiBase, maxListedRepositories), nil)
+	req.Header.Set("Authorization", "Bearer "+token.Token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	var list struct {
+		Total        int `json:"total_count"`
+		Repositories []struct {
+			FullName string `json:"full_name"`
+		} `json:"repositories"`
+	}
+	if err := appJSON(req, &list); err != nil {
+		return warn("app-repositories", "could not read the installation's repositories: %v", err)
+	}
+	names := make([]string, 0, len(list.Repositories))
+	for _, r := range list.Repositories {
+		names = append(names, r.FullName)
+	}
+	listed := strings.Join(names, ", ")
+	if listed == "" {
+		listed = "none"
+	}
+	if list.Total > len(names) {
+		listed = fmt.Sprintf("%s and %d more", listed, list.Total-len(names))
+	}
+	if repoScoped(cfg.URL) {
+		want := repoName(cfg.URL)
+		for _, name := range names {
+			if strings.EqualFold(name, want) {
+				return pass("app-repositories", "the App is installed on %s", want)
+			}
+		}
+		if list.Total > len(names) {
+			return warn("app-repositories", "could not find %s among the first %d of the App's %d repositories", want, len(names), list.Total)
+		}
+		return fail("app-repositories", "the App is not installed on %s, so its jobs get no cache; it is on: %s", want, listed)
+	}
+	return warn("app-repositories", "the App is installed on selected repositories only (%s); jobs in any other get no cache, and their first step waits for a lookup that fails. Add the repositories you serve, or choose all", listed)
+}
+
+// appJSON sends req and decodes a 2xx answer into out.
+func appJSON(req *http.Request, out any) error {
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("%s: HTTP %d", req.URL.Path, resp.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 1<<22)).Decode(out)
+}
+
+// repoName returns the owner/name of a repository URL.
+func repoName(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Trim(u.Path, "/"), ".git")
 }
 
 // repoScoped reports whether FR_URL names a single repository

@@ -16,6 +16,14 @@ and this project adheres to
   the same commit gain, not the first. It needs `cache`, and an image built from
   this release.
 - `firerunner git-proxy`, the proxy on the instance that serves it.
+- `firerunner doctor` checks that a GitHub App installed on selected
+  repositories covers what a cache serves: it fails when a runner's repository
+  is missing, and lists the repositories, with a warning, for an organization.
+
+### Changed
+
+- The log now says why a job has no cache when GitHub refuses a token for its
+  repository, and asks whether the App is installed on it.
 
 ## [0.1.0] - 2026-11-05
 
