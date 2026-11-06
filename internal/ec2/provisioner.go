@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
@@ -725,7 +724,7 @@ func (p *Provisioner) run(ctx context.Context, name string, img image, kind laun
 		if err := ctx.Err(); err != nil {
 			return types.Instance{}, err
 		}
-		out, err := p.c.api.RunInstances(ctx, p.input(name, img, o.market, o.itype, o.subnet, kind))
+		out, err := p.c.api.RunInstances(ctx, p.input(name, img, o.market, o.itype, o.subnet, kind), capacityFailsFast)
 		if err == nil {
 			if len(out.Instances) != 1 {
 				return types.Instance{}, fmt.Errorf("RunInstances returned %d instances, want 1", len(out.Instances))
@@ -770,19 +769,22 @@ func (p *Provisioner) fellBack(name string, first, got option) {
 	}
 }
 
-// CapacityFailsFast keeps the AWS SDK from retrying a capacity error. EC2 answers
-// no spot capacity with HTTP 500, which the SDK retries for about 5 s, and a
-// launch waits that long for each type and subnet it tries before one that has
-// room. The launch walk is the retry: only other failures back off.
-func CapacityFailsFast(o *ec2.Options) {
-	o.Retryer = retry.NewStandard(func(so *retry.StandardOptions) {
-		so.Retryables = append([]retry.IsErrorRetryable{retry.IsErrorRetryableFunc(func(err error) aws.Ternary {
-			if isCapacityErr(err) {
-				return aws.FalseTernary
-			}
-			return aws.UnknownTernary
-		})}, so.Retryables...)
-	})
+// capacityFailsFast keeps the AWS SDK from retrying a launch's capacity error. EC2
+// answers no spot capacity with HTTP 500, which the SDK retries for about 5 s, and
+// a launch would wait that long for each type and subnet it tries before one that
+// has room. The walk over options is the retry. Only RunInstances has one: a start
+// from the pool keeps the SDK's retries, as a failure there discards an instance.
+func capacityFailsFast(o *ec2.Options) {
+	if inner, ok := o.Retryer.(aws.RetryerV2); ok {
+		o.Retryer = capacityRetryer{inner}
+	}
+}
+
+// capacityRetryer wraps the configured retryer, so its mode and attempts stand.
+type capacityRetryer struct{ aws.RetryerV2 }
+
+func (r capacityRetryer) IsErrorRetryable(err error) bool {
+	return !isCapacityErr(err) && r.RetryerV2.IsErrorRetryable(err)
 }
 
 func isCapacityErr(err error) bool {
