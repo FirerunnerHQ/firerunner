@@ -9,6 +9,7 @@ CREATE TABLE job_events (
     run_id      bigint      NOT NULL DEFAULT 0,
     detail      jsonb       NOT NULL DEFAULT '{}'
 ) PARTITION BY RANGE (at);
+CREATE TABLE job_events_default PARTITION OF job_events DEFAULT;
 CREATE INDEX job_events_runner ON job_events (runner, at);
 CREATE INDEX job_events_job ON job_events (job_id, at);
 

@@ -2,11 +2,15 @@ package jobstore
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/firerunnerhq/firerunner/internal/jobevent"
 )
@@ -17,6 +21,124 @@ func TestRecordNeverBlocks(t *testing.T) {
 	s.Record(jobevent.Event{}) // no writer is reading: this must not wait
 	if s.Dropped() != 1 {
 		t.Fatalf("dropped = %d", s.Dropped())
+	}
+}
+
+// fake is a store with a scripted database.
+func fake(t *testing.T, write func(context.Context, []jobevent.Event) error) *Store {
+	t.Helper()
+	wait := retryWait
+	retryWait = time.Millisecond
+	t.Cleanup(func() { retryWait = wait })
+	s := newStore(nil)
+	s.write = write
+	s.prepare = func(context.Context) error { return nil }
+	return s
+}
+
+func ev(id string) jobevent.Event { return jobevent.Event{JobID: id} }
+
+// One row the database refuses costs that row, and the rest of its batch lands.
+func TestFlushIsolatesARejectedRow(t *testing.T) {
+	var wrote []string
+	s := fake(t, func(_ context.Context, b []jobevent.Event) error {
+		for _, e := range b {
+			if e.JobID == "bad" {
+				return &pgconn.PgError{Code: "23514"}
+			}
+		}
+		for _, e := range b {
+			wrote = append(wrote, e.JobID)
+		}
+		return nil
+	})
+	s.flush([]jobevent.Event{ev("a"), ev("bad"), ev("b"), ev("c")})
+	if len(wrote) != 3 || s.Dropped() != 1 {
+		t.Fatalf("wrote %v, dropped %d", wrote, s.Dropped())
+	}
+}
+
+// A database that is away is waited for: nothing is lost.
+func TestFlushRetriesAnOutage(t *testing.T) {
+	calls := 0
+	s := fake(t, func(context.Context, []jobevent.Event) error {
+		calls++
+		if calls < 3 {
+			return errors.New("connection refused")
+		}
+		return nil
+	})
+	s.flush([]jobevent.Event{ev("a")})
+	if calls != 3 || s.Dropped() != 0 {
+		t.Fatalf("calls %d, dropped %d", calls, s.Dropped())
+	}
+}
+
+// Set-up is retried too, and events wait for it.
+func TestEventsWaitForSetUp(t *testing.T) {
+	got := make(chan string, 1)
+	s := fake(t, func(_ context.Context, b []jobevent.Event) error {
+		got <- b[0].JobID
+		return nil
+	})
+	var tries atomic.Int32
+	s.prepare = func(context.Context) error {
+		if tries.Add(1) < 3 {
+			return errors.New("connection refused")
+		}
+		return nil
+	}
+	s.Record(ev("a"))
+	go s.run()
+	defer s.Close(context.Background())
+	select {
+	case id := <-got:
+		if id != "a" || tries.Load() != 3 {
+			t.Fatalf("id %q, tries %d", id, tries.Load())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the event never landed")
+	}
+}
+
+func TestCloseWritesWhatIsLeft(t *testing.T) {
+	var wrote int
+	s := fake(t, func(_ context.Context, b []jobevent.Event) error {
+		wrote += len(b)
+		return nil
+	})
+	go s.run()
+	s.Record(ev("a"))
+	s.Record(ev("b"))
+	s.Close(context.Background())
+	s.Close(context.Background()) // a second close is harmless
+	if wrote != 2 {
+		t.Fatalf("wrote %d", wrote)
+	}
+}
+
+func TestCloseCountsWhatItLoses(t *testing.T) {
+	s := fake(t, func(context.Context, []jobevent.Event) error { return errors.New("connection refused") })
+	s.Record(ev("a"))
+	close(s.stop)
+	s.run()
+	if s.Dropped() != 1 {
+		t.Fatalf("dropped = %d", s.Dropped())
+	}
+}
+
+// Connection errors name hosts and users, so they stay out of the log.
+func TestDescribeHidesTheConnection(t *testing.T) {
+	err := errors.New("failed to connect to user=u database=d host=h")
+	if got := describe(err); strings.Contains(got, "user=") {
+		t.Fatalf("describe = %q", got)
+	}
+}
+
+func TestNewRefusesABadURLWithoutEchoingIt(t *testing.T) {
+	_, err := New("postgres://u:secret@host:notaport/db", nil)
+	if err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -37,11 +159,14 @@ func open(t *testing.T) *Store {
 	if _, err := conn.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(ctx, dsn, nil)
+	s, err := New(dsn, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close(ctx) })
+	if err := s.setUp(ctx); err != nil {
+		t.Fatal(err)
+	}
 	return s
 }
 
@@ -74,10 +199,10 @@ func TestTimeline(t *testing.T) {
 		runner(jobevent.Launched, t0.Add(2*time.Second)), runner(jobevent.Served, t0.Add(12*time.Second)),
 		job(jobevent.Assigned, t0.Add(time.Second)),
 	}
-	if err := s.write(ctx, events); err != nil {
+	if err := s.writeEvents(ctx, events); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.write(ctx, events[:2]); err != nil { // a redelivery
+	if err := s.writeEvents(ctx, events[:2]); err != nil { // a redelivery
 		t.Fatal(err)
 	}
 
@@ -136,9 +261,77 @@ func TestWriterFlushes(t *testing.T) {
 func TestPartitionsAreCreatedAhead(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
-	future := time.Now().UTC().AddDate(0, monthsAhead, 0)
+	now := time.Now().UTC()
+	future := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, monthsAhead, 0)
 	e := jobevent.Event{Kind: jobevent.Launched, At: future, Runner: "r"}
-	if err := s.write(ctx, []jobevent.Event{e}); err != nil {
+	if err := s.writeEvents(ctx, []jobevent.Event{e}); err != nil {
 		t.Fatalf("an event %d months ahead: %v", monthsAhead, err)
+	}
+	var partition string
+	if err := s.pool.QueryRow(ctx, `SELECT tableoid::regclass::text FROM job_events`).Scan(&partition); err != nil {
+		t.Fatal(err)
+	}
+	if partition == "job_events_default" {
+		t.Fatal("the month ahead has no partition")
+	}
+}
+
+// An event outside every month, or holding NUL, must not fail its batch.
+func TestStrangeEventsAreKept(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	old := jobevent.Event{Kind: jobevent.Assigned, At: time.Unix(0, 0), JobID: "old", JobName: "a\x00b", Labels: []string{"c\x00"}}
+	if err := s.writeEvents(ctx, []jobevent.Event{old}); err != nil {
+		t.Fatal(err)
+	}
+	var name string
+	if err := s.pool.QueryRow(ctx, `SELECT job_name FROM jobs WHERE job_id = 'old'`).Scan(&name); err != nil || name != "ab" {
+		t.Fatalf("%q, %v", name, err)
+	}
+}
+
+// Shards starting together on an empty database all succeed.
+func TestConcurrentSetUp(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	if _, err := s.pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 8)
+	for range cap(errs) {
+		go func() { errs <- s.setUp(ctx) }()
+	}
+	for range cap(errs) {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A session in another time zone still creates UTC months.
+func TestPartitionBoundsAreUTC(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	first := time.Date(now.Year(), now.Month(), 1, 3, 0, 0, 0, time.UTC).AddDate(0, 1, 0)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, sql := range []string{
+		`SET LOCAL TIME ZONE 'America/Los_Angeles'`,
+		`DROP TABLE job_events_default`,
+		`DROP TABLE job_events_` + first.Format("2006_01"),
+	} {
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ensurePartitions(ctx, tx, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO job_events (at, kind) VALUES ($1, 'x')`, first); err != nil {
+		t.Fatalf("03:00 UTC on the 1st found no partition: %v", err)
 	}
 }

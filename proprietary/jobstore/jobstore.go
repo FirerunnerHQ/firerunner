@@ -11,14 +11,18 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"sort"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/firerunnerhq/firerunner/internal/jobevent"
@@ -32,6 +36,7 @@ var (
 	queueSize     = 20000
 	batchSize     = 500
 	flushEvery    = time.Second
+	writeTimeout  = 5 * time.Second
 	retryWait     = 5 * time.Second
 	monthsAhead   = 2
 	partitionTick = 24 * time.Hour
@@ -45,28 +50,35 @@ type Store struct {
 	dropped atomic.Int64
 	stop    chan struct{}
 	done    chan struct{}
+	once    sync.Once
+	// write and prepare are the database's side, replaced in tests.
+	write   func(context.Context, []jobevent.Event) error
+	prepare func(context.Context) error
 }
 
-// Open connects, applies migrations and starts the writer. Close ends it.
-func Open(ctx context.Context, dsn string, log *slog.Logger) (*Store, error) {
+// New starts the writer and returns at once: the database may be down, so the
+// writer connects and migrates in its own time, and events wait in the queue. It
+// fails only on a URL that can never work, without echoing the URL.
+func New(dsn string, log *slog.Logger) (*Store, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, errors.New("job store: the database URL is not valid")
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		return nil, errors.New("job store: the database URL is not valid")
+	}
+	s := newStore(log)
+	s.pool, s.write, s.prepare = pool, s.writeEvents, s.setUp
+	go s.run()
+	return s, nil
+}
+
+func newStore(log *slog.Logger) *Store {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("job store: %w", err)
-	}
-	s := &Store{pool: pool, log: log, queue: make(chan jobevent.Event, queueSize), stop: make(chan struct{}), done: make(chan struct{})}
-	if err := s.migrate(ctx); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	if err := s.ensurePartitions(ctx, time.Now()); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	go s.run()
-	return s, nil
+	return &Store{log: log, queue: make(chan jobevent.Event, queueSize), stop: make(chan struct{}), done: make(chan struct{})}
 }
 
 // Record implements jobevent.Sink. It drops the event when the queue is full.
@@ -78,140 +90,246 @@ func (s *Store) Record(e jobevent.Event) {
 	}
 }
 
-// Dropped counts events lost to a full queue.
+// Dropped counts events lost to a full queue, a rejected row or a failed close.
 func (s *Store) Dropped() int64 { return s.dropped.Load() }
 
 // Close flushes what it can within ctx and stops the writer.
 func (s *Store) Close(ctx context.Context) {
-	close(s.stop)
+	s.once.Do(func() { close(s.stop) })
 	select {
 	case <-s.done:
 	case <-ctx.Done():
 	}
-	s.pool.Close()
+	if s.pool != nil {
+		s.pool.Close()
+	}
 }
 
-func (s *Store) migrate(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
-		return fmt.Errorf("job store: migrations table: %w", err)
-	}
-	names, err := fs.Glob(migrations, "migrations/*.sql")
-	if err != nil {
-		return err
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if err := s.apply(ctx, name); err != nil {
-			return fmt.Errorf("job store: %s: %w", name, err)
-		}
-	}
-	return nil
-}
-
-// apply runs one migration under a lock, so two starting shards cannot race.
-func (s *Store) apply(ctx context.Context, name string) error {
-	sql, err := migrations.ReadFile(name)
-	if err != nil {
-		return err
-	}
+// setUp migrates and creates partitions under one lock, so shards starting
+// together on an empty database wait for each other.
+func (s *Store) setUp(ctx context.Context) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7231905)`); err != nil {
 			return err
 		}
-		var done bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE name = $1)`, name).Scan(&done); err != nil {
+		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 			return err
 		}
-		if done {
-			return nil
-		}
-		if _, err := tx.Exec(ctx, string(sql)); err != nil {
+		names, err := fs.Glob(migrations, "migrations/*.sql")
+		if err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO schema_migrations (name) VALUES ($1)`, name)
-		return err
+		sort.Strings(names)
+		for _, name := range names {
+			if err := applyMigration(ctx, tx, name); err != nil {
+				return err
+			}
+		}
+		return ensurePartitions(ctx, tx, time.Now())
 	})
 }
 
-// ensurePartitions creates this month's event partition and those ahead.
-func (s *Store) ensurePartitions(ctx context.Context, now time.Time) error {
+func applyMigration(ctx context.Context, tx pgx.Tx, name string) error {
+	var done bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE name = $1)`, name).Scan(&done); err != nil {
+		return err
+	}
+	if done {
+		return nil
+	}
+	sql, err := migrations.ReadFile(name)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, string(sql)); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO schema_migrations (name) VALUES ($1)`, name)
+	return err
+}
+
+// ensurePartitions creates this month's event partition and those ahead, with
+// bounds in UTC whatever the session's time zone. An event outside them falls in
+// the default partition.
+func ensurePartitions(ctx context.Context, tx pgx.Tx, now time.Time) error {
 	month := time.Date(now.UTC().Year(), now.UTC().Month(), 1, 0, 0, 0, 0, time.UTC)
 	for i := range monthsAhead + 1 {
 		from, to := month.AddDate(0, i, 0), month.AddDate(0, i+1, 0)
-		sql := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS job_events_%s PARTITION OF job_events FOR VALUES FROM ('%s') TO ('%s')`,
+		sql := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS job_events_%s PARTITION OF job_events FOR VALUES FROM ('%s 00:00:00+00') TO ('%s 00:00:00+00')`,
 			from.Format("2006_01"), from.Format(time.DateOnly), to.Format(time.DateOnly))
-		if _, err := s.pool.Exec(ctx, sql); err != nil {
-			return fmt.Errorf("job store: partition: %w", err)
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
+// run owns the database's side. Until set-up succeeds, events wait in the queue.
 func (s *Store) run() {
 	defer close(s.done)
+	if !s.retry(s.prepare, "set up") {
+		s.dropQueued()
+		return
+	}
 	flush := time.NewTicker(flushEvery)
 	defer flush.Stop()
 	partitions := time.NewTicker(partitionTick)
 	defer partitions.Stop()
 	var batch []jobevent.Event
+	var reported int64
 	for {
 		select {
 		case e := <-s.queue:
 			batch = append(batch, e)
 			if len(batch) >= batchSize {
-				batch = s.flush(batch)
+				s.flush(batch)
+				batch = nil
 			}
 		case <-flush.C:
-			batch = s.flush(batch)
-		case <-partitions.C:
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			if err := s.ensurePartitions(ctx, time.Now()); err != nil {
-				s.log.Warn("job store: could not add partitions", "err", err)
-			}
-			cancel()
-		case <-s.stop:
-			for {
-				select {
-				case e := <-s.queue:
-					batch = append(batch, e)
-					continue
-				default:
-				}
-				break
-			}
 			s.flush(batch)
+			batch = nil
+			if n := s.dropped.Load(); n != reported {
+				s.log.Warn("job store: events lost", "total", n)
+				reported = n
+			}
+		case <-partitions.C:
+			s.attempt(s.prepare, "add partitions")
+		case <-s.stop:
+			s.drain(batch)
 			return
 		}
 	}
 }
 
-// flush writes batch and returns what is left to try again: nothing on success,
-// and the batch on failure, up to one queue's worth.
-func (s *Store) flush(batch []jobevent.Event) []jobevent.Event {
-	if len(batch) == 0 {
-		return batch
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), retryWait)
-	defer cancel()
-	if err := s.write(ctx, batch); err != nil {
-		s.log.Warn("job store: write failed; keeping events to retry", "events", len(batch), "err", err)
-		if len(batch) >= queueSize {
-			s.dropped.Add(int64(len(batch)))
-			return nil
+// drain makes one last try at everything left, and counts what it loses.
+func (s *Store) drain(batch []jobevent.Event) {
+	for {
+		select {
+		case e := <-s.queue:
+			batch = append(batch, e)
+			continue
+		default:
 		}
-		return batch
+		break
 	}
-	return nil
+	for len(batch) > 0 {
+		n := min(batchSize, len(batch))
+		if !s.attempt(func(ctx context.Context) error { return s.write(ctx, batch[:n]) }, "write") {
+			s.dropped.Add(int64(len(batch)))
+			s.log.Warn("job store: events lost at close", "events", len(batch))
+			return
+		}
+		batch = batch[n:]
+	}
 }
 
-func (s *Store) write(ctx context.Context, events []jobevent.Event) error {
+// dropQueued counts what is queued when the store never reached the database.
+func (s *Store) dropQueued() {
+	for {
+		select {
+		case <-s.queue:
+			s.dropped.Add(1)
+		default:
+			return
+		}
+	}
+}
+
+// flush writes batch. A row the database rejects is isolated and dropped, so one
+// bad event cannot stop every other. Any other failure waits and tries again, and
+// meanwhile the queue fills, and then drops what is newest.
+func (s *Store) flush(batch []jobevent.Event) {
+	if len(batch) == 0 {
+		return
+	}
+	var err error
+	done := s.retry(func(ctx context.Context) error {
+		err = s.write(ctx, batch)
+		if rejected(err) {
+			return nil
+		}
+		return err
+	}, "write")
+	if !done {
+		s.dropped.Add(int64(len(batch)))
+		return
+	}
+	if !rejected(err) {
+		return
+	}
+	if len(batch) == 1 {
+		s.dropped.Add(1)
+		s.log.Warn("job store: dropped an event the database rejected", "kind", batch[0].Kind, "err", describe(err))
+		return
+	}
+	mid := len(batch) / 2
+	s.flush(batch[:mid])
+	s.flush(batch[mid:])
+}
+
+// rejected reports the server refusing the statement, which no retry can change.
+func rejected(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg)
+}
+
+// retry calls fn until it succeeds or the store stops, and reports success.
+func (s *Store) retry(fn func(context.Context) error, what string) bool {
+	for {
+		if s.attempt(fn, what) {
+			return true
+		}
+		select {
+		case <-s.stop:
+			return s.attempt(fn, what)
+		case <-time.After(retryWait):
+		}
+	}
+}
+
+func (s *Store) attempt(fn func(context.Context) error, what string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+	defer cancel()
+	if err := fn(ctx); err != nil {
+		s.log.Warn("job store: "+what+" failed", "err", describe(err))
+		return false
+	}
+	return true
+}
+
+// describe says what failed without a connection error's host, user or database.
+func describe(err error) string {
+	var pg *pgconn.PgError
+	if errors.As(err, &pg) {
+		return pg.Code + ": " + pg.Message
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timed out"
+	}
+	return "could not reach the database"
+}
+
+func (s *Store) writeEvents(ctx context.Context, events []jobevent.Event) error {
 	b := &pgx.Batch{}
 	for _, e := range events {
-		queue(b, e)
+		queue(b, clean(e))
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		return tx.SendBatch(ctx, b).Close()
 	})
+}
+
+// clean removes NUL, which Postgres text cannot hold. Job names come from users.
+func clean(e jobevent.Event) jobevent.Event {
+	strip := func(v string) string { return strings.ReplaceAll(v, "\x00", "") }
+	e.Tier, e.Runner, e.JobID, e.Repository = strip(e.Tier), strip(e.Runner), strip(e.JobID), strip(e.Repository)
+	e.Workflow, e.JobName, e.EventName, e.Result, e.Reason = strip(e.Workflow), strip(e.JobName), strip(e.EventName), strip(e.Result), strip(e.Reason)
+	labels := make([]string, len(e.Labels))
+	for i, l := range e.Labels {
+		labels[i] = strip(l)
+	}
+	e.Labels = labels
+	return e
 }
 
 const insertEvent = `INSERT INTO job_events (at, kind, tier, runner, job_id, repository, run_id, detail)
