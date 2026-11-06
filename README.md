@@ -389,7 +389,7 @@ See [`examples/tiers-ec2.json`](examples/tiers-ec2.json):
 
 ```json
 {
-  "name": "firerunner-cloud-4c",
+  "name": "firerunner-ubuntu-24.04-4",
   "provisioner": "ec2",
   "min": 0, "max": 40,
   "ec2": {
