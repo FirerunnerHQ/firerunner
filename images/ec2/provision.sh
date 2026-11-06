@@ -85,7 +85,11 @@ cat >/etc/docker/daemon.json <<'JSON'
   "log-opts": { "max-size": "50m", "max-file": "2" }
 }
 JSON
-systemctl enable docker.service containerd.service
+# firerunner-ec2-tune.sh starts Docker, after moving its data if the tier asks,
+# so a boot does not start it twice. The socket is the fallback: the first docker
+# command starts it, if nothing else has.
+systemctl disable docker.service containerd.service
+systemctl enable docker.socket
 
 # actions/runner. GitHub refuses runner versions more than ~30 days old, so the
 # image must be rebuilt monthly (see images/README.md).
@@ -149,7 +153,19 @@ touch /etc/cloud/cloud-init.disabled
 systemctl disable --now snapd.service snapd.socket snapd.seeded.service || true
 for unit in nftables.service apt-daily.timer apt-daily-upgrade.timer man-db.timer motd-news.timer \
 	fstrim.timer e2scrub_all.timer unattended-upgrades.service \
-	ModemManager.service multipathd.service multipathd.socket; do
+	ModemManager.service multipathd.service multipathd.socket \
+	php8.3-fpm.service phpsessionclean.timer podman.service podman-restart.service \
+	podman-clean-transient.service podman-auto-update.service podman-auto-update.timer \
+	hibinit-agent.service networkd-dispatcher.service udisks2.service sysstat.service \
+	sysstat-collect.timer sysstat-summary.timer pollinate.service open-iscsi.service \
+	iscsid.socket open-vm-tools.service vgauth.service lvm2-monitor.service \
+	lvm2-lvmpolld.socket dm-event.socket blk-availability.service ubuntu-advantage.service \
+	ua-reboot-cmds.service grub-common.service grub-initrd-fallback.service \
+	keyboard-setup.service console-setup.service setvtrgb.service secureboot-db.service \
+	apport-autoreport.path apport-forward.socket update-notifier-download.timer \
+	update-notifier-motd.timer dpkg-db-backup.timer logrotate.timer \
+	ec2-instance-connect-harvest-hostkeys.service snapd.autoimport.service \
+	snapd.core-fixup.service snapd.recovery-chooser-trigger.service; do
 	systemctl disable "$unit" 2>/dev/null || true
 done
 

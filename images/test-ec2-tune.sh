@@ -74,7 +74,8 @@ pass "swap goes on the device zramctl chose" called "mkswap /dev/zram0"
 pass "swap is on" called "swapon --priority 100 /dev/zram0"
 pass "prefers swap to dropping page cache" called "sysctl -q vm.swappiness=100"
 pass "says nothing when all went well" [ ! -s "$STATE/stderr" ]
-pass "leaves Docker alone by default" not_called systemctl
+pass "starts Docker without waiting for it" called "systemctl start --no-block containerd.service docker.service"
+pass "does not stop Docker" not_called "systemctl stop"
 
 # ordered A B: A's call comes before B's.
 ordered() {
@@ -290,6 +291,8 @@ pass "no root device: no growpart" not_called growpart
 fresh
 mkdir -p "$TMP/warm"
 echo data > "$TMP/warm/file"
+mkdir -p "$TMP/warm/node24_alpine"
+echo data > "$TMP/warm/node24_alpine/node"
 # shellcheck disable=SC2016 # the stub evaluates these
 stub xargs 'cat > "$STATE/preheat-list"; : > "$STATE/preheated"'
 PATH="$TMP/bin:$PATH" FIRERUNNER_MEMINFO="$STATE/meminfo" FIRERUNNER_SYS_BLOCK="$STATE/sys" FIRERUNNER_PREHEAT_PATHS="$TMP/warm" "$POSIX_SH" "$SCRIPT" 2> "$STATE/stderr"
@@ -298,6 +301,7 @@ for _ in $(seq 1 100); do
 	sleep 0.05
 done
 pass "preheat reads the listed files" grep -q "warm/file" "$STATE/preheat-list"
+pass "preheat skips what cannot run on this host" not grep -q "_alpine" "$STATE/preheat-list"
 
 if [ "$fails" -ne 0 ]; then
 	echo "$fails failure(s)"
