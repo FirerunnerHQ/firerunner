@@ -511,15 +511,19 @@ func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, getResp{
 		OK:                true,
 		SignedDownloadURL: s.blobURL(r, "download", e.ID, e.Sig),
-		MatchedKey:        e.matchedKey(),
+		MatchedKey:        e.matchedKey(req.Key),
 	})
 }
 
-// matchedKey is the key to report for a hit. Entries from before ClientKey have
-// only the lower-case one.
-func (e *Entry) matchedKey() string {
-	if e.ClientKey != "" {
+// matchedKey is the key to report for a hit on asked. An entry from before
+// ClientKey has only the lower-case one, so an exact hit echoes the job's own:
+// entries are immutable, and it would otherwise warn until its key changed.
+func (e *Entry) matchedKey(asked string) string {
+	switch {
+	case e.ClientKey != "":
 		return e.ClientKey
+	case e.Key == strings.ToLower(asked):
+		return asked
 	}
 	return e.Key
 }

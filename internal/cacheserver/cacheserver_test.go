@@ -311,6 +311,33 @@ func TestMatchedKeyKeepsItsCase(t *testing.T) {
 	}
 }
 
+func TestMatchedKey(t *testing.T) {
+	for _, c := range []struct {
+		name, key, client, asked, want string
+	}{
+		{"as written", "a-b", "A-b", "a-B", "A-b"},
+		{"an old entry, exact hit", "a-b", "", "A-B", "A-B"},
+		{"an old entry, prefix hit", "a-b", "", "A-", "a-b"},
+	} {
+		e := &Entry{Key: c.key, ClientKey: c.client}
+		if got := e.matchedKey(c.asked); got != c.want {
+			t.Errorf("%s: %q", c.name, got)
+		}
+	}
+}
+
+// The key as written must outlive a restart, which reads this back.
+func TestClientKeyIsPersisted(t *testing.T) {
+	raw, err := json.Marshal(&Entry{Key: "a", ClientKey: "A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Entry
+	if err := json.Unmarshal(raw, &back); err != nil || back.ClientKey != "A" {
+		t.Fatalf("client key = %q, %v", back.ClientKey, err)
+	}
+}
+
 // TestRepoIsolation uses host identity, never the client metadata.
 func TestRepoIsolation(t *testing.T) {
 	s, err := newAuthorizedStore(t.TempDir(), nil)

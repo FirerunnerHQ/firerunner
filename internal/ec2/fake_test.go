@@ -133,6 +133,7 @@ type fakeEC2 struct {
 	mu        sync.Mutex
 	runErrs   map[string]error
 	runs      []*ec2.RunInstancesInput
+	runOpts   []func(*ec2.Options)
 	attempts  []string // "type/subnet/market" of every RunInstances call
 	instances map[string]*fakeInstance
 	order     []string
@@ -223,10 +224,11 @@ func (f *fakeEC2) runErr(itype, subnet, mkt string) error {
 	return nil
 }
 
-func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, _ ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error) {
+func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, opts ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error) {
 	f.mu.Lock()
 	itype, subnet, mkt := string(in.InstanceType), aws.ToString(in.SubnetId), market(in)
 	f.runs = append(f.runs, in)
+	f.runOpts = opts
 	f.attempts = append(f.attempts, itype+"/"+subnet+"/"+mkt)
 	if err := f.runErr(itype, subnet, mkt); err != nil {
 		f.mu.Unlock()
