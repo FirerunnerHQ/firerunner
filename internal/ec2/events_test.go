@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
@@ -57,8 +58,21 @@ func TestLaunch_RecordsEvents(t *testing.T) {
 	if events.got[0].Path != PathCold {
 		t.Errorf("path = %q", events.got[0].Path)
 	}
+	h.f.mu.Lock()
+	asked := h.f.runAt
+	h.f.mu.Unlock()
+	assertBefore(t, events.got[0], asked)
 	if events.got[1].Reason != "Client.UserInitiatedShutdown" {
 		t.Errorf("reason = %q", events.got[1].Reason)
+	}
+}
+
+// A launch dates from before EC2 was asked, or the config's fetch could precede it
+// and show a negative boot time.
+func assertBefore(t *testing.T, e jobevent.Event, asked time.Time) {
+	t.Helper()
+	if asked.IsZero() || e.At.After(asked) {
+		t.Errorf("launched at %v, EC2 was asked at %v", e.At, asked)
 	}
 }
 
@@ -106,6 +120,10 @@ func TestPoolLaunch_RecordsEvents(t *testing.T) {
 	if first.Kind != jobevent.Launched || first.Path != PathPool || first.Market != config.MarketSpot {
 		t.Fatalf("first = %+v", first)
 	}
+	h.f.mu.Lock()
+	asked := h.f.startAt
+	h.f.mu.Unlock()
+	assertBefore(t, first, asked)
 	inst := h.instance(t)
 	h.f.setState(inst.id, types.InstanceStateNameTerminated)
 	waitErr(t, errc)

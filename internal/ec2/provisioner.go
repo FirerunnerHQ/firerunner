@@ -328,7 +328,7 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 	w := &waiter{p: p, id: id, runner: name, log: log, states: states,
 		itype: string(inst.InstanceType), subnet: aws.ToString(inst.SubnetId), az: placementAZ(inst),
 		spot: inst.InstanceLifecycle == types.InstanceLifecycleTypeSpot}
-	w.record(jobevent.Event{Kind: jobevent.Launched, Path: path})
+	w.record(jobevent.Event{Kind: jobevent.Launched, Path: path, At: resolved})
 
 	ip, err := p.privateIP(ctx, inst)
 	if err != nil {
@@ -409,7 +409,8 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string, onStar
 	// the start took effect, not its job ending.
 	w := &waiter{p: p, id: in.id, runner: name, log: log, states: states, awaitStart: true, spotReq: spotReq,
 		itype: in.itype, subnet: in.subnet, az: in.az, spot: in.spotReq != ""}
-	w.record(jobevent.Event{Kind: jobevent.Launched, Path: PathPool})
+	// As the launch began: the instance may fetch its config before this line.
+	w.record(jobevent.Event{Kind: jobevent.Launched, Path: PathPool, At: claimed})
 	return w.run(ctx, ip)
 }
 
