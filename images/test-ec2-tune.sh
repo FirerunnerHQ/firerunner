@@ -98,6 +98,46 @@ pass "memory: moved before Docker is back" ordered "mount --bind $STATE/mem/cont
 pass "memory: Docker comes back" called "systemctl start containerd.service docker.service"
 pass "memory: says nothing when all went well" [ ! -s "$STATE/stderr" ]
 pass "memory: swap keeps the first device" ordered "mkswap" "systemctl stop"
+pass "memory: zram keeps swap's read-ahead" not_called "sysctl -q vm.page-cluster"
+pass "memory: not on tmpfs at 16 GB" not_called "mount -t tmpfs"
+
+big() { fresh; sed -i.bak 's/^MemTotal:.*/MemTotal: 32000000 kB/' "$STATE/meminfo"; }
+
+big
+run
+pass "large: exits 0" [ "$rc" = 0 ]
+pass "large: tmpfs, half as large again as memory" called "mount -t tmpfs -o noatime,size=48000000k tmpfs $STATE/mem"
+pass "large: no filesystem to compress into" not_called mkfs.ext4
+pass "large: only swap's device" not_called "zramctl --find --size 96000000KiB"
+pass "large: swap reads one page at a time" called "sysctl -q vm.page-cluster=0"
+pass "large: docker's directory moves" called "mount --bind $STATE/mem/docker $STATE/lib/docker"
+pass "large: Docker comes back after the move" ordered "mount --bind $STATE/mem/containerd" "systemctl start"
+pass "large: says nothing when all went well" [ ! -s "$STATE/stderr" ]
+
+big
+FIRERUNNER_DOCKER_TMPFS_MIN_KIB=32000000
+export FIRERUNNER_DOCKER_TMPFS_MIN_KIB
+run
+pass "at the threshold: tmpfs" called "mount -t tmpfs -o noatime,size=48000000k tmpfs $STATE/mem"
+FIRERUNNER_DOCKER_TMPFS_MIN_KIB=32000001
+run
+unset FIRERUNNER_DOCKER_TMPFS_MIN_KIB
+pass "under the threshold: a filesystem" called "mkfs.ext4 -q -m 0 -E nodiscard /dev/zram0"
+
+# Without swap, tmpfs would have nowhere to put what outgrows memory.
+big
+stub swapon 'exit 1'
+run
+pass "no swap: stays compressed" called "mkfs.ext4 -q -m 0 -E nodiscard /dev/zram0"
+pass "no swap: not on tmpfs" not_called "mount -t tmpfs"
+
+big
+stub mount 'case "$*" in *tmpfs*) exit 1 ;; esac; exit 0'
+run
+pass "tmpfs fails: exits 0" [ "$rc" = 0 ]
+pass "tmpfs fails: Docker stays on the disk" not_called "mount --bind"
+pass "tmpfs fails: says so" grep -q 'could not move Docker' "$STATE/stderr"
+pass "tmpfs fails: Docker comes back" called "systemctl start containerd.service docker.service"
 pass "memory: Docker settles before the disk, which can stall" ordered "systemctl start" "sfdisk"
 
 # The boot service waits on this file: it must outlive Docker's restart, and
