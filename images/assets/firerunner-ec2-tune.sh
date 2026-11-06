@@ -22,6 +22,9 @@ PREHEAT_PATHS="${FIRERUNNER_PREHEAT_PATHS:-/usr/bin/dockerd /usr/bin/containerd 
 DOCKER_STORAGE="${FIRERUNNER_DOCKER_STORAGE:-}"
 DOCKER_DIRS="${FIRERUNNER_DOCKER_DIRS:-/var/lib/docker /var/lib/containerd}"
 DOCKER_MEM_DIR="${FIRERUNNER_DOCKER_MEM_DIR:-/run/firerunner-docker}"
+# From here up, Docker's data goes on tmpfs. It is below a 32 GiB instance's
+# MemTotal, and above 16 GiB's, where tmpfs saved no time.
+DOCKER_TMPFS_MIN_KIB="${FIRERUNNER_DOCKER_TMPFS_MIN_KIB:-29360128}"
 # Removed once Docker is back in a known state, for the boot service to wait
 # on. Left in place, it tells the boot service not to run the job.
 DOCKER_PENDING="${FIRERUNNER_DOCKER_PENDING:-}"
@@ -83,9 +86,10 @@ zram_swap() {
 	mkswap "$dev" >/dev/null || return 1
 	swapon --priority 100 "$dev" || return 1
 	sysctl -q vm.swappiness=100 || true
+	swap_up=1
 }
 
-# Moves Docker's data to compressed RAM, for a tier that asks. A large image
+# Moves Docker's data to RAM, compressed if it must be, for a tier that asks. A large image
 # build took 30% less time than on 3000 IOPS of gp3, because EBS stops being read
 # as well as written. Docker starts empty there: images in the AMI stay on the
 # disk, out of its sight. The size only caps the device: zram takes memory as
@@ -107,10 +111,19 @@ docker_memory() {
 }
 
 docker_memory_mount() {
-	zram_device "$(($1 * 3))" || return 1
-	bounded mkfs.ext4 -q -m 0 -E nodiscard "$dev" || return 1
 	mkdir -p "$DOCKER_MEM_DIR" || return 1
-	bounded mount -o noatime,data=writeback,discard "$dev" "$DOCKER_MEM_DIR" || return 1
+	# With memory to spare, tmpfs compresses only what swap takes, so writes cost
+	# no CPU: a large image build's biggest COPY took 3 s, against 14 s on zram.
+	# At 16 GiB memory runs out, so it compresses all the same and saves nothing.
+	# It needs swap, or it has no way to outgrow memory.
+	if [ "$1" -ge "$DOCKER_TMPFS_MIN_KIB" ] && [ -n "$swap_up" ]; then
+		sysctl -q vm.page-cluster=0 || true
+		bounded mount -t tmpfs -o "noatime,size=$(($1 * 3 / 2))k" tmpfs "$DOCKER_MEM_DIR" || return 1
+	else
+		zram_device "$(($1 * 3))" || return 1
+		bounded mkfs.ext4 -q -m 0 -E nodiscard "$dev" || return 1
+		bounded mount -o noatime,data=writeback,discard "$dev" "$DOCKER_MEM_DIR" || return 1
+	fi
 	bound=""
 	for dir in $DOCKER_DIRS; do
 		if ! mkdir -p "$DOCKER_MEM_DIR/${dir##*/}" "$dir" ||
@@ -133,6 +146,7 @@ preheat() {
 }
 
 docker_unsettled=""
+swap_up=""
 preheat
 zram_swap || log "could not set up zram swap; the job runs without swap"
 # Before the disk, which can stall: the job waits for this step, not for that.

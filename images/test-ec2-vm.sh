@@ -228,8 +228,10 @@ check "zram swap is on" 'swap: /dev/zram0'
 check "swappiness is 100" 'swappiness: 100'
 check "docker runs on the tuned disk" 'docker_first_run: rc=0'
 if [ "$docker_storage" = memory ]; then
-	check "docker's data is in zram" 'docker_dir: /var/lib/docker on /dev/zram'
-	check "containerd's data is in zram" 'docker_dir: /var/lib/containerd on /dev/zram'
+	store=/dev/zram
+	[ "$mem" -lt 28672 ] || store=tmpfs
+	check "docker's data is on $store" "docker_dir: /var/lib/docker on $store"
+	check "containerd's data is on $store" "docker_dir: /var/lib/containerd on $store"
 else
 	check "docker's data is on the disk" 'docker_dir: /var/lib/docker on /dev/(root|vda)'
 fi

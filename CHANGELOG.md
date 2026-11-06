@@ -8,6 +8,13 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- `docker_storage: memory` keeps Docker's data on tmpfs on an instance with about
+  32 GiB of memory or more, with an image from this release. Compression then
+  waits for memory to run short, and a large image build took 304 s on
+  r8a.xlarge. Smaller instances keep compressed RAM.
+
 ## [0.1.1] - 2026-11-06
 
 ### Added
