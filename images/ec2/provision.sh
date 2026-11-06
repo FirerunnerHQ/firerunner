@@ -46,6 +46,18 @@ on_exit() {
 trap on_exit EXIT
 mark start
 
+# What the build writes and deletes stays out of the snapshot this way: EBS keeps
+# every block once written, so deleting it from the disk saves nothing.
+SCRATCH="/tmp /var/tmp /var/cache/apt/archives /root/.cache /imagegeneration"
+if [ "$TOOLSET" != minimal ]; then
+	for dir in $SCRATCH; do
+		mkdir -p "$dir"
+		mount -t tmpfs -o size=60% tmpfs "$dir"
+	done
+	mkdir -p /var/cache/apt/archives/partial
+	chmod 1777 /tmp /var/tmp
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 # First boot is when apt-daily and unattended-upgrades run and hold the dpkg
 # lock: wait for it instead of failing at once.
@@ -203,7 +215,13 @@ truncate -s 0 /etc/machine-id
 rm -f /var/lib/dbus/machine-id
 
 apt-get clean
-rm -rf /var/lib/apt/lists/* /var/log/journal/* /tmp/*
+rm -rf /var/lib/apt/lists/* /var/log/journal/*
+if [ "$TOOLSET" != minimal ]; then
+	# Lazily: a daemon the build left running may hold a file there.
+	# shellcheck disable=SC2086 # SCRATCH is a list of paths.
+	umount -l $SCRATCH
+fi
+rm -rf /tmp/* /imagegeneration
 mark finished
 sync
 shutdown -h now

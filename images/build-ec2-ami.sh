@@ -34,6 +34,8 @@
 #   --timeout SECONDS     give up waiting for the build (default 3600; minimal:
 #                         1200)
 #   --render              print the build user-data and exit; touches no AWS
+#   --render-assets       print a script that installs firerunner's own files, for
+#                         layer-ec2-ami.sh, and exit; touches no AWS
 #
 # Output: progress on stderr; on success one JSON line on stdout:
 #   {"ami":"ami-…","ssm_param":"…","runner_version":"…","arch":"…"}
@@ -76,6 +78,7 @@ while [ $# -gt 0 ]; do
 	--tag) tags+=("${2:?}"); shift ;;
 	--timeout) timeout_s="${2:?}"; shift ;;
 	--render) render=1 ;;
+	--render-assets) render=2 ;;
 	-h | --help)
 		sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
@@ -111,11 +114,11 @@ for t in "${tags[@]+"${tags[@]}"}"; do
 	[[ "$t" != *[,\[\]\{\}]* ]] || die "--tag '$t' contains one of , [ ] { }, which the AWS CLI shorthand cannot carry"
 done
 
-if [ -z "$runner_version" ]; then
+if [ -z "$runner_version" ] && [ "$render" != 2 ]; then
 	runner_version="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name)"
 	runner_version="${runner_version#v}"
 fi
-[[ "$runner_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "bad runner version '$runner_version'"
+[ "$render" = 2 ] || [[ "$runner_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "bad runner version '$runner_version'"
 [ -z "$fr_url" ] || [[ "$fr_sha256" =~ ^[0-9a-f]{64}$ ]] || die "--firerunner-url needs --firerunner-sha256"
 [ -z "$fr_version" ] || [[ "$fr_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "bad firerunner version '$fr_version'"
 
@@ -133,6 +136,14 @@ render_userdata() {
 		"$runner_version" "$arch" "$toolset" "$ri_ref" "$ri_skip" "$fr_version" "$fr_url" "$fr_sha256"
 	cat "$HERE/ec2/install-runner-images.sh"
 	strip "$HERE/ec2/install-firerunner.sh"
+	render_assets
+	sed '1d' "$HERE/ec2/provision.sh"
+}
+
+# render_assets prints the two functions that install what firerunner adds to an
+# image. build-ec2-ami.sh and layer-ec2-ami.sh both use them, so a layer cannot
+# drift from a full build.
+render_assets() {
 	echo 'install_boot_unit() {'
 	echo "cat >/usr/local/bin/firerunner-ec2-run.sh <<'FIRERUNNER_RUN_SH'"
 	strip "$HERE/assets/firerunner-ec2-run.sh"
@@ -180,9 +191,17 @@ render_userdata() {
 	cat "$HERE/assets/nodewrap.c"
 	echo 'FIRERUNNER_NODEWRAP'
 	echo '}'
-	sed '1d' "$HERE/ec2/provision.sh"
 }
 
+if [ "$render" = 2 ]; then
+	echo '#!/bin/bash'
+	echo 'set -euo pipefail'
+	render_assets
+	echo 'install_boot_unit'
+	echo 'install_cache_proxy'
+	echo 'rm -f /tmp/nodewrap.c'
+	exit 0
+fi
 if [ "$render" = 1 ]; then
 	render_userdata
 	exit 0

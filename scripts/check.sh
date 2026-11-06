@@ -119,6 +119,7 @@ else
 	skip nodewrap "needs Linux (/proc/self/exe) and cc"
 fi
 step ec2-ami-build images/test-build-ec2-ami.sh
+step ec2-ami-layer images/test-layer-ec2-ami.sh
 step mutate-script scripts/test-mutate.sh
 if command -v jq >/dev/null; then
 	step merge-stack scripts/test-merge-stack.sh
@@ -150,7 +151,7 @@ if command -v shellcheck >/dev/null; then
 		images/assets/firerunner-cache-setup.sh images/test-cache-setup.sh images/test-nodewrap.sh \
 		images/assets/firerunner-git-config.sh images/test-git-config.sh \
 		images/ec2/install-firerunner.sh images/test-install-firerunner.sh \
-		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh scripts/check.sh \
+		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh images/layer-ec2-ami.sh images/test-layer-ec2-ami.sh scripts/check.sh \
 		scripts/mutate.sh scripts/test-mutate.sh \
 		scripts/merge-stack.sh scripts/test-merge-stack.sh \
 		scripts/pr-wait.sh scripts/test-pr-wait.sh \
