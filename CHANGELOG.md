@@ -8,6 +8,13 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- A launch no longer waits about 5 s on each option with no spot capacity, which
+  took a job's queue time to about 50 s when the first types had none.
+- A cache hit returns the key as the job wrote it, so `setup-node` no longer saves
+  again and warns on every run.
+
 ## [0.1.4] - 2026-11-06
 
 ### Changed
