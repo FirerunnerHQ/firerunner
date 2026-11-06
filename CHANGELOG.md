@@ -12,9 +12,9 @@ and this project adheres to
 
 - EC2 instances reach the runner sooner, with an image from this release. The
   time from the config being served to the runner listening fell from about
-  10 s to about 3.5 s on r8a.xlarge, and the first node action no longer waits
-  on the disk for its files. Docker and the git cache's proxy now start alongside
-  the runner, so a job's first `docker` command may wait a few seconds for it.
+  10 s to about 3.5 s on r8a.xlarge. Docker and the git cache's proxy now start
+  alongside the runner, so a job's first `docker` command may wait several
+  seconds for it.
 - The image no longer starts PHP-FPM, Podman's services and other services a job
   does not use at boot. A job can still start them.
 - The standard toolset no longer includes the `Microsoft.Graph` PowerShell module.
