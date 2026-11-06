@@ -191,6 +191,7 @@ func TestAuthVerify_AppRepositories(t *testing.T) {
 		selection string
 		noCache   bool
 		noToken   bool // the check ends before asking for one
+		noAccount bool // GitHub named no account: nothing to compare
 		tokenCode int
 		listCode  int
 		list      string
@@ -206,6 +207,7 @@ func TestAuthVerify_AppRepositories(t *testing.T) {
 		{name: "repo, token refused otherwise", url: "https://github.com/acme/api", selection: "selected", scoped: "api", tokenCode: http.StatusForbidden, level: levelWarn, detail: "HTTP 403"},
 		{name: "repo, owner in another case", url: "https://github.com/ACME/api", selection: "selected", scoped: "api", level: levelPass},
 		{name: "repo of another account", url: "https://github.com/other/api", selection: "selected", noToken: true, level: levelFail, detail: "installation on acme, not other"},
+		{name: "repo, no account named", url: "https://github.com/other/api", selection: "selected", noAccount: true, scoped: "api", level: levelPass},
 		{name: "organization", url: "https://github.com/acme", selection: "selected", list: repos, level: levelWarn, detail: "(acme/api, acme/web)"},
 		{name: "organization, many", url: "https://github.com/acme", selection: "selected", list: truncated, level: levelWarn, detail: "acme/web and 248 more"},
 		{name: "organization, none", url: "https://github.com/acme", selection: "selected", list: empty, level: levelWarn, detail: "(none)"},
@@ -219,7 +221,11 @@ func TestAuthVerify_AppRepositories(t *testing.T) {
 				auth := r.Header.Get("Authorization")
 				switch r.URL.Path {
 				case "/app/installations/123":
-					fmt.Fprintf(w, `{"id":123,"repository_selection":%q,"permissions":{},"account":{"login":"acme"}}`, c.selection)
+					account := `{"login":"acme"}`
+					if c.noAccount {
+						account = "null"
+					}
+					fmt.Fprintf(w, `{"id":123,"repository_selection":%q,"permissions":{},"account":%s}`, c.selection, account)
 				case "/app/installations/123/access_tokens":
 					if c.noToken {
 						t.Error("asked for a token")

@@ -137,7 +137,7 @@ func appRepositories(cfg *config.Config, apiBase, auth, account string) Check {
 	if repoScoped(cfg.URL) {
 		repo = repoName(cfg.URL)
 		owner, name, _ := strings.Cut(repo, "/")
-		if !strings.EqualFold(owner, account) {
+		if account != "" && !strings.EqualFold(owner, account) {
 			return fail("app-repositories", "FR_APP_INSTALLATION_ID is the App's installation on %s, not %s, so jobs in %s get no cache", account, owner, repo)
 		}
 		ask["repositories"] = []string{name}
