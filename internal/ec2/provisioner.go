@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
@@ -767,6 +768,21 @@ func (p *Provisioner) fellBack(name string, first, got option) {
 	if p.o.FellBack != nil {
 		p.o.FellBack(kind)
 	}
+}
+
+// CapacityFailsFast keeps the AWS SDK from retrying a capacity error. EC2 answers
+// no spot capacity with HTTP 500, which the SDK retries for about 5 s, and a
+// launch waits that long for each type and subnet it tries before one that has
+// room. The launch walk is the retry: only other failures back off.
+func CapacityFailsFast(o *ec2.Options) {
+	o.Retryer = retry.NewStandard(func(so *retry.StandardOptions) {
+		so.Retryables = append([]retry.IsErrorRetryable{retry.IsErrorRetryableFunc(func(err error) aws.Ternary {
+			if isCapacityErr(err) {
+				return aws.FalseTernary
+			}
+			return aws.UnknownTernary
+		})}, so.Retryables...)
+	})
 }
 
 func isCapacityErr(err error) bool {

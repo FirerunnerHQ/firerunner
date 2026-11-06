@@ -740,7 +740,7 @@ func newEC2Client(ctx context.Context, cfg *config.Config, log *slog.Logger) (*e
 		return nil, err
 	}
 	log.Info("EC2 provisioner ready", "region", awsCfg.Region)
-	return ec2.NewClient(awsec2.NewFromConfig(awsCfg), awsssm.NewFromConfig(awsCfg), 0, log.With("component", "ec2")), nil
+	return ec2.NewClient(awsec2.NewFromConfig(awsCfg, ec2.CapacityFailsFast), awsssm.NewFromConfig(awsCfg), 0, log.With("component", "ec2")), nil
 }
 
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
