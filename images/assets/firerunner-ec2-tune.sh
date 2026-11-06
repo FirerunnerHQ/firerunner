@@ -17,7 +17,10 @@ SYS_BLOCK="${FIRERUNNER_SYS_BLOCK:-/sys/class/block}"
 # Read in the background, so a job's first docker command does not pay for EBS
 # fetching their blocks from the snapshot.
 # The runner first: a job waits for it, and Docker's binaries can follow.
-PREHEAT_PATHS="${FIRERUNNER_PREHEAT_PATHS:-/opt/runner/bin /opt/runner/externals /usr/local/bin/firerunner /usr/bin/git /usr/bin/dockerd /usr/bin/containerd /usr/bin/docker /usr/bin/runc /usr/libexec/docker}"
+PREHEAT_PATHS="${FIRERUNNER_PREHEAT_PATHS:-/opt/runner/bin /opt/runner/externals /usr/local/bin/firerunner /usr/bin/git}"
+# Docker's, read alongside: dockerd starts at the same moment, and a job's first
+# docker command waits for it.
+PREHEAT_DOCKER_PATHS="${FIRERUNNER_PREHEAT_DOCKER_PATHS:-/usr/bin/dockerd /usr/bin/containerd /usr/bin/containerd-shim-runc-v2 /usr/bin/docker /usr/bin/runc /usr/libexec/docker}"
 # "memory" keeps Docker's data in compressed RAM; set from the tier's
 # docker_storage by firerunner-ec2-run.sh.
 DOCKER_STORAGE="${FIRERUNNER_DOCKER_STORAGE:-}"
@@ -148,6 +151,8 @@ preheat() {
 	# Alpine's node runs only in an Alpine job container, not here. In parallel,
 	# because EBS loads a snapshot faster at a higher queue depth.
 	nohup sh -c "find $PREHEAT_PATHS -xdev -type f ! -path '*_alpine*' -print0 2>/dev/null | xargs -0 -r -P 4 -n 32 cat >/dev/null 2>&1" >/dev/null 2>&1 &
+	# shellcheck disable=SC2086 # PREHEAT_DOCKER_PATHS is a list of paths.
+	nohup sh -c "find $PREHEAT_DOCKER_PATHS -xdev -type f -print0 2>/dev/null | xargs -0 -r -P 4 -n 8 cat >/dev/null 2>&1" >/dev/null 2>&1 &
 }
 
 docker_unsettled=""
