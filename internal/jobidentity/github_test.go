@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -379,6 +380,34 @@ func TestInstallationTokenRefresh(t *testing.T) {
 	g.app.PrivateKey = "invalid"
 	if _, err := g.auth(context.Background(), "owner/repo"); err == nil {
 		t.Fatal("invalid private key accepted")
+	}
+}
+
+// A job in a repository outside the App's installation has no cache, and this
+// error, in the control VM's log, is the only place that says why.
+func TestInstallationTokenRefusalNamesTheRepository(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	code := http.StatusUnprocessableEntity
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(code)
+	}))
+	defer srv.Close()
+	g := &GitHub{base: srv.URL, client: srv.Client(), app: scaleset.GitHubAppAuth{ClientID: "client", InstallationID: 7, PrivateKey: string(raw)}}
+	_, err = g.auth(context.Background(), "owner/repo")
+	if err == nil || !strings.Contains(err.Error(), "is the App installed on it") || !strings.Contains(err.Error(), "owner/repo") {
+		t.Fatalf("422: %v", err)
+	}
+	var status statusError
+	if !errors.As(err, &status) || status.code != code {
+		t.Fatalf("the status was lost: %v", err)
+	}
+	code = http.StatusInternalServerError
+	if _, err := g.auth(context.Background(), "owner/repo"); err == nil || strings.Contains(err.Error(), "is the App installed") {
+		t.Fatalf("500 blamed on the installation: %v", err)
 	}
 }
 

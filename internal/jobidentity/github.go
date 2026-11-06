@@ -95,6 +95,10 @@ func (g *GitHub) auth(ctx context.Context, repo string) (string, error) {
 		"permissions":  map[string]string{"actions": "read", "pull_requests": "read", "metadata": "read", "contents": "read"},
 	})
 	if err := g.request(ctx, http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", g.app.InstallationID), signed, bytes.NewReader(body), &result); err != nil {
+		var status statusError
+		if errors.As(err, &status) && status.code == http.StatusUnprocessableEntity {
+			return "", fmt.Errorf("GitHub refused a token for %s; is the App installed on it, with read on actions, contents and pull requests? %w", repo, err)
+		}
 		return "", err
 	}
 	if result.Token == "" || !result.ExpiresAt.After(now.Add(time.Minute)) {
