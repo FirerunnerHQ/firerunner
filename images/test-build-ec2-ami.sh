@@ -168,6 +168,7 @@ fresh toolset
 PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 >"$STATE/out"
 expect "the default toolset is standard" "" grep -q '^TOOLSET=standard$' "$STATE/out"
 expect "standard skips Haskell" "" grep -q '^RI_SKIP=.*install-haskell.sh' "$STATE/out"
+expect "standard installs PowerShell's modules itself" "" grep -q '^RI_SKIP=.*Install-PowerShellModules.ps1' "$STATE/out"
 PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --toolset full >"$STATE/out"
 expect "full keeps Haskell" "" bash -c "! grep -q '^RI_SKIP=.*install-haskell.sh' '$STATE/out'"
 PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --arch arm64 >"$STATE/out"

@@ -32,6 +32,7 @@ cat >"$TMP/toolset.json" <<'JSON'
   "gfortran": {"versions": ["gfortran-12", "gfortran-14"]},
   "dotnet": {"versions": ["8.0", "10.0"]},
   "azureModules": [{"name": "az"}],
+  "powershellModules": [{"name": "Microsoft.Graph"}, {"name": "Pester", "versions": ["5.9.0"]}],
   "node_modules": [{"name": "grunt"}, {"name": "typescript"}, {"name": "yarn"}],
   "apt": {"common_packages": ["netcat-openbsd"]}
 }
@@ -53,8 +54,48 @@ expect "gcc keeps the latest" '.gcc.versions == ["g++-14"]'
 expect "gfortran keeps the latest" '.gfortran.versions == ["gfortran-14"]'
 expect ".NET keeps the latest" '.dotnet.versions == ["10.0"]'
 expect "Azure PowerShell modules go" '.azureModules == []'
+expect "Microsoft.Graph goes, and the other modules stay" '[.powershellModules[].name] == ["Pester"]'
 expect "global npm modules shrink" '[.node_modules[].name] == ["typescript", "yarn"]'
 expect "what it does not know stays" '.apt.common_packages == ["netcat-openbsd"]'
+
+# install_powershell_modules: from the package URL, at the toolset's version
+# or the latest, into a versioned directory, and proved by importing it.
+bin="$TMP/bin"
+mkdir -p "$bin"
+cat >"$bin/curl" <<'STUB'
+#!/bin/sh
+for a; do last="$a"; done
+echo "$last" >>"$CALLS"
+case "$last" in
+*/Pester/5.9.0) printf 'https://cdn.example/packages/pester.5.9.0.nupkg' ;;
+*/PSScriptAnalyzer) printf 'https://cdn.example/packages/psscriptanalyzer.1.25.0.nupkg' ;;
+*) exit 22 ;;
+esac
+STUB
+cat >"$bin/unzip" <<'STUB'
+#!/bin/sh
+for a; do last="$a"; done
+echo "unzip $last" >>"$CALLS"
+STUB
+cat >"$bin/pwsh" <<'STUB'
+#!/bin/sh
+echo "pwsh $*" >>"$CALLS"
+STUB
+chmod +x "$bin/curl" "$bin/unzip" "$bin/pwsh"
+export CALLS="$TMP/calls"
+: >"$CALLS"
+cat >"$TMP/modules.json" <<'JSON'
+{"powershellModules": [{"name": "Pester", "versions": ["5.9.0"]}, {"name": "PSScriptAnalyzer"}]}
+JSON
+PATH="$bin:$PATH" PS_MODULE_DIR="$TMP/mods" install_powershell_modules "$TMP/modules.json"
+has() {
+	if grep -qF -- "$2" "$CALLS"; then echo "ok: $1"; else echo "FAIL: $1"; fails=$((fails + 1)); fi
+}
+has "a pinned module's version" "https://www.powershellgallery.com/api/v2/package/Pester/5.9.0"
+has "an unpinned module takes the latest" "https://www.powershellgallery.com/api/v2/package/PSScriptAnalyzer"
+has "the pinned module's directory" "unzip $TMP/mods/Pester/5.9.0"
+has "the version comes from the package's name" "unzip $TMP/mods/PSScriptAnalyzer/1.25.0"
+has "the module is imported" "Import-Module '$TMP/mods/PSScriptAnalyzer/1.25.0/PSScriptAnalyzer.psd1'"
 
 if [ "$fails" -ne 0 ]; then
 	echo "$fails failure(s)"
