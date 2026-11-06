@@ -186,8 +186,7 @@ func TestSaveRestoreSingleShot(t *testing.T) {
 	if get["ok"] != true {
 		t.Fatalf("get not ok: %v", get)
 	}
-	// Keys are matched case-insensitively and echoed lowercased.
-	if got := get["matched_key"]; got != "node-modules-abc" {
+	if got := get["matched_key"]; got != "Node-Modules-abc" {
 		t.Fatalf("matched_key = %v", got)
 	}
 	resp, err := http.Get(get["signed_download_url"].(string))
@@ -289,6 +288,26 @@ func TestRestoreKeyPrefix(t *testing.T) {
 	})
 	if get["ok"] != true || get["matched_key"] != "deps-linux-bbb" {
 		t.Fatalf("restore-key match = %v", get)
+	}
+}
+
+// setup-node compares the matched key exactly, so a hit returns the job's own
+// case, while matching ignores case.
+func TestMatchedKeyKeepsItsCase(t *testing.T) {
+	_, base := newTestServer(t)
+	const version, key = "vc", "node-cache-Linux-x64-npm-abc"
+	create := twirp(t, base, "CreateCacheEntry", createReq{Key: key, Version: version})
+	putBlob(t, create["signed_upload_url"].(string), []byte(key))
+	twirp(t, base, "FinalizeCacheEntryUpload", finalizeReq{Key: key, Version: version, SizeBytes: fmt.Sprint(len(key))})
+	for _, asked := range []string{key, "NODE-CACHE-linux-X64-npm-abc"} {
+		get := twirp(t, base, "GetCacheEntryDownloadURL", getReq{Key: asked, Version: version})
+		if get["ok"] != true || get["matched_key"] != key {
+			t.Fatalf("%s: %v", asked, get)
+		}
+	}
+	got := twirp(t, base, "CreateCacheEntry", createReq{Key: "NODE-CACHE-linux-x64-npm-ABC", Version: version})
+	if got["ok"] != false {
+		t.Fatalf("a key differing only in case made a second entry: %v", got)
 	}
 }
 

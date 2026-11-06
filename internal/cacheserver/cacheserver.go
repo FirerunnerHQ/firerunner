@@ -95,12 +95,15 @@ type Entry struct {
 	ID         uint64     `json:"id"`
 	Sig        string     `json:"sig"`
 	RepoID     string     `json:"repo_id"`
-	Key        string     `json:"key"`
-	Version    string     `json:"version"`
-	Size       int64      `json:"size"`
-	Complete   bool       `json:"complete"`
-	CreatedAt  int64      `json:"created_at"`
-	UsedAt     int64      `json:"used_at"`
+	Key        string     `json:"key"` // lower case, as keys match without regard to it
+	// ClientKey is the key as the job wrote it, which a hit must return: setup-node
+	// compares it exactly, and saves again when it differs.
+	ClientKey string `json:"client_key,omitempty"`
+	Version   string `json:"version"`
+	Size      int64  `json:"size"`
+	Complete  bool   `json:"complete"`
+	CreatedAt int64  `json:"created_at"`
+	UsedAt    int64  `json:"used_at"`
 }
 
 // Server is a disk-backed GitHub Actions cache (v2) server. It is safe for
@@ -395,6 +398,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		JobID:      identity.JobID,
 		RunID:      identity.RunID,
 		Key:        key,
+		ClientKey:  req.Key,
 		Version:    req.Version,
 		Size:       -1,
 		CreatedAt:  time.Now().Unix(),
@@ -507,8 +511,17 @@ func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, getResp{
 		OK:                true,
 		SignedDownloadURL: s.blobURL(r, "download", e.ID, e.Sig),
-		MatchedKey:        e.Key,
+		MatchedKey:        e.matchedKey(),
 	})
+}
+
+// matchedKey is the key to report for a hit. Entries from before ClientKey have
+// only the lower-case one.
+func (e *Entry) matchedKey() string {
+	if e.ClientKey != "" {
+		return e.ClientKey
+	}
+	return e.Key
 }
 
 // handleUpload accepts the archive blob. It speaks the subset of the Azure
