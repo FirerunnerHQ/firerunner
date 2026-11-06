@@ -198,7 +198,9 @@ Because the disk lasts for one job, the image favours speed over durability:
   job boot, so `root_volume_gib` takes effect, adds zram swap as large as
   memory, moves Docker's data to RAM for a tier with
   `docker_storage: memory`, on tmpfs from about 32 GiB and in zram below that, and reads Docker's and the runner's files in the
-  background. Each step is best effort, and the job starts either way.
+  background. Each step is best effort, and the job starts either way. Docker
+  starts here too, once its data is in place, and the runner does not wait for
+  it: the first `docker` command does, through the socket.
 - The root filesystem mounts with `data=writeback`, `journal_async_commit` and
   `nobarrier`. A pool instance stops cleanly, so these never risk a disk that
   boots again.
