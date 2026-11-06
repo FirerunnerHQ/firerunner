@@ -50,7 +50,7 @@ type Event struct {
 	Market       string // spot or on-demand
 	Subnet       string
 	Zone         string
-	Path         string // cold, pool or warm
+	Path         string // cold, pool or kept: how the machine was supplied
 	ExitCode     int
 	Reason       string
 }
