@@ -419,7 +419,9 @@ type waiter struct {
 	id     string
 	runner string
 	log    *slog.Logger
-	states <-chan instanceState
+	// interruptedWhy is why AWS took the instance, for its record.
+	interruptedWhy string
+	states         <-chan instanceState
 
 	terminating bool
 	termSince   time.Time // first termination request
@@ -566,13 +568,18 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			if !w.terminating && !w.awaitStart && !w.interrupted && endingState(s.name) {
 				if why := w.interruption(ctx, ip, s); why != "" {
 					w.interrupted = true
+					w.interruptedWhy = why
 					w.spotInterrupted(ip, s, why)
 				}
 			}
 			switch s.name {
 			case types.InstanceStateNameShuttingDown, types.InstanceStateNameTerminated:
 				w.log.Info("instance gone", "state", s.name, "reason", s.reason)
-				w.record(jobevent.Event{Kind: jobevent.InstanceGone, Reason: s.reason})
+				reason := s.reason
+				if w.interruptedWhy != "" {
+					reason = w.interruptedWhy // the instance's own reason can read as a normal end
+				}
+				w.record(jobevent.Event{Kind: jobevent.InstanceGone, Reason: reason})
 				if err := w.runnerResult(ip); result == nil && ctx.Err() == nil {
 					result = err
 				}
@@ -594,6 +601,7 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			now := p.now()
 			switch {
 			case w.terminating && now.Sub(w.termSince) >= p.termWait:
+				w.record(jobevent.Event{Kind: jobevent.InstanceGone, Reason: "did not terminate"})
 				return errors.Join(result, fmt.Errorf("instance %s did not terminate within %s; terminate it by hand", w.id, p.termWait))
 			case w.terminating && now.Sub(w.termLast) >= p.termRetry:
 				// The request may have been throttled or lost; repeat it.

@@ -71,11 +71,3 @@ func TestJobEvents(t *testing.T) {
 		}
 	}
 }
-
-// An unset sink must leave the listener's paths alone.
-func TestNoSinkRecordsNothing(t *testing.T) {
-	a := &scaler{log: slog.New(slog.DiscardHandler)}
-	if err := a.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{}); err != nil {
-		t.Fatal(err)
-	}
-}

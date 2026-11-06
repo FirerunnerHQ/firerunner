@@ -9,6 +9,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
+	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/jobevent"
 )
 
@@ -59,4 +60,53 @@ func TestLaunch_RecordsEvents(t *testing.T) {
 	if events.got[1].Reason != "Client.UserInitiatedShutdown" {
 		t.Errorf("reason = %q", events.got[1].Reason)
 	}
+}
+
+// A spot interruption's own reason stands: AWS's fault injection shows on the
+// instance as the user's own shutdown, which would read as a normal end.
+func TestInterruptionReasonIsRecorded(t *testing.T) {
+	events := &eventLog{}
+	h := newHarness(t, func(o *Options) {
+		o.Events = events
+		o.EC2.Market = config.MarketSpot
+	})
+	errc := h.launch(context.Background())
+	inst := h.instance(t)
+	h.f.mu.Lock()
+	h.f.instances[inst.id].spotStatus = "instance-terminated-by-experiment"
+	h.f.mu.Unlock()
+	h.f.setStateFor(inst.id, types.InstanceStateNameShuttingDown, "Client.UserInitiatedShutdown")
+	waitErr(t, errc)
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	gone := events.got[len(events.got)-1]
+	if gone.Kind != jobevent.InstanceGone || gone.Reason != "instance-terminated-by-experiment" || gone.Market != config.MarketSpot {
+		t.Fatalf("gone = %+v", gone)
+	}
+}
+
+// A pool instance reports its own path, and its market.
+func TestPoolLaunch_RecordsEvents(t *testing.T) {
+	events := &eventLog{}
+	h := poolHarness(t, 1, config.MarketSpot)
+	h.p.o.Events = events
+	h.runPool(t)
+	eventually(t, "a warming instance", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
+	h.stopWarming()
+	eventually(t, "a ready instance", func() bool { r, _ := h.p.pool.Ready(); return r == 1 })
+	errc := h.launch(context.Background())
+	eventually(t, "an event", func() bool {
+		events.mu.Lock()
+		defer events.mu.Unlock()
+		return len(events.got) > 0
+	})
+	events.mu.Lock()
+	first := events.got[0]
+	events.mu.Unlock()
+	if first.Kind != jobevent.Launched || first.Path != PathPool || first.Market != config.MarketSpot {
+		t.Fatalf("first = %+v", first)
+	}
+	inst := h.instance(t)
+	h.f.setState(inst.id, types.InstanceStateNameTerminated)
+	waitErr(t, errc)
 }

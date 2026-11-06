@@ -537,9 +537,6 @@ func offeredJob(b scaleset.JobMessageBase) jobidentity.Job {
 		Event: b.EventName, RunID: b.WorkflowRunID, JobID: b.JobID}
 }
 
-// jobAssignedAttrs are a JobAssigned message's log attributes. GitHub's
-// queue and assignment times, and the delay between them, appear only when
-// the message carries them: on a JIT scale set it has been seen without.
 // jobEvent fills an event from what every GitHub job message carries.
 func jobEvent(kind jobevent.Kind, tier string, b scaleset.JobMessageBase) jobevent.Event {
 	return jobevent.Event{
@@ -549,6 +546,9 @@ func jobEvent(kind jobevent.Kind, tier string, b scaleset.JobMessageBase) jobeve
 	}
 }
 
+// jobAssignedAttrs are a JobAssigned message's log attributes. GitHub's
+// queue and assignment times, and the delay between them, appear only when
+// the message carries them: on a JIT scale set it has been seen without.
 func jobAssignedAttrs(b scaleset.JobMessageBase) []any {
 	attrs := []any{"repository", b.OwnerName + "/" + b.RepositoryName, "job", b.JobDisplayName,
 		"event", b.EventName, "runnerRequestId", b.RunnerRequestID, "jobId", b.JobID}
