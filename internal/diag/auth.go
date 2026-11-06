@@ -53,7 +53,7 @@ func githubAPIBase(rawURL string) string {
 // installation was granted against the least-privilege set (see
 // appPermissions).
 func authVerify(cfg *config.Config, apiBase string) []Check {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), authTimeout)
 	defer cancel()
 
 	var req *http.Request
@@ -87,6 +87,9 @@ func authVerify(cfg *config.Config, apiBase string) []Check {
 			var inst struct {
 				Permissions map[string]string `json:"permissions"`
 				Selection   string            `json:"repository_selection"`
+				Account     struct {
+					Login string `json:"login"`
+				} `json:"account"`
 			}
 			if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&inst); err != nil {
 				checks = append(checks, warn("app-permissions", "could not read the installation's permissions: %v", err))
@@ -94,7 +97,7 @@ func authVerify(cfg *config.Config, apiBase string) []Check {
 				cache := cfg.UsesEC2Cache() || cfg.Firecracker.CachePort != 0 || cfg.Firecracker.CacheURL != ""
 				checks = append(checks, appPermissions(inst.Permissions, repoScoped(cfg.URL), cache))
 				if cache && inst.Selection == "selected" {
-					checks = append(checks, appRepositories(cfg, apiBase, req.Header.Get("Authorization")))
+					checks = append(checks, appRepositories(cfg, apiBase, req.Header.Get("Authorization"), inst.Account.Login))
 				}
 			}
 		}
@@ -106,6 +109,9 @@ func authVerify(cfg *config.Config, apiBase string) []Check {
 	}
 }
 
+// authTimeout bounds one group of requests to GitHub.
+var authTimeout = 5 * time.Second
+
 // maxListedRepositories bounds what a check names, and what it reads.
 const maxListedRepositories = 100
 
@@ -116,17 +122,25 @@ const maxListedRepositories = 100
 // repository can be checked, by asking for the same token; for an organization,
 // only the operator knows which repositories it serves, so this lists them.
 //
+// A name alone says nothing of the owner, so a repository's owner must be the
+// installation's account: another account's repository of the same name would
+// get a token too.
+//
 // auth is the App's JWT. The token it asks for has metadata read alone, and is
 // neither kept nor printed. The check has its own deadline, so that a slow
 // earlier request cannot turn a FAIL into a timeout's WARN.
-func appRepositories(cfg *config.Config, apiBase, auth string) Check {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func appRepositories(cfg *config.Config, apiBase, auth, account string) Check {
+	ctx, cancel := context.WithTimeout(context.Background(), authTimeout)
 	defer cancel()
 	ask := map[string]any{"permissions": map[string]string{"metadata": "read"}}
 	repo := ""
 	if repoScoped(cfg.URL) {
 		repo = repoName(cfg.URL)
-		ask["repositories"] = []string{repo[strings.LastIndex(repo, "/")+1:]}
+		owner, name, _ := strings.Cut(repo, "/")
+		if !strings.EqualFold(owner, account) {
+			return fail("app-repositories", "FR_APP_INSTALLATION_ID is the App's installation on %s, not %s, so jobs in %s get no cache", account, owner, repo)
+		}
+		ask["repositories"] = []string{name}
 	}
 	body, _ := json.Marshal(ask)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -203,7 +217,7 @@ func repoScoped(rawURL string) bool {
 		return false
 	}
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	return len(parts) >= 2 && parts[0] != "enterprises"
+	return len(parts) >= 2 && !strings.EqualFold(parts[0], "enterprises")
 }
 
 // permissionRisk says what an App permission beyond firerunner's needs would

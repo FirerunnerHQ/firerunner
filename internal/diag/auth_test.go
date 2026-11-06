@@ -190,6 +190,7 @@ func TestAuthVerify_AppRepositories(t *testing.T) {
 		url       string
 		selection string
 		noCache   bool
+		noToken   bool // the check ends before asking for one
 		tokenCode int
 		listCode  int
 		list      string
@@ -203,20 +204,26 @@ func TestAuthVerify_AppRepositories(t *testing.T) {
 		{name: "repo, .git", url: "https://github.com/acme/api.git/", selection: "selected", scoped: "api", level: levelPass},
 		{name: "repo absent", url: "https://github.com/acme/billing", selection: "selected", scoped: "billing", tokenCode: http.StatusUnprocessableEntity, level: levelFail, detail: "not installed on acme/billing"},
 		{name: "repo, token refused otherwise", url: "https://github.com/acme/api", selection: "selected", scoped: "api", tokenCode: http.StatusForbidden, level: levelWarn, detail: "HTTP 403"},
+		{name: "repo, owner in another case", url: "https://github.com/ACME/api", selection: "selected", scoped: "api", level: levelPass},
+		{name: "repo of another account", url: "https://github.com/other/api", selection: "selected", noToken: true, level: levelFail, detail: "installation on acme, not other"},
 		{name: "organization", url: "https://github.com/acme", selection: "selected", list: repos, level: levelWarn, detail: "(acme/api, acme/web)"},
 		{name: "organization, many", url: "https://github.com/acme", selection: "selected", list: truncated, level: levelWarn, detail: "acme/web and 248 more"},
 		{name: "organization, none", url: "https://github.com/acme", selection: "selected", list: empty, level: levelWarn, detail: "(none)"},
 		{name: "organization, 422 is no verdict", url: "https://github.com/acme", selection: "selected", tokenCode: http.StatusUnprocessableEntity, level: levelWarn, detail: "HTTP 422"},
 		{name: "organization, list refused", url: "https://github.com/acme", selection: "selected", listCode: http.StatusBadGateway, level: levelWarn, detail: "HTTP 502"},
 		{name: "enterprise is not a repository", url: "https://github.com/enterprises/acme", selection: "selected", list: repos, level: levelWarn, detail: "(acme/api, acme/web)"},
+		{name: "enterprise in another case", url: "https://github.com/Enterprises/acme", selection: "selected", list: repos, level: levelWarn, detail: "(acme/api, acme/web)"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				auth := r.Header.Get("Authorization")
 				switch r.URL.Path {
 				case "/app/installations/123":
-					fmt.Fprintf(w, `{"id":123,"repository_selection":%q,"permissions":{}}`, c.selection)
+					fmt.Fprintf(w, `{"id":123,"repository_selection":%q,"permissions":{},"account":{"login":"acme"}}`, c.selection)
 				case "/app/installations/123/access_tokens":
+					if c.noToken {
+						t.Error("asked for a token")
+					}
 					var body struct {
 						Repositories []string          `json:"repositories"`
 						Permissions  map[string]string `json:"permissions"`
@@ -272,6 +279,30 @@ func TestAuthVerify_AppRepositories(t *testing.T) {
 				t.Fatalf("got %s %q, want %s containing %q", got.Level, got.Detail, c.level, c.detail)
 			}
 		})
+	}
+}
+
+// The repository check has its own deadline: time spent on the request before
+// it must not turn its verdict into a timeout's WARN.
+func TestAuthVerify_AppRepositoriesDeadline(t *testing.T) {
+	pemStr, _ := testRSAKeyPEM(t)
+	defer func(d time.Duration) { authTimeout = d }(authTimeout)
+	authTimeout = 2 * time.Second
+	wait := 1200 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(wait) // each fits the deadline, and the two together do not
+		if strings.HasSuffix(r.URL.Path, "/access_tokens") {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		fmt.Fprint(w, `{"repository_selection":"selected","permissions":{},"account":{"login":"acme"}}`)
+	}))
+	defer srv.Close()
+	cfg := &config.Config{URL: "https://github.com/acme/api", AppClientID: "Iv1.client", AppInstallID: 123, AppPrivateKey: pemStr}
+	cfg.Firecracker.CachePort = 8081
+	checks := authVerify(cfg, srv.URL)
+	if c := checks[len(checks)-1]; c.Name != "app-repositories" || c.Level != levelFail {
+		t.Fatalf("got %s %s %q, want a FAIL", c.Name, c.Level, c.Detail)
 	}
 }
 
