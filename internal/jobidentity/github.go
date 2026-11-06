@@ -95,6 +95,10 @@ func (g *GitHub) auth(ctx context.Context, repo string) (string, error) {
 		"permissions":  map[string]string{"actions": "read", "pull_requests": "read", "metadata": "read", "contents": "read"},
 	})
 	if err := g.request(ctx, http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", g.app.InstallationID), signed, bytes.NewReader(body), &result); err != nil {
+		var status statusError
+		if errors.As(err, &status) && status.code == http.StatusUnprocessableEntity {
+			return "", fmt.Errorf("%w (%s): %w", errTokenRefused, repo, err)
+		}
 		return "", err
 	}
 	if result.Token == "" || !result.ExpiresAt.After(now.Add(time.Minute)) {
@@ -106,6 +110,11 @@ func (g *GitHub) auth(ctx context.Context, repo string) (string, error) {
 	g.tokens[repo] = installationToken{result.Token, result.ExpiresAt}
 	return result.Token, nil
 }
+
+// errTokenRefused is GitHub's 422 for a token for one repository, which it also
+// gives for a repository outside the App's installation. No identity can follow,
+// and the operator can fix that, so callers log it where it will be read.
+var errTokenRefused = errors.New("GitHub refused a token for the repository; is the App installed on it, with read on actions, contents and pull requests?")
 
 // statusError keeps the HTTP status so callers can tell a missing endpoint apart.
 type statusError struct {

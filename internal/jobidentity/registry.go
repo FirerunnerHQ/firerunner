@@ -32,13 +32,14 @@ type lease struct {
 // Registry owns a dedicated directory exclusively. A lock prevents two daemons
 // from clearing each other's records. Keep it alive until all VMs have drained.
 type Registry struct {
-	mu     sync.Mutex
-	dir    string
-	lock   *os.File
-	leases map[string]*lease
-	stop   chan struct{}
-	done   chan struct{}
-	log    *slog.Logger
+	refused map[string]time.Time // repository: when a token refusal was last warned about, under mu
+	mu      sync.Mutex
+	dir     string
+	lock    *os.File
+	leases  map[string]*lease
+	stop    chan struct{}
+	done    chan struct{}
+	log     *slog.Logger
 	// discoverPause is discoverPause, shortened by tests.
 	discoverPause time.Duration
 }

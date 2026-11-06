@@ -180,6 +180,138 @@ func TestAuthVerify_AppPermissions(t *testing.T) {
 	}
 }
 
+func TestAuthVerify_AppRepositories(t *testing.T) {
+	pemStr, _ := testRSAKeyPEM(t)
+	const repos = `{"total_count":2,"repositories":[{"full_name":"acme/api"},{"full_name":"acme/web"}]}`
+	const truncated = `{"total_count":250,"repositories":[{"full_name":"acme/api"},{"full_name":"acme/web"}]}`
+	const empty = `{"total_count":0,"repositories":[]}`
+	for _, c := range []struct {
+		name      string
+		url       string
+		selection string
+		noCache   bool
+		noToken   bool // the check ends before asking for one
+		noAccount bool // GitHub named no account: nothing to compare
+		tokenCode int
+		listCode  int
+		list      string
+		scoped    string // the repository the token must be limited to
+		level     string // "" means the check does not run
+		detail    string
+	}{
+		{name: "all repositories", url: "https://github.com/acme/api", selection: "all"},
+		{name: "no cache", url: "https://github.com/acme/api", selection: "selected", noCache: true},
+		{name: "repo present", url: "https://github.com/acme/api", selection: "selected", scoped: "api", level: levelPass, detail: "acme/api"},
+		{name: "repo, .git", url: "https://github.com/acme/api.git/", selection: "selected", scoped: "api", level: levelPass},
+		{name: "repo absent", url: "https://github.com/acme/billing", selection: "selected", scoped: "billing", tokenCode: http.StatusUnprocessableEntity, level: levelFail, detail: "not installed on acme/billing"},
+		{name: "repo, token refused otherwise", url: "https://github.com/acme/api", selection: "selected", scoped: "api", tokenCode: http.StatusForbidden, level: levelWarn, detail: "HTTP 403"},
+		{name: "repo, owner in another case", url: "https://github.com/ACME/api", selection: "selected", scoped: "api", level: levelPass},
+		{name: "repo of another account", url: "https://github.com/other/api", selection: "selected", noToken: true, level: levelFail, detail: "installation on acme, not other"},
+		{name: "repo, no account named", url: "https://github.com/other/api", selection: "selected", noAccount: true, scoped: "api", level: levelPass},
+		{name: "organization", url: "https://github.com/acme", selection: "selected", list: repos, level: levelWarn, detail: "(acme/api, acme/web)"},
+		{name: "organization, many", url: "https://github.com/acme", selection: "selected", list: truncated, level: levelWarn, detail: "acme/web and 248 more"},
+		{name: "organization, none", url: "https://github.com/acme", selection: "selected", list: empty, level: levelWarn, detail: "(none)"},
+		{name: "organization, 422 is no verdict", url: "https://github.com/acme", selection: "selected", tokenCode: http.StatusUnprocessableEntity, level: levelWarn, detail: "HTTP 422"},
+		{name: "organization, list refused", url: "https://github.com/acme", selection: "selected", listCode: http.StatusBadGateway, level: levelWarn, detail: "HTTP 502"},
+		{name: "enterprise is not a repository", url: "https://github.com/enterprises/acme", selection: "selected", list: repos, level: levelWarn, detail: "(acme/api, acme/web)"},
+		{name: "enterprise in another case", url: "https://github.com/Enterprises/acme", selection: "selected", list: repos, level: levelWarn, detail: "(acme/api, acme/web)"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				auth := r.Header.Get("Authorization")
+				switch r.URL.Path {
+				case "/app/installations/123":
+					account := `{"login":"acme"}`
+					if c.noAccount {
+						account = "null"
+					}
+					fmt.Fprintf(w, `{"id":123,"repository_selection":%q,"permissions":{},"account":%s}`, c.selection, account)
+				case "/app/installations/123/access_tokens":
+					if c.noToken {
+						t.Error("asked for a token")
+					}
+					var body struct {
+						Repositories []string          `json:"repositories"`
+						Permissions  map[string]string `json:"permissions"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					if r.Method != http.MethodPost || strings.Count(auth, ".") != 2 || len(body.Permissions) != 1 || body.Permissions["metadata"] != "read" {
+						t.Errorf("token request: %s auth=%q permissions=%v", r.Method, auth, body.Permissions)
+					}
+					if got := strings.Join(body.Repositories, ","); got != c.scoped {
+						t.Errorf("token limited to %q, want %q", got, c.scoped)
+					}
+					if c.tokenCode != 0 {
+						w.WriteHeader(c.tokenCode)
+						return
+					}
+					w.WriteHeader(http.StatusCreated)
+					fmt.Fprint(w, `{"token":"ghs_listing"}`)
+				case "/installation/repositories":
+					if auth != "Bearer ghs_listing" || r.URL.Query().Get("per_page") != "100" {
+						t.Errorf("list request: auth=%q query=%q", auth, r.URL.RawQuery)
+					}
+					if c.listCode != 0 {
+						w.WriteHeader(c.listCode)
+						return
+					}
+					fmt.Fprint(w, c.list)
+				default:
+					t.Errorf("unexpected path %q", r.URL.Path)
+				}
+			}))
+			defer srv.Close()
+			cfg := &config.Config{URL: c.url, AppClientID: "Iv1.client", AppInstallID: 123, AppPrivateKey: pemStr}
+			if !c.noCache {
+				cfg.Firecracker.CachePort = 8081
+			}
+			checks := authVerify(cfg, srv.URL)
+			var got *Check
+			for i := range checks {
+				if checks[i].Name == "app-repositories" {
+					got = &checks[i]
+				}
+			}
+			if c.level == "" {
+				if got != nil {
+					t.Fatalf("the check ran: %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("no app-repositories check in %+v", checks)
+			}
+			if got.Level != c.level || !strings.Contains(got.Detail, c.detail) {
+				t.Fatalf("got %s %q, want %s containing %q", got.Level, got.Detail, c.level, c.detail)
+			}
+		})
+	}
+}
+
+// The repository check has its own deadline: time spent on the request before
+// it must not turn its verdict into a timeout's WARN.
+func TestAuthVerify_AppRepositoriesDeadline(t *testing.T) {
+	pemStr, _ := testRSAKeyPEM(t)
+	defer func(d time.Duration) { authTimeout = d }(authTimeout)
+	authTimeout = 2 * time.Second
+	wait := 1200 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(wait) // each fits the deadline, and the two together do not
+		if strings.HasSuffix(r.URL.Path, "/access_tokens") {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		fmt.Fprint(w, `{"repository_selection":"selected","permissions":{},"account":{"login":"acme"}}`)
+	}))
+	defer srv.Close()
+	cfg := &config.Config{URL: "https://github.com/acme/api", AppClientID: "Iv1.client", AppInstallID: 123, AppPrivateKey: pemStr}
+	cfg.Firecracker.CachePort = 8081
+	checks := authVerify(cfg, srv.URL)
+	if c := checks[len(checks)-1]; c.Name != "app-repositories" || c.Level != levelFail {
+		t.Fatalf("got %s %s %q, want a FAIL", c.Name, c.Level, c.Detail)
+	}
+}
+
 func TestAppPermissions(t *testing.T) {
 	for _, c := range []struct {
 		name    string
