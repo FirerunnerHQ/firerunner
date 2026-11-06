@@ -461,9 +461,10 @@ firerunner also terminates an instance in these cases:
 Instances and volumes are tagged `firerunner:tier`, `firerunner:runner` and
 `firerunner:owner` (this host's name).
 
-**Stopped pool (`"pool": N`).** A cold instance takes about 40 s from launch
-to running its job. A pool keeps N instances booted once and stopped, so a job
-starts one in seconds:
+**Stopped pool (`"pool": N`).** A pool keeps N instances booted once and
+stopped, so a job starts one with its files already on the disk. On r8a.xlarge
+a job waited 20 s with a pool and 22 s without, because most of the wait is EC2
+starting the instance:
 
 - **Warm.** A pool instance boots with no user-data. Its boot script reads the
   runner's files, so EBS has fetched their blocks from the snapshot, then powers
