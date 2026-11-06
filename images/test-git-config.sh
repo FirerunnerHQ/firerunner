@@ -102,7 +102,7 @@ cat >"$TMP/live/sleep" <<FAKE
 FAKE
 cat >"$TMP/live/rm" <<FAKE
 #!/bin/sh
-echo "\$*" >>"$TMP/removed"
+case "\$*" in *.lock*) echo "\$*" >>"$TMP/removed" ;; esac
 exec "$REAL_RM" "\$@"
 FAKE
 chmod +x "$TMP/live/git" "$TMP/live/sleep" "$TMP/live/rm"
