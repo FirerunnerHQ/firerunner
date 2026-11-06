@@ -103,7 +103,7 @@ volume="${volume:-$default_volume}"
 timeout_s="${timeout_s:-$default_timeout}"
 [[ "$volume" =~ ^[0-9]+$ ]] || die "--volume-gib must be a number"
 [ "$toolset" = minimal ] || [ "$arch" = x64 ] || die "--toolset $toolset is x64 only: its installers come from GitHub's x64 toolset"
-[ "$toolset" != standard ] || ri_skip="$ri_skip install-haskell.sh install-swift.sh install-julia.sh install-firefox.sh install-microsoft-edge.sh install-google-cloud-cli.sh install-codeql-bundle.sh install-kotlin.sh install-bazel.sh install-pulumi.sh install-packer.sh install-vcpkg.sh install-azure-devops-cli.sh install-copilot-cli.sh install-awf.sh install-pypy.sh"
+[ "$toolset" != standard ] || ri_skip="$ri_skip Install-PowerShellModules.ps1 install-haskell.sh install-swift.sh install-julia.sh install-firefox.sh install-microsoft-edge.sh install-google-cloud-cli.sh install-codeql-bundle.sh install-kotlin.sh install-bazel.sh install-pulumi.sh install-packer.sh install-vcpkg.sh install-azure-devops-cli.sh install-copilot-cli.sh install-awf.sh install-pypy.sh"
 [[ "$timeout_s" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
 for t in "${tags[@]+"${tags[@]}"}"; do
 	[[ "$t" == ?*=* ]] || die "--tag wants KEY=VALUE, got '$t'"

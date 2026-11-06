@@ -66,6 +66,6 @@ if jq -e .git "$bundle" >/dev/null; then
 		chmod 0644 "$ROOT/etc/ssl/firerunner-git-ca.pem" &&
 		jq -er .git.cert "$bundle" >"$dir/git.pem" &&
 		jq -er .git.key "$bundle" >"$dir/git.key" &&
-		systemctl start firerunner-git-proxy.service ||
+		systemctl start --no-block firerunner-git-proxy.service ||
 		echo "firerunner-cache-setup: no git cache; git goes to GitHub" >&2
 fi

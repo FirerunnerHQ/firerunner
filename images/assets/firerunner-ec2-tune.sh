@@ -16,7 +16,8 @@ ZRAM_TRIES="${FIRERUNNER_ZRAM_TRIES:-15}"
 SYS_BLOCK="${FIRERUNNER_SYS_BLOCK:-/sys/class/block}"
 # Read in the background, so a job's first docker command does not pay for EBS
 # fetching their blocks from the snapshot.
-PREHEAT_PATHS="${FIRERUNNER_PREHEAT_PATHS:-/usr/bin/dockerd /usr/bin/containerd /usr/bin/docker /usr/bin/runc /usr/libexec/docker /opt/runner/bin /opt/runner/externals}"
+# The runner first: a job waits for it, and Docker's binaries can follow.
+PREHEAT_PATHS="${FIRERUNNER_PREHEAT_PATHS:-/opt/runner/bin /opt/runner/externals /usr/local/bin/firerunner /usr/bin/git /usr/bin/dockerd /usr/bin/containerd /usr/bin/docker /usr/bin/runc /usr/libexec/docker}"
 # "memory" keeps Docker's data in compressed RAM; set from the tier's
 # docker_storage by firerunner-ec2-run.sh.
 DOCKER_STORAGE="${FIRERUNNER_DOCKER_STORAGE:-}"
@@ -103,7 +104,9 @@ docker_memory() {
 		docker_memory_mount "$kib" && moved=0
 	fi
 	# Whatever happened: a stop that failed or timed out may still stop them.
-	if ! bounded systemctl start containerd.service docker.service; then
+	# Not waited for: Docker's data is in place, and the runner need not wait
+	# for dockerd, which the first docker command waits on through the socket.
+	if ! bounded systemctl start --no-block containerd.service docker.service; then
 		log "could not start Docker"
 		docker_unsettled=1
 	fi
@@ -142,7 +145,9 @@ docker_memory_mount() {
 # Detached: reading must not hold the job back.
 preheat() {
 	# shellcheck disable=SC2086 # PREHEAT_PATHS is a list of paths.
-	nohup sh -c "find $PREHEAT_PATHS -xdev -type f -print0 2>/dev/null | xargs -0 -r cat >/dev/null 2>&1" >/dev/null 2>&1 &
+	# Alpine's node runs only in an Alpine job container, not here. In parallel,
+	# because EBS loads a snapshot faster at a higher queue depth.
+	nohup sh -c "find $PREHEAT_PATHS -xdev -type f ! -path '*_alpine*' -print0 2>/dev/null | xargs -0 -r -P 4 -n 32 cat >/dev/null 2>&1" >/dev/null 2>&1 &
 }
 
 docker_unsettled=""
@@ -152,6 +157,9 @@ zram_swap || log "could not set up zram swap; the job runs without swap"
 # Before the disk, which can stall: the job waits for this step, not for that.
 if [ "$DOCKER_STORAGE" = memory ]; then
 	docker_memory || log "could not move Docker to memory; its data stays on the disk"
+else
+	# Not waited for: the first docker command waits on the socket if it must.
+	systemctl start --no-block containerd.service docker.service || log "could not start Docker"
 fi
 [ -n "$docker_unsettled" ] || [ -z "$DOCKER_PENDING" ] || rm -f "$DOCKER_PENDING"
 grow_root || log "could not grow the root filesystem; the job keeps the image's size"

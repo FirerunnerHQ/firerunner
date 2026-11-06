@@ -31,9 +31,31 @@ curate_toolset() {
 		.clang |= (last_only | .default_version = .versions[-1]) |
 		.gcc |= last_only | .gfortran |= last_only | .dotnet |= last_only |
 		.azureModules = [] |
+		.powershellModules |= map(select(.name != "Microsoft.Graph")) |
 		.node_modules |= map(select(.name == "typescript" or .name == "yarn"))
 	' "$1" >"$tmp"
 	mv "$tmp" "$1"
+}
+
+# install_powershell_modules FILE installs the toolset's PowerShell modules from
+# the gallery's package URLs. Install-Module reads the gallery's feed, whose
+# answers sometimes name an address that does not work, and then waits five
+# minutes and fails. FILE's modules must not depend on others.
+install_powershell_modules() {
+	local dir="${PS_MODULE_DIR:-/usr/local/share/powershell/Modules}" name want url version tmp
+	tmp="$(mktemp)"
+	jq -r '.powershellModules[] | "\(.name) \((.versions // [""])[0])"' "$1" | while read -r name want; do
+		url="$(curl -fsSL --retry 5 -o "$tmp" -w '%{url_effective}' \
+			"https://www.powershellgallery.com/api/v2/package/$name${want:+/$want}")"
+		# .../psscriptanalyzer.1.25.0.nupkg
+		version="${url##*/}"
+		version="${version%.nupkg}"
+		version="${version#"$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')".}"
+		mkdir -p "$dir/$name/$version"
+		unzip -q -o "$tmp" -d "$dir/$name/$version"
+		pwsh -NoLogo -NoProfile -Command "Import-Module '$dir/$name/$version/$name.psd1' -ErrorAction Stop"
+	done
+	rm -f "$tmp"
 }
 
 install_runner_images() {
@@ -92,6 +114,7 @@ install_runner_images() {
 	du -xsm /opt/* /opt/hostedtoolcache/* /usr/local/* /usr/share/* /usr/lib/* /home/* /etc/skel/.[a-z]* /var/lib/* 2>/dev/null |
 		sort -rn | head -40 | while read -r mib path; do mark "du $path mib=$mib"; done || true
 	rm -rf "$src" /etc/apt/apt.conf.d/10-firerunner-assume-yes /etc/waagent.conf
+	[ "$TOOLSET" != standard ] || install_powershell_modules "$ig/installers/toolset.json"
 	apt-get -o DPkg::Lock::Timeout=600 clean
 	# A job needs none of the build's scripts.
 	rm -rf "$ig/installers" "$ig/helpers" "$ig/tests" /usr/local/bin/invoke_tests

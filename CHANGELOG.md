@@ -8,6 +8,17 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- EC2 instances reach the runner sooner, with an image from this release. The
+  time from the config being served to the runner listening fell from about
+  10 s to about 3.5 s on r8a.xlarge. Docker and the git cache's proxy now start
+  alongside the runner, so a job's first `docker` command may wait several
+  seconds for it.
+- The image no longer starts PHP-FPM, Podman's services and other services a job
+  does not use at boot. A job can still start them.
+- The standard toolset no longer includes the `Microsoft.Graph` PowerShell module.
+
 ## [0.1.2] - 2026-11-06
 
 ### Changed
