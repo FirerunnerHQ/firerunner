@@ -3,8 +3,11 @@ package jobstore
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -129,10 +132,102 @@ func TestCloseCountsWhatItLoses(t *testing.T) {
 
 // Connection errors name hosts and users, so they stay out of the log.
 func TestDescribeHidesTheConnection(t *testing.T) {
-	err := errors.New("failed to connect to user=u database=d host=h")
-	if got := describe(err); strings.Contains(got, "user=") {
-		t.Fatalf("describe = %q", got)
+	for _, err := range []error{
+		errors.New("failed to connect to user=u database=d host=h"),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "28P01", Message: `password authentication failed for user "u"`}),
+	} {
+		if got := describe(err); strings.Contains(got, "u") && strings.Contains(got, "user") {
+			t.Fatalf("describe = %q", got)
+		}
 	}
+}
+
+// Only a row's own fault may lose it. The rest wait for the database, however
+// the error is wrapped.
+func TestRejected(t *testing.T) {
+	for code, want := range map[string]bool{
+		"22P05": true, "23514": true, "22021": true,
+		"28P01": false, "25006": false, "53300": false, "57P03": false, "53100": false,
+	} {
+		if got := rejected(fmt.Errorf("connect: %w", &pgconn.PgError{Code: code})); got != want {
+			t.Errorf("%s: %v", code, got)
+		}
+	}
+	if rejected(errors.New("connection refused")) {
+		t.Error("a plain error is no rejected row")
+	}
+}
+
+func TestFlushWaitsOutARotatedPassword(t *testing.T) {
+	calls := 0
+	s := fake(t, func(context.Context, []jobevent.Event) error {
+		calls++
+		if calls < 3 {
+			return fmt.Errorf("connect: %w", &pgconn.PgError{Code: "28P01"})
+		}
+		return nil
+	})
+	s.flush([]jobevent.Event{ev("a"), ev("b")})
+	if calls != 3 || s.Dropped() != 0 {
+		t.Fatalf("calls %d, dropped %d", calls, s.Dropped())
+	}
+}
+
+func TestCloseIsolatesARejectedRow(t *testing.T) {
+	var wrote int
+	s := fake(t, func(_ context.Context, b []jobevent.Event) error {
+		for _, e := range b {
+			if e.JobID == "bad" {
+				return &pgconn.PgError{Code: "22021"}
+			}
+		}
+		wrote += len(b)
+		return nil
+	})
+	s.Record(ev("a"))
+	s.Record(ev("bad"))
+	s.Record(ev("b"))
+	close(s.stop)
+	s.run()
+	if wrote != 2 || s.Dropped() != 1 {
+		t.Fatalf("wrote %d, dropped %d", wrote, s.Dropped())
+	}
+}
+
+// A loss is logged even while the writer is stuck waiting for the database.
+func TestLossesAreLoggedDuringAnOutage(t *testing.T) {
+	var out syncBuffer
+	s := fake(t, func(context.Context, []jobevent.Event) error { return nil })
+	s.log = slog.New(slog.NewTextHandler(&out, nil))
+	s.lossEvery = time.Millisecond
+	s.prepare = func(context.Context) error { return errors.New("connection refused") }
+	go s.run()
+	defer s.Close(context.Background())
+	s.dropped.Add(3)
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(out.String(), "events lost") {
+		if time.Now().After(deadline) {
+			t.Fatal("no log of the loss")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
 
 func TestNewRefusesABadURLWithoutEchoingIt(t *testing.T) {
@@ -308,6 +403,32 @@ func TestConcurrentSetUp(t *testing.T) {
 	}
 }
 
+// A row dated into a month with no partition yet must not stop that month's
+// partition from being created when it comes due.
+func TestPartitionTakesItsRowsFromTheDefault(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	month := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0)
+	name := "job_events_" + month.Format("2006_01")
+	if _, err := s.pool.Exec(ctx, `DROP TABLE `+name); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeEvents(ctx, []jobevent.Event{{Kind: jobevent.Launched, At: month.Add(time.Hour), Runner: "r"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.setUp(ctx); err != nil {
+		t.Fatalf("set-up: %v", err)
+	}
+	var partition string
+	if err := s.pool.QueryRow(ctx, `SELECT tableoid::regclass::text FROM job_events`).Scan(&partition); err != nil {
+		t.Fatal(err)
+	}
+	if partition != name {
+		t.Fatalf("the row is in %s", partition)
+	}
+}
+
 // A session in another time zone still creates UTC months.
 func TestPartitionBoundsAreUTC(t *testing.T) {
 	s := open(t)
@@ -321,7 +442,6 @@ func TestPartitionBoundsAreUTC(t *testing.T) {
 	defer func() { _ = tx.Rollback(ctx) }()
 	for _, sql := range []string{
 		`SET LOCAL TIME ZONE 'America/Los_Angeles'`,
-		`DROP TABLE job_events_default`,
 		`DROP TABLE job_events_` + first.Format("2006_01"),
 	} {
 		if _, err := tx.Exec(ctx, sql); err != nil {
@@ -331,7 +451,11 @@ func TestPartitionBoundsAreUTC(t *testing.T) {
 	if err := ensurePartitions(ctx, tx, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO job_events (at, kind) VALUES ($1, 'x')`, first); err != nil {
-		t.Fatalf("03:00 UTC on the 1st found no partition: %v", err)
+	var partition string
+	if err := tx.QueryRow(ctx, `INSERT INTO job_events (at, kind) VALUES ($1, 'x') RETURNING tableoid::regclass::text`, first).Scan(&partition); err != nil {
+		t.Fatal(err)
+	}
+	if partition == "job_events_default" {
+		t.Fatal("03:00 UTC on the 1st found no partition")
 	}
 }

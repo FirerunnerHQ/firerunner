@@ -51,6 +51,8 @@ type Store struct {
 	stop    chan struct{}
 	done    chan struct{}
 	once    sync.Once
+	// lossEvery is how often lost events are reported.
+	lossEvery time.Duration
 	// write and prepare are the database's side, replaced in tests.
 	write   func(context.Context, []jobevent.Event) error
 	prepare func(context.Context) error
@@ -78,7 +80,7 @@ func newStore(log *slog.Logger) *Store {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Store{log: log, queue: make(chan jobevent.Event, queueSize), stop: make(chan struct{}), done: make(chan struct{})}
+	return &Store{log: log, lossEvery: time.Minute, queue: make(chan jobevent.Event, queueSize), stop: make(chan struct{}), done: make(chan struct{})}
 }
 
 // Record implements jobevent.Sink. It drops the event when the queue is full.
@@ -154,9 +156,31 @@ func applyMigration(ctx context.Context, tx pgx.Tx, name string) error {
 func ensurePartitions(ctx context.Context, tx pgx.Tx, now time.Time) error {
 	month := time.Date(now.UTC().Year(), now.UTC().Month(), 1, 0, 0, 0, 0, time.UTC)
 	for i := range monthsAhead + 1 {
-		from, to := month.AddDate(0, i, 0), month.AddDate(0, i+1, 0)
-		sql := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS job_events_%s PARTITION OF job_events FOR VALUES FROM ('%s 00:00:00+00') TO ('%s 00:00:00+00')`,
-			from.Format("2006_01"), from.Format(time.DateOnly), to.Format(time.DateOnly))
+		if err := ensurePartition(ctx, tx, month.AddDate(0, i, 0)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensurePartition creates one month's partition. Postgres refuses while the
+// default partition holds rows of that month, so they move across.
+func ensurePartition(ctx context.Context, tx pgx.Tx, from time.Time) error {
+	name := "job_events_" + from.Format("2006_01")
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	lo, hi := from.Format(time.DateOnly)+" 00:00:00+00", from.AddDate(0, 1, 0).Format(time.DateOnly)+" 00:00:00+00"
+	for _, sql := range []string{
+		fmt.Sprintf(`CREATE TEMP TABLE moved ON COMMIT DROP AS WITH d AS (DELETE FROM job_events_default WHERE at >= '%s' AND at < '%s' RETURNING *) SELECT * FROM d`, lo, hi),
+		fmt.Sprintf(`CREATE TABLE %s PARTITION OF job_events FOR VALUES FROM ('%s') TO ('%s')`, name, lo, hi),
+		`INSERT INTO job_events SELECT * FROM moved`,
+		`DROP TABLE moved`,
+	} {
 		if _, err := tx.Exec(ctx, sql); err != nil {
 			return err
 		}
@@ -167,6 +191,7 @@ func ensurePartitions(ctx context.Context, tx pgx.Tx, now time.Time) error {
 // run owns the database's side. Until set-up succeeds, events wait in the queue.
 func (s *Store) run() {
 	defer close(s.done)
+	go s.reportLosses()
 	if !s.retry(s.prepare, "set up") {
 		s.dropQueued()
 		return
@@ -176,7 +201,6 @@ func (s *Store) run() {
 	partitions := time.NewTicker(partitionTick)
 	defer partitions.Stop()
 	var batch []jobevent.Event
-	var reported int64
 	for {
 		select {
 		case e := <-s.queue:
@@ -188,10 +212,6 @@ func (s *Store) run() {
 		case <-flush.C:
 			s.flush(batch)
 			batch = nil
-			if n := s.dropped.Load(); n != reported {
-				s.log.Warn("job store: events lost", "total", n)
-				reported = n
-			}
 		case <-partitions.C:
 			s.attempt(s.prepare, "add partitions")
 		case <-s.stop:
@@ -214,12 +234,31 @@ func (s *Store) drain(batch []jobevent.Event) {
 	}
 	for len(batch) > 0 {
 		n := min(batchSize, len(batch))
-		if !s.attempt(func(ctx context.Context) error { return s.write(ctx, batch[:n]) }, "write") {
-			s.dropped.Add(int64(len(batch)))
-			s.log.Warn("job store: events lost at close", "events", len(batch))
+		s.flush(batch[:n])
+		batch = batch[n:]
+	}
+}
+
+// reportLosses logs lost events on its own clock, as the writer may be busy
+// waiting for the database, and once more as the store ends.
+func (s *Store) reportLosses() {
+	tick := time.NewTicker(s.lossEvery)
+	defer tick.Stop()
+	var reported int64
+	report := func() {
+		if n := s.dropped.Load(); n != reported {
+			s.log.Warn("job store: events lost", "total", n)
+			reported = n
+		}
+	}
+	for {
+		select {
+		case <-tick.C:
+			report()
+		case <-s.done:
+			report()
 			return
 		}
-		batch = batch[n:]
 	}
 }
 
@@ -267,10 +306,12 @@ func (s *Store) flush(batch []jobevent.Event) {
 	s.flush(batch[mid:])
 }
 
-// rejected reports the server refusing the statement, which no retry can change.
+// rejected reports a row the database cannot take, which no retry can change:
+// data (22) and constraint (23) errors. Anything else, such as a rotated password,
+// a failover or a full disk, is about the database, and every row must wait it out.
 func rejected(err error) bool {
 	var pg *pgconn.PgError
-	return errors.As(err, &pg)
+	return errors.As(err, &pg) && (strings.HasPrefix(pg.Code, "22") || strings.HasPrefix(pg.Code, "23"))
 }
 
 // retry calls fn until it succeeds or the store stops, and reports success.
@@ -297,11 +338,12 @@ func (s *Store) attempt(fn func(context.Context) error, what string) bool {
 	return true
 }
 
-// describe says what failed without a connection error's host, user or database.
+// describe says what failed without a host, user or database, which a server's
+// messages can name too.
 func describe(err error) string {
 	var pg *pgconn.PgError
 	if errors.As(err, &pg) {
-		return pg.Code + ": " + pg.Message
+		return "SQLSTATE " + pg.Code
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timed out"
