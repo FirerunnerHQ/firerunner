@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-06
+
 ### Changed
 
 - A job's first `docker` command no longer waits on Docker's start, with an image
@@ -106,7 +108,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.4
 [0.1.3]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.3
 [0.1.2]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.2
 [0.1.1]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.1
