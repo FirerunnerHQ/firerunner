@@ -19,7 +19,9 @@ import (
 )
 
 // gitProxyDrain bounds the wait for responses still being stored at shutdown.
-const gitProxyDrain = 30 * time.Second
+// It stays under the unit's TimeoutStopSec, and short: until this process ends,
+// git is still pointed at a closed port.
+const gitProxyDrain = 3 * time.Second
 
 // runGitProxy serves the loopback proxy git is pointed at on an EC2 instance.
 func runGitProxy(args []string) error {
@@ -46,6 +48,9 @@ func runGitProxy(args []string) error {
 		return fmt.Errorf("loading the certificate: %w", err)
 	}
 	log := config.NewLogger("info", "text")
+	if err := gitproxy.ClearTemp(*tempDir); err != nil {
+		log.Warn("git-proxy: clearing old temporary files", "err", err)
+	}
 	proxy := gitproxy.New(gitproxy.Config{
 		Certificate: pair,
 		Cache:       &gitproxy.CacheServer{URL: *cacheURL},

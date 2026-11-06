@@ -159,6 +159,7 @@ func newHarness(t *testing.T, mod func(*Config)) *harness {
 		h.cache = c
 	}
 	h.p = New(cfg)
+	h.p.free = func(string) (int64, error) { return DefaultMinFree, nil }
 	h.srv = httptest.NewServer(http.HandlerFunc(h.p.serveGit))
 	t.Cleanup(h.srv.Close)
 	return h
@@ -612,6 +613,79 @@ func TestTooLarge_ReachesTheClientUnstored(t *testing.T) {
 	h.requireNothingStored()
 	if h.tempFiles() != 0 {
 		t.Fatal("the temporary file stayed")
+	}
+}
+
+func TestLowDisk_KeepsNothingAndStillServes(t *testing.T) {
+	h := newHarness(t, nil)
+	h.p.free = func(string) (int64, error) { return DefaultMinFree - 1, nil }
+	h.refs("t")
+	if got, err := h.fetch("t"); err != nil || got != goodPack {
+		t.Fatalf("fetch = %q, %v", got, err)
+	}
+	h.requireNothingStored()
+
+	// A hit needs the same room, and GitHub answers instead.
+	other := newHarness(t, func(c *Config) { c.Cache = readerCache{strings.NewReader(goodPack)} })
+	other.p.free = h.p.free
+	other.refs("t")
+	if got, err := other.fetch("t"); err != nil || got != goodPack {
+		t.Fatalf("fetch = %q, %v", got, err)
+	}
+	if other.gh.fetches.Load() != 1 {
+		t.Fatal("a hit spooled to a full disk")
+	}
+}
+
+// The disk can fill while a large response is on its way, by the job or by
+// another fetch: the proxy must give way before the job's writes fail.
+func TestDiskFillsDuringASave_StopsKeepingIt(t *testing.T) {
+	h := newHarness(t, nil)
+	var looks atomic.Int32
+	h.p.free = func(string) (int64, error) {
+		if looks.Add(1) > 1 {
+			return 0, nil
+		}
+		return DefaultMinFree, nil
+	}
+	large := pkt("packfile\n") + strings.Repeat(pkt("\x01"+strings.Repeat("x", 60000)), recheckEvery/60000+2) + "0000"
+	h.gh.body = strings.NewReader(large)
+	h.refs("t")
+	if got, err := h.fetch("t"); err != nil || got != large {
+		t.Fatalf("fetch: %d bytes, %v", len(got), err)
+	}
+	if looks.Load() < 2 {
+		t.Fatal("the space was never looked at again")
+	}
+	h.requireNothingStored()
+	if h.tempFiles() != 0 {
+		t.Fatal("the temporary file stayed")
+	}
+}
+
+func TestClearTemp_RemovesOnlyItsOwnFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"gitproxy-1", "gitproxy-2", "keep"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ClearTemp(dir); err != nil {
+		t.Fatal(err)
+	}
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 || left[0].Name() != "keep" {
+		t.Fatalf("left %v", left)
+	}
+}
+
+func TestFreeSpace(t *testing.T) {
+	n, err := freeSpace(t.TempDir())
+	if err != nil || n <= 0 {
+		t.Fatalf("freeSpace = %d, %v", n, err)
 	}
 }
 

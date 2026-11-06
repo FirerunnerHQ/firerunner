@@ -1,0 +1,21 @@
+[Unit]
+Description=firerunner git checkout cache proxy
+After=nginx.service
+# Keep trying for the whole job: while this is down, git simply goes direct.
+StartLimitIntervalSec=0
+
+[Service]
+# It carries job tokens, so it holds as little as it can.
+DynamicUser=yes
+LoadCredential=cert:/etc/firerunner-cache/git.pem
+LoadCredential=key:/etc/firerunner-cache/git.key
+CacheDirectory=firerunner-git
+ExecStart=/usr/local/bin/firerunner git-proxy --cert ${CREDENTIALS_DIRECTORY}/cert --key ${CREDENTIALS_DIRECTORY}/key --temp-dir ${CACHE_DIRECTORY}
+# git has no fallback for a dead proxy, so it is pointed here only while this
+# runs. "+" runs these as root, to write /etc/gitconfig.
+ExecStartPost=+/usr/local/libexec/firerunner-git-config on
+ExecStopPost=+/usr/local/libexec/firerunner-git-config off
+Restart=always
+RestartSec=1
+# Covers the proxy's drain and the stop hook, which clears a stale lock.
+TimeoutStopSec=10

@@ -24,6 +24,11 @@
 #                         install GitHub's ubuntu-24.04 tools, x64 only, so arm64
 #                         defaults to minimal
 #   --runner-images-ref R actions/runner-images tag for standard and full
+#   --firerunner-version V firerunner release for the git cache's proxy, such as
+#                         v0.1.1 (default: the latest release)
+#   --firerunner-url URL  take the binary from here instead; needs
+#                         --firerunner-sha256
+#   --firerunner-sha256 H the binary's SHA-256
 #   --volume-gib N        root volume size (default 40; full: 80; minimal: 20)
 #   --tag K=V             extra tag on the instance, AMI and snapshot (repeatable)
 #   --timeout SECONDS     give up waiting for the build (default 3600; minimal:
@@ -42,6 +47,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 region="" subnet="" sg="" param="" itype="" arch="x64" runner_version="" volume=""
 toolset="" ri_ref="ubuntu24/20261101.360"
+fr_version="" fr_url="" fr_sha256=""
 ri_skip="configure-apt-mock.sh configure-system.sh cleanup.sh list-dpkg.sh post-build-validation.sh install-android-sdk.sh install-homebrew.sh configure-snap.sh"
 timeout_s="" render=0
 tags=()
@@ -64,6 +70,9 @@ while [ $# -gt 0 ]; do
 	--volume-gib) volume="${2:?}"; shift ;;
 	--toolset) toolset="${2:?}"; shift ;;
 	--runner-images-ref) ri_ref="${2:?}"; shift ;;
+	--firerunner-version) fr_version="${2:?}"; shift ;;
+	--firerunner-url) fr_url="${2:?}"; shift ;;
+	--firerunner-sha256) fr_sha256="${2:?}"; shift ;;
 	--tag) tags+=("${2:?}"); shift ;;
 	--timeout) timeout_s="${2:?}"; shift ;;
 	--render) render=1 ;;
@@ -107,6 +116,8 @@ if [ -z "$runner_version" ]; then
 	runner_version="${runner_version#v}"
 fi
 [[ "$runner_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "bad runner version '$runner_version'"
+[ -z "$fr_url" ] || [[ "$fr_sha256" =~ ^[0-9a-f]{64}$ ]] || die "--firerunner-url needs --firerunner-sha256"
+[ -z "$fr_version" ] || [[ "$fr_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "bad firerunner version '$fr_version'"
 
 # strip prints an asset without its comment lines, keeping the first line: the
 # comments are for this repository, and EC2 caps compressed user-data at 16 KiB.
@@ -118,9 +129,10 @@ strip() {
 # installs the boot script and unit, then provision.sh's body.
 render_userdata() {
 	echo '#!/bin/bash'
-	printf 'RUNNER_VERSION=%q\nRUNNER_ARCH=%q\nTOOLSET=%q\nRI_REF=%q\nRI_SKIP=%q\nexport RUNNER_VERSION RUNNER_ARCH TOOLSET RI_REF RI_SKIP\n' \
-		"$runner_version" "$arch" "$toolset" "$ri_ref" "$ri_skip"
+	printf 'RUNNER_VERSION=%q\nRUNNER_ARCH=%q\nTOOLSET=%q\nRI_REF=%q\nRI_SKIP=%q\nFR_VERSION=%q\nFR_URL=%q\nFR_SHA256=%q\nexport RUNNER_VERSION RUNNER_ARCH TOOLSET RI_REF RI_SKIP FR_VERSION FR_URL FR_SHA256\n' \
+		"$runner_version" "$arch" "$toolset" "$ri_ref" "$ri_skip" "$fr_version" "$fr_url" "$fr_sha256"
 	cat "$HERE/ec2/install-runner-images.sh"
+	strip "$HERE/ec2/install-firerunner.sh"
 	echo 'install_boot_unit() {'
 	echo "cat >/usr/local/bin/firerunner-ec2-run.sh <<'FIRERUNNER_RUN_SH'"
 	strip "$HERE/assets/firerunner-ec2-run.sh"
@@ -154,6 +166,13 @@ render_userdata() {
 	cat "$HERE/assets/firerunner-cache-setup.sh"
 	echo 'FIRERUNNER_CACHE_SETUP'
 	echo 'chmod 0755 /usr/local/libexec/firerunner-cache-setup'
+	echo "cat >/usr/local/libexec/firerunner-git-config <<'FIRERUNNER_GIT_CONFIG'"
+	strip "$HERE/assets/firerunner-git-config.sh"
+	echo 'FIRERUNNER_GIT_CONFIG'
+	echo 'chmod 0755 /usr/local/libexec/firerunner-git-config'
+	echo "cat >/etc/systemd/system/firerunner-git-proxy.service <<'FIRERUNNER_GIT_UNIT'"
+	strip "$HERE/assets/firerunner-git-proxy.service"
+	echo 'FIRERUNNER_GIT_UNIT'
 	echo "cat >/etc/firerunner/cache-nginx.conf <<'FIRERUNNER_CACHE_NGINX'"
 	cat "$HERE/assets/firerunner-cache-nginx.conf"
 	echo 'FIRERUNNER_CACHE_NGINX'

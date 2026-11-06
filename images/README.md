@@ -187,6 +187,13 @@ Because the disk lasts for one job, the image favours speed over durability:
   source port for the first two minutes, because a new instance in us-east-1
   can lose an outbound connection's SYNs for 1-38 s. See
   [`assets/firerunner-syn-reroll.nft`](assets/firerunner-syn-reroll.nft).
+- For a tier with `git_cache`, `firerunner-git-proxy.service` answers fresh
+  fetches from cache-server. git is pointed at it only while it runs, because
+  git treats a dead proxy as a failed fetch. The image takes the binary from a
+  release, checked against `SHA256SUMS`, with `--firerunner-version` choosing
+  which, or from `--firerunner-url` with `--firerunner-sha256`. A binary that
+  fails the check, or has no `git-proxy`, stays out, and the image then has no
+  git cache.
 - `firerunner-ec2-tune` grows the root filesystem to the volume's size on each
   job boot, so `root_volume_gib` takes effect, adds zram swap as large as
   memory, moves Docker's data to compressed RAM for a tier with

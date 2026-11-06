@@ -144,9 +144,24 @@ expect "render prints the user-data" "" grep -q '^RUNNER_ARCH=arm64$' "$STATE/ou
 expect "render touches no AWS" "" not_called "ec2"
 expect "render ships the SYN rule" "" grep -q 'masquerade fully-random' "$STATE/out"
 expect "the SYN rule leaves the local cache proxy alone" "" grep -q 'daddr != {.*127.0.0.0/8' "$STATE/out"
+expect "render ships the git proxy's unit" "" grep -q '^ExecStopPost=+/usr/local/libexec/firerunner-git-config off$' "$STATE/out"
+expect "render ships the git config helper" "" grep -q 'git config --system --remove-section' "$STATE/out"
+expect "render installs the binary with its checks" "" grep -q 'sha256sum -c -' "$STATE/out"
+expect "the binary is optional, so a build survives without it" "" grep -q '^install_firerunner || mark' "$STATE/out"
 expect "render enables its units" "" grep -q '^systemctl enable firerunner-syn-reroll.service firerunner-syn-reroll-stop.timer$' "$STATE/out"
 expect "render drops the boot script's comments" "" not_grep 'Powering off ends the instance' "$STATE/out"
 expect "render keeps the boot script's commands" "" grep -q 'POWEROFF_FAST:-systemctl poweroff --force' "$STATE/out"
+
+# A binary from a URL must come with its hash.
+fresh fr-url
+rc=0
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --firerunner-url https://x/y >"$STATE/out" 2>&1 || rc=$?
+expect "firerunner url without a hash: refused" "rc=$rc" [ "$rc" != 0 ]
+rc=0
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --firerunner-version latest >"$STATE/out" 2>&1 || rc=$?
+expect "bad firerunner version: refused" "rc=$rc" [ "$rc" != 0 ]
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --firerunner-version v0.1.1 >"$STATE/out"
+expect "firerunner version: reaches the build" "" grep -q '^FR_VERSION=v0.1.1$' "$STATE/out"
 
 # 6. standard is the default, and full keeps what it skips.
 fresh toolset

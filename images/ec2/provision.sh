@@ -24,6 +24,9 @@
 #   RUNNER_ARCH     x64 or arm64
 #   TOOLSET         standard (GitHub's ubuntu-24.04 tools that jobs commonly
 #                   use), full (nearly all of them) or minimal (Docker, git)
+#   FR_VERSION      firerunner release for the git cache's proxy; empty means
+#                   the latest
+#   FR_URL          take the binary from here instead, checked against FR_SHA256
 set -euxo pipefail
 
 : "${RUNNER_VERSION:?}" "${RUNNER_ARCH:?}" "${TOOLSET:?}"
@@ -103,6 +106,10 @@ install_boot_unit
 # starts then, not at boot.
 install_cache_proxy
 systemctl disable nginx.service
+
+# The git cache's proxy, started only for a tier that has one. Best effort: an
+# image without it runs every job, with git going to GitHub.
+install_firerunner || mark "no firerunner binary; no git cache on this image"
 gcc -O2 -static -o /usr/local/libexec/nodewrap /tmp/nodewrap.c
 rm -f /tmp/nodewrap.c
 # Each node the runner bundles execs through nodewrap, which adds the cache

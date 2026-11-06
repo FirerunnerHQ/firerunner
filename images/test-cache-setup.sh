@@ -56,9 +56,14 @@ fresh() {
 POSIX_SH="$(command -v dash || echo sh)"
 setup() {
 	PATH="${FAKE_PATH:-$TMP/bin}:$JQ_DIR:/usr/bin:/bin" FIRERUNNER_CACHE_ROOT="$R" FIRERUNNER_RUNNER_DIR="$STATE/runner" \
+		FIRERUNNER_BIN="${FIRERUNNER_BIN:-/bin/sh}" \
 		"$POSIX_SH" "$SCRIPT" "$STATE/bundle.json" >"$STATE/out" 2>&1
 }
 refused() { ! setup; }
+# git_bundle: add the git proxy's identity to this scratch root's bundle.
+git_bundle() {
+	jq '. + {git: {ca: "GIT-CA", cert: "GIT-LEAF", key: "GIT-KEY"}}' "$STATE/bundle.json" >"$STATE/b" && mv "$STATE/b" "$STATE/bundle.json"
+}
 mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 line() { grep -n -- "$1" "$STATE/calls" | head -n 1 | cut -d: -f1; }
 diverted() { grep -q 'results-receiver.actions.githubusercontent.com' "$R/etc/hosts"; }
@@ -91,6 +96,51 @@ for up in 'a;b:80' 'control.fr.internal' 'host:' '' 'x/y:1'; do
 	expect "upstream '$up': nginx untouched, nothing diverted" "$(cat "$STATE/calls" 2>/dev/null)" \
 		bash -c "[ ! -s '$R/etc/nginx/nginx.conf' ] && ! grep -q results-receiver '$R/etc/hosts'"
 done
+
+# An image without the binary: no git cache, and no proxy to wait for.
+fresh git-no-binary 10.0.0.5:8099
+mkdir -p "$R/etc/ssl"
+git_bundle
+if FIRERUNNER_BIN="$STATE/absent" setup; then rc=0; else rc=$?; fi
+expect "no binary: setup succeeds" "$(cat "$STATE/out")" [ "$rc" = 0 ]
+expect "no binary: the proxy is not started" "$(cat "$STATE/calls")" bash -c "! grep -q firerunner-git-proxy '$STATE/calls'"
+expect "no binary: says so" "$(cat "$STATE/out")" grep -q 'no git cache' "$STATE/out"
+
+# 4. A tier with a git cache. The job runs git as its own user, in a directory
+#    it must be able to reach, and the CA stays out of the system store.
+fresh git control.fr.internal:8099
+mkdir -p "$R/etc/ssl"
+git_bundle
+if setup; then rc=0; else rc=$?; fi
+expect "git: setup succeeds" "$(cat "$STATE/out")" [ "$rc" = 0 ]
+expect "git: the proxy starts, after nginx" "$(cat "$STATE/calls")" \
+	[ "$(line 'systemctl start nginx')" -lt "$(line 'systemctl start firerunner-git-proxy.service')" ]
+expect "git: its leaf and key are the bundle's" "" bash -c "[ \"\$(cat '$R/etc/firerunner-cache/git.pem')\" = GIT-LEAF ] && [ \"\$(cat '$R/etc/firerunner-cache/git.key')\" = GIT-KEY ]"
+expect "git: its key is private" "$(mode "$R/etc/firerunner-cache/git.key")" [ "$(mode "$R/etc/firerunner-cache/git.key")" = 600 ]
+expect "git: its CA is the bundle's" "" [ "$(cat "$R/etc/ssl/firerunner-git-ca.pem")" = GIT-CA ]
+expect "git: the job's user can read its CA" "$(mode "$R/etc/ssl/firerunner-git-ca.pem")" [ "$(mode "$R/etc/ssl/firerunner-git-ca.pem")" = 644 ]
+expect "git: its CA stays out of the system store" "" bash -c "! grep -rq GIT-CA '$R/usr/local/share/ca-certificates'"
+expect "git: the results host still points here" "" grep -qx '127.0.0.1 results-receiver.actions.githubusercontent.com' "$R/etc/hosts"
+
+fresh no-git 10.0.0.5:8099
+setup
+expect "no git cache: the proxy stays off" "$(cat "$STATE/calls")" bash -c "! grep -q firerunner-git-proxy '$STATE/calls'"
+
+# A proxy that will not start costs the git cache, not actions/cache.
+fresh git-fails 10.0.0.5:8099
+mkdir -p "$R/etc/ssl"
+git_bundle
+mkdir -p "$STATE/failbin"
+cat >"$STATE/failbin/systemctl" <<'FAKE'
+#!/bin/sh
+echo "systemctl $*" >> "$STATE/calls"
+case "$*" in *firerunner-git-proxy*) exit 1 ;; esac
+FAKE
+chmod +x "$STATE/failbin/systemctl"
+if FAKE_PATH="$STATE/failbin:$TMP/bin" setup; then rc=0; else rc=$?; fi
+expect "git proxy fails: setup still succeeds" "$(cat "$STATE/out")" [ "$rc" = 0 ]
+expect "git proxy fails: says so" "$(cat "$STATE/out")" grep -q 'no git cache' "$STATE/out"
+expect "git proxy fails: actions/cache is diverted" "" grep -q results-receiver "$R/etc/hosts"
 
 if [ "$fails" -ne 0 ]; then
 	echo "$fails failure(s)"

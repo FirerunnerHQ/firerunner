@@ -155,6 +155,7 @@ func (g *realGit) startProxy(c Cache) *Proxy {
 			},
 		},
 	})
+	p.free = func(string) (int64, error) { return DefaultMinFree, nil } // whatever this host has
 	srv := httptest.NewServer(p)
 	g.t.Cleanup(srv.Close)
 	g.proxy = srv.URL

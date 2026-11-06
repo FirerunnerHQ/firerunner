@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `git_cache` on an EC2 tier, which serves a fresh checkout's fetch through
+  cache-server. A repeat fetch of a 200 MB checkout took 3-6 s instead of 20 s.
+  A commit's first fetch still comes from GitHub, so retries and later jobs on
+  the same commit gain, not the first. It needs `cache`, and an image built from
+  this release.
+- `firerunner git-proxy`, the proxy on the instance that serves it.
+
 ## [0.1.0] - 2026-11-05
 
 First release. The prereleases `v0.1.0-rc.1` to `v0.1.0-rc.12` are not listed
