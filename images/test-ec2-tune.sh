@@ -44,7 +44,7 @@ fresh() {
 }
 run() {
 	rc=0
-	PATH="$TMP/bin:$PATH" FIRERUNNER_MEMINFO="$STATE/meminfo" FIRERUNNER_PREHEAT_PATHS="$TMP/absent" FIRERUNNER_ZRAM_TRIES=4 FIRERUNNER_SYS_BLOCK="$STATE/sys" \
+	PATH="$TMP/bin:$PATH" FIRERUNNER_MEMINFO="$STATE/meminfo" FIRERUNNER_PREHEAT_PATHS="$TMP/absent" FIRERUNNER_PREHEAT_DOCKER_PATHS="$TMP/absent" FIRERUNNER_ZRAM_TRIES=4 FIRERUNNER_SYS_BLOCK="$STATE/sys" \
 		FIRERUNNER_DOCKER_STORAGE="${DOCKER_STORAGE:-}" FIRERUNNER_DOCKER_PENDING="${DOCKER_PENDING:-}" FIRERUNNER_DOCKER_MEM_DIR="$STATE/mem" FIRERUNNER_DOCKER_DIRS="$STATE/lib/docker $STATE/lib/containerd" \
 		"$POSIX_SH" "$SCRIPT" 2> "$STATE/stderr" || rc=$?
 }
@@ -291,16 +291,19 @@ pass "no root device: no growpart" not_called growpart
 fresh
 mkdir -p "$TMP/warm"
 echo data > "$TMP/warm/file"
+mkdir -p "$TMP/warm-docker"
+echo data > "$TMP/warm-docker/dockerd"
 mkdir -p "$TMP/warm/node24_alpine"
 echo data > "$TMP/warm/node24_alpine/node"
 # shellcheck disable=SC2016 # the stub evaluates these
-stub xargs 'cat > "$STATE/preheat-list"; : > "$STATE/preheated"'
-PATH="$TMP/bin:$PATH" FIRERUNNER_MEMINFO="$STATE/meminfo" FIRERUNNER_SYS_BLOCK="$STATE/sys" FIRERUNNER_PREHEAT_PATHS="$TMP/warm" "$POSIX_SH" "$SCRIPT" 2> "$STATE/stderr"
+stub xargs 'cat >> "$STATE/preheat-list"; [ ! -f "$STATE/one-read" ] || : > "$STATE/preheated"; : > "$STATE/one-read"'
+PATH="$TMP/bin:$PATH" FIRERUNNER_MEMINFO="$STATE/meminfo" FIRERUNNER_SYS_BLOCK="$STATE/sys" FIRERUNNER_PREHEAT_PATHS="$TMP/warm" FIRERUNNER_PREHEAT_DOCKER_PATHS="$TMP/warm-docker" "$POSIX_SH" "$SCRIPT" 2> "$STATE/stderr"
 for _ in $(seq 1 100); do
 	[ -f "$STATE/preheated" ] && break
 	sleep 0.05
 done
 pass "preheat reads the listed files" grep -q "warm/file" "$STATE/preheat-list"
+pass "preheat reads Docker's files too" grep -q "warm-docker/dockerd" "$STATE/preheat-list"
 pass "preheat skips what cannot run on this host" not grep -q "_alpine" "$STATE/preheat-list"
 
 if [ "$fails" -ne 0 ]; then

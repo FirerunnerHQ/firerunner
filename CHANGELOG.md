@@ -8,6 +8,12 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- A job's first `docker` command no longer waits on Docker's start, with an image
+  from this release: about 0.1 s instead of 1.8 s on r8a.xlarge. Cold-launch
+  queue time fell by about 1.5 s with it.
+
 ## [0.1.3] - 2026-11-06
 
 ### Changed
