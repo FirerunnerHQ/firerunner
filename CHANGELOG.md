@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-06
+
 ### Changed
 
 - `docker_storage: memory` keeps Docker's data on tmpfs on an instance with about
@@ -85,6 +87,7 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.2
 [0.1.1]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.1
 [0.1.0]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.0
