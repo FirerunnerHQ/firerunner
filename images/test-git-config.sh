@@ -83,6 +83,37 @@ pass "stale lock: github.com goes direct" [ -z "$(get http.proxy https://github.
 budget="$(sed -n 's/^TimeoutStopSec=//p' "$HERE/assets/firerunner-git-proxy.service")"
 pass "stale lock: recovers inside the unit's stop budget ($took s of $budget s)" [ "$took" -lt "$budget" ]
 
+# The image's git fails at once on a lock, where newer git waits a second of its
+# own. A lock another git holds for a moment must be left alone: fake git fails
+# like the image's, and fake sleep is that other git finishing.
+mkdir -p "$TMP/live"
+REAL_GIT="$(command -v git)"
+REAL_RM="$(command -v rm)"
+cat >"$TMP/live/git" <<FAKE
+#!/bin/sh
+case "\$*" in
+*--remove-section*) [ ! -e "$GIT_CONFIG_SYSTEM.lock" ] || exit 255 ;;
+esac
+exec "$REAL_GIT" "\$@"
+FAKE
+cat >"$TMP/live/sleep" <<FAKE
+#!/bin/sh
+"$REAL_RM" -f "$GIT_CONFIG_SYSTEM.lock"
+FAKE
+cat >"$TMP/live/rm" <<FAKE
+#!/bin/sh
+echo "\$*" >>"$TMP/removed"
+exec "$REAL_RM" "\$@"
+FAKE
+chmod +x "$TMP/live/git" "$TMP/live/sleep" "$TMP/live/rm"
+run on
+: >"$GIT_CONFIG_SYSTEM.lock"
+rm -f "$TMP/removed"
+PATH="$TMP/live:$PATH" run off
+pass "live lock: exits 0" [ "$rc" = 0 ]
+pass "live lock: github.com goes direct" [ -z "$(get http.proxy https://github.com/o/r.git)" ]
+pass "live lock: it was left for its owner" [ ! -e "$TMP/removed" ]
+
 # A file it cannot change at all must be reported, not assumed.
 run on
 mkdir "$TMP/ro" && cp "$GIT_CONFIG_SYSTEM" "$TMP/ro/gitconfig"
