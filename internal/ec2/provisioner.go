@@ -22,6 +22,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/jitserver"
+	"github.com/firerunnerhq/firerunner/internal/jobevent"
 )
 
 // ErrNoCapacity reports that every instance type in every subnet, in every
@@ -119,6 +120,8 @@ type Options struct {
 	// ec2.pool_for names. release is called when the launch did not start
 	// a pool instance after all. Nil lets every launch take the pool.
 	UsePool func() (ok bool, release func())
+	// Events, when set, is told of each instance and how its runner went.
+	Events jobevent.Sink
 	// Launched, when set, is told each launch's path (PathPool, PathCold or
 	// PathKept).
 	Launched func(path string)
@@ -322,9 +325,10 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 
 	states, stopWatch := p.c.watch.watch(id)
 	defer stopWatch()
-	w := &waiter{p: p, id: id, log: log, states: states,
+	w := &waiter{p: p, id: id, runner: name, log: log, states: states,
 		itype: string(inst.InstanceType), subnet: aws.ToString(inst.SubnetId), az: placementAZ(inst),
 		spot: inst.InstanceLifecycle == types.InstanceLifecycleTypeSpot}
+	w.record(jobevent.Event{Kind: jobevent.Launched, Path: path})
 
 	ip, err := p.privateIP(ctx, inst)
 	if err != nil {
@@ -403,8 +407,9 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string, onStar
 	defer stopWatch()
 	// Until it is seen running, a "stopped" state is the instance before
 	// the start took effect, not its job ending.
-	w := &waiter{p: p, id: in.id, log: log, states: states, awaitStart: true, spotReq: spotReq,
+	w := &waiter{p: p, id: in.id, runner: name, log: log, states: states, awaitStart: true, spotReq: spotReq,
 		itype: in.itype, subnet: in.subnet, az: in.az, spot: in.spotReq != ""}
+	w.record(jobevent.Event{Kind: jobevent.Launched, Path: PathPool})
 	return w.run(ctx, ip)
 }
 
@@ -412,6 +417,7 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string, onStar
 type waiter struct {
 	p      *Provisioner
 	id     string
+	runner string
 	log    *slog.Logger
 	states <-chan instanceState
 
@@ -566,6 +572,7 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			switch s.name {
 			case types.InstanceStateNameShuttingDown, types.InstanceStateNameTerminated:
 				w.log.Info("instance gone", "state", s.name, "reason", s.reason)
+				w.record(jobevent.Event{Kind: jobevent.InstanceGone, Reason: s.reason})
 				if err := w.runnerResult(ip); result == nil && ctx.Err() == nil {
 					result = err
 				}
@@ -623,6 +630,7 @@ func (w *waiter) runnerResult(ip netip.Addr) error {
 	span("servedToListening", r.Served, r.Listening)
 	span("listeningToJob", r.Listening, r.Job)
 	span("jobToExit", r.Job, r.Exited)
+	w.recordPhases(r)
 	if r.Exited.IsZero() {
 		w.log.Info("runner phases; no exit reported", attrs...)
 		return nil
@@ -633,6 +641,35 @@ func (w *waiter) runnerResult(ip netip.Addr) error {
 		return fmt.Errorf("%w: instance %s, exit status %d", ErrRunnerFailed, w.id, r.ExitCode)
 	}
 	return nil
+}
+
+// record stamps an event with the instance and sends it on.
+func (w *waiter) record(e jobevent.Event) {
+	e.Tier, e.Runner, e.Instance, e.InstanceType, e.Subnet, e.Zone = w.p.o.Tier, w.runner, w.id, w.itype, w.subnet, w.az
+	e.Market = config.MarketOnDemand
+	if w.spot {
+		e.Market = config.MarketSpot
+	}
+	jobevent.Record(w.p.o.Events, e)
+}
+
+// recordPhases sends the stages the instance reported, at their own times.
+func (w *waiter) recordPhases(r jitserver.Report) {
+	for _, p := range []struct {
+		kind jobevent.Kind
+		at   time.Time
+	}{
+		{jobevent.Served, r.Served},
+		{jobevent.Listening, r.Listening},
+		{jobevent.Running, r.Job},
+	} {
+		if !p.at.IsZero() {
+			w.record(jobevent.Event{Kind: p.kind, At: p.at})
+		}
+	}
+	if !r.Exited.IsZero() {
+		w.record(jobevent.Event{Kind: jobevent.Exited, At: r.Exited, ExitCode: r.ExitCode})
+	}
 }
 
 // terminate asks EC2 to terminate the instance. The first request is logged
