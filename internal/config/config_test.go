@@ -1111,3 +1111,15 @@ func TestCheckCatalogReplaces(t *testing.T) {
 		t.Errorf("the daemon refuses a catalog over replaces: %v", err)
 	}
 }
+
+// A database password is never a flag or a default, which -h would print.
+func TestJobEventsDSNComesFromTheEnv(t *testing.T) {
+	t.Setenv("FR_JOB_EVENTS_DSN", "postgres://u:secret@db/fr")
+	c, err := Parse([]string{"--url", "https://github.com/o", "--token", "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.JobEventsDSN != "postgres://u:secret@db/fr" {
+		t.Fatalf("dsn = %q", c.JobEventsDSN)
+	}
+}

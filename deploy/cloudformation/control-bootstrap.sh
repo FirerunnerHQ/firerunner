@@ -26,6 +26,7 @@
 #   tiers            the tier catalog (JSON)
 #   app-private-key  SecureString: the GitHub App key, or
 #   token            SecureString: a PAT (one of the two)
+#   job-events-dsn   SecureString: Postgres URL that keeps job events (optional)
 #
 # On any failure it marks the instance unhealthy, so the group replaces it.
 set -euo pipefail
@@ -115,6 +116,8 @@ if [ "$cache" != off ]; then
 elif [ "$cache_tier" = True ]; then
 	log "a tier sets ec2.cache but the stack's Cache parameter is off: set it to disk or s3"
 fi
+dsn=$(param job-events-dsn)
+[ -z "$dsn" ] || echo "FR_JOB_EVENTS_DSN=$dsn" >> "$etc/firerunner.env"
 key=$(param app-private-key)
 token=$(param token)
 if [ -n "$key" ]; then

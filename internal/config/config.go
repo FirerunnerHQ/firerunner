@@ -35,7 +35,10 @@ type Config struct {
 	MinRunners   int
 
 	// Auth: either a PAT or a GitHub App (App preferred, per GitHub guidance).
-	Token         string
+	Token string
+	// JobEventsDSN is the Postgres URL that keeps job events. It holds a password,
+	// so it comes only from FR_JOB_EVENTS_DSN, never a flag.
+	JobEventsDSN  string
 	AppClientID   string
 	AppInstallID  int64
 	AppPrivateKey string
@@ -442,6 +445,7 @@ func Parse(args []string) (*Config, error) {
 	if c.AppPrivateKey == "" {
 		c.AppPrivateKey = env("FR_APP_PRIVATE_KEY", "")
 	}
+	c.JobEventsDSN = env("FR_JOB_EVENTS_DSN", "")
 	// Surface any malformed FR_* env values now, so a typo fails closed instead
 	// of silently running with a default.
 	if err := er.err(); err != nil {

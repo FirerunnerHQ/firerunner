@@ -129,6 +129,15 @@ expect "app key: unhealthy unit names this instance" "" \
 	grep -q 'set-instance-health --instance-id i-0123 --health-status Unhealthy' "$FR_ROOT/etc/systemd/system/firerunner-unhealthy.service"
 expect "app key: instance left healthy" "$(cat "$STATE/autoscaling" 2>/dev/null)" test ! -f "$STATE/autoscaling"
 
+# A Postgres URL for job events reaches the env file, and only when it is set.
+setup
+echo 'postgres://u:secret@db/fr' > "$STATE/ssm/job-events-dsn"
+expect "job events: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "job events: env carries the URL" "$(envfile)" grep -qx 'FR_JOB_EVENTS_DSN=postgres://u:secret@db/fr' <(envfile)
+setup
+expect "no job events: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "no job events: nothing in the env" "$(envfile)" bash -c "! grep -q FR_JOB_EVENTS_DSN '$FR_ROOT/etc/firerunner/firerunner.env'"
+
 # 2. A PAT instead of an app key.
 setup
 rm "$STATE/ssm/app-private-key"
