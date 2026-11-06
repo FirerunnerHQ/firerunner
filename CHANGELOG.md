@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-06
+
 ### Changed
 
 - EC2 instances reach the runner sooner, with an image from this release. The
@@ -98,7 +100,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.3
 [0.1.2]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.2
 [0.1.1]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.1
 [0.1.0]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.0
