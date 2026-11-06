@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `images/layer-ec2-ami.sh`, which puts a firerunner release on an existing AMI.
+  It took 84 s, against about 40 minutes for a full build.
+
+### Changed
+
+- `build-ec2-ami.sh` keeps its scratch files out of the snapshot.
+
 ## [0.1.5] - 2026-11-06
 
 ### Fixed
