@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-06
+
 ### Added
 
 - `git_cache` on an EC2 tier, which serves a fresh checkout's fetch through
@@ -76,5 +78,6 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.1
 [0.1.0]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.0
