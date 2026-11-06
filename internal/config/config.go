@@ -37,11 +37,13 @@ type Config struct {
 	// Auth: either a PAT or a GitHub App (App preferred, per GitHub guidance).
 	Token string
 	// JobEventsDSN is the Postgres URL that keeps job events. It holds a password,
-	// so it comes only from FR_JOB_EVENTS_DSN, never a flag.
-	JobEventsDSN  string
-	AppClientID   string
-	AppInstallID  int64
-	AppPrivateKey string
+	// so it comes only from FR_JOB_EVENTS_DSN, or from the file that
+	// FR_JOB_EVENTS_DSN_FILE names, and never a flag.
+	JobEventsDSN     string
+	JobEventsDSNFile string
+	AppClientID      string
+	AppInstallID     int64
+	AppPrivateKey    string
 
 	// Runner microVM shape.
 	VCPU   int
@@ -446,6 +448,7 @@ func Parse(args []string) (*Config, error) {
 		c.AppPrivateKey = env("FR_APP_PRIVATE_KEY", "")
 	}
 	c.JobEventsDSN = env("FR_JOB_EVENTS_DSN", "")
+	c.JobEventsDSNFile = env("FR_JOB_EVENTS_DSN_FILE", "")
 	// Surface any malformed FR_* env values now, so a typo fails closed instead
 	// of silently running with a default.
 	if err := er.err(); err != nil {

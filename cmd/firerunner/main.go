@@ -745,28 +745,36 @@ func newEC2Client(ctx context.Context, cfg *config.Config, log *slog.Logger) (*e
 	return ec2.NewClient(awsec2.NewFromConfig(awsCfg), awsssm.NewFromConfig(awsCfg), 0, log.With("component", "ec2")), nil
 }
 
-// openJobEvents returns where job events go, and how to close it. A database
-// that is down costs the record, never a job, so it only warns.
-func openJobEvents(ctx context.Context, cfg *config.Config, log *slog.Logger) (jobevent.Sink, func()) {
-	if cfg.JobEventsDSN == "" {
+// openJobEvents returns where job events go, and how to close it. The store
+// connects in the background, so a database that is down costs the record, never
+// a job, nor any time at start.
+func openJobEvents(cfg *config.Config, log *slog.Logger) (jobevent.Sink, func()) {
+	dsn := cfg.JobEventsDSN
+	if dsn == "" && cfg.JobEventsDSNFile != "" {
+		raw, err := os.ReadFile(cfg.JobEventsDSNFile)
+		if err != nil {
+			log.Warn("job events are off: cannot read the database URL's file", "file", cfg.JobEventsDSNFile)
+			return nil, func() {}
+		}
+		dsn = strings.TrimSpace(string(raw))
+	}
+	if dsn == "" {
 		return nil, func() {}
 	}
-	openCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	store, err := jobstore.Open(openCtx, cfg.JobEventsDSN, log)
+	store, err := jobstore.New(dsn, log)
 	if err != nil {
 		log.Warn("job events are off", "err", err)
 		return nil, func() {}
 	}
 	return store, func() {
-		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		store.Close(closeCtx)
+		store.Close(ctx)
 	}
 }
 
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
-	events, closeEvents := openJobEvents(ctx, cfg, log)
+	events, closeEvents := openJobEvents(cfg, log)
 	defer closeEvents()
 	privateKey, err := cfg.ResolvePrivateKey()
 	if err != nil {

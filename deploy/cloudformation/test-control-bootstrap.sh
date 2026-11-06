@@ -131,12 +131,14 @@ expect "app key: instance left healthy" "$(cat "$STATE/autoscaling" 2>/dev/null)
 
 # A Postgres URL for job events reaches the env file, and only when it is set.
 setup
-echo 'postgres://u:secret@db/fr' > "$STATE/ssm/job-events-dsn"
-expect "job events: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
-expect "job events: env carries the URL" "$(envfile)" grep -qx 'FR_JOB_EVENTS_DSN=postgres://u:secret@db/fr' <(envfile)
+echo "postgres://u:p(w'\$x@db/fr" > "$STATE/ssm/job-events-dsn"
+expect "job events: a shell-hostile password still boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "job events: env names the file" "$(envfile)" grep -qx "FR_JOB_EVENTS_DSN_FILE=$FR_ROOT/etc/firerunner/job-events-dsn" <(envfile)
+expect "job events: the URL is not in the env file" "$(envfile)" bash -c "! grep -q 'postgres://' '$FR_ROOT/etc/firerunner/firerunner.env'"
+expect "job events: the file holds it unchanged" "" grep -qxF "postgres://u:p(w'\$x@db/fr" "$FR_ROOT/etc/firerunner/job-events-dsn"
 setup
 expect "no job events: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
-expect "no job events: nothing in the env" "$(envfile)" bash -c "! grep -q FR_JOB_EVENTS_DSN '$FR_ROOT/etc/firerunner/firerunner.env'"
+expect "no job events: nothing in the env" "$(envfile)" bash -c "! grep -q FR_JOB_EVENTS '$FR_ROOT/etc/firerunner/firerunner.env'"
 
 # 2. A PAT instead of an app key.
 setup

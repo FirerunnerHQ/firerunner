@@ -1122,4 +1122,7 @@ func TestJobEventsDSNComesFromTheEnv(t *testing.T) {
 	if c.JobEventsDSN != "postgres://u:secret@db/fr" {
 		t.Fatalf("dsn = %q", c.JobEventsDSN)
 	}
+	if _, err := Parse([]string{"--url", "https://github.com/o", "--token", "t", "--job-events-dsn", "x"}); err == nil {
+		t.Fatal("a password must not be a flag")
+	}
 }
