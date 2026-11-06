@@ -193,21 +193,22 @@ func TestAuthVerify_AppRepositories(t *testing.T) {
 		tokenCode int
 		listCode  int
 		list      string
+		scoped    string // the repository the token must be limited to
 		level     string // "" means the check does not run
 		detail    string
 	}{
 		{name: "all repositories", url: "https://github.com/acme/api", selection: "all"},
 		{name: "no cache", url: "https://github.com/acme/api", selection: "selected", noCache: true},
-		{name: "repo present", url: "https://github.com/acme/api", selection: "selected", list: repos, level: levelPass, detail: "acme/api"},
-		{name: "repo present, other case", url: "https://github.com/Acme/API.git", selection: "selected", list: repos, level: levelPass},
-		{name: "repo absent", url: "https://github.com/acme/billing", selection: "selected", list: repos, level: levelFail, detail: "not installed on acme/billing, so its jobs get no cache; it is on: acme/api, acme/web"},
-		{name: "no repositories", url: "https://github.com/acme/billing", selection: "selected", list: empty, level: levelFail, detail: "it is on: none"},
-		{name: "repo beyond the page", url: "https://github.com/acme/billing", selection: "selected", list: truncated, level: levelWarn, detail: "first 2 of the App's 250"},
-		{name: "repo on a short page", url: "https://github.com/acme/api", selection: "selected", list: truncated, level: levelPass},
+		{name: "repo present", url: "https://github.com/acme/api", selection: "selected", scoped: "api", level: levelPass, detail: "acme/api"},
+		{name: "repo, .git", url: "https://github.com/acme/api.git/", selection: "selected", scoped: "api", level: levelPass},
+		{name: "repo absent", url: "https://github.com/acme/billing", selection: "selected", scoped: "billing", tokenCode: http.StatusUnprocessableEntity, level: levelFail, detail: "not installed on acme/billing"},
+		{name: "repo, token refused otherwise", url: "https://github.com/acme/api", selection: "selected", scoped: "api", tokenCode: http.StatusForbidden, level: levelWarn, detail: "HTTP 403"},
 		{name: "organization", url: "https://github.com/acme", selection: "selected", list: repos, level: levelWarn, detail: "(acme/api, acme/web)"},
 		{name: "organization, many", url: "https://github.com/acme", selection: "selected", list: truncated, level: levelWarn, detail: "acme/web and 248 more"},
-		{name: "token refused", url: "https://github.com/acme/api", selection: "selected", tokenCode: http.StatusForbidden, list: repos, level: levelWarn, detail: "HTTP 403"},
-		{name: "list refused", url: "https://github.com/acme/api", selection: "selected", listCode: http.StatusBadGateway, list: repos, level: levelWarn, detail: "HTTP 502"},
+		{name: "organization, none", url: "https://github.com/acme", selection: "selected", list: empty, level: levelWarn, detail: "(none)"},
+		{name: "organization, 422 is no verdict", url: "https://github.com/acme", selection: "selected", tokenCode: http.StatusUnprocessableEntity, level: levelWarn, detail: "HTTP 422"},
+		{name: "organization, list refused", url: "https://github.com/acme", selection: "selected", listCode: http.StatusBadGateway, level: levelWarn, detail: "HTTP 502"},
+		{name: "enterprise is not a repository", url: "https://github.com/enterprises/acme", selection: "selected", list: repos, level: levelWarn, detail: "(acme/api, acme/web)"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -217,11 +218,15 @@ func TestAuthVerify_AppRepositories(t *testing.T) {
 					fmt.Fprintf(w, `{"id":123,"repository_selection":%q,"permissions":{}}`, c.selection)
 				case "/app/installations/123/access_tokens":
 					var body struct {
-						Permissions map[string]string `json:"permissions"`
+						Repositories []string          `json:"repositories"`
+						Permissions  map[string]string `json:"permissions"`
 					}
 					_ = json.NewDecoder(r.Body).Decode(&body)
 					if r.Method != http.MethodPost || strings.Count(auth, ".") != 2 || len(body.Permissions) != 1 || body.Permissions["metadata"] != "read" {
 						t.Errorf("token request: %s auth=%q permissions=%v", r.Method, auth, body.Permissions)
+					}
+					if got := strings.Join(body.Repositories, ","); got != c.scoped {
+						t.Errorf("token limited to %q, want %q", got, c.scoped)
 					}
 					if c.tokenCode != 0 {
 						w.WriteHeader(c.tokenCode)

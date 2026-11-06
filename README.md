@@ -1246,10 +1246,11 @@ firewall before exposing its listener.
 The cache-enabled daemon's GitHub App additionally needs repository **Actions:
 read**, **Contents: read** (ref, activity and compare checks), and **Pull requests: read**
 (PR association), plus its existing runner-registration permissions. Install
-it on every repository served: a job in any other runs with no cache, and its
-first step waits up to 15 s for a lookup that fails. `firerunner doctor` checks
-this for a repository runner, and lists the App's repositories for an
-organization runner. The resolver uses a separate REST client and
+it on every repository served: a job in any other runs with no cache, and a
+cache request waits for a lookup that fails, up to 15 s for a `git_cache` fetch
+and `--identity-wait` for `actions/cache`. `firerunner doctor` checks this for a
+repository runner, and lists the App's repositories for an organization runner.
+The resolver uses a separate REST client and
 short-lived installation tokens restricted to the requested repository and
 Actions/Pull requests/Metadata/Contents read permissions. Contents read remains
 necessary for branch/tag probes and for the activity and compare endpoints. Concurrent matrix jobs share one resolution;
