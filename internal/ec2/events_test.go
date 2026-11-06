@@ -76,6 +76,29 @@ func assertBefore(t *testing.T, e jobevent.Event, asked time.Time) {
 	}
 }
 
+// An instance that outlives its termination may still run and bill, so it is not
+// recorded as gone.
+func TestStuckInstanceIsNotRecordedAsGone(t *testing.T) {
+	events := &eventLog{}
+	h := newHarness(t, func(o *Options) { o.Events = events })
+	h.f.terminateErr = apiErr("RequestLimitExceeded")
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := h.launch(ctx)
+	inst := h.instance(t)
+	h.f.setState(inst.id, types.InstanceStateNameRunning)
+	cancel()
+	if err := waitErr(t, errc); err == nil {
+		t.Fatal("the launch should give up")
+	}
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	for _, e := range events.got {
+		if e.Kind == jobevent.InstanceGone {
+			t.Fatalf("recorded as gone: %+v", e)
+		}
+	}
+}
+
 // A spot interruption's own reason stands: AWS's fault injection shows on the
 // instance as the user's own shutdown, which would read as a normal end.
 func TestInterruptionReasonIsRecorded(t *testing.T) {
