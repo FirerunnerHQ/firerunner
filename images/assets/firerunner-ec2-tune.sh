@@ -104,7 +104,9 @@ docker_memory() {
 		docker_memory_mount "$kib" && moved=0
 	fi
 	# Whatever happened: a stop that failed or timed out may still stop them.
-	if ! bounded systemctl start containerd.service docker.service; then
+	# Not waited for: Docker's data is in place, and the runner need not wait
+	# for dockerd, which the first docker command waits on through the socket.
+	if ! bounded systemctl start --no-block containerd.service docker.service; then
 		log "could not start Docker"
 		docker_unsettled=1
 	fi

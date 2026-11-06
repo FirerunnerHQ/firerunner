@@ -96,7 +96,7 @@ pass "memory: mounted, handing deleted data's memory back" called "mount -o noat
 pass "memory: docker's directory moves" called "mount --bind $STATE/mem/docker $STATE/lib/docker"
 pass "memory: containerd's directory moves" called "mount --bind $STATE/mem/containerd $STATE/lib/containerd"
 pass "memory: moved before Docker is back" ordered "mount --bind $STATE/mem/containerd" "systemctl start"
-pass "memory: Docker comes back" called "systemctl start containerd.service docker.service"
+pass "memory: Docker comes back" called "systemctl start --no-block containerd.service docker.service"
 pass "memory: says nothing when all went well" [ ! -s "$STATE/stderr" ]
 pass "memory: swap keeps the first device" ordered "mkswap" "systemctl stop"
 pass "memory: zram keeps swap's read-ahead" not_called "sysctl -q vm.page-cluster"
@@ -138,7 +138,7 @@ run
 pass "tmpfs fails: exits 0" [ "$rc" = 0 ]
 pass "tmpfs fails: Docker stays on the disk" not_called "mount --bind"
 pass "tmpfs fails: says so" grep -q 'could not move Docker' "$STATE/stderr"
-pass "tmpfs fails: Docker comes back" called "systemctl start containerd.service docker.service"
+pass "tmpfs fails: Docker comes back" called "systemctl start --no-block containerd.service docker.service"
 pass "memory: Docker settles before the disk, which can stall" ordered "systemctl start" "sfdisk"
 
 # The boot service waits on this file: it must outlive Docker's restart, and
@@ -167,7 +167,7 @@ fresh
 stub mkfs.ext4 'exit 1'
 run
 pass "no filesystem: exits 0" [ "$rc" = 0 ]
-pass "no filesystem: Docker comes back" called "systemctl start containerd.service docker.service"
+pass "no filesystem: Docker comes back" called "systemctl start --no-block containerd.service docker.service"
 pass "no filesystem: says so" grep -q "stays on the disk" "$STATE/stderr"
 pass "no filesystem: nothing mounted" not_called mount
 
@@ -206,7 +206,7 @@ run
 pass "Docker will not stop: exits 0" [ "$rc" = 0 ]
 pass "Docker will not stop: its data stays" not_called mkfs.ext4
 pass "Docker will not stop: says so" grep -q "stays on the disk" "$STATE/stderr"
-pass "Docker will not stop: asks it back, as a stop that timed out still happens" called "systemctl start containerd.service docker.service"
+pass "Docker will not stop: asks it back, as a stop that timed out still happens" called "systemctl start --no-block containerd.service docker.service"
 
 fresh
 # shellcheck disable=SC2016 # the stub evaluates this

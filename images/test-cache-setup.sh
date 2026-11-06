@@ -114,7 +114,7 @@ git_bundle
 if setup; then rc=0; else rc=$?; fi
 expect "git: setup succeeds" "$(cat "$STATE/out")" [ "$rc" = 0 ]
 expect "git: the proxy starts, after nginx" "$(cat "$STATE/calls")" \
-	[ "$(line 'systemctl start nginx')" -lt "$(line 'systemctl start firerunner-git-proxy.service')" ]
+	[ "$(line 'systemctl start nginx')" -lt "$(line 'systemctl start --no-block firerunner-git-proxy.service')" ]
 expect "git: its leaf and key are the bundle's" "" bash -c "[ \"\$(cat '$R/etc/firerunner-cache/git.pem')\" = GIT-LEAF ] && [ \"\$(cat '$R/etc/firerunner-cache/git.key')\" = GIT-KEY ]"
 expect "git: its key is private" "$(mode "$R/etc/firerunner-cache/git.key")" [ "$(mode "$R/etc/firerunner-cache/git.key")" = 600 ]
 expect "git: its CA is the bundle's" "" [ "$(cat "$R/etc/ssl/firerunner-git-ca.pem")" = GIT-CA ]
