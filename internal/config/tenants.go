@@ -48,6 +48,9 @@ func (c *Config) validateTenants() error {
 	if c.AppClientID == "" {
 		return errors.New("--tenants needs GitHub App credentials: a token reaches one organization")
 	}
+	if strings.Contains(c.Owner, "/") {
+		return fmt.Errorf("--owner %q: with --tenants it cannot hold a slash, which starts a tenant's owner tag", c.Owner)
+	}
 	catalog := map[string]Tier{}
 	for _, t := range c.Tiers {
 		catalog[t.Name] = t

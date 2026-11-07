@@ -55,6 +55,11 @@ func TestValidateTenants(t *testing.T) {
 		t.Error("one id twice: accepted")
 	}
 	c := tenantConfig(goodTenant())
+	c.Owner = "fr/t1"
+	if err := c.validateTenants(); err == nil {
+		t.Error("an owner that reads as a tenant's: accepted")
+	}
+	c = tenantConfig(goodTenant())
 	c.AppClientID = ""
 	if err := c.validateTenants(); err == nil {
 		t.Error("tenants on a token: accepted")

@@ -127,7 +127,7 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner, privateKey string) 
 		group = cfg.RunnerGroup
 	}
 	return tenant{
-		ID: c.ID, Owner: owner + "-" + c.ID, URL: c.URL, RunnerGroup: group, KeepOnClose: cfg.Owner != "",
+		ID: c.ID, Owner: owner + "/" + c.ID, URL: c.URL, RunnerGroup: group, KeepOnClose: cfg.Owner != "",
 		App: scaleset.GitHubAppAuth{
 			ClientID:       cfg.AppClientID,
 			InstallationID: c.InstallationID,

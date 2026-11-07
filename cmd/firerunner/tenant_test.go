@@ -38,7 +38,7 @@ func TestEC2OptionsAreTheTenants(t *testing.T) {
 func TestExtraTenant(t *testing.T) {
 	cfg := &config.Config{AppClientID: "Iv1", RunnerGroup: "home", Owner: "base"}
 	got := extraTenant(cfg, config.Tenant{ID: "t1", URL: "https://github.com/acme", InstallationID: 7}, "base", "pem")
-	if got.Owner != "base-t1" {
+	if got.Owner != "base/t1" {
 		t.Fatalf("owner = %q: it scopes the reaper, and must differ from the install's", got.Owner)
 	}
 	if got.App.InstallationID != 7 || got.App.ClientID != "Iv1" || got.App.PrivateKey != "pem" || got.Token != "" {

@@ -63,7 +63,8 @@ those installations too, on the same GitHub App and tier catalog:
 [{"id": "acme", "url": "https://github.com/acme", "installation_id": 1234, "tiers": ["firerunner-ubuntu-24.04-2"]}]
 ```
 
-Each gets its own scale sets and the owner tag `<owner>-<id>`. A tenant that cannot
+Each gets its own scale sets and the owner tag `<owner>/<id>`, which the VM's role
+and the reaper Lambda also cover. A tenant that cannot
 start is logged and skipped. Its tiers run with caches off, and each tier's `max`
 applies per tenant.
 
