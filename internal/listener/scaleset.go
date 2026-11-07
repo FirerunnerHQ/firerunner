@@ -17,6 +17,7 @@ import (
 
 	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/ghauth"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jobevent"
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
@@ -37,7 +38,7 @@ type Config struct {
 
 	// Auth: a personal access token, or a GitHub App (preferred, per GitHub).
 	Token string
-	App   scaleset.GitHubAppAuth
+	App   ghauth.App
 
 	// SystemInfo metadata reported to GitHub.
 	Version   string
@@ -960,20 +961,26 @@ func (j *JITSource) RemoveRunner(ctx context.Context, name string) error {
 
 // --- helpers ---
 
+// newClient authenticates as the App when there is one. Its JWTs come from
+// cfg.App.JWT, one source for the whole process, signed in this process or in
+// KMS: the library never sees a key.
 func newClient(cfg Config) (*scaleset.Client, error) {
-	if cfg.App.Validate() == nil {
-		return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
+	if cfg.App.Valid() {
+		return scaleset.NewClientWithJWTProvider(scaleset.ClientWithJWTProviderConfig{
 			GitHubConfigURL: cfg.URL,
-			GitHubAppAuth:   cfg.App,
+			InstallationID:  cfg.App.InstallationID,
 			SystemInfo:      systemInfo(cfg, 0),
-		})
+		}, cfg.App.JWT, clientOptions...)
 	}
 	return scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
 		GitHubConfigURL:     cfg.URL,
 		PersonalAccessToken: cfg.Token,
 		SystemInfo:          systemInfo(cfg, 0),
-	})
+	}, clientOptions...)
 }
+
+// clientOptions are added to every client; tests point them at a fake GitHub.
+var clientOptions []scaleset.HTTPOption
 
 func runnerGroupID(ctx context.Context, client *scaleset.Client, group string) (int, error) {
 	if group == scaleset.DefaultRunnerGroup {

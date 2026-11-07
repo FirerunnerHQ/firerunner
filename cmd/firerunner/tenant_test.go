@@ -41,21 +41,31 @@ func TestEC2OptionsAreTheTenants(t *testing.T) {
 
 func TestExtraTenant(t *testing.T) {
 	cfg := &config.Config{AppClientID: "Iv1", RunnerGroup: "home", Owner: "base"}
-	got := extraTenant(cfg, config.Tenant{ID: "t1", URL: "https://github.com/acme", InstallationID: 7}, "base", "pem", ghauth.NewJWT("Iv1", nil))
+	jwt := ghauth.NewJWT("Iv1", nil)
+	got := extraTenant(cfg, config.Tenant{ID: "t1", URL: "https://github.com/acme", InstallationID: 7}, "base", jwt)
 	if got.Owner != "base/t1" {
 		t.Fatalf("owner = %q: it scopes the reaper, and must differ from the install's", got.Owner)
 	}
-	if got.App.InstallationID != 7 || got.App.ClientID != "Iv1" || got.App.PrivateKey != "pem" || got.Token != "" {
-		t.Fatalf("app = %+v", got.App)
-	}
-	if got.Auth.InstallationID != 7 || got.Auth.JWT == nil {
-		t.Fatalf("auth = %+v: the tenant's REST calls would use another installation", got.Auth)
+	if got.Auth.InstallationID != 7 || got.Auth.JWT != jwt || got.Token != "" {
+		t.Fatalf("auth = %+v: the tenant would act as another installation", got.Auth)
 	}
 	if got.URL != "https://github.com/acme" || got.RunnerGroup != "home" || !got.KeepOnClose {
 		t.Fatalf("tenant = %+v", got)
 	}
-	if got := extraTenant(cfg, config.Tenant{ID: "t1", RunnerGroup: "own"}, "base", "", nil); got.RunnerGroup != "own" {
+	if got := extraTenant(cfg, config.Tenant{ID: "t1", RunnerGroup: "own"}, "base", nil); got.RunnerGroup != "own" {
 		t.Fatalf("group = %q", got.RunnerGroup)
+	}
+}
+
+// A tenant's scale sets authenticate as its own installation, with the shard's
+// one JWT source: the library is given no key.
+func TestListenerConfigIsTheTenantsApp(t *testing.T) {
+	s := &shard{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler)}
+	jwt := ghauth.NewJWT("Iv1", nil)
+	ten := tenant{URL: "https://github.com/acme", Auth: ghauth.App{InstallationID: 7, JWT: jwt}}
+	lc := s.listenerConfig(ten, config.Tier{Name: "t", Max: 3}, tenantHooks{}, health.NewTracker("t"), assigned.New(nil), s.log)
+	if lc.App.InstallationID != 7 || lc.App.JWT != jwt || lc.URL != ten.URL || lc.MaxRunners != 3 {
+		t.Fatalf("listener config = %+v", lc)
 	}
 }
 
@@ -172,4 +182,22 @@ func trackerNames(l *liveTenants) string {
 		names = append(names, tr.Snapshot().Name)
 	}
 	return fmt.Sprint(names)
+}
+
+// A key in another region is signed with there.
+func TestKMSClientUsesTheKeysRegion(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	cfg := &config.Config{AWSRegion: "us-east-1", AppKMSKey: "arn:aws:kms:eu-west-1:111122223333:key/0aaa"}
+	c, err := kmsClient(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Options().Region; got != "eu-west-1" {
+		t.Fatalf("region = %s, want the key's", got)
+	}
+	cfg.AppKMSKey = "alias/github-app"
+	if c, _ := kmsClient(context.Background(), cfg); c.Options().Region != "us-east-1" {
+		t.Fatalf("an alias left the VM's region: %s", c.Options().Region)
+	}
 }

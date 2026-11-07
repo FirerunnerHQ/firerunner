@@ -859,6 +859,13 @@ func deviceID(path string) (uint64, bool) {
 }
 
 func authCheck(cfg *config.Config) Check {
+	// The daemon refuses these at startup, so doctor does too.
+	switch {
+	case cfg.AppKMSKey != "" && cfg.AppPrivateKey != "":
+		return fail("auth", "--app-kms-key and --app-private-key are both set: set one")
+	case cfg.AppKMSKey != "" && cfg.AppClientID == "":
+		return fail("auth", "--app-kms-key needs --app-client-id")
+	}
 	if cfg.Token == "" {
 		if cfg.AppClientID == "" {
 			return fail("auth", "no --token and no GitHub App credentials")
@@ -874,6 +881,9 @@ func authCheck(cfg *config.Config) Check {
 	}
 	if cfg.Token != "" {
 		return pass("auth", "PAT configured")
+	}
+	if cfg.AppKMSKey != "" {
+		return pass("auth", "GitHub App configured (client %s, installation %d), signing in KMS key %s", cfg.AppClientID, cfg.AppInstallID, cfg.AppKMSKey)
 	}
 	return pass("auth", "GitHub App configured (client %s, installation %d)", cfg.AppClientID, cfg.AppInstallID)
 }

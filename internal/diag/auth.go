@@ -12,6 +12,9 @@ import (
 	"strings"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
+
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/ghauth"
 )
@@ -57,13 +60,23 @@ func authVerify(cfg *config.Config, apiBase string) []Check {
 		req, _ = http.NewRequestWithContext(ctx, http.MethodGet, apiBase+"/rate_limit", nil)
 		req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	} else {
-		key, err := cfg.ResolvePrivateKey()
-		if err != nil {
-			return []Check{fail("auth-verify", "GitHub App private key: %v", err)}
-		}
-		jwt, err := appJWT(cfg.AppClientID, key, time.Now())
-		if err != nil {
-			return []Check{fail("auth-verify", "cannot sign GitHub App JWT: %v", err)}
+		var jwt string
+		if cfg.AppKMSKey != "" {
+			j, err := kmsJWT(ctx, cfg)
+			if err == nil {
+				jwt, err = j.Token(ctx)
+			}
+			if err != nil {
+				return []Check{fail("auth-verify", "cannot sign the GitHub App JWT in KMS: %v", err)}
+			}
+		} else {
+			key, err := cfg.ResolvePrivateKey()
+			if err != nil {
+				return []Check{fail("auth-verify", "GitHub App private key: %v", err)}
+			}
+			if jwt, err = appJWT(cfg.AppClientID, key, time.Now()); err != nil {
+				return []Check{fail("auth-verify", "cannot sign GitHub App JWT: %v", err)}
+			}
 		}
 		req, _ = http.NewRequestWithContext(ctx, http.MethodGet,
 			fmt.Sprintf("%s/app/installations/%d", apiBase, cfg.AppInstallID), nil)
@@ -285,6 +298,22 @@ func appPermissions(granted map[string]string, repo, cache bool) Check {
 	}
 	sort.Strings(extra)
 	return warn("app-permissions", "the App grants more than firerunner uses; remove from the App's settings: %s", strings.Join(extra, "; "))
+}
+
+// kmsJWT signs the App's JWTs with --app-kms-key, as the daemon does.
+func kmsJWT(ctx context.Context, cfg *config.Config) (*ghauth.JWT, error) {
+	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithEC2IMDSRegion()}
+	if cfg.AWSRegion != "" {
+		opts = append(opts, awsconfig.WithRegion(cfg.AWSRegion))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if r := ghauth.KeyRegion(cfg.AppKMSKey); r != "" {
+		awsCfg.Region = r
+	}
+	return ghauth.NewJWT(cfg.AppClientID, ghauth.KMSSigner{API: kms.NewFromConfig(awsCfg), KeyID: cfg.AppKMSKey}), nil
 }
 
 // appJWT builds the short-lived RS256 JWT GitHub requires to authenticate as a

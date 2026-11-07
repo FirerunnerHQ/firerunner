@@ -71,6 +71,14 @@ Parameters:
   CachePort:
     Type: Number
     Default: 8099
+  AppKMSKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "(arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/(mrk-)?[0-9a-f-]+)?"
+    Description: >-
+      An AWS KMS key holding the GitHub App's private key (see the README,
+      "Keeping the App key in KMS"). Set, the VM signs with it and is given
+      no key: <prefix>/control/app-private-key is not read.
   RootVolumeGiB:
     Type: Number
     Default: 30
@@ -83,6 +91,7 @@ Conditions:
   CreateZone: !Equals [!Ref HostedZoneId, ""]
   CacheOn: !Not [!Equals [!Ref Cache, "off"]]
   CacheS3: !Equals [!Ref Cache, "s3"]
+  AppKeyInKMS: !Not [!Equals [!Ref AppKMSKeyArn, ""]]
 
 Resources:
   Zone:
@@ -238,6 +247,14 @@ Resources:
                   Resource: !GetAtt CacheBucket.Arn
                   Condition: { StringLike: { "s3:prefix": ["firerunner-cache/*"] } }
                 - !Ref AWS::NoValue
+              # Signing only: the key cannot be read, and only this key.
+              - !If
+                - AppKeyInKMS
+                - Effect: Allow
+                  Action: kms:Sign
+                  Resource: !Ref AppKMSKeyArn
+                  Condition: { StringEquals: { "kms:SigningAlgorithm": RSASSA_PKCS1_V1_5_SHA_256, "kms:MessageType": DIGEST } }
+                - !Ref AWS::NoValue
               - Effect: Allow
                 Action: autoscaling:SetInstanceHealth
                 Resource: !Sub "arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-control"
@@ -293,6 +310,7 @@ Resources:
               FR_CACHE_PORT=${CachePort}
               FR_CACHE_BUCKET=${CacheBucketName}
               FR_ROOT_GIB=${RootVolumeGiB}
+              FR_APP_KMS_KEY=${AppKMSKeyArn}
               EOF
               version=$(aws ssm get-parameter --name ${ParameterPrefix}/control/version --query Parameter.Value --output text)
               case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) false ;; esac

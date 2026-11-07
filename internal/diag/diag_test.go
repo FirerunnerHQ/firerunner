@@ -198,6 +198,18 @@ func TestDeviceID(t *testing.T) {
 }
 
 func TestAuthCheck(t *testing.T) {
+	// What startup refuses, doctor does not pass.
+	for name, c := range map[string]*config.Config{
+		"a KMS key and a private key": {AppClientID: "Iv1", AppInstallID: 7, AppKMSKey: "alias/k", AppPrivateKey: "/k.pem"},
+		"a KMS key without a client":  {Token: "ghp_x", AppKMSKey: "alias/k"},
+	} {
+		if got := authCheck(c); got.Level != levelFail {
+			t.Errorf("%s: %v", name, got.Level)
+		}
+	}
+	if c := authCheck(&config.Config{AppClientID: "Iv1", AppInstallID: 7, AppKMSKey: "alias/k"}); c.Level != levelPass {
+		t.Errorf("a KMS key alone: %v %s", c.Level, c.Detail)
+	}
 	if c := authCheck(&config.Config{Token: "ghp_x"}); c.Level != levelPass {
 		t.Errorf("token: %s %s", c.Level, c.Detail)
 	}

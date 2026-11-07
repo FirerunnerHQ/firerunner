@@ -304,3 +304,17 @@ func TestJWTWaitersShareOneSignature(t *testing.T) {
 		t.Fatalf("%d more signatures, want the one shared", n)
 	}
 }
+
+func TestKeyRegion(t *testing.T) {
+	for key, want := range map[string]string{
+		"arn:aws:kms:eu-west-1:111122223333:key/0aaa":         "eu-west-1",
+		"arn:aws:kms:us-east-1:111122223333:key/mrk-0aaa":     "us-east-1",
+		"arn:aws-cn:kms:cn-north-1:111122223333:alias/github": "cn-north-1",
+		"alias/github-app": "",
+		"0aaa-1111":        "",
+	} {
+		if got := KeyRegion(key); got != want {
+			t.Errorf("KeyRegion(%q) = %q, want %q", key, got, want)
+		}
+	}
+}
