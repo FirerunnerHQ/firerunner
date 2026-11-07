@@ -16,9 +16,13 @@ func TestEC2OptionsAreTheTenants(t *testing.T) {
 	s := &shard{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler)}
 	var heard string
 	hooks := tenantHooks{onRunnerJob: func(runner string) { heard = runner }}
-	o := s.ec2Options(tenant{Owner: "tenant-1"}, config.Tier{Name: "t"}, hooks, health.NewTracker("t"), assigned.New(nil))
+	tier := config.Tier{Name: "t", EC2: &config.EC2Tier{InstanceTypes: []string{"c8a.large"}, Pool: 2}}
+	o := s.ec2Options(tenant{Owner: "tenant-1"}, tier, hooks, health.NewTracker("t"), assigned.New(nil))
 	if o.Owner != "tenant-1" || o.Tier != "t" {
 		t.Fatalf("owner %q, tier %q", o.Owner, o.Tier)
+	}
+	if o.EC2.Pool != 2 || !o.Pooled || len(o.EC2.InstanceTypes) != 1 {
+		t.Fatalf("EC2 = %+v, pooled %v", o.EC2, o.Pooled)
 	}
 	if o.OnRunnerJob == nil {
 		t.Fatal("the tier does not hear of its runners' jobs")

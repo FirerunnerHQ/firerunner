@@ -93,9 +93,14 @@ type servedTenant struct {
 
 // ec2Options is what a tier's EC2 provisioner gets from its tenant and shard.
 func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracker *health.Tracker, jobs *assigned.Jobs) ec2.Options {
+	// A scheduled pool starts at the current window's size; the schedule
+	// follower resizes it from there.
+	e := *tier.EC2
+	e.Pool = tier.SizesAt(time.Now()).Pool
 	return ec2.Options{
 		Tier:        tier.Name,
 		Owner:       t.Owner,
+		EC2:         e,
 		Pooled:      tier.MaxPool() > 0,
 		JIT:         s.jit,
 		JITURL:      jitserver.URL(s.cfg.JITEndpoint()),
@@ -141,13 +146,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	var newEC2 func(config.Tier) provisioner.Provisioner
 	if s.ec2Client != nil {
 		newEC2 = func(tier config.Tier) provisioner.Provisioner {
-			// A scheduled pool starts at the current window's size; the
-			// schedule follower resizes it from there.
-			e := *tier.EC2
-			e.Pool = tier.SizesAt(time.Now()).Pool
-			o := s.ec2Options(t, tier, hooks, tierHealth[tier.Name], tierJobs[tier.Name])
-			o.EC2 = e
-			p := s.ec2Client.Tier(o)
+			p := s.ec2Client.Tier(s.ec2Options(t, tier, hooks, tierHealth[tier.Name], tierJobs[tier.Name]))
 			// A tier's stopped pool fills and refills in the background for
 			// the life of the process; its instances stay stopped on exit and
 			// are found again on the next start.
