@@ -252,11 +252,13 @@ func (c *countingSigner) SignSHA256(ctx context.Context, d []byte) ([]byte, erro
 // A JWT GitHub refuses, signed while the clock was wrong say, is not offered
 // again: the next listing signs a new one.
 func TestRefusedJWTIsSignedAgain(t *testing.T) {
-	var refuse atomic.Bool
-	refuse.Store(true)
+	// GitHub refuses the first JWT until it is replaced, as with a clock that
+	// was wrong when it was signed.
+	var refuse atomic.Int32
+	refuse.Store(2)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/app/installations/42/access_tokens" && refuse.Swap(false):
+		case r.URL.Path == "/app/installations/42/access_tokens" && refuse.Add(-1) >= 0:
 			w.WriteHeader(http.StatusUnauthorized)
 		case r.URL.Path == "/app/installations/42/access_tokens":
 			w.WriteHeader(http.StatusCreated)
@@ -267,13 +269,21 @@ func TestRefusedJWTIsSignedAgain(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := &countingSigner{Signer: ghauth.KeySigner{Key: testKey(t)}}
-	c, err := New("https://github.com/acme", "", ghauth.App{InstallationID: 42, JWT: ghauth.NewJWT("Iv1.x", s)})
+	var clock atomic.Int64
+	clock.Store(time.Now().Unix())
+	jwt := ghauth.NewJWT("Iv1.x", s).WithClock(func() time.Time { return time.Unix(clock.Load(), 0) })
+	c, err := New("https://github.com/acme", "", ghauth.App{InstallationID: 42, JWT: jwt})
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.base = srv.URL
 	if _, err := c.Runners(context.Background()); err == nil {
 		t.Fatal("a refused JWT listed runners")
+	}
+	// Refused while new, it is kept: a lasting refusal must not sign per request.
+	clock.Add(61)
+	if _, err := c.Runners(context.Background()); err == nil {
+		t.Fatal("the same refused JWT went through")
 	}
 	if _, err := c.Runners(context.Background()); err != nil {
 		t.Fatal(err)

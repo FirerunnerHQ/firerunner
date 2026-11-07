@@ -68,6 +68,10 @@ const (
 	// renewBefore is how long before expiry a cached JWT is replaced, so a
 	// request never carries one that ends in flight.
 	renewBefore = time.Minute
+	// refusalWait is how young a refused JWT is kept all the same. A refusal
+	// that lasts, from a clock still wrong or a key since rotated, then costs
+	// a signature a minute instead of one per request.
+	refusalWait = time.Minute
 )
 
 // signTimeout bounds one signature: a KMS that does not answer must not hold
@@ -84,14 +88,16 @@ type JWT struct {
 
 	mu       sync.Mutex
 	token    string
+	signedAt time.Time
 	expiry   time.Time
 	inflight *signing
 }
 
 type signing struct {
-	done  chan struct{}
-	token string
-	err   error
+	done    chan struct{}
+	waiters int // callers waiting on it, for tests
+	token   string
+	err     error
 }
 
 // NewJWT returns the JWTs of the App whose client ID (or App ID) is issuer.
@@ -124,6 +130,7 @@ func (j *JWT) Token(ctx context.Context) (string, error) {
 		j.inflight = c
 		go j.sign(c)
 	}
+	c.waiters++
 	j.mu.Unlock()
 	select {
 	case <-c.done:
@@ -144,7 +151,7 @@ func (j *JWT) sign(c *signing) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if err == nil {
-		j.token, j.expiry = token, exp
+		j.token, j.signedAt, j.expiry = token, now, exp
 	}
 	c.token, c.err = token, err
 	j.inflight = nil
@@ -166,13 +173,13 @@ func (j *JWT) signAt(ctx context.Context, now, exp time.Time) (string, error) {
 	return unsigned + "." + enc(sig), nil
 }
 
-// Refused drops token if it is the cached JWT, so the next caller signs anew.
-// Call it when GitHub answers 401 to it: the clock may have been wrong when it
-// was signed.
+// Refused drops token if it is the cached JWT and at least refusalWait old, so
+// a later caller signs anew. Call it when GitHub answers 401 to it: the clock
+// may have been wrong when it was signed.
 func (j *JWT) Refused(token string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.token == token {
+	if j.token == token && j.wall().Sub(j.signedAt) >= refusalWait {
 		j.token = ""
 	}
 }

@@ -647,10 +647,12 @@ func TestRefusedJWTIsSignedAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var refuse atomic.Bool
-	refuse.Store(true)
+	// GitHub refuses the first JWT until it is replaced, as with a clock that
+	// was wrong when it was signed.
+	var refuse atomic.Int32
+	refuse.Store(2)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if refuse.Swap(false) {
+		if refuse.Add(-1) >= 0 {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -659,9 +661,17 @@ func TestRefusedJWTIsSignedAgain(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := &countingSigner{Signer: ghauth.KeySigner{Key: key}}
-	g := &GitHub{base: srv.URL, client: srv.Client(), app: ghauth.App{InstallationID: 7, JWT: ghauth.NewJWT("client", s)}}
+	var clock atomic.Int64
+	clock.Store(time.Now().Unix())
+	jwt := ghauth.NewJWT("client", s).WithClock(func() time.Time { return time.Unix(clock.Load(), 0) })
+	g := &GitHub{base: srv.URL, client: srv.Client(), app: ghauth.App{InstallationID: 7, JWT: jwt}}
 	if _, err := g.auth(context.Background(), "owner/repo"); err == nil {
 		t.Fatal("a refused JWT got a token")
+	}
+	// Refused while new, it is kept: a lasting refusal must not sign per request.
+	clock.Add(61)
+	if _, err := g.auth(context.Background(), "owner/repo"); err == nil {
+		t.Fatal("the same refused JWT went through")
 	}
 	if _, err := g.auth(context.Background(), "owner/repo"); err != nil {
 		t.Fatal(err)

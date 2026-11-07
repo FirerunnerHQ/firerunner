@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -151,18 +152,28 @@ func TestAppValid(t *testing.T) {
 	}
 }
 
-// A JWT GitHub refused is signed again, and only that one is dropped.
+// A JWT GitHub refused is signed again, at most once a minute, and only that
+// one is dropped.
 func TestRefusedJWTIsSignedAgain(t *testing.T) {
 	s := &countingSigner{Signer: KeySigner{Key: key(t)}}
-	j := NewJWT("Iv1.app", s)
+	now := time.Unix(1_000_000, 0)
+	j := NewJWT("Iv1.app", s).WithClock(func() time.Time { return now })
 	first, _ := j.Token(context.Background())
+	now = now.Add(time.Minute)
 	j.Refused("some other token")
 	if again, _ := j.Token(context.Background()); again != first {
 		t.Fatal("another token's refusal dropped this one")
 	}
 	j.Refused(first)
-	if _, err := j.Token(context.Background()); err != nil || s.n != 2 {
+	second, err := j.Token(context.Background())
+	if err != nil || s.n != 2 {
 		t.Fatalf("not signed again after a refusal: %d signatures, %v", s.n, err)
+	}
+	// A refusal that lasts costs a signature a minute, not one per request.
+	now = now.Add(59 * time.Second)
+	j.Refused(second)
+	if again, _ := j.Token(context.Background()); again != second || s.n != 2 {
+		t.Fatalf("a JWT refused within a minute of signing was signed again: %d signatures", s.n)
 	}
 }
 
@@ -209,6 +220,16 @@ func TestJWTWaitersShareOneSignature(t *testing.T) {
 	<-b.calls
 	for range 2 {
 		go func() { _, err := j.Token(context.Background()); errs <- err }()
+	}
+	// All three wait on the one signature before it is let through.
+	for {
+		j.mu.Lock()
+		n := j.inflight.waiters
+		j.mu.Unlock()
+		if n == 3 {
+			break
+		}
+		runtime.Gosched()
 	}
 	cancel()
 	if err := <-errs; !errors.Is(err, context.Canceled) {
