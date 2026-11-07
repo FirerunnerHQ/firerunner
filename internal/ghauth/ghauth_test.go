@@ -150,3 +150,77 @@ func TestAppValid(t *testing.T) {
 		t.Fatal("an App is not valid")
 	}
 }
+
+// A JWT GitHub refused is signed again, and only that one is dropped.
+func TestRefusedJWTIsSignedAgain(t *testing.T) {
+	s := &countingSigner{Signer: KeySigner{Key: key(t)}}
+	j := NewJWT("Iv1.app", s)
+	first, _ := j.Token(context.Background())
+	j.Refused("some other token")
+	if again, _ := j.Token(context.Background()); again != first {
+		t.Fatal("another token's refusal dropped this one")
+	}
+	j.Refused(first)
+	if _, err := j.Token(context.Background()); err != nil || s.n != 2 {
+		t.Fatalf("not signed again after a refusal: %d signatures, %v", s.n, err)
+	}
+}
+
+// A clock that moves past the JWT's exp gets a new one. The case this guards in
+// production, a wall clock that steps while Go's monotonic reading does not,
+// cannot be built in a test: wall() strips the monotonic reading, and only
+// review keeps it there.
+func TestJWTExpiresByTheClock(t *testing.T) {
+	s := &countingSigner{Signer: KeySigner{Key: key(t)}}
+	start := time.Now()
+	now := start
+	j := NewJWT("Iv1.app", s).WithClock(func() time.Time { return now })
+	if _, err := j.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Jump the wall clock past expiry while the monotonic reading stays put.
+	now = start.Round(0).Add(time.Hour)
+	if _, err := j.Token(context.Background()); err != nil || s.n != 2 {
+		t.Fatalf("a JWT past its wall-clock expiry was reused: %d signatures", s.n)
+	}
+}
+
+// blockingSigner holds every signature until released.
+type blockingSigner struct {
+	release chan struct{}
+	calls   chan struct{}
+	Signer
+}
+
+func (b *blockingSigner) SignSHA256(ctx context.Context, d []byte) ([]byte, error) {
+	b.calls <- struct{}{}
+	<-b.release
+	return b.Signer.SignSHA256(ctx, d)
+}
+
+// Callers waiting on a slow signer share one signature, and each can give up on
+// its own deadline without failing the others.
+func TestJWTWaitersShareOneSignature(t *testing.T) {
+	b := &blockingSigner{release: make(chan struct{}), calls: make(chan struct{}, 4), Signer: KeySigner{Key: key(t)}}
+	j := NewJWT("Iv1.app", b)
+	impatient, cancel := context.WithCancel(context.Background())
+	errs := make(chan error, 3)
+	go func() { _, err := j.Token(impatient); errs <- err }()
+	<-b.calls
+	for range 2 {
+		go func() { _, err := j.Token(context.Background()); errs <- err }()
+	}
+	cancel()
+	if err := <-errs; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the impatient caller got %v, want its own cancellation", err)
+	}
+	close(b.release)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("a patient caller failed: %v", err)
+		}
+	}
+	if n := len(b.calls); n != 0 {
+		t.Fatalf("%d more signatures, want the one shared", n)
+	}
+}

@@ -156,6 +156,9 @@ func (c *Client) auth(ctx context.Context) (string, error) {
 		ExpiresAt time.Time `json:"expires_at"`
 	}
 	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", c.app.InstallationID), signed, body, &out); err != nil {
+		if errors.Is(err, errUnauthorized) {
+			c.app.JWT.Refused(signed)
+		}
 		return "", err
 	}
 	if out.Token == "" || !out.ExpiresAt.After(now.Add(time.Minute)) {

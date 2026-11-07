@@ -1,6 +1,7 @@
 package ghrunners
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -234,5 +236,49 @@ func TestTokenWithoutExpiryRejected(t *testing.T) {
 func TestEnterpriseURLRejected(t *testing.T) {
 	if _, err := New("https://github.com/enterprises/acme", "x", ghauth.App{}); err == nil || !strings.Contains(err.Error(), "enterprise") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+type countingSigner struct {
+	ghauth.Signer
+	n atomic.Int32
+}
+
+func (c *countingSigner) SignSHA256(ctx context.Context, d []byte) ([]byte, error) {
+	c.n.Add(1)
+	return c.Signer.SignSHA256(ctx, d)
+}
+
+// A JWT GitHub refuses, signed while the clock was wrong say, is not offered
+// again: the next listing signs a new one.
+func TestRefusedJWTIsSignedAgain(t *testing.T) {
+	var refuse atomic.Bool
+	refuse.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/app/installations/42/access_tokens" && refuse.Swap(false):
+			w.WriteHeader(http.StatusUnauthorized)
+		case r.URL.Path == "/app/installations/42/access_tokens":
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"token":"inst","expires_at":%q}`, tokenExpiry().Format(time.RFC3339))
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"runners": []Runner{}})
+		}
+	}))
+	defer srv.Close()
+	s := &countingSigner{Signer: ghauth.KeySigner{Key: testKey(t)}}
+	c, err := New("https://github.com/acme", "", ghauth.App{InstallationID: 42, JWT: ghauth.NewJWT("Iv1.x", s)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.base = srv.URL
+	if _, err := c.Runners(context.Background()); err == nil {
+		t.Fatal("a refused JWT listed runners")
+	}
+	if _, err := c.Runners(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.n.Load(); n != 2 {
+		t.Fatalf("%d signatures, want a new JWT after the refusal", n)
 	}
 }

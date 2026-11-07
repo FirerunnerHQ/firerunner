@@ -96,6 +96,9 @@ func (g *GitHub) auth(ctx context.Context, repo string) (string, error) {
 		if errors.As(err, &status) && status.code == http.StatusUnprocessableEntity {
 			return "", fmt.Errorf("%w (%s): %w", errTokenRefused, repo, err)
 		}
+		if errors.As(err, &status) && status.code == http.StatusUnauthorized {
+			g.app.JWT.Refused(signed)
+		}
 		return "", err
 	}
 	if result.Token == "" || !result.ExpiresAt.After(now.Add(time.Minute)) {

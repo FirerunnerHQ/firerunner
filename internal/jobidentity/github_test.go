@@ -630,3 +630,43 @@ type refusingSigner struct{}
 func (refusingSigner) SignSHA256(context.Context, []byte) ([]byte, error) {
 	return nil, errors.New("refused")
 }
+
+type countingSigner struct {
+	ghauth.Signer
+	n atomic.Int32
+}
+
+func (c *countingSigner) SignSHA256(ctx context.Context, d []byte) ([]byte, error) {
+	c.n.Add(1)
+	return c.Signer.SignSHA256(ctx, d)
+}
+
+// A JWT GitHub refuses is not offered again.
+func TestRefusedJWTIsSignedAgain(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refuse atomic.Bool
+	refuse.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if refuse.Swap(false) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "t", "expires_at": time.Now().Add(time.Hour)})
+	}))
+	defer srv.Close()
+	s := &countingSigner{Signer: ghauth.KeySigner{Key: key}}
+	g := &GitHub{base: srv.URL, client: srv.Client(), app: ghauth.App{InstallationID: 7, JWT: ghauth.NewJWT("client", s)}}
+	if _, err := g.auth(context.Background(), "owner/repo"); err == nil {
+		t.Fatal("a refused JWT got a token")
+	}
+	if _, err := g.auth(context.Background(), "owner/repo"); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.n.Load(); n != 2 {
+		t.Fatalf("%d signatures, want a new JWT after the refusal", n)
+	}
+}

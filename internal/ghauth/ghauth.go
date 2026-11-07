@@ -70,16 +70,28 @@ const (
 	renewBefore = time.Minute
 )
 
+// signTimeout bounds one signature: a KMS that does not answer must not hold
+// every tenant's token requests.
+const signTimeout = 10 * time.Second
+
 // JWT is a GitHub App's JWT, signed once and reused until it nears expiry: with
-// KMS, each signature is a network call and costs one.
+// KMS, each signature is a network call and costs one. Callers asking while a
+// signature is in flight wait for it, each for as long as its own context.
 type JWT struct {
 	issuer string
 	signer Signer
 	now    func() time.Time
 
-	mu     sync.Mutex
-	token  string
-	expiry time.Time
+	mu       sync.Mutex
+	token    string
+	expiry   time.Time
+	inflight *signing
+}
+
+type signing struct {
+	done  chan struct{}
+	token string
+	err   error
 }
 
 // NewJWT returns the JWTs of the App whose client ID (or App ID) is issuer.
@@ -94,15 +106,52 @@ func (j *JWT) WithClock(now func() time.Time) *JWT {
 	return j
 }
 
+// wall is the time on the clock GitHub checks exp and iat against. A
+// monotonic reading would ignore a clock step, and stand still while the
+// machine is suspended.
+func (j *JWT) wall() time.Time { return j.now().Round(0) }
+
 // Token returns a JWT valid for at least renewBefore.
 func (j *JWT) Token(ctx context.Context) (string, error) {
 	j.mu.Lock()
-	defer j.mu.Unlock()
-	now := j.now()
-	if j.token != "" && j.expiry.Sub(now) > renewBefore {
+	if j.token != "" && j.expiry.Sub(j.wall()) > renewBefore {
+		defer j.mu.Unlock()
 		return j.token, nil
 	}
+	c := j.inflight
+	if c == nil {
+		c = &signing{done: make(chan struct{})}
+		j.inflight = c
+		go j.sign(c)
+	}
+	j.mu.Unlock()
+	select {
+	case <-c.done:
+		return c.token, c.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// sign makes a new JWT for whoever waits on c. It runs on its own deadline, not
+// a caller's, as every caller shares its result.
+func (j *JWT) sign(c *signing) {
+	ctx, cancel := context.WithTimeout(context.Background(), signTimeout)
+	defer cancel()
+	now := j.wall()
 	exp := now.Add(lifetime)
+	token, err := j.signAt(ctx, now, exp)
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if err == nil {
+		j.token, j.expiry = token, exp
+	}
+	c.token, c.err = token, err
+	j.inflight = nil
+	close(c.done)
+}
+
+func (j *JWT) signAt(ctx context.Context, now, exp time.Time) (string, error) {
 	claims, err := json.Marshal(map[string]any{"iat": now.Add(-backdate).Unix(), "exp": exp.Unix(), "iss": j.issuer})
 	if err != nil {
 		return "", err
@@ -114,8 +163,18 @@ func (j *JWT) Token(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	j.token, j.expiry = unsigned+"."+enc(sig), exp
-	return j.token, nil
+	return unsigned + "." + enc(sig), nil
+}
+
+// Refused drops token if it is the cached JWT, so the next caller signs anew.
+// Call it when GitHub answers 401 to it: the clock may have been wrong when it
+// was signed.
+func (j *JWT) Refused(token string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.token == token {
+		j.token = ""
+	}
 }
 
 // App is a GitHub App installation: what to ask for tokens with.
