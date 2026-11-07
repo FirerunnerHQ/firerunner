@@ -151,8 +151,12 @@ func (j *JWT) sign(c *signing) {
 	token, err := j.signAt(ctx, now, exp)
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if err == nil {
+	switch {
+	case err == nil:
 		j.token, j.signedAt, j.expiry = token, now, exp
+	case j.token != "" && j.expiry.After(now) && !now.Before(j.signedAt):
+		// The one cached still has under a minute: better than nothing.
+		token, err = j.token, nil
 	}
 	c.token, c.err = token, err
 	j.inflight = nil

@@ -177,10 +177,7 @@ func TestRefusedJWTIsSignedAgain(t *testing.T) {
 	}
 }
 
-// A clock that moves past the JWT's exp gets a new one. The case this guards in
-// production, a wall clock that steps while Go's monotonic reading does not,
-// cannot be built in a test: wall() strips the monotonic reading, and only
-// review keeps it there.
+// A clock that moves past the JWT's exp gets a new one.
 func TestJWTExpiresByTheClock(t *testing.T) {
 	s := &countingSigner{Signer: KeySigner{Key: key(t)}}
 	start := time.Now()
@@ -216,6 +213,47 @@ func TestJWTSignedBeforeAClockStepBackIsReplaced(t *testing.T) {
 		t.Fatalf("served a JWT signed in the future: %d signatures", s.n)
 	}
 }
+
+// The cache keeps wall-clock times only. With Go's monotonic reading kept, its
+// comparisons would ignore a clock step and stand still through a suspend.
+func TestJWTKeepsNoMonotonicReading(t *testing.T) {
+	j := NewJWT("Iv1.app", KeySigner{Key: key(t)})
+	if _, err := j.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if j.expiry != j.expiry.Round(0) || j.signedAt != j.signedAt.Round(0) {
+		t.Fatalf("expiry %v, signed %v: a monotonic reading", j.expiry, j.signedAt)
+	}
+}
+
+// A signature that fails while the cached JWT still has its last minute leaves
+// that JWT in use, rather than failing every request.
+func TestFailedSignatureKeepsAStillValidJWT(t *testing.T) {
+	k := key(t)
+	fail := false
+	s := signerFunc(func(ctx context.Context, d []byte) ([]byte, error) {
+		if fail {
+			return nil, errors.New("ThrottlingException")
+		}
+		return KeySigner{Key: k}.SignSHA256(ctx, d)
+	})
+	now := time.Unix(1_000_000, 0)
+	j := NewJWT("Iv1.app", s).WithClock(func() time.Time { return now })
+	first, _ := j.Token(context.Background())
+	fail = true
+	now = now.Add(8*time.Minute + 30*time.Second)
+	if got, err := j.Token(context.Background()); err != nil || got != first {
+		t.Fatalf("got %v with half a minute left", err)
+	}
+	now = now.Add(time.Minute)
+	if _, err := j.Token(context.Background()); err == nil {
+		t.Fatal("an expired JWT was handed out")
+	}
+}
+
+type signerFunc func(context.Context, []byte) ([]byte, error)
+
+func (f signerFunc) SignSHA256(ctx context.Context, d []byte) ([]byte, error) { return f(ctx, d) }
 
 // blockingSigner holds every signature until released.
 type blockingSigner struct {
