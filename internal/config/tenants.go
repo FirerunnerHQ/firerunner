@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"regexp"
@@ -39,7 +40,7 @@ func loadTenants(path string) ([]Tenant, error) {
 	if err := dec.Decode(&tenants); err != nil {
 		return nil, fmt.Errorf("--tenants %s: %w", path, err)
 	}
-	if dec.More() {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("--tenants %s: content after the list", path)
 	}
 	return tenants, nil

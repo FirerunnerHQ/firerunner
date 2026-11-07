@@ -116,6 +116,12 @@ func TestLoadTenants(t *testing.T) {
 	if _, err := loadTenants(write(`[] [{"id":"t2"}]`)); err == nil {
 		t.Fatal("a second list: accepted, and its tenants silently not served")
 	}
+	if _, err := loadTenants(write(`[] ]`)); err == nil {
+		t.Fatal("a stray bracket: accepted")
+	}
+	if _, err := loadTenants(write("[]\n")); err != nil {
+		t.Fatalf("a final newline: %v", err)
+	}
 	if _, err := loadTenants(write(`[] garbage`)); err == nil {
 		t.Fatal("trailing garbage: accepted")
 	}
