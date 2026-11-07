@@ -569,14 +569,6 @@ func tierPending(t config.Tier, shared *scheduler.PendingLaunches) *scheduler.Pe
 	return shared
 }
 
-func tierNames(tiers []config.Tier) []string {
-	names := make([]string, len(tiers))
-	for i, t := range tiers {
-		names[i] = t.Name
-	}
-	return names
-}
-
 // healthBreakers converts the EC2 launch options backing off for the health
 // file.
 func healthBreakers(bs []ec2.Breaker) []health.Breaker {
@@ -843,18 +835,32 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 	}
 
-	served, err := s.start(ctx, t, hooks)
+	first, err := s.start(ctx, t, hooks)
 	if err != nil {
 		return err
 	}
-	defer served.close(context.WithoutCancel(ctx))
+	served := servedTenants{first}
+	defer func() { served.close(context.WithoutCancel(ctx)) }()
+	for _, c := range cfg.Tenants {
+		// One tenant that cannot start, an App since removed say, stops
+		// nobody else.
+		st, err := s.start(ctx, extraTenant(cfg, c, owner, privateKey), tenantHooks{})
+		if err != nil {
+			log.Error("tenant not served", "tenant", c.ID, "err", err)
+			continue
+		}
+		served = append(served, st)
+	}
 
 	log.Info("firerunner starting",
 		"url", cfg.URL,
-		"tiers", len(served.tiers),
+		"tiers", len(first.tiers),
+		"tenants", len(served),
 		"maxRunners", cfg.MaxRunners,
 	)
-	served.logTiers(log)
+	for _, st := range served {
+		st.logTiers(log)
+	}
 
 	if s.fc != nil {
 		// Reclaim taps and job dirs orphaned by a previous unclean exit before
@@ -870,10 +876,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	// Publish each tier's listener health for status and doctor.
 	healthPath := filepath.Join(cfg.Firecracker.WorkDir, health.FileName)
-	stopHealth := publishHealth(healthPath, served.trackers, func(f *health.File) {
-		if served.reaperState != nil {
-			f.Reaper = served.reaperState()
-		}
+	stopHealth := publishHealth(healthPath, served.trackers(), func(f *health.File) {
+		f.Reaper = served.reaper()
 		if s.ec2Client != nil {
 			f.EC2Breakers = healthBreakers(s.ec2Client.Breakers())
 		}
@@ -887,7 +891,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	runErr := serveTiers(runCtx, cancel, tierNames(served.tiers), served.runs(cfg, log), log)
+	runErr := serveTiers(runCtx, cancel, served.names(), served.runs(cfg, log), log)
 	// No tier is listening any more. Stop refreshing the health file before
 	// the drain, which can wait out long jobs: a file that keeps its last
 	// write time ages into "stale" instead of claiming live listeners.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -27,6 +28,8 @@ import (
 // it is to GitHub, and the tiers it serves. Owner is its firerunner:owner tag,
 // which scopes the reaper and the stopped pools to its own instances.
 type tenant struct {
+	// ID is empty for the tenant the flags name.
+	ID          string
 	Owner       string
 	URL         string
 	RunnerGroup string
@@ -82,6 +85,7 @@ func (s *shard) identityHooks(ctx context.Context, t tenant) (tenantHooks, error
 // servedTenant is a tenant running on a shard. Its slices share an order: a
 // tier's index means the same in each.
 type servedTenant struct {
+	t           tenant
 	tiers       []config.Tier
 	trackers    []*health.Tracker
 	provs       []provisioner.Provisioner
@@ -112,15 +116,43 @@ func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracke
 		Launched:    tracker.Launched,
 		FellBack:    tracker.FellBack,
 		Interrupted: tracker.Interrupted,
-		Logger:      s.log.With("tier", tier.Name),
+		Logger:      s.log.With("tier", t.tierKey(tier.Name)),
 	}
+}
+
+// extraTenant is a tenant from the --tenants file, on the install's App.
+func extraTenant(cfg *config.Config, c config.Tenant, owner, privateKey string) tenant {
+	group := c.RunnerGroup
+	if group == "" {
+		group = cfg.RunnerGroup
+	}
+	return tenant{
+		ID: c.ID, Owner: owner + "-" + c.ID, URL: c.URL, RunnerGroup: group, KeepOnClose: cfg.Owner != "",
+		App: scaleset.GitHubAppAuth{
+			ClientID:       cfg.AppClientID,
+			InstallationID: c.InstallationID,
+			PrivateKey:     privateKey,
+		},
+		Tiers: cfg.TenantTiers(c),
+	}
+}
+
+// tierKey names a tier uniquely on a shard: tenants share the default labels.
+func (t tenant) tierKey(tier string) string {
+	if t.ID == "" {
+		return tier
+	}
+	return t.ID + "/" + tier
 }
 
 // start registers a tenant's scale sets and builds what serves them. A failure
 // leaves none of its scale sets open.
 func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*servedTenant, error) {
 	cfg, log := s.cfg, s.log
-	st := &servedTenant{tiers: t.Tiers}
+	if t.ID != "" {
+		log = log.With("tenant", t.ID)
+	}
+	st := &servedTenant{t: t, tiers: t.Tiers}
 
 	// The REST runner list behind --runner-sweep, shared by the tenant's tiers.
 	if cfg.RunnerSweep != "off" {
@@ -139,7 +171,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	tierHealth := map[string]*health.Tracker{}
 	tierJobs := map[string]*assigned.Jobs{}
 	for i, tier := range t.Tiers {
-		st.trackers[i] = health.NewTracker(tier.Name)
+		st.trackers[i] = health.NewTracker(t.tierKey(tier.Name))
 		tierHealth[tier.Name] = st.trackers[i]
 		tierJobs[tier.Name] = assigned.New(poolPolicy(tier))
 	}
@@ -225,6 +257,82 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 		}
 	}
 	return st, nil
+}
+
+// servedTenants are a shard's running tenants.
+type servedTenants []*servedTenant
+
+func (ss servedTenants) close(ctx context.Context) {
+	for _, st := range ss {
+		st.close(ctx)
+	}
+}
+
+func (ss servedTenants) drain() {
+	for _, st := range ss {
+		st.drain()
+	}
+}
+
+func (ss servedTenants) trackers() []*health.Tracker {
+	var out []*health.Tracker
+	for _, st := range ss {
+		out = append(out, st.trackers...)
+	}
+	return out
+}
+
+// names returns every tier's shard-wide name, in runs' order.
+func (ss servedTenants) names() []string {
+	var out []string
+	for _, st := range ss {
+		for _, tier := range st.tiers {
+			out = append(out, st.t.tierKey(tier.Name))
+		}
+	}
+	return out
+}
+
+func (ss servedTenants) runs(cfg *config.Config, log *slog.Logger) []func(context.Context) error {
+	var out []func(context.Context) error
+	for _, st := range ss {
+		out = append(out, st.runs(cfg, log)...)
+	}
+	return out
+}
+
+// reaper adds up the tenants' reapers' latest sweeps.
+func (ss servedTenants) reaper() *health.Reaper {
+	var sum *health.Reaper
+	for _, st := range ss {
+		if st.reaperState == nil {
+			continue
+		}
+		r := st.reaperState()
+		if r == nil {
+			continue
+		}
+		if sum == nil {
+			c := *r
+			sum = &c // appended to below, never to the reaper's own slices
+			sum.Instances = slices.Clone(r.Instances)
+			sum.SpotRequests = slices.Clone(r.SpotRequests)
+			sum.Busy = slices.Clone(r.Busy)
+			sum.Young = slices.Clone(r.Young)
+			continue
+		}
+		sum.Instances = append(sum.Instances, r.Instances...)
+		sum.SpotRequests = append(sum.SpotRequests, r.SpotRequests...)
+		sum.Busy = append(sum.Busy, r.Busy...)
+		sum.Young = append(sum.Young, r.Young...)
+		if r.At.After(sum.At) {
+			sum.At = r.At
+		}
+		if sum.Error == "" {
+			sum.Error = r.Error
+		}
+	}
+	return sum
 }
 
 // close closes the tenant's scale set sessions.

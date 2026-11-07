@@ -54,6 +54,19 @@ firerunner keeps each job's stages, machine and result there. The code is under
 [`proprietary/`](../../proprietary/LICENSE). A database that is down costs that
 record, never a job.
 
+## Tenants (optional)
+
+Store a JSON array as the String `<prefix>/control/tenants`, and the VM serves
+those installations too, on the same GitHub App and tier catalog:
+
+```json
+[{"id": "acme", "url": "https://github.com/acme", "installation_id": 1234, "tiers": ["firerunner-ubuntu-24.04-2"]}]
+```
+
+Each gets its own scale sets and the owner tag `<owner>-<id>`. A tenant that cannot
+start is logged and skipped. Its tiers run with caches off, and each tier's `max`
+applies per tenant.
+
 ## Before the first deploy
 
 You need:
