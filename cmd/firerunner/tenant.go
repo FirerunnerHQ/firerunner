@@ -136,6 +136,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 				UsePool:     tierJobs[tier.Name].ClaimPool,
 				Cache:       s.ec2Cache,
 				Events:      s.events,
+				OnRunnerJob: hooks.onRunnerJob,
 				Launched:    tierHealth[tier.Name].Launched,
 				FellBack:    tierHealth[tier.Name].FellBack,
 				Interrupted: tierHealth[tier.Name].Interrupted,

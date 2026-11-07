@@ -429,35 +429,37 @@ func TestCacheBundleDroppedWithAnExpiredConfig(t *testing.T) {
 	}
 }
 
-// TestOnPhaseOncePerPhase: the hook hears a runner's first report of each
-// phase, not repeats.
-func TestOnPhaseOncePerPhase(t *testing.T) {
+// TestOnJobOnce: a registration's hook hears its runner's first job report,
+// not repeats, other phases, or another registration's runner.
+func TestOnJobOnce(t *testing.T) {
 	s := New(time.Minute, nil)
 	heard := make(chan string, 8)
-	s.OnPhase(func(runner, phase string) { heard <- runner + " " + phase })
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
-		t.Fatal(err)
+	other := make(chan string, 8)
+	neighbour := netip.MustParseAddr("10.0.3.9")
+	for ip, c := range map[netip.Addr]chan string{guest: heard, neighbour: other} {
+		if err := s.Register(ip, "runner-"+ip.String(), "secret"); err != nil {
+			t.Fatal(err)
+		}
+		s.OnJob(ip, func(runner string) { c <- runner })
 	}
 	fetch(t, s, http.MethodGet, Path, from(guest))
 	for _, q := range []string{"phase=job", "phase=job", "phase=exited&rc=0"} {
 		report(t, s, from(guest), q)
 	}
 	report(t, s, from(foreign), "phase=job") // forbidden: no hook
-	var got []string
-	for len(got) < 2 {
-		select {
-		case h := <-heard:
-			got = append(got, h)
-		case <-time.After(2 * time.Second):
-			t.Fatalf("heard %v, want the first job and exited reports", got)
+	select {
+	case h := <-heard:
+		if h != "runner-"+guest.String() {
+			t.Fatalf("heard %q", h)
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the job report was not heard")
 	}
 	select {
 	case h := <-heard:
 		t.Fatalf("heard an extra %q", h)
+	case h := <-other:
+		t.Fatalf("the neighbour heard %q", h)
 	case <-time.After(50 * time.Millisecond):
-	}
-	if !(got[0] == "runner-1 job" && got[1] == "runner-1 exited" || got[1] == "runner-1 job" && got[0] == "runner-1 exited") {
-		t.Fatalf("heard %v", got)
 	}
 }

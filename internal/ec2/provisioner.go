@@ -122,6 +122,9 @@ type Options struct {
 	UsePool func() (ok bool, release func())
 	// Events, when set, is told of each instance and how its runner went.
 	Events jobevent.Sink
+	// OnRunnerJob, when set, is told when an instance's runner reports its
+	// job, within seconds of it starting.
+	OnRunnerJob func(runner string)
 	// Launched, when set, is told each launch's path (PathPool, PathCold or
 	// PathKept).
 	Launched func(path string)
@@ -182,6 +185,14 @@ type VMJobs interface {
 // this address, whose scope the instance would then act in. release undoes
 // all of it.
 func (p *Provisioner) register(ip netip.Addr, name, jit string) (release func(), err error) {
+	release, err = p.bind(ip, name, jit)
+	if err == nil && p.o.OnRunnerJob != nil {
+		p.o.JIT.OnJob(ip, p.o.OnRunnerJob)
+	}
+	return release, err
+}
+
+func (p *Provisioner) bind(ip netip.Addr, name, jit string) (release func(), err error) {
 	c := p.o.Cache
 	if c == nil || !p.o.EC2.Cache {
 		if err := p.o.JIT.Register(ip, name, jit); err != nil {

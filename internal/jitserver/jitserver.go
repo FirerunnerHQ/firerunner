@@ -84,6 +84,8 @@ type entry struct {
 	// cacheServed.
 	cache       []byte
 	cacheServed bool
+	// onJob, if set, is told when the runner reports its job.
+	onJob func(runner string)
 }
 
 // Report is what an instance told the server about its runner. A zero time
@@ -101,8 +103,6 @@ type Report struct {
 // Server serves each registered config exactly once, to the address it was
 // registered for.
 type Server struct {
-	// onPhase, if set, is told each runner's first report of a phase.
-	onPhase func(runner, phase string)
 	mu      sync.Mutex
 	entries map[netip.Addr]*entry
 	ttl     time.Duration
@@ -145,9 +145,17 @@ func (s *Server) register(ip netip.Addr, runner, jit string, cache []byte) error
 	return nil
 }
 
-// OnPhase sets fn to be told, once per runner and phase, when its instance
-// first reports it (listening, job, exited). Call it before serving.
-func (s *Server) OnPhase(fn func(runner, phase string)) { s.onPhase = fn }
+// OnJob sets fn to be told, once, when the runner registered at ip reports its
+// job. It belongs to the registration, so on a shard each tenant hears only of
+// its own runners. Call it right after registering: a report comes only after
+// the instance has fetched its config and started its runner.
+func (s *Server) OnJob(ip netip.Addr, fn func(runner string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.entries[ip.Unmap()]; ok {
+		e.onJob = fn
+	}
+}
 
 // RegisterWithCache is Register with a cache bundle (the proxy's TLS
 // material and the cache-server address), set in the same step so the
@@ -337,7 +345,7 @@ func (s *Server) reportHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown phase", http.StatusBadRequest)
 		return
 	}
-	runner, rep, first, ok := s.record(ip, phase, rc)
+	runner, rep, first, onJob, ok := s.record(ip, phase, rc)
 	if !ok {
 		s.log.Debug("runner report from an address without a served config", "ip", ip, "phase", phase)
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -350,21 +358,22 @@ func (s *Server) reportHTTP(w http.ResponseWriter, r *http.Request) {
 			attrs = append(attrs, "rc", rc)
 		}
 		s.log.Info("runner phase", attrs...)
-		if s.onPhase != nil {
-			go s.onPhase(runner, phase)
+		if onJob != nil {
+			go onJob(runner)
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// record notes phase for ip's runner, keeping a phase's first report. ok is
-// false when ip has no registration or was never served its config.
-func (s *Server) record(ip netip.Addr, phase string, rc int) (runner string, rep Report, first, ok bool) {
+// record notes phase for ip's runner, keeping a phase's first report. onJob
+// is the hook to tell of a first job report. ok is false when ip has no
+// registration or was never served its config.
+func (s *Server) record(ip netip.Addr, phase string, rc int) (runner string, rep Report, first bool, onJob func(string), ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, found := s.entries[ip]
 	if !found || !e.served {
-		return "", Report{}, false, false
+		return "", Report{}, false, nil, false
 	}
 	var at *time.Time
 	switch phase {
@@ -380,8 +389,11 @@ func (s *Server) record(ip netip.Addr, phase string, rc int) (runner string, rep
 		if phase == PhaseExited {
 			e.report.ExitCode = rc
 		}
+		if phase == PhaseJob {
+			onJob = e.onJob
+		}
 	}
-	return e.runner, e.report, first, true
+	return e.runner, e.report, first, onJob, true
 }
 
 func remoteIP(r *http.Request) (netip.Addr, error) {
