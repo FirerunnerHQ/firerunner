@@ -129,12 +129,13 @@ Placeholders such as `subnet-0aaa…` are fine.
 
 ## Known pitfalls
 
-- **`scaleset.Client` serialises every call.** In `actions/scaleset` v0.4.0 its
-  `mu` is held across the whole HTTP request and is not context-aware, so a
-  context deadline does not bound a call while another goroutine holds the
-  client. Give each concurrent use its own client: `internal/listener` keeps
-  separate ones for message sessions, runner removal and a pool for JIT
-  generation. Do not add a second user to an existing client.
+- **`scaleset.Client` holds one lock across a token refresh.** Since
+  `actions/scaleset` v0.5.0 calls no longer serialise on the client, but the
+  admin token refresh still holds `refreshMu` across its HTTP requests, and it
+  is not context-aware: a stuck refresh blocks every call on that client.
+  `internal/listener` keeps separate clients for message sessions, runner
+  removal and a pool for JIT generation, which v0.4.0 needed; do not add a
+  second user to one without that in mind.
 - **Persistent spot requests: cancel after the start.** A stopped instance
   whose persistent request was cancelled can never start again
   (`IncorrectSpotRequestState`), and terminating one whose request is still

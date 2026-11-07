@@ -774,7 +774,8 @@ GitHub never sent `JobAvailable` messages (0 in 33 jobs); it assigns jobs to a
 JIT scale set directly.
 
 `FR_CHAOS_EXIT_AFTER_DELETE=1` makes the daemon exit right after deleting a
-message, before acting on it. It is a fault-injection switch for recovery tests
+message. Since actions/scaleset v0.5.0 a message is deleted only after it is acted
+on, so a crash before that has it delivered again rather than lost. It is a fault-injection switch for recovery tests
 only; never set it in production.
 
 **Checking a configuration offline.** `firerunner config check` validates the

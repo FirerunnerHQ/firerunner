@@ -72,10 +72,10 @@ type ScaleSet struct {
 	cfg    Config
 	log    *slog.Logger
 	client *scaleset.Client
-	// removeClient serves only runner deregistration. scaleset.Client holds one
-	// non-context-aware mutex across every call, so sharing client would let a
-	// slow JIT generation stall a scale-down past its deadline, and a slow
-	// removal delay the next scale-up. The scheduler issues one removal at a
+	// removeClient serves only runner deregistration. actions/scaleset v0.4.0
+	// held one non-context-aware mutex across every call, and v0.5.0 still holds
+	// one across a token refresh, so sharing client could let a slow refresh
+	// stall a scale-down past its deadline. The scheduler issues one removal at a
 	// time per tier; the reconciler's lost-runner lookups and offline-runner
 	// removals (rare: one per leaked runner) are its only other callers.
 	removeClient *scaleset.Client
@@ -116,11 +116,10 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Message sessions get a client of their own too: every session request
-	// (open, refresh, close) takes its parent client's mutex, which a JIT
-	// generation holds across its network round trip. During a GitHub outage
-	// that would queue a reconnect's close and reopen behind stuck JIT
-	// requests, past their own deadlines.
+	// Message sessions get a client of their own too. In v0.4.0 every session
+	// request took its parent client's mutex, which a JIT generation held across
+	// its round trip; v0.5.0 holds one only across a token refresh. Either way a
+	// stuck call on a shared client would hold up a reconnect.
 	sessionClient, err := newClient(cfg)
 	if err != nil {
 		return nil, err
@@ -366,11 +365,12 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		s.recycle = nil
 		s.mu.Unlock()
 	}()
-	l, err := sslistener.New(trackedSession{session: sess, health: s.health, pending: s.cfg.Pending, events: s.cfg.Events, tier: s.cfg.Name, offered: s.cfg.OnJobOffered, log: s.log, chaos: chaosExitAfterDelete()}, sslistener.Config{
+	ts := trackedSession{session: sess, health: s.health, pending: s.cfg.Pending, events: s.cfg.Events, tier: s.cfg.Name, offered: s.cfg.OnJobOffered, log: s.log, chaos: chaosExitAfterDelete()}
+	l, err := sslistener.New(ts, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
-	}, sslistener.WithMetricsRecorder(&s.stats))
+	})
 	if err != nil {
 		return fmt.Errorf("create scaleset listener: %w", err)
 	}
@@ -383,6 +383,8 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		tier:         s.cfg.Name,
 		maxRunners:   s.cfg.MaxRunners,
 		log:          s.log,
+		stats:        &s.stats,
+		acquire:      ts.AcquireJobs,
 	}
 	if capacity != nil {
 		a.capacity = capacity
@@ -421,8 +423,7 @@ func (s *ScaleSet) Recycle(reason string) bool {
 	return true
 }
 
-// statsRecorder keeps the latest statistics GitHub sent (an
-// sslistener.MetricsRecorder).
+// statsRecorder keeps the latest statistics GitHub sent.
 type statsRecorder struct {
 	mu    sync.Mutex
 	stats scaleset.RunnerScaleSetStatistic
@@ -438,9 +439,6 @@ func (r *statsRecorder) RecordStatistics(st *scaleset.RunnerScaleSetStatistic) {
 	r.stats, r.at, r.ok = *st, time.Now(), true
 	r.mu.Unlock()
 }
-func (r *statsRecorder) RecordJobStarted(*scaleset.JobStarted)     {}
-func (r *statsRecorder) RecordJobCompleted(*scaleset.JobCompleted) {}
-func (r *statsRecorder) RecordDesiredRunners(int)                  {}
 
 func (r *statsRecorder) latest() (scaleset.RunnerScaleSetStatistic, time.Time, bool) {
 	r.mu.Lock()
@@ -450,10 +448,9 @@ func (r *statsRecorder) latest() (scaleset.RunnerScaleSetStatistic, time.Time, b
 
 // chaosExitAfterDelete reports whether FR_CHAOS_EXIT_AFTER_DELETE is set: a
 // fault-injection switch for testing recovery, never for production. The
-// process then exits right after GitHub accepts a message's deletion, before
-// the message is acted on. actions/scaleset deletes a message first, then
-// acquires its available jobs and applies its statistics, so this is the
-// moment a crash loses the message.
+// process then exits right after GitHub accepts a message's deletion. Since
+// actions/scaleset v0.5.0 a message is acted on first and deleted after, so a
+// crash before the deletion has the message delivered again rather than lost.
 func chaosExitAfterDelete() bool { return os.Getenv("FR_CHAOS_EXIT_AFTER_DELETE") == "1" }
 
 // trackedSession records each successful GetMessage in the tier's health,
@@ -474,7 +471,7 @@ type trackedSession struct {
 func (t trackedSession) DeleteMessage(ctx context.Context, messageID int) error {
 	err := t.session.DeleteMessage(ctx, messageID)
 	if err == nil && t.chaos {
-		fmt.Fprintf(os.Stderr, "firerunner: FR_CHAOS_EXIT_AFTER_DELETE: exiting after deleting message %d, before acting on it\n", messageID)
+		fmt.Fprintf(os.Stderr, "firerunner: FR_CHAOS_EXIT_AFTER_DELETE: exiting after deleting message %d\n", messageID)
 		os.Exit(137)
 	}
 	return err
@@ -648,9 +645,66 @@ type scaler struct {
 	maxRunners   int
 	log          *slog.Logger
 	lastAdvert   int
+	// stats keeps each message's statistics, for a long poll that ends with
+	// none; acquire asks GitHub for the jobs a message offers.
+	stats   *statsRecorder
+	acquire func(ctx context.Context, ids []int64) ([]int64, error)
 }
 
 var _ sslistener.Scaler = (*scaler)(nil)
+
+// Scale acts on one message as actions/scaleset v0.4.0's listener did before
+// it handed messages to the Scaler: statistics, the jobs it offers, starts,
+// completions, then the desired count. nil is a long poll that ended empty.
+// The listener deletes the message after Scale returns, so a message Scale
+// fails on, or a crash during it, is delivered again: everything here must
+// bear being done twice.
+func (a *scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
+	if msg == nil {
+		st, _, _ := a.stats.latest()
+		_, err := a.HandleDesiredRunnerCount(ctx, st.TotalAssignedJobs)
+		return err
+	}
+	// A message is acted on in full once it is in hand, as before.
+	ctx = context.WithoutCancel(ctx)
+	a.stats.RecordStatistics(msg.Statistics)
+	if len(msg.JobAvailableMessages) > 0 && a.acquire != nil {
+		ids := make([]int64, 0, len(msg.JobAvailableMessages))
+		for _, j := range msg.JobAvailableMessages {
+			if j != nil {
+				ids = append(ids, j.RunnerRequestID)
+			}
+		}
+		a.log.Info("acquiring jobs", "count", len(ids))
+		acquired, err := a.acquire(ctx, ids)
+		if err != nil {
+			return fmt.Errorf("acquire jobs: %w", err)
+		}
+		a.log.Info("jobs acquired", "count", len(acquired))
+	}
+	for _, j := range msg.JobStartedMessages {
+		if j != nil {
+			if err := a.HandleJobStarted(ctx, j); err != nil {
+				return err
+			}
+		}
+	}
+	for _, j := range msg.JobCompletedMessages {
+		if j != nil {
+			if err := a.HandleJobCompleted(ctx, j); err != nil {
+				return err
+			}
+		}
+	}
+	count := 0
+	if msg.Statistics != nil {
+		count = msg.Statistics.TotalAssignedJobs
+	} else if st, _, ok := a.stats.latest(); ok {
+		count = st.TotalAssignedJobs
+	}
+	_, err := a.HandleDesiredRunnerCount(ctx, count)
+	return err
+}
 
 func (a *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
 	// The scheduler adds its warm-runner floor to GitHub's count itself.
@@ -745,9 +799,10 @@ func jitParallelism(maxRunners int) int {
 }
 
 // clientPool hands out JIT clients so concurrent launches do not queue on one.
-// A scaleset.Client holds a mutex across every request, so a burst of launches
-// sharing one client generates its configs one after another: 20 queued jobs
-// waited up to ~20 round trips for their runners. The pool grows on demand up
+// In actions/scaleset v0.4.0 a client held a mutex across every request, so a
+// burst of launches sharing one generated its configs one after another: 20
+// queued jobs waited up to ~20 round trips for their runners. v0.5.0 no longer
+// does; whether the pool still earns its keep is to be measured. The pool grows on demand up
 // to its limit, reusing idle clients (and their cached tokens) first, and
 // beyond that waits for one to free up.
 type clientPool struct {

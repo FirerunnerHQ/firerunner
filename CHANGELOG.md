@@ -8,6 +8,12 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- firerunner uses actions/scaleset v0.5.0. A message from GitHub is now deleted
+  only after it is acted on, so a crash in between has it delivered again rather
+  than lost.
+
 ## [0.1.7] - 2026-11-07
 
 ### Added
