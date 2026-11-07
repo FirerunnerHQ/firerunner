@@ -8,6 +8,12 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `FR_APP_KMS_KEY` signs the GitHub App's JWTs with a key kept in AWS KMS, so
+  the daemon never holds it. The control VM stack takes its ARN as
+  `AppKMSKeyArn`.
+
 ### Changed
 
 - firerunner uses actions/scaleset v0.5.0. A message from GitHub is now deleted
