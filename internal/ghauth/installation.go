@@ -8,40 +8,23 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 )
 
-// tokenRenewBefore is how long before expiry an installation token is replaced.
-// GitHub issues them for an hour.
-const tokenRenewBefore = 5 * time.Minute
-
 // Installation hands out one installation's tokens, narrowed to Permissions,
-// and reuses each until it nears expiry.
+// a new one each time: a revoked token must not outlive its revocation, and
+// the caller cannot say when GitHub refused one. Ask only as often as a token
+// is needed, as the scale set client does once per Actions service session.
 type Installation struct {
 	// Base is the REST API root, e.g. https://api.github.com.
 	Base        string
 	App         App
 	Permissions map[string]string
 	HTTP        *http.Client
-	now         func() time.Time
-
-	mu     sync.Mutex
-	token  string
-	expiry time.Time
 }
 
-// Token returns a token valid for at least tokenRenewBefore.
+// Token returns a new installation token.
 func (i *Installation) Token(ctx context.Context) (string, error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	now := time.Now().Round(0)
-	if i.now != nil {
-		now = i.now().Round(0)
-	}
-	if i.token != "" && i.expiry.Sub(now) > tokenRenewBefore {
-		return i.token, nil
-	}
 	if !i.App.Valid() {
 		return "", errors.New("ghauth: no GitHub App installation")
 	}
@@ -87,9 +70,8 @@ func (i *Installation) Token(ctx context.Context) (string, error) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&out); err != nil {
 		return "", fmt.Errorf("ghauth: installation token: %w", err)
 	}
-	if out.Token == "" || out.ExpiresAt.Sub(now) <= tokenRenewBefore {
+	if out.Token == "" || !out.ExpiresAt.After(time.Now()) {
 		return "", errors.New("ghauth: installation token without a usable expiry")
 	}
-	i.token, i.expiry = out.Token, out.ExpiresAt
-	return i.token, nil
+	return out.Token, nil
 }

@@ -11,11 +11,11 @@ import (
 	"time"
 )
 
-func TestInstallationTokenNarrowedAndReused(t *testing.T) {
+// Each token is new, so one GitHub revoked is never handed out again, and is
+// narrowed to what was asked.
+func TestInstallationTokenNarrowedAndNew(t *testing.T) {
 	k := key(t)
 	var calls atomic.Int32
-	var clock atomic.Int64 // the test's time, which the server issues by
-	clock.Store(time.Now().Unix())
 	var asked map[string]map[string]string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/app/installations/7/access_tokens" {
@@ -26,22 +26,18 @@ func TestInstallationTokenNarrowedAndReused(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&asked)
 		n := calls.Add(1)
 		w.WriteHeader(http.StatusCreated)
-		fmt.Fprintf(w, `{"token":"ghs_%d","expires_at":%q}`, n, time.Unix(clock.Load(), 0).Add(time.Hour).Format(time.RFC3339))
+		fmt.Fprintf(w, `{"token":"ghs_%d","expires_at":%q}`, n, time.Now().Add(time.Hour).Format(time.RFC3339))
 	}))
 	defer srv.Close()
 	i := &Installation{Base: srv.URL, App: App{InstallationID: 7, JWT: NewJWT("Iv1", KeySigner{Key: k})},
-		Permissions: map[string]string{"organization_self_hosted_runners": "write"}, now: func() time.Time { return time.Unix(clock.Load(), 0) }}
-	for range 2 {
-		if tok, err := i.Token(context.Background()); err != nil || tok != "ghs_1" {
-			t.Fatalf("token %q, %v", tok, err)
+		Permissions: map[string]string{"organization_self_hosted_runners": "write"}}
+	for n := 1; n <= 2; n++ {
+		if tok, err := i.Token(context.Background()); err != nil || tok != fmt.Sprintf("ghs_%d", n) {
+			t.Fatalf("token %q, %v: want a new one each time", tok, err)
 		}
 	}
 	if fmt.Sprint(asked) != "map[permissions:map[organization_self_hosted_runners:write]]" {
 		t.Fatalf("asked for %v", asked)
-	}
-	clock.Add(int64((56 * time.Minute).Seconds()))
-	if tok, _ := i.Token(context.Background()); tok != "ghs_2" {
-		t.Fatalf("a token five minutes from expiry was reused: %q", tok)
 	}
 }
 
