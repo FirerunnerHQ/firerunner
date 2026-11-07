@@ -44,6 +44,9 @@ type Config struct {
 	AppClientID      string
 	AppInstallID     int64
 	AppPrivateKey    string
+	// AppKMSKey names an AWS KMS key holding the App's private key, which then
+	// never enters this process. It replaces AppPrivateKey.
+	AppKMSKey string
 
 	// Runner microVM shape.
 	VCPU   int
@@ -383,6 +386,7 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.StringVar(&c.AppClientID, "app-client-id", env("FR_APP_CLIENT_ID", ""), "GitHub App client id")
 	fs.Int64Var(&c.AppInstallID, "app-installation-id", int64(er.int("FR_APP_INSTALLATION_ID", 0)), "GitHub App installation id")
 	fs.StringVar(&c.AppPrivateKey, "app-private-key", "", "GitHub App private key (PEM path or contents); default FR_APP_PRIVATE_KEY")
+	fs.StringVar(&c.AppKMSKey, "app-kms-key", "", "AWS KMS key (ID, ARN or alias) that holds the GitHub App's private key and signs its JWTs, in place of --app-private-key; default FR_APP_KMS_KEY")
 
 	fs.IntVar(&c.VCPU, "vcpu", er.int("FR_VCPU", 4), "vCPUs per microVM")
 	fs.IntVar(&c.MemMiB, "mem-mib", er.int("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
@@ -449,6 +453,10 @@ func Parse(args []string) (*Config, error) {
 	}
 	if c.AppPrivateKey == "" {
 		c.AppPrivateKey = env("FR_APP_PRIVATE_KEY", "")
+	}
+	// Not a secret, but it names a key, and credentials are never flag defaults.
+	if c.AppKMSKey == "" {
+		c.AppKMSKey = env("FR_APP_KMS_KEY", "")
 	}
 	c.JobEventsDSN = env("FR_JOB_EVENTS_DSN", "")
 	c.JobEventsDSNFile = env("FR_JOB_EVENTS_DSN_FILE", "")
@@ -581,6 +589,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("--mem-mib must be >= 128")
 	case c.Token == "" && c.AppClientID == "":
 		return fmt.Errorf("provide --token or GitHub App credentials")
+	case c.AppKMSKey != "" && c.AppPrivateKey != "":
+		return fmt.Errorf("--app-kms-key and --app-private-key: set one")
+	case c.AppKMSKey != "" && c.AppClientID == "":
+		return fmt.Errorf("--app-kms-key needs --app-client-id")
 	case c.Token == "" && c.AppInstallID == 0:
 		return fmt.Errorf("--app-installation-id is required with --app-client-id (or set --token)")
 	case c.Firecracker.Jailer && (c.Firecracker.JailUID < 1 || c.Firecracker.JailGID < 1):

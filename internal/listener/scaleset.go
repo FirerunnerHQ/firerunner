@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/actions/scaleset"
 	sslistener "github.com/actions/scaleset/listener"
+	"github.com/hashicorp/go-retryablehttp"
 
 	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/core"
@@ -38,6 +40,9 @@ type Config struct {
 	// Auth: a personal access token, or a GitHub App (preferred, per GitHub).
 	Token string
 	App   scaleset.GitHubAppAuth
+	// Tokens, if set, supplies the App's installation tokens instead, so this
+	// process needs no App key: one signed in KMS, or by a broker, will do.
+	Tokens func(context.Context) (string, error)
 
 	// SystemInfo metadata reported to GitHub.
 	Version   string
@@ -885,7 +890,19 @@ func (j *JITSource) RemoveRunner(ctx context.Context, name string) error {
 
 // --- helpers ---
 
+// brokered stands in for the token in a client whose tokens come from
+// Config.Tokens. The library sends it only to ask for a runner registration
+// token, and withToken swaps it for a real one on the way out.
+const brokered = "firerunner-brokered-token"
+
 func newClient(cfg Config) (*scaleset.Client, error) {
+	if cfg.Tokens != nil {
+		return scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
+			GitHubConfigURL:     cfg.URL,
+			PersonalAccessToken: brokered,
+			SystemInfo:          systemInfo(cfg, 0),
+		}, scaleset.WithRetryableHTTPClint(withToken(retryablehttp.NewClient(), cfg.Tokens, cfg.Logger)))
+	}
 	if cfg.App.Validate() == nil {
 		return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
 			GitHubConfigURL: cfg.URL,
@@ -947,4 +964,29 @@ func randSuffix() string {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
+}
+
+// withToken makes rc send a fresh installation token wherever the library
+// sends the brokered placeholder. The library takes a token only at
+// construction and accepts no transport of its own, so this rides on the hook
+// retryablehttp calls before every attempt, which sees the request it sends.
+// TestBrokeredTokenReachesGitHub pins that to the library's behaviour. A token
+// that cannot be had leaves no Authorization, and GitHub's 401 says why.
+func withToken(rc *retryablehttp.Client, tokens func(context.Context) (string, error), log *slog.Logger) *retryablehttp.Client {
+	rc.RetryMax, rc.RetryWaitMax = 4, 30*time.Second // the library's defaults
+	rc.RequestLogHook = func(_ retryablehttp.Logger, req *http.Request, _ int) {
+		if req.Header.Get("Authorization") != "Bearer "+brokered {
+			return
+		}
+		tok, err := tokens(req.Context())
+		if err != nil {
+			req.Header.Del("Authorization")
+			if log != nil {
+				log.Warn("no installation token for GitHub", "err", err)
+			}
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	return rc
 }
