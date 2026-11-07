@@ -28,25 +28,35 @@ func (l *eventLog) Record(e jobevent.Event) {
 // An instance's job report reaches the tier that launched it, which is how a
 // shard's tenants each resolve only their own runners.
 func TestLaunch_ToldWhenItsRunnerReportsAJob(t *testing.T) {
-	heard := make(chan string, 1)
-	h := newHarness(t, func(o *Options) { o.OnRunnerJob = func(runner string) { heard <- runner } })
-	errc := h.launch(context.Background())
-	inst := h.instance(t)
-	if code, _ := h.fetch(inst.ip); code != http.StatusOK {
-		t.Fatalf("fetch = %d", code)
+	for name, cached := range map[string]bool{"uncached": false, "cached": true} {
+		t.Run(name, func(t *testing.T) {
+			heard := make(chan string, 1)
+			h := newHarness(t, func(o *Options) {
+				o.OnRunnerJob = func(runner string) { heard <- runner }
+				if cached {
+					o.EC2.Cache = true
+					o.Cache = cacheOpts(t, &fakeJobs{bound: map[string]string{}})
+				}
+			})
+			errc := h.launch(context.Background())
+			inst := h.instance(t)
+			if code, _ := h.fetch(inst.ip); code != http.StatusOK {
+				t.Fatalf("fetch = %d", code)
+			}
+			h.report(t, inst.ip, "phase=job")
+			select {
+			case r := <-heard:
+				if r != "runner-1" {
+					t.Fatalf("heard %q", r)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the job report was not heard")
+			}
+			h.report(t, inst.ip, "phase=exited&rc=0")
+			h.f.setStateFor(inst.id, types.InstanceStateNameTerminated, "Client.UserInitiatedShutdown")
+			waitErr(t, errc)
+		})
 	}
-	h.report(t, inst.ip, "phase=job")
-	select {
-	case r := <-heard:
-		if r != "runner-1" {
-			t.Fatalf("heard %q", r)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the job report was not heard")
-	}
-	h.report(t, inst.ip, "phase=exited&rc=0")
-	h.f.setStateFor(inst.id, types.InstanceStateNameTerminated, "Client.UserInitiatedShutdown")
-	waitErr(t, errc)
 }
 
 // A job's instance reports what it is, each stage at its own time, and why it

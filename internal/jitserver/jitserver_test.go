@@ -33,7 +33,7 @@ func from(ip netip.Addr) string { return netip.AddrPortFrom(ip, 40000).String() 
 
 func TestServesOnceThen404(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.Register(guest, "runner-1", "eyJqaXQiOiJ4In0="); err != nil {
+	if err := s.Register(guest, "runner-1", "eyJqaXQiOiJ4In0=", nil); err != nil {
 		t.Fatal(err)
 	}
 	if !s.Pending(guest) {
@@ -56,7 +56,7 @@ func TestServesOnceThen404(t *testing.T) {
 
 func TestForeignAddressForbidden(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+	if err := s.Register(guest, "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	code, body := fetch(t, s, http.MethodGet, Path, from(foreign))
@@ -73,7 +73,7 @@ func TestExpiresWhenNeverFetched(t *testing.T) {
 	s := New(time.Minute, nil)
 	now := time.Unix(1_000_000, 0)
 	s.now = func() time.Time { return now }
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+	if err := s.Register(guest, "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(time.Minute) // exactly at expiry counts as expired
@@ -91,16 +91,16 @@ func TestExpiresWhenNeverFetched(t *testing.T) {
 
 func TestRevokeAndReuseAddress(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.Register(guest, "runner-1", "one"); err != nil {
+	if err := s.Register(guest, "runner-1", "one", nil); err != nil {
 		t.Fatal(err)
 	}
 	// While the address holds a registration, served or not, a second launch
 	// on it is refused: the old instance may still be the one asking.
-	if err := s.Register(guest, "runner-2", "two"); !errors.Is(err, ErrRegistered) {
+	if err := s.Register(guest, "runner-2", "two", nil); !errors.Is(err, ErrRegistered) {
 		t.Fatalf("double register err = %v, want ErrRegistered", err)
 	}
 	fetch(t, s, http.MethodGet, Path, from(guest))
-	if err := s.Register(guest, "runner-2", "two"); !errors.Is(err, ErrRegistered) {
+	if err := s.Register(guest, "runner-2", "two", nil); !errors.Is(err, ErrRegistered) {
 		t.Fatalf("register over a served tombstone err = %v, want ErrRegistered", err)
 	}
 	s.Revoke(guest)
@@ -108,7 +108,7 @@ func TestRevokeAndReuseAddress(t *testing.T) {
 		t.Fatalf("fetch after revoke = %d, want 403", code)
 	}
 	// A recycled IP gets only its new instance's config.
-	if err := s.Register(guest, "runner-2", "two"); err != nil {
+	if err := s.Register(guest, "runner-2", "two", nil); err != nil {
 		t.Fatalf("register after revoke: %v", err)
 	}
 	if code, body := fetch(t, s, http.MethodGet, Path, from(guest)); code != http.StatusOK || body != "two" {
@@ -119,7 +119,7 @@ func TestRevokeAndReuseAddress(t *testing.T) {
 func TestRevokeBeforeFetch(t *testing.T) {
 	// A launch abandoned before the instance asked leaves nothing to fetch.
 	s := New(time.Minute, nil)
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+	if err := s.Register(guest, "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	s.Revoke(guest)
@@ -132,7 +132,7 @@ func TestIPv4MappedAddresses(t *testing.T) {
 	// A dual-stack listener reports IPv4 peers as ::ffff:a.b.c.d; they must
 	// match a registration made with the plain IPv4 address, and vice versa.
 	s := New(time.Minute, nil)
-	if err := s.Register(netip.MustParseAddr("::ffff:10.0.1.17"), "runner-1", "secret"); err != nil {
+	if err := s.Register(netip.MustParseAddr("::ffff:10.0.1.17"), "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	if !s.Pending(guest) {
@@ -145,7 +145,7 @@ func TestIPv4MappedAddresses(t *testing.T) {
 
 func TestRejectsBadRequests(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+	if err := s.Register(guest, "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	cases := []struct {
@@ -179,7 +179,7 @@ func TestRegisterValidation(t *testing.T) {
 		"no runner":   {guest, "", "j"},
 		"no config":   {guest, "r", ""},
 	} {
-		if err := s.Register(c.ip, c.runner, c.jit); !errors.Is(err, ErrInvalid) {
+		if err := s.Register(c.ip, c.runner, c.jit, nil); !errors.Is(err, ErrInvalid) {
 			t.Errorf("%s: err = %v, want ErrInvalid", name, err)
 		}
 	}
@@ -188,7 +188,7 @@ func TestRegisterValidation(t *testing.T) {
 func TestConcurrentFetchesServeOnce(t *testing.T) {
 	// A retrying guest may race itself; exactly one request gets the config.
 	s := New(time.Minute, nil)
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+	if err := s.Register(guest, "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	var ok atomic.Int32
@@ -213,7 +213,7 @@ func TestOverRealListener(t *testing.T) {
 	s := New(time.Minute, nil)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
-	if err := s.Register(netip.MustParseAddr("127.0.0.1"), "runner-1", "secret"); err != nil {
+	if err := s.Register(netip.MustParseAddr("127.0.0.1"), "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	get := func() (int, string) {
@@ -261,7 +261,7 @@ func TestReportFromTheServedAddress(t *testing.T) {
 	s := New(time.Minute, nil)
 	now := time.Unix(1_000_000, 0)
 	s.now = func() time.Time { return now }
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+	if err := s.Register(guest, "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	// Before its config is served, the address cannot report: the runner
@@ -304,7 +304,7 @@ func TestReportFromTheServedAddress(t *testing.T) {
 
 func TestReportFromAForeignAddressForbidden(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+	if err := s.Register(guest, "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	fetch(t, s, http.MethodGet, Path, from(guest))
@@ -318,7 +318,7 @@ func TestReportFromAForeignAddressForbidden(t *testing.T) {
 
 func TestReportAfterRevokeIgnored(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+	if err := s.Register(guest, "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	fetch(t, s, http.MethodGet, Path, from(guest))
@@ -327,7 +327,7 @@ func TestReportAfterRevokeIgnored(t *testing.T) {
 		t.Fatalf("report after revoke = %d, want 403", code)
 	}
 	// The address's next registration starts with no report.
-	if err := s.Register(guest, "runner-2", "secret2"); err != nil {
+	if err := s.Register(guest, "runner-2", "secret2", nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.Report(guest); got != (Report{}) {
@@ -337,7 +337,7 @@ func TestReportAfterRevokeIgnored(t *testing.T) {
 
 func TestReportRejectsBadRequests(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+	if err := s.Register(guest, "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	fetch(t, s, http.MethodGet, Path, from(guest))
@@ -367,7 +367,7 @@ func TestReportRejectsBadRequests(t *testing.T) {
 // forgotten.
 func TestCacheBundleOnceAfterTheConfig(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.RegisterWithCache(guest, "runner-1", "secret", []byte(`{"key":"k"}`)); err != nil {
+	if err := s.RegisterWithCache(guest, "runner-1", "secret", []byte(`{"key":"k"}`), nil); err != nil {
 		t.Fatal(err)
 	}
 	if code, _ := fetch(t, s, http.MethodGet, CachePath, from(guest)); code != http.StatusForbidden {
@@ -396,13 +396,13 @@ func TestCacheBundleOnceAfterTheConfig(t *testing.T) {
 
 func TestCacheBundleRules(t *testing.T) {
 	s := New(time.Minute, nil)
-	if err := s.RegisterWithCache(guest, "runner-1", "secret", nil); err == nil {
+	if err := s.RegisterWithCache(guest, "runner-1", "secret", nil, nil); err == nil {
 		t.Fatal("registered with an empty bundle")
 	}
-	if err := s.Register(guest, "runner-1", "secret"); err != nil {
+	if err := s.Register(guest, "runner-1", "secret", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RegisterWithCache(guest, "runner-2", "secret", []byte("b")); err == nil {
+	if err := s.RegisterWithCache(guest, "runner-2", "secret", []byte("b"), nil); err == nil {
 		t.Fatal("a second registration took the address")
 	}
 	fetch(t, s, http.MethodGet, Path, from(guest))
@@ -416,7 +416,7 @@ func TestCacheBundleDroppedWithAnExpiredConfig(t *testing.T) {
 	s := New(time.Minute, nil)
 	now := time.Unix(1_000_000, 0)
 	s.now = func() time.Time { return now }
-	if err := s.RegisterWithCache(guest, "runner-1", "secret", []byte("key")); err != nil {
+	if err := s.RegisterWithCache(guest, "runner-1", "secret", []byte("key"), nil); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(2 * time.Minute)
@@ -436,11 +436,12 @@ func TestOnJobOnce(t *testing.T) {
 	heard := make(chan string, 8)
 	other := make(chan string, 8)
 	neighbour := netip.MustParseAddr("10.0.3.9")
-	for ip, c := range map[netip.Addr]chan string{guest: heard, neighbour: other} {
-		if err := s.Register(ip, "runner-"+ip.String(), "secret"); err != nil {
-			t.Fatal(err)
-		}
-		s.OnJob(ip, func(runner string) { c <- runner })
+	if err := s.Register(guest, "runner-1", "secret", func(runner string) { heard <- runner }); err != nil {
+		t.Fatal(err)
+	}
+	// Last, so that a hook shared by the whole server would be this one.
+	if err := s.Register(neighbour, "runner-2", "secret", func(runner string) { other <- runner }); err != nil {
+		t.Fatal(err)
 	}
 	fetch(t, s, http.MethodGet, Path, from(guest))
 	for _, q := range []string{"phase=job", "phase=job", "phase=exited&rc=0"} {
@@ -449,7 +450,7 @@ func TestOnJobOnce(t *testing.T) {
 	report(t, s, from(foreign), "phase=job") // forbidden: no hook
 	select {
 	case h := <-heard:
-		if h != "runner-"+guest.String() {
+		if h != "runner-1" {
 			t.Fatalf("heard %q", h)
 		}
 	case <-time.After(2 * time.Second):

@@ -185,17 +185,9 @@ type VMJobs interface {
 // this address, whose scope the instance would then act in. release undoes
 // all of it.
 func (p *Provisioner) register(ip netip.Addr, name, jit string) (release func(), err error) {
-	release, err = p.bind(ip, name, jit)
-	if err == nil && p.o.OnRunnerJob != nil {
-		p.o.JIT.OnJob(ip, p.o.OnRunnerJob)
-	}
-	return release, err
-}
-
-func (p *Provisioner) bind(ip netip.Addr, name, jit string) (release func(), err error) {
 	c := p.o.Cache
 	if c == nil || !p.o.EC2.Cache {
-		if err := p.o.JIT.Register(ip, name, jit); err != nil {
+		if err := p.o.JIT.Register(ip, name, jit, p.o.OnRunnerJob); err != nil {
 			return nil, err
 		}
 		return func() { p.o.JIT.Revoke(ip) }, nil
@@ -207,12 +199,12 @@ func (p *Provisioner) bind(ip netip.Addr, name, jit string) (release func(), err
 	bundle, err := c.CA.Bundle(c.LeafTTL, c.Upstream, git)
 	if err != nil {
 		p.log.Warn("no cache bundle; the job runs without the cache", "runner", name, "err", err)
-		if err := p.o.JIT.Register(ip, name, jit); err != nil {
+		if err := p.o.JIT.Register(ip, name, jit, p.o.OnRunnerJob); err != nil {
 			return nil, err
 		}
 		return func() { p.o.JIT.Revoke(ip) }, nil
 	}
-	if err := p.o.JIT.RegisterWithCache(ip, name, jit, bundle); err != nil {
+	if err := p.o.JIT.RegisterWithCache(ip, name, jit, bundle, p.o.OnRunnerJob); err != nil {
 		return nil, err
 	}
 	if c.Jobs == nil {

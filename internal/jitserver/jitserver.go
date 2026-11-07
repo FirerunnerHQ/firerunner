@@ -127,11 +127,14 @@ func New(ttl time.Duration, log *slog.Logger) *Server {
 // an early request gets 403 and the guest retries. An address keeps its
 // registration, served or not, until Revoke, so a recycled IP never inherits a
 // stale config.
-func (s *Server) Register(ip netip.Addr, runner, jit string) error {
-	return s.register(ip, runner, jit, nil)
+//
+// onJob, if not nil, is told once, when this runner reports its job. It belongs
+// to the registration, so on a shard each tenant hears only of its own runners.
+func (s *Server) Register(ip netip.Addr, runner, jit string, onJob func(runner string)) error {
+	return s.register(ip, runner, jit, nil, onJob)
 }
 
-func (s *Server) register(ip netip.Addr, runner, jit string, cache []byte) error {
+func (s *Server) register(ip netip.Addr, runner, jit string, cache []byte, onJob func(string)) error {
 	ip = ip.Unmap()
 	if !ip.IsValid() || ip.IsUnspecified() || runner == "" || jit == "" {
 		return ErrInvalid
@@ -141,20 +144,8 @@ func (s *Server) register(ip netip.Addr, runner, jit string, cache []byte) error
 	if e, ok := s.entries[ip]; ok {
 		return errors.Join(ErrRegistered, errors.New("held by runner "+e.runner))
 	}
-	s.entries[ip] = &entry{runner: runner, jit: jit, expires: s.now().Add(s.ttl), cache: cache}
+	s.entries[ip] = &entry{runner: runner, jit: jit, expires: s.now().Add(s.ttl), cache: cache, onJob: onJob}
 	return nil
-}
-
-// OnJob sets fn to be told, once, when the runner registered at ip reports its
-// job. It belongs to the registration, so on a shard each tenant hears only of
-// its own runners. Call it right after registering: a report comes only after
-// the instance has fetched its config and started its runner.
-func (s *Server) OnJob(ip netip.Addr, fn func(runner string)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.entries[ip.Unmap()]; ok {
-		e.onJob = fn
-	}
 }
 
 // RegisterWithCache is Register with a cache bundle (the proxy's TLS
@@ -162,11 +153,11 @@ func (s *Server) OnJob(ip netip.Addr, fn func(runner string)) {
 // instance cannot fetch its config before the bundle is there. The bundle is
 // handed out once at CachePath to that address after its config. It holds a
 // private key, so nothing logs it.
-func (s *Server) RegisterWithCache(ip netip.Addr, runner, jit string, bundle []byte) error {
+func (s *Server) RegisterWithCache(ip netip.Addr, runner, jit string, bundle []byte, onJob func(runner string)) error {
 	if len(bundle) == 0 {
 		return ErrInvalid
 	}
-	return s.register(ip, runner, jit, append([]byte(nil), bundle...))
+	return s.register(ip, runner, jit, append([]byte(nil), bundle...), onJob)
 }
 
 // Revoke drops ip's registration, served or not. The launcher calls it when
