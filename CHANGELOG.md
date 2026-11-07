@@ -8,10 +8,13 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-06
+
 ### Added
 
 - `FR_JOB_EVENTS_DSN` keeps each job's stages, machine and result in Postgres. It
-  is part of `proprietary/`, for the hosted service.
+  is part of `proprietary/`, for the hosted service, and is off unless set. The
+  release binaries now include that code, under its own license.
 - `images/layer-ec2-ami.sh`, which puts a firerunner release on an existing AMI.
   It took 84 s, against about 40 minutes for a full build.
 
@@ -128,7 +131,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.6
 [0.1.5]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.5
 [0.1.4]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.4
 [0.1.3]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.3

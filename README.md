@@ -1374,7 +1374,9 @@ Notes:
 ## License
 
 [MIT](./LICENSE), copyright Kaik, Inc. The `LICENSE` file lists the directories
-that carry a different license.
+that carry a different license. Release binaries are built from the whole repository, so
+they include the code under `proprietary/`, which stays under
+[its own license](./proprietary/LICENSE).
 
 ## Contributing
 
