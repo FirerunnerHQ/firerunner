@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/actions/scaleset"
+
+	"github.com/firerunnerhq/firerunner/internal/health"
 )
 
 // Scale does what actions/scaleset v0.4.0's listener did with a message, in its
@@ -48,15 +51,42 @@ func TestScaleActsOnAMessage(t *testing.T) {
 // failing would keep it, and one that always fails would block the tier.
 func TestScaleGoesOnWhenJobsCannotBeAcquired(t *testing.T) {
 	var desired []int
+	var ended error
 	a := &scaler{log: testLogger(), stats: &statsRecorder{},
-		acquire:   func(context.Context, []int64) ([]int64, error) { return nil, errors.New("503") },
-		onDesired: func(_ context.Context, n int) int { desired = append(desired, n); return n },
+		acquire:    func(context.Context, []int64) ([]int64, error) { return nil, errors.New("503") },
+		onDesired:  func(_ context.Context, n int) int { desired = append(desired, n); return n },
+		endSession: func(err error) { ended = err },
 	}
 	msg := &scaleset.RunnerScaleSetMessage{MessageID: 1, Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 2},
 		JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 7}}}}
 	if err := a.Scale(context.Background(), msg); err != nil || fmt.Sprint(desired) != "[2]" {
 		t.Fatalf("Scale = %v, desired %v", err, desired)
 	}
+	if ended == nil {
+		t.Fatal("the session goes on: a new one would offer the jobs again")
+	}
+}
+
+// A session ended that way is reopened as after a failure, and its message is
+// deleted before it ends.
+func TestFailedAcquisitionReopensTheSession(t *testing.T) {
+	fastReconnect(t)
+	first := newFakeSession(0, false)
+	first.failAcquire.Store(true)
+	first.msgs <- &scaleset.RunnerScaleSetMessage{MessageID: 9, Statistics: &scaleset.RunnerScaleSetStatistic{},
+		JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 7}}}}
+	tr := health.NewTracker("a")
+	o := &opener{results: []openResult{{sess: newFakeSession(0, false)}}}
+	ss := testScaleSet("a", first, o, tr)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ss.Run(ctx, func(context.Context, int) int { return 0 }, nil, nil, nil) }()
+	eventually(t, "a new session", func() bool { return o.opened() >= 1 })
+	if got := first.deleted(); fmt.Sprint(got) != "[9]" {
+		t.Fatalf("deleted %v: the message must go before the session", got)
+	}
+	// status and doctor say why, not only that the session ended.
+	eventually(t, "the reason in health", func() bool { return strings.Contains(tr.Snapshot().LastError, "acquire jobs") })
 }
 
 // A message in hand is acted on in full though the session's context ends.

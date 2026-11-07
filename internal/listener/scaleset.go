@@ -385,6 +385,7 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		log:          s.log,
 		stats:        &s.stats,
 		acquire:      ts.AcquireJobs,
+		endSession:   func(err error) { cancel(fmt.Errorf("%w: %w", errSessionEnded, err)) },
 	}
 	if capacity != nil {
 		a.capacity = capacity
@@ -392,14 +393,22 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		a.advertiseCapacity()
 	}
 	err = l.Run(ctx, a)
-	if errors.Is(context.Cause(ctx), errRecycled) {
+	switch cause := context.Cause(ctx); {
+	case errors.Is(cause, errRecycled):
 		return errRecycled
+	case errors.Is(cause, errSessionEnded):
+		return cause
 	}
 	return err
 }
 
-// errRecycled ends a session that Recycle asked to replace.
-var errRecycled = errors.New("session recycled")
+var (
+	// errRecycled ends a session that Recycle asked to replace.
+	errRecycled = errors.New("session recycled")
+	// errSessionEnded ends a session Scale gave up on, to reopen it as after
+	// any failure.
+	errSessionEnded = errors.New("session ended")
+)
 
 // Stats returns the scale set statistics GitHub sent with the latest
 // message, and when they arrived; ok is false before the first.
@@ -649,6 +658,8 @@ type scaler struct {
 	// none; acquire asks GitHub for the jobs a message offers.
 	stats   *statsRecorder
 	acquire func(ctx context.Context, ids []int64) ([]int64, error)
+	// endSession ends the session once the message in hand is deleted.
+	endSession func(error)
 }
 
 var _ sslistener.Scaler = (*scaler)(nil)
@@ -679,9 +690,14 @@ func (a *scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 		a.log.Info("acquiring jobs", "count", len(ids))
 		// A failure is not the message's: failing it would have the listener
 		// keep it, and one that always fails would block every later message.
-		// GitHub offers an unacquired job again, as when v0.4.0 lost it.
+		// As v0.4.0 did, the session ends instead, and a new one offers the
+		// jobs again; the message is deleted first, as the context it is
+		// handled in does not end with the session.
 		if acquired, err := a.acquire(ctx, ids); err != nil {
-			a.log.Warn("could not acquire jobs", "count", len(ids), "err", err)
+			a.log.Warn("could not acquire jobs; reopening the session", "count", len(ids), "err", err)
+			if a.endSession != nil {
+				a.endSession(fmt.Errorf("acquire jobs: %w", err))
+			}
 		} else {
 			a.log.Info("jobs acquired", "count", len(acquired))
 		}
