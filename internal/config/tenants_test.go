@@ -11,7 +11,7 @@ import (
 
 func tenantConfig(tenants ...Tenant) *Config {
 	return &Config{
-		URL: "https://github.com/home", AppClientID: "Iv1", Tenants: tenants,
+		URL: "https://github.com/home", AppClientID: "Iv1", AppPrivateKey: "key.pem", Tenants: tenants,
 		Tiers: []Tier{
 			{Name: "cloud", Provisioner: ProvisionerEC2, Min: 2, Schedule: &schedule.Schedule{},
 				EC2: &EC2Tier{Cache: true, GitCache: true, Pool: 3, PoolFor: &PoolFor{}}},
@@ -69,6 +69,11 @@ func TestValidateTenants(t *testing.T) {
 	c.AppClientID = ""
 	if err := c.validateTenants(); err == nil {
 		t.Error("tenants on a token: accepted")
+	}
+	c = tenantConfig(goodTenant())
+	c.Token, c.AppPrivateKey = "ghp_x", ""
+	if err := c.validateTenants(); err == nil {
+		t.Error("tenants with a client id but no key: accepted")
 	}
 }
 

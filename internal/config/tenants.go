@@ -49,8 +49,8 @@ func (c *Config) validateTenants() error {
 	if len(c.Tenants) == 0 {
 		return nil
 	}
-	if c.AppClientID == "" {
-		return errors.New("--tenants needs GitHub App credentials: a token reaches one organization")
+	if c.AppClientID == "" || c.AppPrivateKey == "" {
+		return errors.New("--tenants needs a GitHub App's client id and key: a token reaches one organization")
 	}
 	if strings.Contains(c.Owner, "/") {
 		return fmt.Errorf("--owner %q: with --tenants it cannot hold a slash, which starts a tenant's owner tag", c.Owner)
