@@ -32,7 +32,7 @@ func (c *Config) ResolvePrivateKey() (string, error) {
 	const flagName = "--app-private-key"
 	v := c.AppPrivateKey
 	if v == "" {
-		if c.AppClientID != "" && c.Token == "" {
+		if c.AppClientID != "" && c.Token == "" && c.AppKMSKey == "" {
 			return "", errors.New(flagName + " is required with --app-client-id (or set --token)")
 		}
 		return "", nil

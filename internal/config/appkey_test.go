@@ -190,3 +190,28 @@ func TestFromFlags_AppNeedsInstallationID(t *testing.T) {
 		t.Fatalf("err %v", err)
 	}
 }
+
+func TestAppKMSKey(t *testing.T) {
+	base := []string{"--url", "https://github.com/acme", "--app-client-id", "Iv1", "--app-installation-id", "7",
+		"--kernel", "/vmlinux", "--golden", "/golden.ext4", "--ext-iface", "eth0"}
+	c, err := FromFlags(append(base, "--app-kms-key", "alias/github-app"))
+	if err != nil {
+		t.Fatalf("a KMS key in place of a private key: %v", err)
+	}
+	if key, err := c.ResolvePrivateKey(); err != nil || key != "" {
+		t.Fatalf("ResolvePrivateKey = %q, %v: with KMS there is none to resolve", key, err)
+	}
+	if _, err := FromFlags(append(base, "--app-kms-key", "alias/a", "--app-private-key", "/k.pem")); err == nil {
+		t.Fatal("both a KMS key and a private key: accepted")
+	}
+	noClient := []string{"--url", "https://github.com/acme", "--token", "t", "--app-kms-key", "alias/a",
+		"--kernel", "/vmlinux", "--golden", "/golden.ext4", "--ext-iface", "eth0"}
+	if _, err := FromFlags(noClient); err == nil {
+		t.Fatal("a KMS key without a client id: accepted")
+	}
+	if c, err := FromFlags(base); err != nil {
+		t.Fatal(err)
+	} else if _, err := c.ResolvePrivateKey(); err == nil {
+		t.Fatal("an App with neither key: accepted")
+	}
+}

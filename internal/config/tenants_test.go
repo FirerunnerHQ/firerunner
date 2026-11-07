@@ -129,3 +129,12 @@ func TestLoadTenants(t *testing.T) {
 		t.Fatal("a missing file: no error")
 	}
 }
+
+// A KMS key stands in for the App's key, for tenants as for the install.
+func TestTenantsWithAKMSKey(t *testing.T) {
+	c := tenantConfig(goodTenant())
+	c.AppPrivateKey, c.AppKMSKey = "", "alias/github-app"
+	if err := c.validateTenants(); err != nil {
+		t.Fatalf("a KMS key refused: %v", err)
+	}
+}

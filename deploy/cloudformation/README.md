@@ -54,6 +54,14 @@ firerunner keeps each job's stages, machine and result there. The code is under
 [`proprietary/`](../../proprietary/LICENSE). A database that is down costs that
 record, never a job.
 
+## Keeping the App key in KMS (optional)
+
+Import the GitHub App's private key into an AWS KMS key with `KeySpec` `RSA_2048`
+and `KeyUsage` `SIGN_VERIFY`, and pass its ARN as the stack's `AppKMSKeyArn`. The
+VM's role may then only `kms:Sign` with it (RS256 over a digest), firerunner signs
+the App's JWTs there, and `<prefix>/control/app-private-key` is not read: no copy
+of the key reaches the VM. Each signature is in CloudTrail.
+
 ## Tenants (optional)
 
 Store a JSON array as the String `<prefix>/control/tenants`, and the VM serves

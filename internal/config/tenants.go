@@ -50,7 +50,7 @@ func (c *Config) validateTenants() error {
 	if len(c.Tenants) == 0 {
 		return nil
 	}
-	if c.AppClientID == "" || c.AppPrivateKey == "" {
+	if c.AppClientID == "" || (c.AppPrivateKey == "" && c.AppKMSKey == "") {
 		return errors.New("--tenants needs a GitHub App's client id and key: a token reaches one organization")
 	}
 	if strings.Contains(c.Owner, "/") {

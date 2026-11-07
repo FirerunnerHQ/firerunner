@@ -25,10 +25,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/actions/scaleset"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
 	awssq "github.com/aws/aws-sdk-go-v2/service/servicequotas"
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
@@ -701,6 +701,29 @@ func ec2Preflight(cfg *config.Config) []diag.Check {
 	return out
 }
 
+// newAppJWT returns the App's JWT source, for every tenant and client in the
+// process: its key from --app-private-key, or AWS KMS, where the key never
+// leaves the service. Nil for a PAT install.
+func newAppJWT(ctx context.Context, cfg *config.Config, privateKey string) (*ghauth.JWT, error) {
+	switch {
+	case cfg.AppClientID == "":
+		return nil, nil
+	case cfg.AppKMSKey != "":
+		awsCfg, err := loadAWSConfig(ctx, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("--app-kms-key: %w", err)
+		}
+		return ghauth.NewJWT(cfg.AppClientID, ghauth.KMSSigner{API: kms.NewFromConfig(awsCfg), KeyID: cfg.AppKMSKey}), nil
+	case privateKey != "":
+		key, err := config.ParseAppPrivateKey([]byte(privateKey))
+		if err != nil {
+			return nil, fmt.Errorf("GitHub App private key: %w", err)
+		}
+		return ghauth.NewJWT(cfg.AppClientID, ghauth.KeySigner{Key: key}), nil
+	}
+	return nil, nil
+}
+
 // loadAWSConfig loads the default credential chain (the control VM's
 // instance role). The region is --aws-region when set, else the SDK's usual
 // sources, falling back to IMDS.
@@ -777,24 +800,15 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 
 	// One JWT source for the shard: every tenant is an installation of one App.
-	var appJWT *ghauth.JWT
-	if privateKey != "" && cfg.AppClientID != "" {
-		key, err := config.ParseAppPrivateKey([]byte(privateKey))
-		if err != nil {
-			return fmt.Errorf("GitHub App private key: %w", err)
-		}
-		appJWT = ghauth.NewJWT(cfg.AppClientID, ghauth.KeySigner{Key: key})
+	appJWT, err := newAppJWT(ctx, cfg, privateKey)
+	if err != nil {
+		return err
 	}
 
 	// A static install is one tenant, made from its flags.
 	t := tenant{
 		Owner: owner, URL: cfg.URL, RunnerGroup: cfg.RunnerGroup, KeepOnClose: cfg.Owner != "",
 		Token: cfg.Token,
-		App: scaleset.GitHubAppAuth{
-			ClientID:       cfg.AppClientID,
-			InstallationID: cfg.AppInstallID,
-			PrivateKey:     privateKey,
-		},
 		Tiers: cfg.EffectiveTiers(),
 	}
 	if appJWT != nil {
@@ -898,7 +912,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// there touches nobody else. They end with runCtx, and drain themselves.
 	var tenants sync.WaitGroup
 	for _, c := range cfg.Tenants {
-		l := s.loop(extraTenant(cfg, c, owner, privateKey, appJWT), live)
+		l := s.loop(extraTenant(cfg, c, owner, appJWT), live)
 		tenants.Go(func() { l.run(runCtx) })
 	}
 

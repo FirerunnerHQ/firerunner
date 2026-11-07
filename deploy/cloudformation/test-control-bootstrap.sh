@@ -129,6 +129,15 @@ expect "app key: unhealthy unit names this instance" "" \
 	grep -q 'set-instance-health --instance-id i-0123 --health-status Unhealthy' "$FR_ROOT/etc/systemd/system/firerunner-unhealthy.service"
 expect "app key: instance left healthy" "$(cat "$STATE/autoscaling" 2>/dev/null)" test ! -f "$STATE/autoscaling"
 
+# With the App's key in KMS, the VM is told the key's ARN and fetches no key,
+# even one left in SSM.
+setup
+printf 'FR_APP_KMS_KEY=arn:aws:kms:us-west-2:123456789012:key/0aaa\n' >> "$FR_ROOT/etc/firerunner/bootstrap.env"
+expect "kms key: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "kms key: env names it" "$(envfile)" grep -qx "FR_APP_KMS_KEY=arn:aws:kms:us-west-2:123456789012:key/0aaa" <(envfile)
+expect "kms key: no key on disk" "" test ! -e "$FR_ROOT/etc/firerunner/app-key.pem"
+expect "kms key: no key in the env" "$(envfile)" bash -c "! grep -q FR_APP_PRIVATE_KEY '$FR_ROOT/etc/firerunner/firerunner.env'"
+
 # A Postgres URL for job events reaches the env file, and only when it is set.
 setup
 echo "postgres://u:p(w'\$x@db/fr" > "$STATE/ssm/job-events-dsn"
@@ -267,7 +276,8 @@ m = re.search(r"Fn::Base64: !Sub\n            - \|\n(.*?)\n            - ZoneId"
 body = "\n".join(l[14:] for l in m.group(1).split("\n"))
 vals = {"AWS::Region": "us-west-2", "ParameterPrefix": "/fr", "Owner": "prod-a", "AWS::StackName": "fr",
         "ZoneId": "Z123", "JitName": "control", "ZoneName": "fr.internal", "JitPort": "8098", "ReleaseRepo": "acme/fr",
-        "Cache": "s3", "CachePort": "8099", "CacheBucketName": "fr-cache-bucket", "RootVolumeGiB": "30"}
+        "Cache": "s3", "CachePort": "8099", "CacheBucketName": "fr-cache-bucket", "RootVolumeGiB": "30",
+        "AppKMSKeyArn": ""}
 body = re.sub(r"\$\{([A-Za-z:]+)\}", lambda m: vals[m.group(1)], body)
 print(body.replace("/etc/firerunner", sys.argv[2] + "/etc/firerunner"))
 PY2
