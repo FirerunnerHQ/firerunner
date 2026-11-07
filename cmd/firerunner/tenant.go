@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -86,6 +89,7 @@ func (s *shard) identityHooks(ctx context.Context, t tenant) (tenantHooks, error
 // tier's index means the same in each.
 type servedTenant struct {
 	t           tenant
+	log         *slog.Logger
 	tiers       []config.Tier
 	trackers    []*health.Tracker
 	provs       []provisioner.Provisioner
@@ -137,6 +141,28 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner, privateKey string) 
 	}
 }
 
+// loop builds the loop that keeps t running on this shard.
+func (s *shard) loop(t tenant, live *liveTenants) *tenantLoop {
+	return &tenantLoop{
+		id: t.ID,
+		start: func(ctx context.Context) (*servedTenant, error) {
+			st, err := s.start(ctx, t, tenantHooks{})
+			if err == nil {
+				st.logTiers()
+			}
+			return st, err
+		},
+		serve: func(ctx context.Context, cancel context.CancelFunc, st *servedTenant) error {
+			return serveTiers(ctx, cancel, st.names(), st.runs(s.cfg), st.log)
+		},
+		stop: func(st *servedTenant) {
+			st.drain()
+			st.close(context.Background())
+		},
+		live: live, log: s.log, min: tenantRetryMin, max: tenantRetryMax,
+	}
+}
+
 // tierKey names a tier uniquely on a shard: tenants share the default labels.
 func (t tenant) tierKey(tier string) string {
 	if t.ID == "" {
@@ -152,7 +178,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	if t.ID != "" {
 		log = log.With("tenant", t.ID)
 	}
-	st := &servedTenant{t: t, tiers: t.Tiers}
+	st := &servedTenant{t: t, tiers: t.Tiers, log: log}
 
 	// The REST runner list behind --runner-sweep, shared by the tenant's tiers.
 	if cfg.RunnerSweep != "off" {
@@ -259,52 +285,70 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	return st, nil
 }
 
-// servedTenants are a shard's running tenants.
-type servedTenants []*servedTenant
-
-func (ss servedTenants) close(ctx context.Context) {
-	for _, st := range ss {
-		st.close(ctx)
+// names returns each tier's shard-wide name, in runs' order.
+func (st *servedTenant) names() []string {
+	var out []string
+	for _, tier := range st.tiers {
+		out = append(out, st.t.tierKey(tier.Name))
 	}
+	return out
 }
 
-func (ss servedTenants) drain() {
-	for _, st := range ss {
-		st.drain()
-	}
+// liveTenants is what the health file reports: the tenants being served, and
+// for each that is not, why.
+type liveTenants struct {
+	mu      sync.Mutex
+	served  []*servedTenant
+	waiting map[string]*health.Tracker
 }
 
-func (ss servedTenants) trackers() []*health.Tracker {
+func (l *liveTenants) add(st *servedTenant) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.served = append(l.served, st)
+	delete(l.waiting, st.t.ID)
+}
+
+func (l *liveTenants) remove(st *servedTenant) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.served = slices.DeleteFunc(l.served, func(x *servedTenant) bool { return x == st })
+}
+
+// wait records that a tenant is down until its next try.
+func (l *liveTenants) wait(id string, err error, backoff time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.waiting == nil {
+		l.waiting = map[string]*health.Tracker{}
+	}
+	tr, ok := l.waiting[id]
+	if !ok {
+		tr = health.NewTracker(id)
+		l.waiting[id] = tr
+	}
+	tr.Reconnecting(err, backoff)
+}
+
+func (l *liveTenants) trackers() []*health.Tracker {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	var out []*health.Tracker
-	for _, st := range ss {
+	for _, st := range l.served {
 		out = append(out, st.trackers...)
 	}
-	return out
-}
-
-// names returns every tier's shard-wide name, in runs' order.
-func (ss servedTenants) names() []string {
-	var out []string
-	for _, st := range ss {
-		for _, tier := range st.tiers {
-			out = append(out, st.t.tierKey(tier.Name))
-		}
+	for _, id := range slices.Sorted(maps.Keys(l.waiting)) {
+		out = append(out, l.waiting[id])
 	}
 	return out
 }
 
-func (ss servedTenants) runs(cfg *config.Config, log *slog.Logger) []func(context.Context) error {
-	var out []func(context.Context) error
-	for _, st := range ss {
-		out = append(out, st.runs(cfg, log)...)
-	}
-	return out
-}
-
-// reaper adds up the tenants' reapers' latest sweeps.
-func (ss servedTenants) reaper() *health.Reaper {
+// reaper adds up the served tenants' latest sweeps.
+func (l *liveTenants) reaper() *health.Reaper {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	var sum *health.Reaper
-	for _, st := range ss {
+	for _, st := range l.served {
 		if st.reaperState == nil {
 			continue
 		}
@@ -335,6 +379,67 @@ func (ss servedTenants) reaper() *health.Reaper {
 	return sum
 }
 
+// A tenant that stops is tried again after these, doubling.
+const (
+	tenantRetryMin = 30 * time.Second
+	tenantRetryMax = 5 * time.Minute
+)
+
+// tenantLoop keeps one tenant running for as long as its context lives. What
+// goes wrong with it stays with it: a session it must register again, an App
+// since removed, a start that fails. Its goroutines end with each try.
+type tenantLoop struct {
+	id       string
+	start    func(ctx context.Context) (*servedTenant, error)
+	serve    func(ctx context.Context, cancel context.CancelFunc, st *servedTenant) error
+	stop     func(st *servedTenant)
+	live     *liveTenants
+	log      *slog.Logger
+	min, max time.Duration
+}
+
+func (l *tenantLoop) run(ctx context.Context) {
+	wait := l.min
+	for ctx.Err() == nil {
+		err := l.try(ctx, &wait)
+		if ctx.Err() != nil {
+			return
+		}
+		l.log.Error("tenant stopped; trying again", "tenant", l.id, "err", err, "in", wait)
+		l.live.wait(l.id, err, wait)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		wait = min(wait*2, l.max)
+	}
+}
+
+// try serves the tenant until it stops, and resets the wait if it served for
+// longer than the longest one.
+func (l *tenantLoop) try(ctx context.Context, wait *time.Duration) error {
+	tctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	st, err := l.start(tctx)
+	if err != nil {
+		return err
+	}
+	began := time.Now()
+	l.live.add(st)
+	defer l.live.remove(st)
+	err = l.serve(tctx, cancel, st)
+	cancel()
+	l.stop(st)
+	if time.Since(began) > l.max {
+		*wait = l.min
+	}
+	if err == nil {
+		err = errors.New("its tiers stopped")
+	}
+	return err
+}
+
 // close closes the tenant's scale set sessions.
 func (st *servedTenant) close(ctx context.Context) {
 	for _, l := range st.listeners {
@@ -343,7 +448,8 @@ func (st *servedTenant) close(ctx context.Context) {
 }
 
 // logTiers says what each tier runs on.
-func (st *servedTenant) logTiers(log *slog.Logger) {
+func (st *servedTenant) logTiers() {
+	log := st.log
 	for i, t := range st.tiers {
 		if t.IsEC2() {
 			log.Info("serving tier",
@@ -360,7 +466,8 @@ func (st *servedTenant) logTiers(log *slog.Logger) {
 }
 
 // runs returns one function per tier that serves it until its context ends.
-func (st *servedTenant) runs(cfg *config.Config, log *slog.Logger) []func(context.Context) error {
+func (st *servedTenant) runs(cfg *config.Config) []func(context.Context) error {
+	log := st.log
 	runs := make([]func(context.Context) error, len(st.listeners))
 	for i := range st.listeners {
 		lis, sched, tracker, prov, tier := st.listeners[i], st.scheds[i], st.trackers[i], st.provs[i], st.tiers[i]

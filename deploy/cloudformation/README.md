@@ -64,10 +64,8 @@ those installations too, on the same GitHub App and tier catalog:
 ```
 
 Each gets its own scale sets and the owner tag `<owner>/<id>`, which the VM's role
-and the reaper Lambda also cover. A tenant that cannot
-start is logged and skipped. Its tiers run with caches off, and each tier's `max`
-applies per tenant.
-
+and the reaper Lambda also cover. A tenant that stops is tried again by itself,
+and shows in `firerunner status` meanwhile; the others are not touched.
 ## Before the first deploy
 
 You need:

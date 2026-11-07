@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"testing"
 	"time"
 
@@ -56,32 +59,113 @@ func TestExtraTenant(t *testing.T) {
 // order of the runs they label.
 func TestServedTenantNames(t *testing.T) {
 	tiers := []config.Tier{{Name: "a"}, {Name: "b"}}
-	ss := servedTenants{
-		{tiers: tiers},
-		{t: tenant{ID: "t1"}, tiers: tiers},
-	}
-	if got, want := fmt.Sprint(ss.names()), "[a b t1/a t1/b]"; got != want {
-		t.Fatalf("names = %s, want %s", got, want)
+	home, other := servedTenant{tiers: tiers}, servedTenant{t: tenant{ID: "t1"}, tiers: tiers}
+	if got := fmt.Sprint(home.names(), other.names()); got != "[a b] [t1/a t1/b]" {
+		t.Fatalf("names = %s", got)
 	}
 }
 
-func TestServedTenantsReaper(t *testing.T) {
+func TestLiveTenantsReaper(t *testing.T) {
 	early, late := time.Unix(100, 0), time.Unix(200, 0)
 	first := &health.Reaper{At: early, Instances: []string{"i-1"}}
-	ss := servedTenants{
+	l := &liveTenants{served: []*servedTenant{
 		{},
 		{reaperState: func() *health.Reaper { return nil }},
 		{reaperState: func() *health.Reaper { return first }},
 		{reaperState: func() *health.Reaper { return &health.Reaper{At: late, Instances: []string{"i-2"}, Error: "denied"} }},
-	}
-	got := ss.reaper()
+	}}
+	got := l.reaper()
 	if !got.At.Equal(late) || fmt.Sprint(got.Instances) != "[i-1 i-2]" || got.Error != "denied" {
 		t.Fatalf("sum = %+v", got)
 	}
 	if len(first.Instances) != 1 {
 		t.Fatalf("the sum changed a reaper's own report: %+v", first)
 	}
-	if (servedTenants{{}}).reaper() != nil {
+	if (&liveTenants{served: []*servedTenant{{}}}).reaper() != nil {
 		t.Fatal("no reaper reports something")
 	}
+}
+
+// A tenant that cannot start is reported, is tried again, and leaves health
+// when it stops.
+func TestTenantLoopRetriesAFailedStart(t *testing.T) {
+	live := &liveTenants{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serving := make(chan *servedTenant, 1)
+	stopped := make(chan *servedTenant, 1)
+	sawDown := make(chan bool, 1)
+	tries := 0
+	l := &tenantLoop{
+		id: "t1", live: live, log: slog.New(slog.DiscardHandler), min: time.Millisecond, max: time.Millisecond,
+		start: func(context.Context) (*servedTenant, error) {
+			tries++
+			if tries == 1 {
+				return nil, errors.New("no such App")
+			}
+			sawDown <- slices.ContainsFunc(live.trackers(), func(tr *health.Tracker) bool {
+				return tr.Snapshot().Name == "t1" && tr.Snapshot().State == health.Reconnecting
+			})
+			return &servedTenant{t: tenant{ID: "t1"}, trackers: []*health.Tracker{health.NewTracker("t1/a")}}, nil
+		},
+		serve: func(ctx context.Context, _ context.CancelFunc, st *servedTenant) error {
+			serving <- st
+			<-ctx.Done()
+			return nil
+		},
+		stop: func(st *servedTenant) { stopped <- st },
+	}
+	done := make(chan struct{})
+	go func() { l.run(ctx); close(done) }()
+
+	st := <-serving
+	if !<-sawDown {
+		t.Fatal("a tenant that failed to start was not reported")
+	}
+	if names := trackerNames(live); names != "[t1/a]" {
+		t.Fatalf("while serving, health shows %s", names)
+	}
+	cancel()
+	if got := <-stopped; got != st {
+		t.Fatal("stopped another tenant")
+	}
+	<-done
+	if names := trackerNames(live); names != "[]" {
+		t.Fatalf("after stopping, health shows %s", names)
+	}
+}
+
+// The context a try runs in ends before the tenant is drained, taking its
+// pools and reaper, and the tenant is then tried again.
+func TestTenantLoopEndsATriesContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ended := make(chan struct{})
+	tries := 0
+	l := &tenantLoop{
+		id: "t1", live: &liveTenants{}, log: slog.New(slog.DiscardHandler), min: time.Millisecond, max: time.Millisecond,
+		start: func(tctx context.Context) (*servedTenant, error) {
+			tries++
+			if tries == 1 {
+				go func() { <-tctx.Done(); close(ended) }()
+				return &servedTenant{t: tenant{ID: "t1"}}, nil
+			}
+			cancel()
+			return nil, errors.New("done")
+		},
+		serve: func(context.Context, context.CancelFunc, *servedTenant) error { return errors.New("restart") },
+		stop:  func(*servedTenant) { <-ended },
+	}
+	l.run(ctx)
+	if tries != 2 {
+		t.Fatalf("tries = %d, want it tried again after stopping", tries)
+	}
+}
+
+func trackerNames(l *liveTenants) string {
+	names := []string{}
+	for _, tr := range l.trackers() {
+		names = append(names, tr.Snapshot().Name)
+	}
+	return fmt.Sprint(names)
 }
