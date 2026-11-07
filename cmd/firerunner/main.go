@@ -569,14 +569,6 @@ func tierPending(t config.Tier, shared *scheduler.PendingLaunches) *scheduler.Pe
 	return shared
 }
 
-func tierNames(tiers []config.Tier) []string {
-	names := make([]string, len(tiers))
-	for i, t := range tiers {
-		names[i] = t.Name
-	}
-	return names
-}
-
 // healthBreakers converts the EC2 launch options backing off for the health
 // file.
 func healthBreakers(bs []ec2.Breaker) []health.Breaker {
@@ -596,10 +588,10 @@ const healthInterval = 10 * time.Second
 // publishHealth writes the trackers' state, with whatever fill adds (the
 // reaper's, the EC2 breakers) when fill is non-nil, to path now and every
 // healthInterval until the returned func is called, which writes it once more.
-func publishHealth(path string, trackers []*health.Tracker, fill func(*health.File), log *slog.Logger) func() {
+func publishHealth(path string, trackers func() []*health.Tracker, fill func(*health.File), log *slog.Logger) func() {
 	write := func() {
 		f := health.File{PID: os.Getpid(), WrittenAt: time.Now().UTC()}
-		for _, tr := range trackers {
+		for _, tr := range trackers() {
 			f.Tiers = append(f.Tiers, tr.Snapshot())
 		}
 		if fill != nil {
@@ -848,13 +840,16 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return err
 	}
 	defer served.close(context.WithoutCancel(ctx))
+	live := &liveTenants{}
+	live.add(served)
 
 	log.Info("firerunner starting",
 		"url", cfg.URL,
 		"tiers", len(served.tiers),
+		"tenants", len(cfg.Tenants),
 		"maxRunners", cfg.MaxRunners,
 	)
-	served.logTiers(log)
+	served.logTiers()
 
 	if s.fc != nil {
 		// Reclaim taps and job dirs orphaned by a previous unclean exit before
@@ -870,10 +865,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	// Publish each tier's listener health for status and doctor.
 	healthPath := filepath.Join(cfg.Firecracker.WorkDir, health.FileName)
-	stopHealth := publishHealth(healthPath, served.trackers, func(f *health.File) {
-		if served.reaperState != nil {
-			f.Reaper = served.reaperState()
-		}
+	stopHealth := publishHealth(healthPath, live.trackers, func(f *health.File) {
+		f.Reaper = live.reaper()
 		if s.ec2Client != nil {
 			f.EC2Breakers = healthBreakers(s.ec2Client.Breakers())
 		}
@@ -887,7 +880,16 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	runErr := serveTiers(runCtx, cancel, tierNames(served.tiers), served.runs(cfg, log), log)
+	// Each other tenant has a loop of its own, so that a slow start or a failure
+	// there touches nobody else. They end with runCtx, and drain themselves.
+	var tenants sync.WaitGroup
+	for _, c := range cfg.Tenants {
+		l := s.loop(extraTenant(cfg, c, owner, privateKey), live)
+		tenants.Go(func() { l.run(runCtx) })
+	}
+
+	runErr := serveTiers(runCtx, cancel, served.names(), served.runs(cfg), log)
+	cancel()
 	// No tier is listening any more. Stop refreshing the health file before
 	// the drain, which can wait out long jobs: a file that keeps its last
 	// write time ages into "stale" instead of claiming live listeners.
@@ -895,6 +897,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	log.Info("shutdown signalled, draining in-flight microVMs")
 	served.drain()
+	tenants.Wait()
 	log.Info("firerunner stopped")
 
 	if runErr != nil && ctx.Err() == nil {

@@ -32,3 +32,11 @@ if before.count("- Effect: Allow") != 1 or "- Effect" in after:  # the one befor
 if byoc.count("PolicyName:") != 1 or "ManagedPolicyArns" in byoc:
     sys.exit("FAIL byoc-role.yaml grants more than its one runner-compute policy")
 print("ok   byoc-role.yaml grants only the runner-compute policy")
+
+# A tenant's instances carry <owner>/<id>, so every grant on the owner tag must
+# reach them, or its launches are denied while its scale sets look healthy.
+for name in ("control.yaml", "byoc-role.yaml", "reaper.yaml"):
+    for line in open(os.path.join(HERE, name)):
+        if "Tag/firerunner:owner" in line and '[!Ref Owner, !Sub "${Owner}/*"]' not in line:
+            sys.exit(f"FAIL {name}: an owner condition leaves out tenants: {line.strip()}")
+print("ok   every owner condition covers the install's tenants")

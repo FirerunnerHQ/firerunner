@@ -27,6 +27,7 @@
 #   app-private-key  SecureString: the GitHub App key, or
 #   token            SecureString: a PAT (one of the two)
 #   job-events-dsn   SecureString: Postgres URL that keeps job events (optional)
+#   tenants          tenants served beside this install, JSON (optional)
 #
 # On any failure it marks the instance unhealthy, so the group replaces it.
 set -euo pipefail
@@ -122,6 +123,11 @@ if [ -n "$dsn" ]; then
 	# anything a shell would act on.
 	printf '%s\n' "$dsn" > "$etc/job-events-dsn"
 	echo "FR_JOB_EVENTS_DSN_FILE=$etc/job-events-dsn" >> "$etc/firerunner.env"
+fi
+tenants=$(param tenants)
+if [ -n "$tenants" ]; then
+	printf '%s\n' "$tenants" > "$etc/tenants.json"
+	echo "FR_TENANTS=$etc/tenants.json" >> "$etc/firerunner.env"
 fi
 key=$(param app-private-key)
 token=$(param token)

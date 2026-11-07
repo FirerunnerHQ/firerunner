@@ -162,7 +162,7 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
-                Condition: { StringEquals: { "aws:RequestTag/firerunner:owner": !Ref Owner } }
+                Condition: { StringLike: { "aws:RequestTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] } }
               - Effect: Allow
                 Action: ec2:RunInstances
                 Resource:
@@ -183,14 +183,13 @@ Resources:
                 Action: ec2:CreateTags
                 Resource: "*"
                 Condition:
-                  StringEquals:
-                    ec2:CreateAction: RunInstances
-                    "aws:RequestTag/firerunner:owner": !Ref Owner
+                  StringEquals: { ec2:CreateAction: RunInstances }
+                  StringLike: { "aws:RequestTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] }
               - Effect: Allow
                 Action: ec2:CreateTags
                 Resource: "*"
                 Condition:
-                  StringEquals: { "aws:ResourceTag/firerunner:owner": !Ref Owner }
+                  StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] }
                   ForAllValues:StringNotEquals: { aws:TagKeys: [firerunner:owner] }
               - Effect: Allow
                 Action:
@@ -209,11 +208,11 @@ Resources:
               - Effect: Allow
                 Action: [ec2:TerminateInstances, ec2:StartInstances, ec2:ModifyInstanceAttribute]
                 Resource: "*"
-                Condition: { StringEquals: { "aws:ResourceTag/firerunner:owner": !Ref Owner } }
+                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] } }
               - Effect: Allow
                 Action: ec2:CancelSpotInstanceRequests
                 Resource: "*"
-                Condition: { StringEquals: { "aws:ResourceTag/firerunner:owner": !Ref Owner } }
+                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] } }
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/*"

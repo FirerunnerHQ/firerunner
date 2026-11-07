@@ -92,7 +92,7 @@ class ReaperTest(unittest.TestCase):
 
     def test_scoped_to_owner_and_running_states(self):
         _, ec2 = self.run_reaper([])
-        self.assertIn({"Name": "tag:firerunner:owner", "Values": ["acme"]}, ec2.filters)
+        self.assertIn({"Name": "tag:firerunner:owner", "Values": ["acme", "acme/*"]}, ec2.filters)
         self.assertIn({"Name": "instance-state-name", "Values": ["pending", "running", "stopped"]}, ec2.filters)
 
     def test_cancels_the_spot_request_before_terminating(self):
