@@ -3,9 +3,7 @@ package ghrunners
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,19 +14,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/actions/scaleset"
+	"github.com/firerunnerhq/firerunner/internal/ghauth"
 )
 
 // tokenExpiry is when the fake server's installation tokens expire.
 var tokenExpiry = func() time.Time { return time.Now().Add(time.Hour) }
 
-func testKey(t *testing.T) string {
+func testKey(t *testing.T) *rsa.PrivateKey {
 	t.Helper()
 	k, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}))
+	return k
 }
 
 // server serves n runners under scope, 100 per page, and installation
@@ -61,7 +59,7 @@ func server(t *testing.T, scope string, n int, perms *string, tokens *int) *http
 
 func client(t *testing.T, srv *httptest.Server, rawURL, pat string) *Client {
 	t.Helper()
-	c, err := New(rawURL, pat, scaleset.GitHubAppAuth{ClientID: "Iv1.x", InstallationID: 42, PrivateKey: testKey(t)})
+	c, err := New(rawURL, pat, ghauth.App{InstallationID: 42, JWT: ghauth.NewJWT("Iv1.x", ghauth.KeySigner{Key: testKey(t)})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +115,7 @@ func TestErrors(t *testing.T) {
 		t.Fatalf("err = %v, want the HTTP status", err)
 	}
 	for _, bad := range []string{"http://github.com/acme", "https://github.com/", "https://github.com/a/b/c"} {
-		if _, err := New(bad, "x", scaleset.GitHubAppAuth{}); err == nil {
+		if _, err := New(bad, "x", ghauth.App{}); err == nil {
 			t.Errorf("New(%q) accepted", bad)
 		}
 	}
@@ -234,7 +232,7 @@ func TestTokenWithoutExpiryRejected(t *testing.T) {
 }
 
 func TestEnterpriseURLRejected(t *testing.T) {
-	if _, err := New("https://github.com/enterprises/acme", "x", scaleset.GitHubAppAuth{}); err == nil || !strings.Contains(err.Error(), "enterprise") {
+	if _, err := New("https://github.com/enterprises/acme", "x", ghauth.App{}); err == nil || !strings.Contains(err.Error(), "enterprise") {
 		t.Fatalf("err = %v", err)
 	}
 }

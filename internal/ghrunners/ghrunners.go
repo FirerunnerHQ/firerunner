@@ -17,8 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/actions/scaleset"
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/firerunnerhq/firerunner/internal/ghauth"
 )
 
 // Runner is a self-hosted runner as the REST API lists it.
@@ -37,7 +36,7 @@ type Client struct {
 	scope string // "/orgs/ORG" or "/repos/OWNER/REPO"
 	repo  bool
 	pat   string
-	app   scaleset.GitHubAppAuth
+	app   ghauth.App
 	http  *http.Client
 	now   func() time.Time
 	// CacheFor is how long a listing is reused (default 1m).
@@ -55,7 +54,7 @@ type Client struct {
 
 // New returns a client for the runners under rawURL (https://HOST/ORG or
 // https://HOST/OWNER/REPO), authenticated by a PAT, else the App.
-func New(rawURL, pat string, app scaleset.GitHubAppAuth) (*Client, error) {
+func New(rawURL, pat string, app ghauth.App) (*Client, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return nil, errors.New("ghrunners: the GitHub URL must use https")
@@ -140,17 +139,12 @@ func (c *Client) auth(ctx context.Context) (string, error) {
 	if c.token != "" && c.expiry.Sub(now) > time.Minute {
 		return c.token, nil
 	}
-	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(c.app.PrivateKey))
-	if err != nil {
-		return "", fmt.Errorf("ghrunners: App private key: %w", err)
+	if !c.app.Valid() {
+		return "", errors.New("ghrunners: no PAT and no GitHub App")
 	}
-	signed, err := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.RegisteredClaims{
-		Issuer:    c.app.ClientID,
-		IssuedAt:  jwt.NewNumericDate(now.Add(-time.Minute)),
-		ExpiresAt: jwt.NewNumericDate(now.Add(9 * time.Minute)),
-	}).SignedString(key)
+	signed, err := c.app.JWT.Token(ctx)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("ghrunners: App JWT: %w", err)
 	}
 	perm := "organization_self_hosted_runners"
 	if c.repo {

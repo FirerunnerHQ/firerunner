@@ -15,6 +15,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/ec2"
+	"github.com/firerunnerhq/firerunner/internal/ghauth"
 	"github.com/firerunnerhq/firerunner/internal/ghrunners"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jitserver"
@@ -39,6 +40,8 @@ type tenant struct {
 	KeepOnClose bool
 	Token       string
 	App         scaleset.GitHubAppAuth
+	// Auth is App's installation, with JWTs signed once for the whole shard.
+	Auth ghauth.App
 	Tiers       []config.Tier
 }
 
@@ -66,7 +69,7 @@ type tenantHooks struct {
 
 // identityHooks resolves a tenant's job identities with its own credentials.
 func (s *shard) identityHooks(ctx context.Context, t tenant) (tenantHooks, error) {
-	resolver, err := jobidentity.NewGitHub(t.URL, t.Token, t.App)
+	resolver, err := jobidentity.NewGitHub(t.URL, t.Token, t.Auth)
 	if err != nil {
 		return tenantHooks{}, err
 	}
@@ -125,7 +128,7 @@ func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracke
 }
 
 // extraTenant is a tenant from the --tenants file, on the install's App.
-func extraTenant(cfg *config.Config, c config.Tenant, owner, privateKey string) tenant {
+func extraTenant(cfg *config.Config, c config.Tenant, owner, privateKey string, jwt *ghauth.JWT) tenant {
 	group := c.RunnerGroup
 	if group == "" {
 		group = cfg.RunnerGroup
@@ -137,6 +140,7 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner, privateKey string) 
 			InstallationID: c.InstallationID,
 			PrivateKey:     privateKey,
 		},
+		Auth:  ghauth.App{InstallationID: c.InstallationID, JWT: jwt},
 		Tiers: cfg.TenantTiers(c),
 	}
 }
@@ -182,7 +186,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 
 	// The REST runner list behind --runner-sweep, shared by the tenant's tiers.
 	if cfg.RunnerSweep != "off" {
-		list, err := ghrunners.New(t.URL, t.Token, t.App)
+		list, err := ghrunners.New(t.URL, t.Token, t.Auth)
 		if err != nil {
 			log.Warn("runner sweep disabled", "err", err)
 		} else {

@@ -14,8 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/actions/scaleset"
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/firerunnerhq/firerunner/internal/ghauth"
 )
 
 // GitHub resolves only authenticated REST data. Tokens never enter job records.
@@ -24,7 +23,7 @@ type GitHub struct {
 	base      string
 	client    *http.Client
 	pat       string
-	app       scaleset.GitHubAppAuth
+	app       ghauth.App
 	mu        sync.Mutex
 	tokens    map[string]installationToken
 	resolveMu sync.Mutex
@@ -45,7 +44,7 @@ type runResult struct {
 	expiry   time.Time
 }
 
-func NewGitHub(rawURL, pat string, app scaleset.GitHubAppAuth) (*GitHub, error) {
+func NewGitHub(rawURL, pat string, app ghauth.App) (*GitHub, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return nil, errors.New("GitHub URL must use https")
@@ -76,15 +75,13 @@ func (g *GitHub) auth(ctx context.Context, repo string) (string, error) {
 	if t := g.tokens[repo]; t.value != "" && time.Until(t.expiry) > time.Minute {
 		return t.value, nil
 	}
-	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(g.app.PrivateKey))
-	if err != nil {
-		return "", err
+	if !g.app.Valid() {
+		return "", errors.New("no PAT and no GitHub App")
 	}
 	now := time.Now()
-	t := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.RegisteredClaims{Issuer: g.app.ClientID, IssuedAt: jwt.NewNumericDate(now.Add(-time.Minute)), ExpiresAt: jwt.NewNumericDate(now.Add(9 * time.Minute))})
-	signed, err := t.SignedString(key)
+	signed, err := g.app.JWT.Token(ctx)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("App JWT: %w", err)
 	}
 	var result struct {
 		Token     string    `json:"token"`

@@ -3,11 +3,6 @@ package diag
 import (
 	"bytes"
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +13,7 @@ import (
 	"time"
 
 	"github.com/firerunnerhq/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/ghauth"
 )
 
 // githubAPIBase derives the REST API base URL from the configured org/repo URL,
@@ -293,27 +289,12 @@ func appPermissions(granted map[string]string, repo, cache bool) Check {
 
 // appJWT builds the short-lived RS256 JWT GitHub requires to authenticate as a
 // GitHub App. The issuer is the App's client ID (GitHub also accepts the App
-// ID). Kept stdlib-only: PKCS#1/PKCS#8 PEM parsing + rsa.SignPKCS1v15.
+// ID).
 func appJWT(issuer, pemKey string, now time.Time) (string, error) {
 	key, err := config.ParseAppPrivateKey([]byte(pemKey))
 	if err != nil {
 		return "", err
 	}
-	enc := base64.RawURLEncoding.EncodeToString
-	header := enc([]byte(`{"alg":"RS256","typ":"JWT"}`))
-	claims, err := json.Marshal(map[string]any{
-		"iat": now.Add(-60 * time.Second).Unix(),
-		"exp": now.Add(9 * time.Minute).Unix(), // GitHub caps App JWTs at 10 min
-		"iss": issuer,
-	})
-	if err != nil {
-		return "", err
-	}
-	signingInput := header + "." + enc(claims)
-	sum := sha256.Sum256([]byte(signingInput))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, sum[:])
-	if err != nil {
-		return "", err
-	}
-	return signingInput + "." + enc(sig), nil
+	j := ghauth.NewJWT(issuer, ghauth.KeySigner{Key: key}).WithClock(func() time.Time { return now })
+	return j.Token(context.Background())
 }
