@@ -74,7 +74,7 @@ Parameters:
   AppKMSKeyArn:
     Type: String
     Default: ""
-    AllowedPattern: "(arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/[0-9a-f-]+)?"
+    AllowedPattern: "(arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/(mrk-)?[0-9a-f-]+)?"
     Description: >-
       An AWS KMS key holding the GitHub App's private key (see the README,
       "Keeping the App key in KMS"). Set, the VM signs with it and is given
