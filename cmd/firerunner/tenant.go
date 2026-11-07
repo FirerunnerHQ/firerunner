@@ -41,8 +41,8 @@ type tenant struct {
 	Token       string
 	App         scaleset.GitHubAppAuth
 	// Auth is App's installation, with JWTs signed once for the whole shard.
-	Auth ghauth.App
-	Tiers       []config.Tier
+	Auth  ghauth.App
+	Tiers []config.Tier
 }
 
 // shard holds what a process's tenants share. Its EC2 client carries the
