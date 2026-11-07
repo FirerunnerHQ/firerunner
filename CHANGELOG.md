@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-07
+
 ### Added
 
 - `FR_APP_KMS_KEY` signs the GitHub App's JWTs with a key kept in AWS KMS, so
@@ -153,7 +155,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.8
 [0.1.7]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.7
 [0.1.6]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.6
 [0.1.5]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.5
