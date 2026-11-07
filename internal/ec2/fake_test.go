@@ -134,7 +134,9 @@ type fakeEC2 struct {
 	runErrs   map[string]error
 	runs      []*ec2.RunInstancesInput
 	runOpts   []func(*ec2.Options)
-	attempts  []string // "type/subnet/market" of every RunInstances call
+	runAt     time.Time // when RunInstances last arrived
+	startAt   time.Time // when StartInstances last arrived
+	attempts  []string  // "type/subnet/market" of every RunInstances call
 	instances map[string]*fakeInstance
 	order     []string
 	next      int
@@ -229,6 +231,7 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, opt
 	itype, subnet, mkt := string(in.InstanceType), aws.ToString(in.SubnetId), market(in)
 	f.runs = append(f.runs, in)
 	f.runOpts = opts
+	f.runAt = time.Now()
 	f.attempts = append(f.attempts, itype+"/"+subnet+"/"+mkt)
 	if err := f.runErr(itype, subnet, mkt); err != nil {
 		f.mu.Unlock()
@@ -410,6 +413,7 @@ func (f *fakeEC2) DescribeSpotInstanceRequests(_ context.Context, in *ec2.Descri
 func (f *fakeEC2) StartInstances(_ context.Context, in *ec2.StartInstancesInput, _ ...func(*ec2.Options)) (*ec2.StartInstancesOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.startAt = time.Now()
 	if f.startErr != nil {
 		return nil, f.startErr
 	}

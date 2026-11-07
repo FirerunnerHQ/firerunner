@@ -18,6 +18,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/jobevent"
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 )
 
@@ -47,6 +48,8 @@ type Config struct {
 	// scale set (JobAvailable, JobAssigned), as it arrives: the cache's
 	// identity discovery takes its candidate runs from them.
 	OnJobOffered func(jobidentity.Job)
+	// Events, if set, is told of each job's assignment, start and end.
+	Events jobevent.Sink
 	// Pending, if set, keeps the tier's assigned-but-not-started jobs, read
 	// from each message before the library acts on it.
 	Pending *assigned.Jobs
@@ -363,7 +366,7 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		s.recycle = nil
 		s.mu.Unlock()
 	}()
-	l, err := sslistener.New(trackedSession{session: sess, health: s.health, pending: s.cfg.Pending, offered: s.cfg.OnJobOffered, log: s.log, chaos: chaosExitAfterDelete()}, sslistener.Config{
+	l, err := sslistener.New(trackedSession{session: sess, health: s.health, pending: s.cfg.Pending, events: s.cfg.Events, tier: s.cfg.Name, offered: s.cfg.OnJobOffered, log: s.log, chaos: chaosExitAfterDelete()}, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
 		Logger:     s.log.WithGroup("scaleset"),
@@ -376,6 +379,8 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		onJobStarted: s.cfg.OnJobStarted,
 		onBusy:       onBusy,
 		onCompleted:  onCompleted,
+		events:       s.cfg.Events,
+		tier:         s.cfg.Name,
 		maxRunners:   s.cfg.MaxRunners,
 		log:          s.log,
 	}
@@ -459,6 +464,8 @@ type trackedSession struct {
 	health  *health.Tracker
 	pending *assigned.Jobs
 	offered func(jobidentity.Job)
+	events  jobevent.Sink
+	tier    string
 	log     *slog.Logger
 	// chaos exits the process after DeleteMessage (see chaosExitAfterDelete).
 	chaos bool
@@ -496,6 +503,15 @@ func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapaci
 			}
 		}
 	}
+	if err == nil && m != nil {
+		for _, a := range m.JobAssignedMessages {
+			if a != nil {
+				e := jobEvent(jobevent.Assigned, t.tier, a.JobMessageBase)
+				e.At = a.ScaleSetAssignTime
+				jobevent.Record(t.events, e)
+			}
+		}
+	}
 	if err == nil && m != nil && t.offered != nil {
 		for _, a := range m.JobAvailableMessages {
 			if a != nil {
@@ -519,6 +535,15 @@ func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapaci
 func offeredJob(b scaleset.JobMessageBase) jobidentity.Job {
 	return jobidentity.Job{WorkflowRef: b.JobWorkflowRef, Repository: b.OwnerName + "/" + b.RepositoryName,
 		Event: b.EventName, RunID: b.WorkflowRunID, JobID: b.JobID}
+}
+
+// jobEvent fills an event from what every GitHub job message carries.
+func jobEvent(kind jobevent.Kind, tier string, b scaleset.JobMessageBase) jobevent.Event {
+	return jobevent.Event{
+		Kind: kind, Tier: tier, JobID: b.JobID, Repository: b.OwnerName + "/" + b.RepositoryName,
+		Workflow: b.JobWorkflowRef, JobName: b.JobDisplayName, EventName: b.EventName,
+		RunID: b.WorkflowRunID, Labels: b.RequestLabels, QueuedAt: b.QueueTime,
+	}
 }
 
 // jobAssignedAttrs are a JobAssigned message's log attributes. GitHub's
@@ -616,6 +641,8 @@ type scaler struct {
 	onDesired    DesiredFunc
 	onBusy       BusyFunc
 	onCompleted  CompletedFunc
+	events       jobevent.Sink
+	tier         string
 	capacity     CapacityFunc
 	setCapacity  func(int)
 	maxRunners   int
@@ -657,6 +684,9 @@ func (a *scaler) advertiseCapacity() {
 func (a *scaler) HandleJobStarted(ctx context.Context, j *scaleset.JobStarted) error {
 	a.log.Info("job started", "runner", j.RunnerName, "runnerRequestId", j.RunnerRequestID,
 		"repository", j.OwnerName+"/"+j.RepositoryName, "runId", j.WorkflowRunID, "jobId", j.JobID)
+	e := jobEvent(jobevent.Started, a.tier, j.JobMessageBase)
+	e.Runner, e.At = j.RunnerName, j.RunnerAssignTime
+	jobevent.Record(a.events, e)
 	if a.onBusy != nil && j.RunnerName != "" {
 		a.onBusy(j.RunnerName)
 	}
@@ -668,6 +698,9 @@ func (a *scaler) HandleJobStarted(ctx context.Context, j *scaleset.JobStarted) e
 
 func (a *scaler) HandleJobCompleted(_ context.Context, j *scaleset.JobCompleted) error {
 	a.log.Info("job completed", "runner", j.RunnerName, "result", j.Result)
+	e := jobEvent(jobevent.Completed, a.tier, j.JobMessageBase)
+	e.Runner, e.Result, e.At = j.RunnerName, j.Result, j.FinishTime
+	jobevent.Record(a.events, e)
 	if a.onCompleted != nil && j.RunnerName != "" {
 		a.onCompleted(j.RunnerName)
 	}

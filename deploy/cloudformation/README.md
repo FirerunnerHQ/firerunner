@@ -47,6 +47,13 @@ credentials are stack parameters and SSM parameters.
 3. Any failure marks the instance unhealthy. The group replaces it, and the
    log says why (see [Debugging](#debugging)).
 
+## Job events (optional)
+
+Store a Postgres URL as the SecureString `<prefix>/control/job-events-dsn`, and
+firerunner keeps each job's stages, machine and result there. The code is under
+[`proprietary/`](../../proprietary/LICENSE). A database that is down costs that
+record, never a job.
+
 ## Before the first deploy
 
 You need:

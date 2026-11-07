@@ -10,6 +10,8 @@ and this project adheres to
 
 ### Added
 
+- `FR_JOB_EVENTS_DSN` keeps each job's stages, machine and result in Postgres. It
+  is part of `proprietary/`, for the hosted service.
 - `images/layer-ec2-ami.sh`, which puts a firerunner release on an existing AMI.
   It took 84 s, against about 40 minutes for a full build.
 

@@ -43,12 +43,14 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/ghrunners"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jitserver"
+	"github.com/firerunnerhq/firerunner/internal/jobevent"
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 	"github.com/firerunnerhq/firerunner/internal/listener"
 	"github.com/firerunnerhq/firerunner/internal/provisioner"
 	"github.com/firerunnerhq/firerunner/internal/reconcile"
 	"github.com/firerunnerhq/firerunner/internal/schedule"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
+	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
 // version is overridable at build time via -ldflags; see buildVersion for
@@ -743,7 +745,37 @@ func newEC2Client(ctx context.Context, cfg *config.Config, log *slog.Logger) (*e
 	return ec2.NewClient(awsec2.NewFromConfig(awsCfg), awsssm.NewFromConfig(awsCfg), 0, log.With("component", "ec2")), nil
 }
 
+// openJobEvents returns where job events go, and how to close it. The store
+// connects in the background, so a database that is down costs the record, never
+// a job, nor any time at start.
+func openJobEvents(cfg *config.Config, log *slog.Logger) (jobevent.Sink, func()) {
+	dsn := cfg.JobEventsDSN
+	if dsn == "" && cfg.JobEventsDSNFile != "" {
+		raw, err := os.ReadFile(cfg.JobEventsDSNFile)
+		if err != nil {
+			log.Warn("job events are off: cannot read the database URL's file", "file", cfg.JobEventsDSNFile)
+			return nil, func() {}
+		}
+		dsn = strings.TrimSpace(string(raw))
+	}
+	if dsn == "" {
+		return nil, func() {}
+	}
+	store, err := jobstore.New(dsn, log)
+	if err != nil {
+		log.Warn("job events are off", "err", err)
+		return nil, func() {}
+	}
+	return store, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		store.Close(ctx)
+	}
+}
+
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
+	events, closeEvents := openJobEvents(cfg, log)
+	defer closeEvents()
 	privateKey, err := cfg.ResolvePrivateKey()
 	if err != nil {
 		return err
@@ -865,6 +897,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				MaxLifetime: cfg.Firecracker.MaxVMLifetime,
 				UsePool:     tierJobs[t.Name].ClaimPool,
 				Cache:       ec2Cache,
+				Events:      events,
 				Launched:    tierHealth[t.Name].Launched,
 				FellBack:    tierHealth[t.Name].FellBack,
 				Interrupted: tierHealth[t.Name].Interrupted,
@@ -911,6 +944,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			URL:          cfg.URL,
 			OnJobStarted: onJobStarted,
 			OnJobOffered: onJobOffered,
+			Events:       events,
 			Health:       tracker,
 			Pending:      tierJobs[t.Name],
 			Name:         t.Name,

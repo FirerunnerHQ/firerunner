@@ -21,9 +21,18 @@ jobs:
   # change saves a fresh entry and the next run restores the nearest one.
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 20
     env:
       # The restored cache also holds test results: run every test anyway.
       GOFLAGS: -count=1
+      FR_TEST_POSTGRES_URL: postgres://postgres:test@127.0.0.1:5432/postgres?sslmode=disable
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
