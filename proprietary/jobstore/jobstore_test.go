@@ -226,6 +226,27 @@ func TestCloseLogsItsLosses(t *testing.T) {
 	}
 }
 
+// A database that hangs outlasts Close's deadline, and the loss still gets logged.
+func TestCloseLogsLossesWhenItGivesUp(t *testing.T) {
+	var out syncBuffer
+	hang := make(chan struct{})
+	defer close(hang)
+	s := fake(t, func(context.Context, []jobevent.Event) error {
+		<-hang
+		return nil
+	})
+	s.log = slog.New(slog.NewTextHandler(&out, nil))
+	go s.run()
+	s.Record(ev("a"))
+	s.dropped.Add(7)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	s.Close(ctx)
+	if !strings.Contains(out.String(), "events lost") {
+		t.Fatalf("log = %q", out.String())
+	}
+}
+
 type syncBuffer struct {
 	mu sync.Mutex
 	b  strings.Builder

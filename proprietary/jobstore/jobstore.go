@@ -103,6 +103,7 @@ func (s *Store) Close(ctx context.Context) {
 	case <-s.done:
 	case <-ctx.Done():
 	}
+	s.reportLoss() // the writer may still be stuck, and the process exits next
 	if s.pool != nil {
 		s.pool.Close()
 	}
