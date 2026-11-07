@@ -875,6 +875,9 @@ func authCheck(cfg *config.Config) Check {
 	if cfg.Token != "" {
 		return pass("auth", "PAT configured")
 	}
+	if cfg.AppKMSKey != "" {
+		return pass("auth", "GitHub App configured (client %s, installation %d), signing in KMS key %s", cfg.AppClientID, cfg.AppInstallID, cfg.AppKMSKey)
+	}
 	return pass("auth", "GitHub App configured (client %s, installation %d)", cfg.AppClientID, cfg.AppInstallID)
 }
 

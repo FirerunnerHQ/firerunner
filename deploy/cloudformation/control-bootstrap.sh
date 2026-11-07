@@ -20,6 +20,7 @@
 #   FR_CACHE_PORT its port (default 8099)
 #   FR_CACHE_BUCKET  with s3, the bucket (prefix firerunner-cache/)
 #   FR_ROOT_GIB   the root volume's size, which caps the cache's local use
+#   FR_APP_KMS_KEY  a KMS key that signs for the GitHub App; set, no key is read
 #
 # and these SSM parameters under $FR_PREFIX/control/:
 #   env              FR_* lines (non-secret): FR_URL, FR_APP_CLIENT_ID, ...
@@ -129,9 +130,17 @@ if [ -n "$tenants" ]; then
 	printf '%s\n' "$tenants" > "$etc/tenants.json"
 	echo "FR_TENANTS=$etc/tenants.json" >> "$etc/firerunner.env"
 fi
-key=$(param app-private-key)
-token=$(param token)
-if [ -n "$key" ]; then
+key='' token=''
+if [ -n "${FR_APP_KMS_KEY:-}" ]; then
+	# The key stays in KMS: nothing to fetch, and none on this disk.
+	echo "FR_APP_KMS_KEY=$FR_APP_KMS_KEY" >> "$etc/firerunner.env"
+else
+	key=$(param app-private-key)
+	token=$(param token)
+fi
+if [ -n "${FR_APP_KMS_KEY:-}" ]; then
+	:
+elif [ -n "$key" ]; then
 	printf '%s\n' "$key" > "$etc/app-key.pem"
 	echo "FR_APP_PRIVATE_KEY=$etc/app-key.pem" >> "$etc/firerunner.env"
 elif [ -n "$token" ]; then

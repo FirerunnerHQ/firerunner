@@ -173,3 +173,40 @@ func trackerNames(l *liveTenants) string {
 	}
 	return fmt.Sprint(names)
 }
+
+// With the App's key in KMS, a tenant's scale sets get installation tokens
+// narrowed to registering runners: org or repository, by its URL.
+func TestBrokeredTenantTokens(t *testing.T) {
+	jwt := ghauth.NewJWT("Iv1", nil)
+	org := tenant{URL: "https://github.com/acme", Auth: ghauth.App{InstallationID: 7, JWT: jwt}}
+	org.brokerTokens()
+	if org.Tokens == nil {
+		t.Fatal("no tokens for a tenant without a key")
+	}
+	withKey := org
+	withKey.Tokens = nil
+	withKey.App.PrivateKey = "pem"
+	withKey.brokerTokens()
+	if withKey.Tokens != nil {
+		t.Fatal("brokered tokens beside a key the library would use")
+	}
+	for url, want := range map[string]string{
+		"https://github.com/acme":     "map[organization_self_hosted_runners:write]",
+		"https://github.com/acme/app": "map[administration:write]",
+	} {
+		inst := registration(url, org.Auth)
+		if got := fmt.Sprint(inst.Permissions); got != want || inst.Base != "https://api.github.com" {
+			t.Errorf("%s: asks %s of %s", url, got, inst.Base)
+		}
+	}
+	s := &shard{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler)}
+	lc := s.listenerConfig(org, config.Tier{Name: "t", Max: 3}, tenantHooks{}, health.NewTracker("t"), assigned.New(nil), s.log)
+	if lc.Tokens == nil || lc.URL != org.URL || lc.Name != "t" || lc.MaxRunners != 3 {
+		t.Fatalf("listener config = %+v: its scale sets would have no credential", lc)
+	}
+	pat := tenant{URL: "https://github.com/acme", Token: "ghp_x"}
+	pat.brokerTokens()
+	if pat.Tokens != nil {
+		t.Fatal("brokered tokens for a PAT install")
+	}
+}

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,8 +43,11 @@ type tenant struct {
 	Token       string
 	App         scaleset.GitHubAppAuth
 	// Auth is App's installation, with JWTs signed once for the whole shard.
-	Auth  ghauth.App
-	Tiers []config.Tier
+	Auth ghauth.App
+	// Tokens, when the App's key is not in this process, gives its scale sets
+	// installation tokens narrowed to registering runners.
+	Tokens func(context.Context) (string, error)
+	Tiers  []config.Tier
 }
 
 // shard holds what a process's tenants share. Its EC2 client carries the
@@ -102,6 +107,30 @@ type servedTenant struct {
 	reaperState func() *health.Reaper
 }
 
+// listenerConfig is what a tier's scale set listener gets from its tenant.
+func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tracker *health.Tracker, jobs *assigned.Jobs, log *slog.Logger) listener.Config {
+	return listener.Config{
+		URL:          t.URL,
+		OnJobStarted: hooks.onJobStarted,
+		OnJobOffered: hooks.onJobOffered,
+		Events:       s.events,
+		Health:       tracker,
+		Pending:      jobs,
+		Name:         tier.Name,
+		RunnerGroup:  t.RunnerGroup,
+		Labels:       tier.Labels,
+		MaxRunners:   tier.Max,
+		// A named install outlives its process: keep its scale set across
+		// restarts and control VM replacements.
+		KeepOnClose: t.KeepOnClose,
+		Token:       t.Token,
+		Tokens:      t.Tokens,
+		App:         t.App,
+		Version:     version,
+		Logger:      log,
+	}
+}
+
 // ec2Options is what a tier's EC2 provisioner gets from its tenant and shard.
 func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracker *health.Tracker, jobs *assigned.Jobs) ec2.Options {
 	// A scheduled pool starts at the current window's size; the schedule
@@ -133,7 +162,7 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner, privateKey string, 
 	if group == "" {
 		group = cfg.RunnerGroup
 	}
-	return tenant{
+	t := tenant{
 		ID: c.ID, Owner: owner + "/" + c.ID, URL: c.URL, RunnerGroup: group, KeepOnClose: cfg.Owner != "",
 		App: scaleset.GitHubAppAuth{
 			ClientID:       cfg.AppClientID,
@@ -143,6 +172,34 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner, privateKey string, 
 		Auth:  ghauth.App{InstallationID: c.InstallationID, JWT: jwt},
 		Tiers: cfg.TenantTiers(c),
 	}
+	t.brokerTokens()
+	return t
+}
+
+// brokerTokens gives t's scale sets their tokens from its App installation when
+// there is no key to hand them. A scale set needs only to register runners.
+func (t *tenant) brokerTokens() {
+	if t.App.PrivateKey != "" || !t.Auth.Valid() {
+		return
+	}
+	if inst := registration(t.URL, t.Auth); inst != nil {
+		t.Tokens = inst.Token
+	}
+}
+
+// registration is an installation's tokens for registering runners at rawURL:
+// the org's self-hosted runners, or a repository's administration, which
+// GitHub asks of a repository's runner registration.
+func registration(rawURL string, app ghauth.App) *ghauth.Installation {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	perm := "organization_self_hosted_runners"
+	if parts := strings.Split(strings.Trim(u.Path, "/"), "/"); len(parts) == 2 {
+		perm = "administration"
+	}
+	return &ghauth.Installation{Base: ghrunners.APIBase(u), App: app, Permissions: map[string]string{perm: "write"}}
 }
 
 // loop builds the loop that keeps t running on this shard.
@@ -235,25 +292,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	// before we start booting microVMs.
 	for i, tier := range t.Tiers {
 		tlog := log.With("tier", tier.Name)
-		lis, err := listener.New(ctx, listener.Config{
-			URL:          t.URL,
-			OnJobStarted: hooks.onJobStarted,
-			OnJobOffered: hooks.onJobOffered,
-			Events:       s.events,
-			Health:       st.trackers[i],
-			Pending:      tierJobs[tier.Name],
-			Name:         tier.Name,
-			RunnerGroup:  t.RunnerGroup,
-			Labels:       tier.Labels,
-			MaxRunners:   tier.Max,
-			// A named install outlives its process: keep its scale set
-			// across restarts and control VM replacements.
-			KeepOnClose: t.KeepOnClose,
-			Token:       t.Token,
-			App:         t.App,
-			Version:     version,
-			Logger:      tlog,
-		}, t.Owner)
+		lis, err := listener.New(ctx, s.listenerConfig(t, tier, hooks, st.trackers[i], tierJobs[tier.Name], tlog), t.Owner)
 		if err != nil {
 			st.close(context.WithoutCancel(ctx))
 			return nil, fmt.Errorf("tier %q: %w", tier.Name, err)

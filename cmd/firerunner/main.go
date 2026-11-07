@@ -29,6 +29,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
 	awssq "github.com/aws/aws-sdk-go-v2/service/servicequotas"
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
@@ -701,6 +702,28 @@ func ec2Preflight(cfg *config.Config) []diag.Check {
 	return out
 }
 
+// newAppJWT returns the App's JWT source: its key from --app-private-key, or
+// AWS KMS, where the key never leaves the service. Nil for a PAT install.
+func newAppJWT(ctx context.Context, cfg *config.Config, privateKey string) (*ghauth.JWT, error) {
+	switch {
+	case cfg.AppClientID == "":
+		return nil, nil
+	case cfg.AppKMSKey != "":
+		awsCfg, err := loadAWSConfig(ctx, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("--app-kms-key: %w", err)
+		}
+		return ghauth.NewJWT(cfg.AppClientID, ghauth.KMSSigner{API: kms.NewFromConfig(awsCfg), KeyID: cfg.AppKMSKey}), nil
+	case privateKey != "":
+		key, err := config.ParseAppPrivateKey([]byte(privateKey))
+		if err != nil {
+			return nil, fmt.Errorf("GitHub App private key: %w", err)
+		}
+		return ghauth.NewJWT(cfg.AppClientID, ghauth.KeySigner{Key: key}), nil
+	}
+	return nil, nil
+}
+
 // loadAWSConfig loads the default credential chain (the control VM's
 // instance role). The region is --aws-region when set, else the SDK's usual
 // sources, falling back to IMDS.
@@ -777,13 +800,9 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 
 	// One JWT source for the shard: every tenant is an installation of one App.
-	var appJWT *ghauth.JWT
-	if privateKey != "" && cfg.AppClientID != "" {
-		key, err := config.ParseAppPrivateKey([]byte(privateKey))
-		if err != nil {
-			return fmt.Errorf("GitHub App private key: %w", err)
-		}
-		appJWT = ghauth.NewJWT(cfg.AppClientID, ghauth.KeySigner{Key: key})
+	appJWT, err := newAppJWT(ctx, cfg, privateKey)
+	if err != nil {
+		return err
 	}
 
 	// A static install is one tenant, made from its flags.
@@ -799,6 +818,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	if appJWT != nil {
 		t.Auth = ghauth.App{InstallationID: cfg.AppInstallID, JWT: appJWT}
+		t.brokerTokens()
 	}
 	s := &shard{cfg: cfg, log: log, events: events}
 
