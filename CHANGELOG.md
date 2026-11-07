@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-07
+
 ### Added
 
 - `FR_TENANTS` serves more installations from one daemon, on its GitHub App and
@@ -139,7 +141,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.7
 [0.1.6]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.6
 [0.1.5]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.5
 [0.1.4]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.4
