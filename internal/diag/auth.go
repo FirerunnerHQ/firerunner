@@ -310,6 +310,9 @@ func kmsJWT(ctx context.Context, cfg *config.Config) (*ghauth.JWT, error) {
 	if err != nil {
 		return nil, err
 	}
+	if r := ghauth.KeyRegion(cfg.AppKMSKey); r != "" {
+		awsCfg.Region = r
+	}
 	return ghauth.NewJWT(cfg.AppClientID, ghauth.KMSSigner{API: kms.NewFromConfig(awsCfg), KeyID: cfg.AppKMSKey}), nil
 }
 

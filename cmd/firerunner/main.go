@@ -713,6 +713,9 @@ func newAppJWT(ctx context.Context, cfg *config.Config, privateKey string) (*gha
 		if err != nil {
 			return nil, fmt.Errorf("--app-kms-key: %w", err)
 		}
+		if r := ghauth.KeyRegion(cfg.AppKMSKey); r != "" {
+			awsCfg.Region = r
+		}
 		return ghauth.NewJWT(cfg.AppClientID, ghauth.KMSSigner{API: kms.NewFromConfig(awsCfg), KeyID: cfg.AppKMSKey}), nil
 	case privateKey != "":
 		key, err := config.ParseAppPrivateKey([]byte(privateKey))

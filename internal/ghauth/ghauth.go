@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,17 @@ func (s KeySigner) SignSHA256(_ context.Context, digest []byte) ([]byte, error) 
 // KMSAPI is the one call KMSSigner makes; *kms.Client satisfies it.
 type KMSAPI interface {
 	Sign(ctx context.Context, in *kms.SignInput, opts ...func(*kms.Options)) (*kms.SignOutput, error)
+}
+
+// KeyRegion is the region a KMS key ARN names, or "" for a key ID or alias,
+// which name a key in the client's own region. A key is signed with in its own
+// region: a client for another one cannot find it.
+func KeyRegion(key string) string {
+	parts := strings.SplitN(key, ":", 6)
+	if len(parts) == 6 && parts[0] == "arn" && parts[2] == "kms" {
+		return parts[3]
+	}
+	return ""
 }
 
 // KMSSigner signs with an RSA key in AWS KMS, by key ID, ARN or alias.
