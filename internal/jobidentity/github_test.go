@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -19,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/actions/scaleset"
+	"github.com/firerunnerhq/firerunner/internal/ghauth"
 	"github.com/golang-jwt/jwt/v4"
 )
 
@@ -333,7 +331,6 @@ func TestInstallationTokenRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" || r.URL.Path != "/app/installations/7/access_tokens" {
@@ -358,7 +355,7 @@ func TestInstallationTokenRefresh(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"token": fmt.Sprint(n), "expires_at": time.Now().Add(time.Hour)})
 	}))
 	defer srv.Close()
-	g := &GitHub{base: srv.URL, client: srv.Client(), app: scaleset.GitHubAppAuth{ClientID: "client", InstallationID: 7, PrivateKey: string(raw)}}
+	g := &GitHub{base: srv.URL, client: srv.Client(), app: ghauth.App{InstallationID: 7, JWT: ghauth.NewJWT("client", ghauth.KeySigner{Key: key})}}
 	for range 2 {
 		v, err := g.auth(context.Background(), "owner/repo")
 		if err != nil || v != "1" {
@@ -377,9 +374,9 @@ func TestInstallationTokenRefresh(t *testing.T) {
 		t.Fatalf("repository token cache: %s %v", v, err)
 	}
 	g.tokens["owner/repo"] = installationToken{value: "old", expiry: time.Now()}
-	g.app.PrivateKey = "invalid"
+	g.app.JWT = ghauth.NewJWT("client", refusingSigner{})
 	if _, err := g.auth(context.Background(), "owner/repo"); err == nil {
-		t.Fatal("invalid private key accepted")
+		t.Fatal("a signer's refusal was ignored")
 	}
 }
 
@@ -390,13 +387,12 @@ func TestInstallationTokenRefusalNamesTheRepository(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	code := http.StatusUnprocessableEntity
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(code)
 	}))
 	defer srv.Close()
-	g := &GitHub{base: srv.URL, client: srv.Client(), app: scaleset.GitHubAppAuth{ClientID: "client", InstallationID: 7, PrivateKey: string(raw)}}
+	g := &GitHub{base: srv.URL, client: srv.Client(), app: ghauth.App{InstallationID: 7, JWT: ghauth.NewJWT("client", ghauth.KeySigner{Key: key})}}
 	_, err = g.auth(context.Background(), "owner/repo")
 	if !errors.Is(err, errTokenRefused) || !strings.Contains(err.Error(), "owner/repo") {
 		t.Fatalf("422: %v", err)
@@ -429,7 +425,7 @@ func TestGitHubURL(t *testing.T) {
 		{"https://ghe.com.evil.example/org", "https://ghe.com.evil.example/api/v3"},
 	} {
 		t.Run(tt.raw, func(t *testing.T) {
-			g, err := NewGitHub(tt.raw, "pat", scaleset.GitHubAppAuth{})
+			g, err := NewGitHub(tt.raw, "pat", ghauth.App{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -442,7 +438,7 @@ func TestGitHubURL(t *testing.T) {
 		t.Run("force GHES="+value, func(t *testing.T) {
 			t.Setenv("GITHUB_ACTIONS_FORCE_GHES", value)
 			for _, host := range []string{"github.com", "tenant.ghe.com"} {
-				g, err := NewGitHub("https://"+host+"/org", "pat", scaleset.GitHubAppAuth{})
+				g, err := NewGitHub("https://"+host+"/org", "pat", ghauth.App{})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -453,7 +449,7 @@ func TestGitHubURL(t *testing.T) {
 		})
 	}
 	for _, raw := range []string{"http://github.com/owner", "https:///owner", "://invalid"} {
-		if _, err := NewGitHub(raw, "pat", scaleset.GitHubAppAuth{}); err == nil {
+		if _, err := NewGitHub(raw, "pat", ghauth.App{}); err == nil {
 			t.Fatalf("invalid URL accepted: %s", raw)
 		}
 	}
@@ -626,5 +622,61 @@ func TestNextCursor(t *testing.T) {
 	}
 	if nextCursor(`<https://x/y?after=a>; rel="prev"`) != "" || nextCursor("") != "" {
 		t.Fatal("cursor without next")
+	}
+}
+
+type refusingSigner struct{}
+
+func (refusingSigner) SignSHA256(context.Context, []byte) ([]byte, error) {
+	return nil, errors.New("refused")
+}
+
+type countingSigner struct {
+	ghauth.Signer
+	n atomic.Int32
+}
+
+func (c *countingSigner) SignSHA256(ctx context.Context, d []byte) ([]byte, error) {
+	c.n.Add(1)
+	return c.Signer.SignSHA256(ctx, d)
+}
+
+// A JWT GitHub refuses is not offered again.
+func TestRefusedJWTIsSignedAgain(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// GitHub refuses the first JWT until it is replaced, as with a clock that
+	// was wrong when it was signed.
+	var refuse atomic.Int32
+	refuse.Store(2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if refuse.Add(-1) >= 0 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "t", "expires_at": time.Now().Add(time.Hour)})
+	}))
+	defer srv.Close()
+	s := &countingSigner{Signer: ghauth.KeySigner{Key: key}}
+	var clock atomic.Int64
+	clock.Store(time.Now().Unix())
+	jwt := ghauth.NewJWT("client", s).WithClock(func() time.Time { return time.Unix(clock.Load(), 0) })
+	g := &GitHub{base: srv.URL, client: srv.Client(), app: ghauth.App{InstallationID: 7, JWT: jwt}}
+	if _, err := g.auth(context.Background(), "owner/repo"); err == nil {
+		t.Fatal("a refused JWT got a token")
+	}
+	// Refused while new, it is kept: a lasting refusal must not sign per request.
+	clock.Add(61)
+	if _, err := g.auth(context.Background(), "owner/repo"); err == nil {
+		t.Fatal("the same refused JWT went through")
+	}
+	if _, err := g.auth(context.Background(), "owner/repo"); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.n.Load(); n != 2 {
+		t.Fatalf("%d signatures, want a new JWT after the refusal", n)
 	}
 }

@@ -40,6 +40,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/diag"
 	"github.com/firerunnerhq/firerunner/internal/ec2"
+	"github.com/firerunnerhq/firerunner/internal/ghauth"
 	"github.com/firerunnerhq/firerunner/internal/ghrunners"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jitserver"
@@ -775,6 +776,16 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 	}
 
+	// One JWT source for the shard: every tenant is an installation of one App.
+	var appJWT *ghauth.JWT
+	if privateKey != "" && cfg.AppClientID != "" {
+		key, err := config.ParseAppPrivateKey([]byte(privateKey))
+		if err != nil {
+			return fmt.Errorf("GitHub App private key: %w", err)
+		}
+		appJWT = ghauth.NewJWT(cfg.AppClientID, ghauth.KeySigner{Key: key})
+	}
+
 	// A static install is one tenant, made from its flags.
 	t := tenant{
 		Owner: owner, URL: cfg.URL, RunnerGroup: cfg.RunnerGroup, KeepOnClose: cfg.Owner != "",
@@ -785,6 +796,9 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			PrivateKey:     privateKey,
 		},
 		Tiers: cfg.EffectiveTiers(),
+	}
+	if appJWT != nil {
+		t.Auth = ghauth.App{InstallationID: cfg.AppInstallID, JWT: appJWT}
 	}
 	s := &shard{cfg: cfg, log: log, events: events}
 
@@ -884,7 +898,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// there touches nobody else. They end with runCtx, and drain themselves.
 	var tenants sync.WaitGroup
 	for _, c := range cfg.Tenants {
-		l := s.loop(extraTenant(cfg, c, owner, privateKey), live)
+		l := s.loop(extraTenant(cfg, c, owner, privateKey, appJWT), live)
 		tenants.Go(func() { l.run(runCtx) })
 	}
 

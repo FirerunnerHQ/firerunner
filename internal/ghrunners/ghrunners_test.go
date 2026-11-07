@@ -1,11 +1,10 @@
 package ghrunners
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,22 +12,23 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/actions/scaleset"
+	"github.com/firerunnerhq/firerunner/internal/ghauth"
 )
 
 // tokenExpiry is when the fake server's installation tokens expire.
 var tokenExpiry = func() time.Time { return time.Now().Add(time.Hour) }
 
-func testKey(t *testing.T) string {
+func testKey(t *testing.T) *rsa.PrivateKey {
 	t.Helper()
 	k, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}))
+	return k
 }
 
 // server serves n runners under scope, 100 per page, and installation
@@ -61,7 +61,7 @@ func server(t *testing.T, scope string, n int, perms *string, tokens *int) *http
 
 func client(t *testing.T, srv *httptest.Server, rawURL, pat string) *Client {
 	t.Helper()
-	c, err := New(rawURL, pat, scaleset.GitHubAppAuth{ClientID: "Iv1.x", InstallationID: 42, PrivateKey: testKey(t)})
+	c, err := New(rawURL, pat, ghauth.App{InstallationID: 42, JWT: ghauth.NewJWT("Iv1.x", ghauth.KeySigner{Key: testKey(t)})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestErrors(t *testing.T) {
 		t.Fatalf("err = %v, want the HTTP status", err)
 	}
 	for _, bad := range []string{"http://github.com/acme", "https://github.com/", "https://github.com/a/b/c"} {
-		if _, err := New(bad, "x", scaleset.GitHubAppAuth{}); err == nil {
+		if _, err := New(bad, "x", ghauth.App{}); err == nil {
 			t.Errorf("New(%q) accepted", bad)
 		}
 	}
@@ -234,7 +234,61 @@ func TestTokenWithoutExpiryRejected(t *testing.T) {
 }
 
 func TestEnterpriseURLRejected(t *testing.T) {
-	if _, err := New("https://github.com/enterprises/acme", "x", scaleset.GitHubAppAuth{}); err == nil || !strings.Contains(err.Error(), "enterprise") {
+	if _, err := New("https://github.com/enterprises/acme", "x", ghauth.App{}); err == nil || !strings.Contains(err.Error(), "enterprise") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+type countingSigner struct {
+	ghauth.Signer
+	n atomic.Int32
+}
+
+func (c *countingSigner) SignSHA256(ctx context.Context, d []byte) ([]byte, error) {
+	c.n.Add(1)
+	return c.Signer.SignSHA256(ctx, d)
+}
+
+// A JWT GitHub refuses, signed while the clock was wrong say, is not offered
+// again: the next listing signs a new one.
+func TestRefusedJWTIsSignedAgain(t *testing.T) {
+	// GitHub refuses the first JWT until it is replaced, as with a clock that
+	// was wrong when it was signed.
+	var refuse atomic.Int32
+	refuse.Store(2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/app/installations/42/access_tokens" && refuse.Add(-1) >= 0:
+			w.WriteHeader(http.StatusUnauthorized)
+		case r.URL.Path == "/app/installations/42/access_tokens":
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"token":"inst","expires_at":%q}`, tokenExpiry().Format(time.RFC3339))
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"runners": []Runner{}})
+		}
+	}))
+	defer srv.Close()
+	s := &countingSigner{Signer: ghauth.KeySigner{Key: testKey(t)}}
+	var clock atomic.Int64
+	clock.Store(time.Now().Unix())
+	jwt := ghauth.NewJWT("Iv1.x", s).WithClock(func() time.Time { return time.Unix(clock.Load(), 0) })
+	c, err := New("https://github.com/acme", "", ghauth.App{InstallationID: 42, JWT: jwt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.base = srv.URL
+	if _, err := c.Runners(context.Background()); err == nil {
+		t.Fatal("a refused JWT listed runners")
+	}
+	// Refused while new, it is kept: a lasting refusal must not sign per request.
+	clock.Add(61)
+	if _, err := c.Runners(context.Background()); err == nil {
+		t.Fatal("the same refused JWT went through")
+	}
+	if _, err := c.Runners(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.n.Load(); n != 2 {
+		t.Fatalf("%d signatures, want a new JWT after the refusal", n)
 	}
 }
