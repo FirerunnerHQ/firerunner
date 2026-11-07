@@ -9,22 +9,22 @@ import (
 	"github.com/actions/scaleset"
 )
 
-// Scale does what actions/scaleset v0.4.0's listener did with a message:
-// acquires the jobs it offers, tells of starts and completions, and sizes the
-// tier from its statistics; an empty long poll resizes from the last ones.
+// Scale does what actions/scaleset v0.4.0's listener did with a message, in its
+// order: acquires the jobs it offers, tells of starts, then completions, then
+// sizes the tier, which a completion's re-plan relies on. An empty long poll
+// resizes from the last statistics.
 func TestScaleActsOnAMessage(t *testing.T) {
-	var acquired []int64
-	var busy, done []string
-	var desired []int
+	var seen []string
+	note := func(f string, v ...any) { seen = append(seen, fmt.Sprintf(f, v...)) }
 	a := &scaler{
 		log: testLogger(), stats: &statsRecorder{},
 		acquire: func(_ context.Context, ids []int64) ([]int64, error) {
-			acquired = append(acquired, ids...)
+			note("acquire %v", ids)
 			return ids, nil
 		},
-		onBusy:      func(r string) { busy = append(busy, r) },
-		onCompleted: func(r string) { done = append(done, r) },
-		onDesired:   func(_ context.Context, n int) int { desired = append(desired, n); return n },
+		onBusy:      func(r string) { note("busy %s", r) },
+		onCompleted: func(r string) { note("completed %s", r) },
+		onDesired:   func(_ context.Context, n int) int { note("desired %d", n); return n },
 	}
 	msg := &scaleset.RunnerScaleSetMessage{
 		MessageID:            1,
@@ -36,25 +36,26 @@ func TestScaleActsOnAMessage(t *testing.T) {
 	if err := a.Scale(context.Background(), msg); err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(acquired, busy, done, desired) != "[7 8] [r-1] [r-0] [3]" {
-		t.Fatalf("acquired %v, busy %v, completed %v, desired %v", acquired, busy, done, desired)
+	if err := a.Scale(context.Background(), nil); err != nil {
+		t.Fatal(err)
 	}
-	if err := a.Scale(context.Background(), nil); err != nil || fmt.Sprint(desired) != "[3 3]" {
-		t.Fatalf("an empty poll sized the tier from %v, %v", desired, err)
+	if got := fmt.Sprint(seen); got != "[acquire [7 8] busy r-1 completed r-0 desired 3 desired 3]" {
+		t.Fatalf("Scale did %s", got)
 	}
 }
 
-// A message whose jobs cannot be acquired fails, so the listener keeps it for
-// another delivery instead of deleting it.
-func TestScaleFailsWhenJobsCannotBeAcquired(t *testing.T) {
+// A message whose jobs cannot be acquired is still acted on and succeeds:
+// failing would keep it, and one that always fails would block the tier.
+func TestScaleGoesOnWhenJobsCannotBeAcquired(t *testing.T) {
+	var desired []int
 	a := &scaler{log: testLogger(), stats: &statsRecorder{},
 		acquire:   func(context.Context, []int64) ([]int64, error) { return nil, errors.New("503") },
-		onDesired: func(context.Context, int) int { return 0 },
+		onDesired: func(_ context.Context, n int) int { desired = append(desired, n); return n },
 	}
-	msg := &scaleset.RunnerScaleSetMessage{MessageID: 1,
+	msg := &scaleset.RunnerScaleSetMessage{MessageID: 1, Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 2},
 		JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 7}}}}
-	if err := a.Scale(context.Background(), msg); err == nil {
-		t.Fatal("a failed acquisition passed")
+	if err := a.Scale(context.Background(), msg); err != nil || fmt.Sprint(desired) != "[2]" {
+		t.Fatalf("Scale = %v, desired %v", err, desired)
 	}
 }
 

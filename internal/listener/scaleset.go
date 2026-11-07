@@ -658,7 +658,8 @@ var _ sslistener.Scaler = (*scaler)(nil)
 // completions, then the desired count. nil is a long poll that ended empty.
 // The listener deletes the message after Scale returns, so a message Scale
 // fails on, or a crash during it, is delivered again: everything here must
-// bear being done twice.
+// bear being done twice. One known cost: a message delivered again after a
+// reconnect sizes the tier from its older statistics until the next message.
 func (a *scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
 	if msg == nil {
 		st, _, _ := a.stats.latest()
@@ -676,11 +677,14 @@ func (a *scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 			}
 		}
 		a.log.Info("acquiring jobs", "count", len(ids))
-		acquired, err := a.acquire(ctx, ids)
-		if err != nil {
-			return fmt.Errorf("acquire jobs: %w", err)
+		// A failure is not the message's: failing it would have the listener
+		// keep it, and one that always fails would block every later message.
+		// GitHub offers an unacquired job again, as when v0.4.0 lost it.
+		if acquired, err := a.acquire(ctx, ids); err != nil {
+			a.log.Warn("could not acquire jobs", "count", len(ids), "err", err)
+		} else {
+			a.log.Info("jobs acquired", "count", len(acquired))
 		}
-		a.log.Info("jobs acquired", "count", len(acquired))
 	}
 	for _, j := range msg.JobStartedMessages {
 		if j != nil {

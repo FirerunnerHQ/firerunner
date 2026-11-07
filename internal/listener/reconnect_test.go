@@ -582,8 +582,9 @@ func TestRecycleReconnectsAndStatsAreRecorded(t *testing.T) {
 }
 
 func TestChaosExitAfterDelete(t *testing.T) {
-	// The fault switch exits once GitHub accepted the deletion, before the
-	// message is acted on. Run it in a child process, since it calls os.Exit.
+	// The fault switch exits once GitHub accepted the deletion, which since
+	// actions/scaleset v0.5.0 follows acting on the message. Run it in a child
+	// process, since it calls os.Exit.
 	if os.Getenv("FR_CHAOS_CHILD") == "1" {
 		f := newFakeSession(0, false)
 		ts := trackedSession{session: f, chaos: chaosExitAfterDelete()}
