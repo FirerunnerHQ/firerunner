@@ -108,6 +108,12 @@ func TestLoadTenants(t *testing.T) {
 	if _, err := loadTenants(write(`[{"id":"t1","installation":7}]`)); err == nil || !strings.Contains(err.Error(), "installation") {
 		t.Fatalf("a misspelt field: %v", err)
 	}
+	if _, err := loadTenants(write(`[] [{"id":"t2"}]`)); err == nil {
+		t.Fatal("a second list: accepted, and its tenants silently not served")
+	}
+	if _, err := loadTenants(write(`[] garbage`)); err == nil {
+		t.Fatal("trailing garbage: accepted")
+	}
 	if _, err := loadTenants(filepath.Join(dir, "missing")); err == nil {
 		t.Fatal("a missing file: no error")
 	}

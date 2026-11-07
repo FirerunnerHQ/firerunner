@@ -39,6 +39,9 @@ func loadTenants(path string) ([]Tenant, error) {
 	if err := dec.Decode(&tenants); err != nil {
 		return nil, fmt.Errorf("--tenants %s: %w", path, err)
 	}
+	if dec.More() {
+		return nil, fmt.Errorf("--tenants %s: content after the list", path)
+	}
 	return tenants, nil
 }
 
