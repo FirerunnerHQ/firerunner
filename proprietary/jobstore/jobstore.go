@@ -93,7 +93,9 @@ func (s *Store) Record(e jobevent.Event) {
 	}
 }
 
-// Dropped counts events lost to a full queue, a rejected row or a failed close.
+// Dropped counts events lost to a full queue, a rejected row or a failed write at
+// close. A close that gives up on a hung writer cannot count what the writer still
+// holds, so after one this is a lower bound.
 func (s *Store) Dropped() int64 { return s.dropped.Load() }
 
 // Close flushes what it can within ctx and stops the writer.

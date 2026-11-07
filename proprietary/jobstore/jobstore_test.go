@@ -226,8 +226,9 @@ func TestCloseLogsItsLosses(t *testing.T) {
 	}
 }
 
-// A database that hangs outlasts Close's deadline, and the loss still gets logged.
-func TestCloseLogsLossesWhenItGivesUp(t *testing.T) {
+// A database that hangs outlasts Close's deadline, and what was already lost still
+// gets logged. What the writer holds is not counted: see Dropped.
+func TestCloseLogsKnownLossesWhenItGivesUp(t *testing.T) {
 	var out syncBuffer
 	hang := make(chan struct{})
 	defer close(hang)
