@@ -309,6 +309,32 @@ func runner(kind jobevent.Kind, at time.Time) jobevent.Event {
 	return jobevent.Event{Kind: kind, At: at, Tier: "t", Runner: "runner-1", Instance: "i-1", InstanceType: "c8a.large", Market: "spot", Zone: "z", Path: "cold"}
 }
 
+// GitHub's scale set messages carry no queue time, as seen on a real job. The
+// wait firerunner answers for still reads, and the wait it cannot know stays
+// empty rather than made up.
+func TestTimelineWithoutQueueTime(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	t0 := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+
+	assigned := job(jobevent.Assigned, t0)
+	started := job(jobevent.Started, t0.Add(27*time.Second))
+	assigned.QueuedAt, started.QueuedAt = time.Time{}, time.Time{}
+	if err := s.writeEvents(ctx, []jobevent.Event{assigned, started}); err != nil {
+		t.Fatal(err)
+	}
+	var supply float64
+	var queueKnown bool
+	err := s.pool.QueryRow(ctx, `SELECT supply_seconds, queue_seconds IS NOT NULL OR github_seconds IS NOT NULL
+		FROM job_timeline WHERE job_id = 'job-1'`).Scan(&supply, &queueKnown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if supply != 27 || queueKnown {
+		t.Fatalf("supply=%v queueKnown=%v", supply, queueKnown)
+	}
+}
+
 // The whole story, arriving out of order and twice, reads the same.
 func TestTimeline(t *testing.T) {
 	s := open(t)
