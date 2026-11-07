@@ -2,6 +2,7 @@ package listener
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -13,21 +14,22 @@ import (
 	"time"
 
 	"github.com/actions/scaleset"
-	"github.com/hashicorp/go-retryablehttp"
 )
 
 // fakeGitHub answers what the scale set client asks to reach the Actions
-// service, and records the Authorization of each registration-token request.
+// service. It records the Authorization of each registration-token request and
+// counts the Actions service calls, which it refuses with 403.
 type fakeGitHub struct {
-	srv  *httptest.Server
-	mu   sync.Mutex
-	seen []string
+	srv     *httptest.Server
+	mu      sync.Mutex
+	seen    []string
+	service atomic.Int32
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
 	f := &fakeGitHub{}
 	exp := time.Now().Add(time.Hour).Unix()
-	admin := "e30." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, exp))) + ".sig"
+	admin := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, exp))) + ".sig"
 	f.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v3/orgs/acme/actions/runners/registration-token":
@@ -43,7 +45,8 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 		case "/api/v3/actions/runner-registration":
 			fmt.Fprintf(w, `{"url":%q,"token":%q}`, f.srv.URL+"/svc", admin)
 		default:
-			w.WriteHeader(http.StatusNotFound)
+			f.service.Add(1)
+			w.WriteHeader(http.StatusForbidden)
 		}
 	}))
 	t.Cleanup(f.srv.Close)
@@ -56,14 +59,16 @@ func (f *fakeGitHub) auths() []string {
 	return append([]string(nil), f.seen...)
 }
 
-// client is a scale set client on the brokered path, trusting f's certificate.
+// client is a scale set client built as newClient builds one for brokered
+// tokens, trusting f's certificate, with quick retries.
 func (f *fakeGitHub) client(t *testing.T, tokens func(context.Context) (string, error)) *scaleset.Client {
 	t.Helper()
-	rc := retryablehttp.NewClient()
-	rc.HTTPClient.Transport = f.srv.Client().Transport
+	pool := x509.NewCertPool()
+	pool.AddCert(f.srv.Certificate())
 	c, err := scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
 		GitHubConfigURL: f.srv.URL + "/acme", PersonalAccessToken: brokered,
-	}, scaleset.WithRetryableHTTPClint(withToken(rc, tokens, nil)))
+	}, append(brokeredOptions(tokens, nil), scaleset.WithRootCAs(pool),
+		scaleset.WithRetryMax(2), scaleset.WithRetryWaitMax(time.Millisecond))...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +77,7 @@ func (f *fakeGitHub) client(t *testing.T, tokens func(context.Context) (string, 
 
 // The real library, given the placeholder, sends GitHub the token Tokens
 // returns, and never the placeholder. If an upgrade of actions/scaleset stops
-// calling retryablehttp's hook with the request it sends, this fails.
+// asking its transport's proxy function about each request, this fails.
 func TestBrokeredTokenReachesGitHub(t *testing.T) {
 	f := newFakeGitHub(t)
 	var n atomic.Int32
@@ -86,18 +91,33 @@ func TestBrokeredTokenReachesGitHub(t *testing.T) {
 	if got[0] != "Bearer ghs_1" {
 		t.Fatalf("GitHub saw %q, want the brokered token", got[0])
 	}
+	// The library's own retrying client, not one shared and changed by it: a
+	// refusal from the Actions service is not retried as a 5xx would be.
+	if n := f.service.Load(); n != 1 {
+		t.Fatalf("the Actions service was asked %d times for one refused call", n)
+	}
 }
 
-// Without a token, GitHub gets no Authorization: never the placeholder.
-func TestBrokeredTokenFailureSendsNone(t *testing.T) {
+// Without a token, nothing reaches GitHub, the library tries again, and its
+// error is not one that stops the tier.
+func TestBrokeredTokenFailureIsTransient(t *testing.T) {
 	f := newFakeGitHub(t)
-	c := f.client(t, func(context.Context) (string, error) { return "", errors.New("KMS down") })
-	if _, err := c.GetRunnerGroupByName(context.Background(), "default"); err == nil {
+	var asks atomic.Int32
+	c := f.client(t, func(context.Context) (string, error) {
+		asks.Add(1)
+		return "", errors.New("ThrottlingException")
+	})
+	_, err := c.GetRunnerGroupByName(context.Background(), "default")
+	if err == nil {
 		t.Fatal("no error without a token")
 	}
-	for _, a := range f.auths() {
-		if a != "" {
-			t.Fatalf("GitHub saw %q", a)
-		}
+	if isFatal(err) {
+		t.Fatalf("a missing token stops the tier: %v", err)
+	}
+	if got := f.auths(); len(got) != 0 {
+		t.Fatalf("GitHub was asked for a registration token %d times, with %q", len(got), got)
+	}
+	if asks.Load() < 2 {
+		t.Fatalf("asked for a token %d times: the library's retries should ask again", asks.Load())
 	}
 }

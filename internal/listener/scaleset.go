@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -15,7 +16,6 @@ import (
 
 	"github.com/actions/scaleset"
 	sslistener "github.com/actions/scaleset/listener"
-	"github.com/hashicorp/go-retryablehttp"
 
 	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/core"
@@ -901,7 +901,7 @@ func newClient(cfg Config) (*scaleset.Client, error) {
 			GitHubConfigURL:     cfg.URL,
 			PersonalAccessToken: brokered,
 			SystemInfo:          systemInfo(cfg, 0),
-		}, scaleset.WithRetryableHTTPClint(withToken(retryablehttp.NewClient(), cfg.Tokens, cfg.Logger)))
+		}, brokeredOptions(cfg.Tokens, cfg.Logger)...)
 	}
 	if cfg.App.Validate() == nil {
 		return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
@@ -966,27 +966,35 @@ func randSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
-// withToken makes rc send a fresh installation token wherever the library
-// sends the brokered placeholder. The library takes a token only at
-// construction and accepts no transport of its own, so this rides on the hook
-// retryablehttp calls before every attempt, which sees the request it sends.
-// TestBrokeredTokenReachesGitHub pins that to the library's behaviour. A token
-// that cannot be had leaves no Authorization, and GitHub's 401 says why.
-func withToken(rc *retryablehttp.Client, tokens func(context.Context) (string, error), log *slog.Logger) *retryablehttp.Client {
-	rc.RetryMax, rc.RetryWaitMax = 4, 30*time.Second // the library's defaults
-	rc.RequestLogHook = func(_ retryablehttp.Logger, req *http.Request, _ int) {
-		if req.Header.Get("Authorization") != "Bearer "+brokered {
-			return
-		}
-		tok, err := tokens(req.Context())
-		if err != nil {
-			req.Header.Del("Authorization")
-			if log != nil {
-				log.Warn("no installation token for GitHub", "err", err)
+// errNoToken fails a request that needed an installation token and got none.
+// It names no HTTP status, so it reads as the transient failure it is, not as
+// GitHub refusing the App (isFatal).
+var errNoToken = errors.New("firerunner: no installation token yet")
+
+// brokeredOptions are the HTTP options of a client on brokered tokens.
+func brokeredOptions(tokens func(context.Context) (string, error), log *slog.Logger) []scaleset.HTTPOption {
+	return []scaleset.HTTPOption{scaleset.WithProxy(tokenProxy(tokens, log))}
+}
+
+// tokenProxy makes the client send a fresh installation token wherever the
+// library sends the brokered placeholder. The library takes a token only at
+// construction, and a custom HTTP client of its own it mutates and shares, but
+// its transport asks this proxy function about every request before writing
+// it. TestBrokeredTokenReachesGitHub pins that to the library. A token that
+// cannot be had fails the request here, before it leaves, and the library's
+// retries ask again.
+func tokenProxy(tokens func(context.Context) (string, error), log *slog.Logger) func(*http.Request) (*url.URL, error) {
+	return func(req *http.Request) (*url.URL, error) {
+		if req.Header.Get("Authorization") == "Bearer "+brokered {
+			tok, err := tokens(req.Context())
+			if err != nil {
+				if log != nil {
+					log.Warn("no installation token for GitHub", "err", err)
+				}
+				return nil, errNoToken
 			}
-			return
+			req.Header.Set("Authorization", "Bearer "+tok)
 		}
-		req.Header.Set("Authorization", "Bearer "+tok)
+		return http.ProxyFromEnvironment(req)
 	}
-	return rc
 }
