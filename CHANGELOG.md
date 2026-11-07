@@ -8,6 +8,12 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- The `job_timeline` view has `supply_seconds`, from GitHub assigning a job to the
+  job starting. `queue_seconds` stays empty for now, as GitHub's scale set messages
+  carry no queue time.
+
 ## [0.1.6] - 2026-11-06
 
 ### Added

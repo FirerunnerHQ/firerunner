@@ -41,7 +41,7 @@ type Event struct {
 	EventName  string // push, pull_request, ...
 	RunID      int64
 	Labels     []string
-	QueuedAt   time.Time
+	QueuedAt   time.Time // zero on a JIT scale set: its messages omit it
 	Result     string
 
 	// From the provisioner.
