@@ -565,7 +565,7 @@ func TestLaunch_RegistrationConflictAborts(t *testing.T) {
 	// impossible, but a stale one must never be overwritten or revoked).
 	h := newHarness(t, nil)
 	other := netip.MustParseAddr("10.0.1.1") // the fake's first instance IP
-	if err := h.jit.Register(other, "someone-else", "theirs"); err != nil {
+	if err := h.jit.Register(other, "someone-else", "theirs", nil); err != nil {
 		t.Fatal(err)
 	}
 	err := waitErr(t, h.launch(context.Background()))

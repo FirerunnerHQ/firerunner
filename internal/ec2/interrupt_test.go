@@ -3,6 +3,7 @@ package ec2
 import (
 	"context"
 	"net/http"
+	"net/netip"
 	"sync"
 	"testing"
 
@@ -168,6 +169,7 @@ func TestLaunch_PooledStaleInterruptionIgnored(t *testing.T) {
 	errc := h.launch(context.Background())
 	eventually(t, "stale stopped reads after the start", func() bool { return h.f.polledAlone(pooledID) >= 2 })
 	in := h.f.instance(pooledID)
+	eventually(t, "its config registered", func() bool { return h.jit.Pending(netip.MustParseAddr(in.ip)) })
 	if code, _ := h.fetch(in.ip); code != http.StatusOK {
 		t.Fatalf("fetch = %d", code)
 	}

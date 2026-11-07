@@ -635,15 +635,8 @@ func publishHealth(path string, trackers []*health.Tracker, fill func(*health.Fi
 // serveJIT starts the endpoint EC2 instances fetch their JIT configs from, on
 // the control VM's VPC address. Binding fails fast if the address is not this
 // host's. The returned func shuts it down.
-func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger, onRunnerJob func(runner string)) (*jitserver.Server, func(), error) {
+func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitserver.Server, func(), error) {
 	jit := jitserver.New(cfg.JITTTL, log.With("component", "jitserver"))
-	if onRunnerJob != nil {
-		jit.OnPhase(func(runner, phase string) {
-			if phase == jitserver.PhaseJob {
-				onRunnerJob(runner)
-			}
-		})
-	}
 	ln, err := net.Listen("tcp", cfg.JITAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("--jit-addr: %w", err)
@@ -837,7 +830,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		s.fc = provisioner.NewFirecracker(cfg.Firecracker, log)
 	}
 	if cfg.UsesEC2() {
-		jit, stopJIT, err := serveJIT(ctx, cfg, log, hooks.onRunnerJob)
+		jit, stopJIT, err := serveJIT(ctx, cfg, log)
 		if err != nil {
 			return err
 		}
