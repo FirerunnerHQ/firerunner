@@ -196,6 +196,27 @@ func TestJWTExpiresByTheClock(t *testing.T) {
 	}
 }
 
+// A clock set back, as NTP does to one that ran fast at boot, makes the JWT it
+// signed wrong at once: it is signed again, refused or not.
+func TestJWTSignedBeforeAClockStepBackIsReplaced(t *testing.T) {
+	s := &countingSigner{Signer: KeySigner{Key: key(t)}}
+	now := time.Unix(1_000_000, 0).Add(3 * time.Hour)
+	j := NewJWT("Iv1.app", s).WithClock(func() time.Time { return now })
+	fast, _ := j.Token(context.Background())
+	now = now.Add(-3 * time.Hour)
+	j.Refused(fast)
+	if again, err := j.Token(context.Background()); err != nil || again == fast || s.n != 2 {
+		t.Fatalf("kept a JWT from before the clock was set back: %d signatures, %v", s.n, err)
+	}
+
+	// Unrefused, too.
+	fast, _ = j.Token(context.Background())
+	now = now.Add(-time.Hour)
+	if again, _ := j.Token(context.Background()); again == fast || s.n != 3 {
+		t.Fatalf("served a JWT signed in the future: %d signatures", s.n)
+	}
+}
+
 // blockingSigner holds every signature until released.
 type blockingSigner struct {
 	release chan struct{}

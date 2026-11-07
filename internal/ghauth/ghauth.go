@@ -117,10 +117,11 @@ func (j *JWT) WithClock(now func() time.Time) *JWT {
 // machine is suspended.
 func (j *JWT) wall() time.Time { return j.now().Round(0) }
 
-// Token returns a JWT valid for at least renewBefore.
+// Token returns a JWT valid for at least renewBefore. One signed by a clock
+// since set back is signed anew: its iat would be in GitHub's future.
 func (j *JWT) Token(ctx context.Context) (string, error) {
 	j.mu.Lock()
-	if j.token != "" && j.expiry.Sub(j.wall()) > renewBefore {
+	if now := j.wall(); j.token != "" && j.expiry.Sub(now) > renewBefore && !now.Before(j.signedAt) {
 		defer j.mu.Unlock()
 		return j.token, nil
 	}
@@ -179,6 +180,7 @@ func (j *JWT) signAt(ctx context.Context, now, exp time.Time) (string, error) {
 func (j *JWT) Refused(token string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	// One signed by a clock since set back is not kept here: Token replaces it.
 	if j.token == token && j.wall().Sub(j.signedAt) >= refusalWait {
 		j.token = ""
 	}
