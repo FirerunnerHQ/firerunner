@@ -383,7 +383,9 @@ const insertEvent = `INSERT INTO job_events (at, kind, tier, runner, job_id, rep
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 
 // A column set by any event stays set: COALESCE and NULLIF let events arrive in
-// any order, and more than once.
+// any order, and more than once. A job's stage keeps its first time: a message
+// GitHub delivers again is recorded again, and one without GitHub's own time
+// is stamped when it arrives, which would otherwise move the stage later.
 const upsertJob = `INSERT INTO jobs (job_id, repository, workflow, job_name, event_name, run_id, tier, runner, queued_at, assigned_at, started_at, completed_at, result)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 ON CONFLICT (job_id) DO UPDATE SET
@@ -394,10 +396,10 @@ ON CONFLICT (job_id) DO UPDATE SET
     run_id = GREATEST(EXCLUDED.run_id, jobs.run_id),
     tier = COALESCE(NULLIF(EXCLUDED.tier, ''), jobs.tier),
     runner = COALESCE(NULLIF(EXCLUDED.runner, ''), jobs.runner),
-    queued_at = COALESCE(EXCLUDED.queued_at, jobs.queued_at),
-    assigned_at = COALESCE(EXCLUDED.assigned_at, jobs.assigned_at),
-    started_at = COALESCE(EXCLUDED.started_at, jobs.started_at),
-    completed_at = COALESCE(EXCLUDED.completed_at, jobs.completed_at),
+    queued_at = LEAST(EXCLUDED.queued_at, jobs.queued_at),
+    assigned_at = LEAST(EXCLUDED.assigned_at, jobs.assigned_at),
+    started_at = LEAST(EXCLUDED.started_at, jobs.started_at),
+    completed_at = LEAST(EXCLUDED.completed_at, jobs.completed_at),
     result = COALESCE(NULLIF(EXCLUDED.result, ''), jobs.result)`
 
 const upsertRunner = `INSERT INTO runners (runner, tier, instance, instance_type, market, subnet, zone, path, launched_at, served_at, listening_at, running_at, exited_at, exit_code, gone_at, gone_reason)
