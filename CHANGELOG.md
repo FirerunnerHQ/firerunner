@@ -11,7 +11,7 @@ and this project adheres to
 ### Added
 
 - `FR_TENANTS` serves more installations from one daemon, on its GitHub App and
-  tier catalog, with caches off. This is groundwork for the hosted service.
+  tier catalog, with caches off and no hot runners. This is groundwork for the hosted service.
 - The `job_timeline` view has `supply_seconds`, from GitHub assigning a job to the
   job starting. `queue_seconds` stays empty for now, as GitHub's scale set messages
   carry no queue time.

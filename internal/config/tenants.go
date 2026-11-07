@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -55,7 +56,7 @@ func (c *Config) validateTenants() error {
 	for _, t := range c.Tiers {
 		catalog[t.Name] = t
 	}
-	ids, urls := map[string]bool{}, map[string]bool{normalURL(c.URL): true}
+	ids, urls := map[string]bool{}, map[string]bool{accountOf(c.URL): true}
 	for _, t := range c.Tenants {
 		if !tenantID.MatchString(t.ID) {
 			return fmt.Errorf("tenant %q: an id is lowercase letters, digits and hyphens, at most 32", t.ID)
@@ -65,11 +66,11 @@ func (c *Config) validateTenants() error {
 		}
 		ids[t.ID] = true
 		// Two sessions on one scale set would fight over it.
-		if u := normalURL(t.URL); u == "" || urls[u] {
-			return fmt.Errorf("tenant %q: url %q is empty or already served", t.ID, t.URL)
-		} else {
-			urls[u] = true
+		u := accountOf(t.URL)
+		if u == "" || urls[u] {
+			return fmt.Errorf("tenant %q: url %q is not an https URL of an account not yet served", t.ID, t.URL)
 		}
+		urls[u] = true
 		if t.InstallationID <= 0 {
 			return fmt.Errorf("tenant %q: installation_id is required", t.ID)
 		}
@@ -94,10 +95,24 @@ func (c *Config) validateTenants() error {
 	return nil
 }
 
-func normalURL(u string) string { return strings.ToLower(strings.TrimRight(strings.TrimSpace(u), "/")) }
+// accountOf returns the host and organization of a runner URL, or "" if it is
+// not an https URL naming one. A repository in an organization counts as that
+// organization, whose runners its jobs could also reach.
+func accountOf(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return ""
+	}
+	org, _, _ := strings.Cut(strings.Trim(u.Path, "/"), "/")
+	if org == "" {
+		return ""
+	}
+	return strings.ToLower(u.Host + "/" + org)
+}
 
-// TenantTiers returns the catalog tiers t gets. Their caches are off: the cache
-// has no boundary between tenants yet (#168).
+// TenantTiers returns the catalog tiers t gets. Their caches are off, as the
+// cache has no boundary between tenants yet (#168), and they keep no hot runners
+// or pool, which would multiply by the tenants however idle they are.
 func (c *Config) TenantTiers(t Tenant) []Tier {
 	var tiers []Tier
 	for _, name := range t.Tiers {
@@ -107,7 +122,8 @@ func (c *Config) TenantTiers(t Tenant) []Tier {
 			}
 			e := *tier.EC2
 			e.Cache, e.GitCache = false, false
-			tier.EC2 = &e
+			e.Pool, e.PoolFor = 0, nil
+			tier.EC2, tier.Min, tier.Schedule = &e, 0, nil
 			tiers = append(tiers, tier)
 		}
 	}

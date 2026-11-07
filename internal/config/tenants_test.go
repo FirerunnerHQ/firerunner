@@ -5,13 +5,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/firerunnerhq/firerunner/internal/schedule"
 )
 
 func tenantConfig(tenants ...Tenant) *Config {
 	return &Config{
 		URL: "https://github.com/home", AppClientID: "Iv1", Tenants: tenants,
 		Tiers: []Tier{
-			{Name: "cloud", Provisioner: ProvisionerEC2, EC2: &EC2Tier{Cache: true, GitCache: true}},
+			{Name: "cloud", Provisioner: ProvisionerEC2, Min: 2, Schedule: &schedule.Schedule{},
+				EC2: &EC2Tier{Cache: true, GitCache: true, Pool: 3, PoolFor: &PoolFor{}}},
 			{Name: "micro"},
 		},
 	}
@@ -27,6 +30,9 @@ func TestValidateTenants(t *testing.T) {
 		"no id":                 func(x *Tenant) { x.ID = "" },
 		"no url":                func(x *Tenant) { x.URL = " " },
 		"the install's own url": func(x *Tenant) { x.URL = "https://GitHub.com/home/" },
+		"a repo of the install": func(x *Tenant) { x.URL = "https://github.com/home/repo" },
+		"plain http":            func(x *Tenant) { x.URL = "http://github.com/acme" },
+		"no account":            func(x *Tenant) { x.URL = "https://github.com/" },
 		"no installation":       func(x *Tenant) { x.InstallationID = 0 },
 		"no tiers":              func(x *Tenant) { x.Tiers = nil },
 		"an unknown tier":       func(x *Tenant) { x.Tiers = []string{"nope"} },
@@ -68,7 +74,7 @@ func TestValidateTenants(t *testing.T) {
 
 // The cache has no boundary between tenants yet, and a tenant's tier must not
 // change the catalog's own.
-func TestTenantTiersHaveNoCache(t *testing.T) {
+func TestTenantTiersHaveNoCacheOrIdleMachines(t *testing.T) {
 	c := tenantConfig()
 	got := c.TenantTiers(goodTenant())
 	if len(got) != 1 || got[0].Name != "cloud" {
@@ -77,8 +83,12 @@ func TestTenantTiersHaveNoCache(t *testing.T) {
 	if got[0].EC2.Cache || got[0].EC2.GitCache {
 		t.Fatalf("a tenant's tier caches: %+v", got[0].EC2)
 	}
-	if !c.Tiers[0].EC2.Cache || !c.Tiers[0].EC2.GitCache {
-		t.Fatal("the catalog's own tier lost its cache")
+	if got[0].Min != 0 || got[0].Schedule != nil || got[0].EC2.Pool != 0 || got[0].EC2.PoolFor != nil {
+		t.Fatalf("a tenant's tier keeps machines idle: %+v, %+v", got[0], got[0].EC2)
+	}
+	own := c.Tiers[0]
+	if !own.EC2.Cache || !own.EC2.GitCache || own.EC2.Pool != 3 || own.Min != 2 {
+		t.Fatalf("the catalog's own tier changed: %+v, %+v", own, own.EC2)
 	}
 }
 

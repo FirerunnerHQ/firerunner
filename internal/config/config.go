@@ -387,7 +387,7 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.IntVar(&c.VCPU, "vcpu", er.int("FR_VCPU", 4), "vCPUs per microVM")
 	fs.IntVar(&c.MemMiB, "mem-mib", er.int("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
 
-	fs.StringVar(&c.TenantsPath, "tenants", env("FR_TENANTS", ""), "path to a JSON array of tenants served beside this install, each {id,url,installation_id,tiers}, using its GitHub App and tier catalog. Their tiers run with caches off.")
+	fs.StringVar(&c.TenantsPath, "tenants", env("FR_TENANTS", ""), "path to a JSON array of tenants served beside this install, each {id,url,installation_id,tiers}, using its GitHub App and tier catalog. Their tiers run with caches off and no hot runners or pool.")
 	fs.StringVar(&c.TiersPath, "tiers", env("FR_TIERS", ""), "path to a JSON tier catalog (array of {name,labels,provisioner,min,max} plus {vcpu,mem_mib,golden,toolcache} for a firecracker tier or an ec2 block for an ec2 tier). When set, firerunner serves every tier from this one process and developers pick one with runs-on: <name>; --max-runners is the slot budget shared by the firecracker tiers. When unset, a single firecracker tier is derived from --name/--vcpu/--mem-mib/--golden.")
 
 	fs.StringVar(&c.Firecracker.Binary, "firecracker-bin", env("FR_FIRECRACKER_BIN", "firecracker"), "path to firecracker binary")

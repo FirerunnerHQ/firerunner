@@ -65,7 +65,10 @@ those installations too, on the same GitHub App and tier catalog:
 
 Each gets its own scale sets and the owner tag `<owner>/<id>`, which the VM's role
 and the reaper Lambda also cover. A tenant that stops is tried again by itself,
-and shows in `firerunner status` meanwhile; the others are not touched.
+and shows in `firerunner status` meanwhile; the others are not touched. A tenant's
+tiers run with caches off and no hot runners or pool, and a tier's `max` applies per
+tenant. Take a tenant out of the list only once its instances are gone: only the
+reaper Lambda still covers them.
 ## Before the first deploy
 
 You need:
