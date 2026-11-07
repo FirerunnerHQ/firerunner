@@ -183,3 +183,21 @@ func trackerNames(l *liveTenants) string {
 	}
 	return fmt.Sprint(names)
 }
+
+// A key in another region is signed with there.
+func TestKMSClientUsesTheKeysRegion(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	cfg := &config.Config{AWSRegion: "us-east-1", AppKMSKey: "arn:aws:kms:eu-west-1:111122223333:key/0aaa"}
+	c, err := kmsClient(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Options().Region; got != "eu-west-1" {
+		t.Fatalf("region = %s, want the key's", got)
+	}
+	cfg.AppKMSKey = "alias/github-app"
+	if c, _ := kmsClient(context.Background(), cfg); c.Options().Region != "us-east-1" {
+		t.Fatalf("an alias left the VM's region: %s", c.Options().Region)
+	}
+}

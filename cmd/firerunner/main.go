@@ -709,14 +709,11 @@ func newAppJWT(ctx context.Context, cfg *config.Config, privateKey string) (*gha
 	case cfg.AppClientID == "":
 		return nil, nil
 	case cfg.AppKMSKey != "":
-		awsCfg, err := loadAWSConfig(ctx, cfg)
+		client, err := kmsClient(ctx, cfg)
 		if err != nil {
-			return nil, fmt.Errorf("--app-kms-key: %w", err)
+			return nil, err
 		}
-		if r := ghauth.KeyRegion(cfg.AppKMSKey); r != "" {
-			awsCfg.Region = r
-		}
-		return ghauth.NewJWT(cfg.AppClientID, ghauth.KMSSigner{API: kms.NewFromConfig(awsCfg), KeyID: cfg.AppKMSKey}), nil
+		return ghauth.NewJWT(cfg.AppClientID, ghauth.KMSSigner{API: client, KeyID: cfg.AppKMSKey}), nil
 	case privateKey != "":
 		key, err := config.ParseAppPrivateKey([]byte(privateKey))
 		if err != nil {
@@ -725,6 +722,19 @@ func newAppJWT(ctx context.Context, cfg *config.Config, privateKey string) (*gha
 		return ghauth.NewJWT(cfg.AppClientID, ghauth.KeySigner{Key: key}), nil
 	}
 	return nil, nil
+}
+
+// kmsClient is a KMS client in the region of --app-kms-key, which an ARN names
+// and need not be the VM's: a client for another region cannot find the key.
+func kmsClient(ctx context.Context, cfg *config.Config) (*kms.Client, error) {
+	awsCfg, err := loadAWSConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("--app-kms-key: %w", err)
+	}
+	if r := ghauth.KeyRegion(cfg.AppKMSKey); r != "" {
+		awsCfg.Region = r
+	}
+	return kms.NewFromConfig(awsCfg), nil
 }
 
 // loadAWSConfig loads the default credential chain (the control VM's
