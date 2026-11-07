@@ -790,249 +790,99 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 	}
 
-	app := scaleset.GitHubAppAuth{
-		ClientID:       cfg.AppClientID,
-		InstallationID: cfg.AppInstallID,
-		PrivateKey:     privateKey,
+	// A static install is one tenant, made from its flags.
+	t := tenant{
+		Owner: owner, URL: cfg.URL, RunnerGroup: cfg.RunnerGroup, KeepOnClose: cfg.Owner != "",
+		Token: cfg.Token,
+		App: scaleset.GitHubAppAuth{
+			ClientID:       cfg.AppClientID,
+			InstallationID: cfg.AppInstallID,
+			PrivateKey:     privateKey,
+		},
+		Tiers: cfg.EffectiveTiers(),
 	}
-
-	// The REST runner list behind --runner-sweep, shared by every tier.
-	var runnerList *ghrunners.Client
-	if cfg.RunnerSweep != "off" {
-		if runnerList, err = ghrunners.New(cfg.URL, cfg.Token, app); err != nil {
-			log.Warn("runner sweep disabled", "err", err)
-			runnerList = nil
-		}
-	}
+	s := &shard{cfg: cfg, log: log, events: events}
 
 	// Each tier is its own GitHub scale set; developers pick one with
 	// runs-on: <tier name>. One Firecracker provisioner backs every Firecracker
 	// tier: they share the host kernel, tool cache, network and the MaxRunners
 	// slot budget, while each keeps its own microVM shape and golden image.
 
-	var onJobStarted func(context.Context, jobidentity.Job)
-	var cacheJobs *jobidentity.Registry
-	var onJobOffered func(jobidentity.Job)
-	var onRunnerJob func(runner string)
+	var hooks tenantHooks
 	if firecrackerCache(cfg) || cfg.UsesEC2Cache() {
 		jobs, err := jobidentity.NewRegistry(cfg.CacheJobsDir, log)
 		if err != nil {
 			return fmt.Errorf("cache job registry: %w", err)
 		}
 		defer jobs.Close()
-		resolver, err := jobidentity.NewGitHub(cfg.URL, cfg.Token, app)
-		if err != nil {
-			return err
-		}
 		// Firecracker guests get identities only when their own cache is
 		// on: one for the EC2 cache alone would give them scope there too.
 		if firecrackerCache(cfg) {
 			cfg.Firecracker.Jobs = jobs
 		}
-		cacheJobs = jobs
-		onJobStarted = func(ctx context.Context, j jobidentity.Job) { jobs.Start(ctx, j, resolver) }
-		if cfg.UsesEC2Cache() {
-			// GitHub may deliver JobStarted only once the job is over: an EC2
-			// instance's own report that its job started, matched against
-			// the runs GitHub offered, finds it within seconds (#28).
-			cands := &jobidentity.Candidates{}
-			onJobOffered = cands.Offer
-			onRunnerJob = func(runner string) { jobs.Discover(ctx, runner, cands, resolver, resolver) }
+		s.cacheJobs = jobs
+		if hooks, err = s.identityHooks(ctx, t); err != nil {
+			return err
 		}
 	}
-	var ec2Cache *ec2.CacheOptions
 	if cfg.UsesEC2Cache() {
 		ca, gitCA, err := loadCacheCAs(cfg)
 		if err != nil {
 			return err
 		}
-		ec2Cache = &ec2.CacheOptions{CA: ca, GitCA: gitCA, Upstream: cfg.EC2CacheAddr, Jobs: cacheJobs, LeafTTL: leafTTL(cfg)}
-		log.Info("EC2 cache proxy enabled", "upstream", cfg.EC2CacheAddr, "leafTTL", ec2Cache.LeafTTL)
+		s.ec2Cache = &ec2.CacheOptions{CA: ca, GitCA: gitCA, Upstream: cfg.EC2CacheAddr, Jobs: s.cacheJobs, LeafTTL: leafTTL(cfg)}
+		log.Info("EC2 cache proxy enabled", "upstream", cfg.EC2CacheAddr, "leafTTL", s.ec2Cache.LeafTTL)
 	}
-	var fc *provisioner.Firecracker
 	if cfg.UsesFirecracker() {
-		fc = provisioner.NewFirecracker(cfg.Firecracker, log)
+		s.fc = provisioner.NewFirecracker(cfg.Firecracker, log)
 	}
-	tiers := cfg.EffectiveTiers()
-	// A tier's provisioner and listener share its health and the jobs
-	// assigned to it: the listener records both, and an EC2 provisioner
-	// reports its launch paths and asks whether a launch may take the pool.
-	trackers := make([]*health.Tracker, len(tiers))
-	tierHealth := map[string]*health.Tracker{}
-	tierJobs := map[string]*assigned.Jobs{}
-	for i, t := range tiers {
-		trackers[i] = health.NewTracker(t.Name)
-		tierHealth[t.Name] = trackers[i]
-		tierJobs[t.Name] = assigned.New(poolPolicy(t))
-	}
-	var (
-		newEC2    func(config.Tier) provisioner.Provisioner
-		ec2Client *ec2.Client
-	)
 	if cfg.UsesEC2() {
-		jit, stopJIT, err := serveJIT(ctx, cfg, log, onRunnerJob)
+		jit, stopJIT, err := serveJIT(ctx, cfg, log, hooks.onRunnerJob)
 		if err != nil {
 			return err
 		}
 		// Instances still running their jobs fetch nothing more, but stop the
 		// endpoint only after the drain all the same.
 		defer stopJIT()
-		client, err := newEC2Client(ctx, cfg, log)
-		if err != nil {
+		s.jit = jit
+		if s.ec2Client, err = newEC2Client(ctx, cfg, log); err != nil {
 			return err
 		}
-		ec2Client = client
-		newEC2 = func(t config.Tier) provisioner.Provisioner {
-			// A scheduled pool starts at the current window's size; the
-			// schedule follower resizes it from there.
-			e := *t.EC2
-			e.Pool = t.SizesAt(time.Now()).Pool
-			p := client.Tier(ec2.Options{
-				Tier:        t.Name,
-				Owner:       owner,
-				EC2:         e,
-				Pooled:      t.MaxPool() > 0,
-				JIT:         jit,
-				JITURL:      jitserver.URL(cfg.JITEndpoint()),
-				MaxLifetime: cfg.Firecracker.MaxVMLifetime,
-				UsePool:     tierJobs[t.Name].ClaimPool,
-				Cache:       ec2Cache,
-				Events:      events,
-				Launched:    tierHealth[t.Name].Launched,
-				FellBack:    tierHealth[t.Name].FellBack,
-				Interrupted: tierHealth[t.Name].Interrupted,
-				Logger:      log.With("tier", t.Name),
-			})
-			// A tier's stopped pool fills and refills in the background for
-			// the life of the process; its instances stay stopped on exit and
-			// are found again on the next start.
-			if pool := p.Pool(); pool != nil {
-				go pool.Run(ctx)
-			}
-			return p
-		}
-	}
-	provs := make([]provisioner.Provisioner, len(tiers))
-	for i, t := range tiers {
-		var shared provisioner.Provisioner
-		if fc != nil {
-			shared = fc
-		}
-		p, err := tierProvisioner(t, shared, newEC2)
-		if err != nil {
-			return fmt.Errorf("tier %q: %w", t.Name, err)
-		}
-		provs[i] = p
 	}
 
-	// Register every tier's scale set up front so a failure aborts cleanly
-	// before we start booting microVMs.
-	var (
-		listeners []*listener.ScaleSet
-		scheds    []*scheduler.Scheduler
-		pending   scheduler.PendingLaunches
-	)
-	closeAll := func() {
-		for _, l := range listeners {
-			_ = l.Close(context.WithoutCancel(ctx))
-		}
+	served, err := s.start(ctx, t, hooks)
+	if err != nil {
+		return err
 	}
-	for i, t := range tiers {
-		tlog := log.With("tier", t.Name)
-		tracker := trackers[i]
-		lis, err := listener.New(ctx, listener.Config{
-			URL:          cfg.URL,
-			OnJobStarted: onJobStarted,
-			OnJobOffered: onJobOffered,
-			Events:       events,
-			Health:       tracker,
-			Pending:      tierJobs[t.Name],
-			Name:         t.Name,
-			RunnerGroup:  cfg.RunnerGroup,
-			Labels:       t.Labels,
-			MaxRunners:   t.Max,
-			// A named install outlives its process: keep its scale set
-			// across restarts and control VM replacements.
-			KeepOnClose: cfg.Owner != "",
-			Token:       cfg.Token,
-			App:         app,
-			Version:     version,
-			Logger:      tlog,
-		}, owner)
-		if err != nil {
-			closeAll()
-			return fmt.Errorf("tier %q: %w", t.Name, err)
-		}
-		listeners = append(listeners, lis)
-		jit := lis.JIT()
-		scheds = append(scheds, scheduler.New(scheduler.Options{
-			Max:         t.Max,
-			Min:         t.SizesAt(time.Now()).Min,
-			Spec:        t.Spec(),
-			Provisioner: provs[i],
-			JIT:         jit,
-			Remover:     jit,
-			Logger:      tlog,
-			Pending:     tierPending(t, &pending),
-		}))
-	}
-	defer closeAll()
-
-	var reaperState func() *health.Reaper
-	if ec2Client != nil && cfg.EC2Reaper != "off" {
-		reaper := ec2Client.NewReaper(reaperOptions(cfg, owner, tiers, listeners, log))
-		go reaper.Run(ctx)
-		reaperState = func() *health.Reaper {
-			rep, ok := reaper.Last()
-			if !ok {
-				return nil
-			}
-			return &health.Reaper{
-				At: rep.At, DryRun: rep.DryRun, Instances: rep.Instances, SpotRequests: rep.SpotRequests,
-				Busy: rep.Busy, Young: rep.Young, Error: rep.Err,
-			}
-		}
-	}
+	defer served.close(context.WithoutCancel(ctx))
 
 	log.Info("firerunner starting",
 		"url", cfg.URL,
-		"tiers", len(tiers),
+		"tiers", len(served.tiers),
 		"maxRunners", cfg.MaxRunners,
 	)
-	for i, t := range tiers {
-		if t.IsEC2() {
-			log.Info("serving tier",
-				"name", t.Name, "provisioner", provs[i].Name(),
-				"instanceTypes", t.EC2.InstanceTypes, "market", t.EC2.Market,
-				"min", t.Min, "max", t.Max)
-			continue
-		}
-		log.Info("serving tier",
-			"name", t.Name, "provisioner", provs[i].Name(),
-			"vcpu", t.VCPU, "memMiB", t.MemMiB,
-			"golden", t.Golden, "min", t.Min, "max", t.Max)
-	}
+	served.logTiers(log)
 
-	if fc != nil {
+	if s.fc != nil {
 		// Reclaim taps and job dirs orphaned by a previous unclean exit before
 		// we start allocating new slots, so a crash-restart cycle can't exhaust
 		// them.
-		fc.CleanupStale(ctx)
+		s.fc.CleanupStale(ctx)
 
-		if err := fc.SetupNetwork(ctx); err != nil {
+		if err := s.fc.SetupNetwork(ctx); err != nil {
 			return fmt.Errorf("setup network: %w", err)
 		}
-		go fc.RefreshNetwork(ctx)
+		go s.fc.RefreshNetwork(ctx)
 	}
 
 	// Publish each tier's listener health for status and doctor.
 	healthPath := filepath.Join(cfg.Firecracker.WorkDir, health.FileName)
-	stopHealth := publishHealth(healthPath, trackers, func(f *health.File) {
-		if reaperState != nil {
-			f.Reaper = reaperState()
+	stopHealth := publishHealth(healthPath, served.trackers, func(f *health.File) {
+		if served.reaperState != nil {
+			f.Reaper = served.reaperState()
 		}
-		if ec2Client != nil {
-			f.EC2Breakers = healthBreakers(ec2Client.Breakers())
+		if s.ec2Client != nil {
+			f.EC2Breakers = healthBreakers(s.ec2Client.Breakers())
 		}
 	}, log)
 
@@ -1044,49 +894,14 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	runs := make([]func(context.Context) error, len(listeners))
-	for i := range listeners {
-		lis, sched, tracker, prov := listeners[i], scheds[i], trackers[i], provs[i]
-		// tierCtx is this tier's own lifetime (see serveTiers): launches, the
-		// re-plan after a runner exits and the warm-pool top-up bind to it,
-		// so a tier that stops cancels its idle runners and stops launching,
-		// while busy ones finish.
-		runs[i] = func(tierCtx context.Context) error {
-			onDesired := func(_ context.Context, desired int) int {
-				sched.Reconcile(tierCtx, desired)
-				return sched.Running()
-			}
-			onBusy := func(name string) { sched.MarkBusy(name) }
-			onCompleted := func(name string) { sched.MarkCompleted(name) }
-			capacity := func() int { return sched.Capacity() }
-			// The reconciler compares GitHub's statistics with this tier's
-			// runners for as long as the tier serves.
-			jit := lis.JIT()
-			ropts := reconcile.Options{
-				Health: tracker, Logger: log.With("tier", tiers[i].Name, "component", "reconcile"),
-			}
-			if runnerList != nil {
-				ropts.Offline = offlineRunners{list: runnerList, jit: jit}
-				ropts.OfflineDryRun = cfg.RunnerSweep == "dry-run"
-			}
-			go reconcile.New(statsSource{lis}, sched, jit.Exists, ropts).Run(tierCtx)
-			if tiers[i].Schedule != nil {
-				go schedule.Follow(tierCtx, tiers[i].SizesAt, scheduleTarget(sched, prov, tracker),
-					30*time.Second, nil, log.With("tier", tiers[i].Name, "component", "schedule"))
-			}
-			return lis.Run(tierCtx, onDesired, onBusy, onCompleted, capacity)
-		}
-	}
-	runErr := serveTiers(runCtx, cancel, tierNames(tiers), runs, log)
+	runErr := serveTiers(runCtx, cancel, tierNames(served.tiers), served.runs(cfg, log), log)
 	// No tier is listening any more. Stop refreshing the health file before
 	// the drain, which can wait out long jobs: a file that keeps its last
 	// write time ages into "stale" instead of claiming live listeners.
 	stopHealth()
 
 	log.Info("shutdown signalled, draining in-flight microVMs")
-	for _, sched := range scheds {
-		sched.Drain()
-	}
+	served.drain()
 	log.Info("firerunner stopped")
 
 	if runErr != nil && ctx.Err() == nil {
