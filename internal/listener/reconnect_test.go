@@ -28,9 +28,13 @@ import (
 type fakeSession struct {
 	assigned int // initial TotalAssignedJobs
 	failing  atomic.Bool
-	msgs     chan *scaleset.RunnerScaleSetMessage
-	closed   atomic.Bool
-	gets     atomic.Int32
+	// failAcquire makes AcquireJobs fail; dels records deleted messages.
+	failAcquire atomic.Bool
+	delMu       sync.Mutex
+	dels        []int
+	msgs        chan *scaleset.RunnerScaleSetMessage
+	closed      atomic.Bool
+	gets        atomic.Int32
 }
 
 func newFakeSession(assigned int, failing bool) *fakeSession {
@@ -61,8 +65,23 @@ func (f *fakeSession) GetMessage(ctx context.Context, _, _ int) (*scaleset.Runne
 	}
 }
 
-func (f *fakeSession) DeleteMessage(context.Context, int) error { return nil }
+func (f *fakeSession) DeleteMessage(_ context.Context, id int) error {
+	f.delMu.Lock()
+	defer f.delMu.Unlock()
+	f.dels = append(f.dels, id)
+	return nil
+}
+
+func (f *fakeSession) deleted() []int {
+	f.delMu.Lock()
+	defer f.delMu.Unlock()
+	return append([]int(nil), f.dels...)
+}
+
 func (f *fakeSession) AcquireJobs(_ context.Context, ids []int64) ([]int64, error) {
+	if f.failAcquire.Load() {
+		return nil, errors.New("acquire: 503")
+	}
 	return ids, nil
 }
 func (f *fakeSession) Close(context.Context) error { f.closed.Store(true); return nil }
@@ -582,8 +601,9 @@ func TestRecycleReconnectsAndStatsAreRecorded(t *testing.T) {
 }
 
 func TestChaosExitAfterDelete(t *testing.T) {
-	// The fault switch exits once GitHub accepted the deletion, before the
-	// message is acted on. Run it in a child process, since it calls os.Exit.
+	// The fault switch exits once GitHub accepted the deletion, which since
+	// actions/scaleset v0.5.0 follows acting on the message. Run it in a child
+	// process, since it calls os.Exit.
 	if os.Getenv("FR_CHAOS_CHILD") == "1" {
 		f := newFakeSession(0, false)
 		ts := trackedSession{session: f, chaos: chaosExitAfterDelete()}

@@ -335,6 +335,28 @@ func TestTimelineWithoutQueueTime(t *testing.T) {
 	}
 }
 
+// A job's message delivered again, its start stamped on arrival the second
+// time, keeps the stage's first time.
+func TestRedeliveredStartKeepsItsFirstTime(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	t0 := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	first := job(jobevent.Started, t0)
+	again := job(jobevent.Started, t0.Add(40*time.Second))
+	for _, e := range []jobevent.Event{first, again} {
+		if err := s.writeEvents(ctx, []jobevent.Event{e}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var started, queued time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT started_at, queued_at FROM jobs WHERE job_id = 'job-1'`).Scan(&started, &queued); err != nil {
+		t.Fatal(err)
+	}
+	if !started.Equal(t0) || !queued.Equal(t0.Add(-time.Minute)) {
+		t.Fatalf("started %v, queued %v: a redelivery moved a stage", started, queued)
+	}
+}
+
 // The whole story, arriving out of order and twice, reads the same.
 func TestTimeline(t *testing.T) {
 	s := open(t)
