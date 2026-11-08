@@ -364,17 +364,23 @@ const mailPorts = "25, 465, 587, 2525"
 
 // guestEgressGuards writes the forward rules that hold in every egress mode:
 // guests reach no non-public network and no mail port. The forward hook sees a
-// packet after prerouting DNAT, so a destination the HOST rewrote (the CI
-// hosts redirect guest DNS to a resolver on a private veth) is exempt from the
-// non-public drop: a guest cannot create a DNAT entry, only the host's own
-// rules can. In allowlist mode these come after the explicit resolver accept,
-// so a configured LAN resolver stays reachable on port 53 only.
+// packet after prerouting DNAT, so DNS the HOST rewrote (the CI hosts redirect
+// guest DNS to a resolver on a private veth) is exempt from the non-public
+// drop: a guest cannot create a DNAT entry, only the host's own rules can.
+// Only DNS is exempt, over TCP or UDP to port 53 as the guest sent it. A host
+// has other DNAT rules (Docker's or Kubernetes' published ports, which
+// rewrite to private container addresses), and exempting every DNAT'd flow
+// would let a guest reach the services behind them. In allowlist mode these
+// come after the explicit resolver accept, so a configured LAN resolver stays
+// reachable on port 53 only.
 //
 // ⚠️ The exemption must test the dnat BIT: "ct status != dnat" compiles to an
 // exact compare against 0x20, which every real connection (confirmed, seen-
 // reply, ...) fails, so it would drop host-DNAT'd traffic too.
 func guestEgressGuards(b *strings.Builder, vmCidr string) {
 	fmt.Fprintf(b, "\t\tip saddr %s ip daddr @nonpublic ct status & dnat == 0 drop\n", vmCidr)
+	fmt.Fprintf(b, "\t\tip saddr %s ip daddr @nonpublic meta l4proto != { tcp, udp } drop\n", vmCidr)
+	fmt.Fprintf(b, "\t\tip saddr %s ip daddr @nonpublic ct original proto-dst != 53 drop\n", vmCidr)
 	fmt.Fprintf(b, "\t\tip saddr %s tcp dport { %s } drop\n", vmCidr, mailPorts)
 }
 

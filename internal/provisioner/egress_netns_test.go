@@ -126,6 +126,17 @@ const guestDNAT = `table ip guest_dns {
 }
 `
 
+// publishedPort mirrors a host service that rewrites a port to a private
+// address, as Docker or Kubernetes publish a container's port. Only the host's
+// DNS redirect is exempt from the non-public drop; this one must not be.
+const publishedPort = `table ip published {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    tcp dport 8080 dnat to 10.0.0.5:443
+  }
+}
+`
+
 // reachable dials ip:port over TCP from a namespace. Nothing listens anywhere,
 // so a packet that arrives is answered with a RST (connection refused) while a
 // dropped one times out: the two outcomes separate "delivered" from "filtered"
@@ -219,6 +230,7 @@ func TestEgressNetNSOpen(t *testing.T) {
 	requireNetNS(t)
 	l := newLab(t)
 	l.load(t, "guest-dns.nft", guestDNAT)
+	l.load(t, "published.nft", publishedPort)
 	l.load(t, "firerunner.nft", mustNFTRuleset(t, egressRuleset{
 		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
 		VMCidr: labCIDR, CachePort: labCache, Open: true,
@@ -229,6 +241,7 @@ func TestEgressNetNSOpen(t *testing.T) {
 		// 8.8.8.8 is routed nowhere in the lab: only the host's DNAT to the
 		// private resolver can deliver it.
 		{"host-DNAT'd DNS", "8.8.8.8", 53, true},
+		{"a host's published port to a private address", "9.9.9.9", 8080, false},
 	}, guestBoundaries...))
 }
 

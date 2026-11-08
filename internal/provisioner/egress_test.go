@@ -309,6 +309,8 @@ func TestBuildNFTRulesetGuestEgressGuards(t *testing.T) {
 			}
 			rules := forwardChain(t, out)
 			ruleIndex(t, rules, "ip saddr "+vmCIDR+" ip daddr @nonpublic ct status & dnat == 0 drop")
+			ruleIndex(t, rules, "ip saddr "+vmCIDR+" ip daddr @nonpublic meta l4proto != { tcp, udp } drop")
+			ruleIndex(t, rules, "ip saddr "+vmCIDR+" ip daddr @nonpublic ct original proto-dst != 53 drop")
 			ruleIndex(t, rules, "ip saddr "+vmCIDR+" tcp dport { 25, 465, 587, 2525 } drop")
 		})
 	}
@@ -369,7 +371,9 @@ func TestBuildNFTRulesetOpenOrder(t *testing.T) {
 		"ip saddr != " + vmCIDR + " drop",
 		"iifname . ip saddr != @guest_sources",
 		"ip daddr " + vmCIDR + " drop",
-		"@nonpublic",
+		"@nonpublic ct status & dnat == 0 drop",
+		"@nonpublic meta l4proto != { tcp, udp } drop",
+		"@nonpublic ct original proto-dst != 53 drop",
 		"dport { 25, 465, 587, 2525 } drop",
 	}
 	prev := -1
