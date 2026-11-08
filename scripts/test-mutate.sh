@@ -102,6 +102,9 @@ mutate guard/guard.go 'n > 10' 'n >= 10' -- -run TestAllow ./guard
 expect "custom args: CAUGHT" "$(cat "$OUT")" verdict_is CAUGHT
 mutate guard/guard.go 'n > 10' 'n >= 10' -- -run TestNothing ./guard
 expect "custom args: no test ran, SURVIVED" "$(cat "$OUT")" verdict_is SURVIVED
+mutate guard/guard.go 'n > 10' 'n >= 10' -- go test -run TestAllow ./guard
+expect "custom args with 'go test' in front: CAUGHT" "$(cat "$OUT")" verdict_is CAUGHT
+expect "custom args with 'go test' in front: says it dropped them" "" grep -q "dropped 'go test'" "$OUT"
 fresh hang
 MUTATE_TIMEOUT=2s mutate guard/guard.go 'return n > 10' 'for {}'
 expect "hang: CAUGHT by the timeout" "$(cat "$OUT")" verdict_is CAUGHT

@@ -8,7 +8,8 @@
 #   FILE        the file to break; 'old text' must occur in it exactly once
 #   -- ARGS     replace the default go test arguments (FILE's package) with
 #               ARGS, run from the current directory; name the packages,
-#               e.g. -- -race -run TestLaunch ./internal/scheduler
+#               e.g. -- -race -run TestLaunch ./internal/scheduler (a leading
+#               "go test" is dropped, with a note)
 #   --exec CMD  run CMD [ARGS...] instead of go test, from the current
 #               directory, for tests that are not Go, e.g.
 #               --exec images/test-ec2-run.sh
@@ -78,6 +79,12 @@ if [ "$#" -gt 0 ]; then
 	--)
 		shift
 		custom=1
+		# `-- go test -run X ./pkg` is the natural thing to type, and go test
+		# would read "go" and "test" as package names. Take the arguments.
+		if [ "${1:-}" = go ] && [ "${2:-}" = test ]; then
+			shift 2
+			echo "mutate: note: after --, pass go test's arguments only; dropped 'go test'" >&2
+		fi
 		;;
 	--exec)
 		shift
