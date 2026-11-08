@@ -119,6 +119,12 @@ carries the runner/job output) is streamed to a per-runner file under
 `--log-dir` on the host — off-VM log forwarding, as GitHub recommends for
 ephemeral runners.
 
+The guest decides what it writes there, so each file keeps at most
+`--log-max-mib` (default 64), with a closing line saying the rest was
+dropped. All of them together take at most `--log-dir-max-mib` (default 2048):
+the oldest are removed before a new runner's log is opened. The files are
+readable only by the daemon's user (mode 0600).
+
 ## Alignment with GitHub's official recommendations
 
 - **Ephemeral / JIT runners** — one job per runner, auto-deregistered (GitHub's
@@ -160,8 +166,9 @@ that reaches and how long it lasts:
 - **No secret at boot.** EC2 user-data carries only the JIT endpoint. The
   JIT config is served once, to the instance's own private IP.
 - **No job logs kept.** firerunner keeps no job output; GitHub holds the job
-  logs. A Firecracker VM's serial console is kept only if you set
-  `--log-dir`.
+  logs. A Firecracker VM's serial console is kept in a file only if you set
+  `--log-dir`. At `--log-level debug` its lines also go to the daemon's own
+  log.
 
 In your workflows, grant `GITHUB_TOKEN` the least it needs (start from
 `permissions: {}` and add per job). Prefer OIDC with narrowly scoped cloud

@@ -280,6 +280,28 @@ func TestFromFlags_GuestConnLimits(t *testing.T) {
 	}
 }
 
+func TestFromFlags_LogCaps(t *testing.T) {
+	c, err := FromFlags(baseArgs())
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.LogMaxBytes != 64<<20 || c.Firecracker.LogDirMaxBytes != 2048<<20 {
+		t.Fatalf("defaults: %d per runner, %d in all", c.Firecracker.LogMaxBytes, c.Firecracker.LogDirMaxBytes)
+	}
+	for _, args := range [][]string{
+		{"--log-max-mib", "-1"},
+		{"--log-dir-max-mib", "-1"},
+		{"--log-max-mib", "100", "--log-dir-max-mib", "50"},
+	} {
+		if _, err := FromFlags(append(baseArgs(), args...)); err == nil {
+			t.Errorf("%v: expected an error", args)
+		}
+	}
+	if _, err := FromFlags(append(baseArgs(), "--log-max-mib", "100", "--log-dir-max-mib", "0")); err != nil {
+		t.Errorf("no directory cap with a per-runner cap: %v", err)
+	}
+}
+
 func TestFromFlags_NetNSRequiresJailer(t *testing.T) {
 	if _, err := FromFlags(append(baseArgs(), "--netns")); err == nil {
 		t.Fatal("expected error: --netns requires --jailer")

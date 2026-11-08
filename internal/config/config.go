@@ -358,6 +358,7 @@ func FromFlags(args []string) (*Config, error) {
 type flagVals struct {
 	labels, jailerCgroup, egress, dnsServers string
 	metaRefresh                              time.Duration
+	logMaxMiB, logDirMaxMiB                  int
 }
 
 // FlagSet returns the daemon's flags, registered exactly as Parse registers
@@ -406,6 +407,8 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.StringVar(&c.Firecracker.BootArgs, "boot-args", env("FR_BOOT_ARGS", ""), "kernel command line (default keeps reboot=k)")
 	fs.StringVar(&c.Firecracker.ExtIface, "ext-iface", env("FR_EXT_IFACE", ""), "host external interface for microVM egress NAT (required)")
 	fs.StringVar(&c.Firecracker.LogDir, "log-dir", env("FR_LOG_DIR", ""), "directory for per-runner console logs (off-VM log forwarding)")
+	fs.IntVar(&v.logMaxMiB, "log-max-mib", er.int("FR_LOG_MAX_MIB", 64), "with --log-dir, MiB of console kept per runner; the rest is dropped (0 = no cap)")
+	fs.IntVar(&v.logDirMaxMiB, "log-dir-max-mib", er.int("FR_LOG_DIR_MAX_MIB", 2048), "with --log-dir, MiB all runner logs may take; the oldest are removed first (0 = no cap)")
 
 	fs.BoolVar(&c.Firecracker.Jailer, "jailer", er.boolean("FR_JAILER", false), "run each microVM under the Firecracker jailer (chroot + PID ns + privilege drop); opt-in, requires a root launcher and --jail-uid/--jail-gid")
 	fs.StringVar(&c.Firecracker.JailerBin, "jailer-bin", env("FR_JAILER_BIN", "jailer"), "path to the jailer binary (must match the firecracker version)")
@@ -475,6 +478,8 @@ func Parse(args []string) (*Config, error) {
 		}
 	}
 	c.Firecracker.CgroupLimits = splitSemi(v.jailerCgroup)
+	c.Firecracker.LogMaxBytes = int64(v.logMaxMiB) << 20
+	c.Firecracker.LogDirMaxBytes = int64(v.logDirMaxMiB) << 20
 	// The provisioner's per-VM network pool is bounded by the runner capacity.
 	// With a tier catalog this is the slot budget shared across all tiers.
 	c.Firecracker.MaxVMs = c.MaxRunners
@@ -597,6 +602,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("--app-kms-key needs --app-client-id")
 	case c.Token == "" && c.AppInstallID == 0:
 		return fmt.Errorf("--app-installation-id is required with --app-client-id (or set --token)")
+	case c.Firecracker.LogMaxBytes < 0 || c.Firecracker.LogDirMaxBytes < 0:
+		return fmt.Errorf("--log-max-mib and --log-dir-max-mib must be >= 0 (0 = no cap)")
+	case c.Firecracker.LogDirMaxBytes > 0 && c.Firecracker.LogMaxBytes > c.Firecracker.LogDirMaxBytes:
+		return fmt.Errorf("--log-max-mib cannot exceed --log-dir-max-mib")
 	case c.Firecracker.GuestConnLimit < 0 || c.Firecracker.GuestConnRate < 0 ||
 		c.Firecracker.GuestConnLimit > provisioner.MaxGuestConnLimit || c.Firecracker.GuestConnRate > provisioner.MaxGuestConnLimit:
 		return fmt.Errorf("--guest-conn-limit and --guest-conn-rate must be 0..%d (0 = no limit)", provisioner.MaxGuestConnLimit)
