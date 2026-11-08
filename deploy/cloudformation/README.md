@@ -236,7 +236,9 @@ another AWS account, such as a hosted one, run runners in this account.
     into this `VpcId`'s subnets and security groups;
   - start, re-tag, modify and terminate only instances with that tag;
   - cancel only that tag's spot requests;
-  - read AMI parameters under the prefix.
+  - read AMI parameters under the prefix, except `<prefix>/control/*`. A
+    control VM of this account's own keeps its GitHub credentials and config
+    there, so the role is denied them, even when both use the same prefix.
 
   [`test-policies.py`](test-policies.py) checks that the two copies are
   identical and that the role holds nothing more.

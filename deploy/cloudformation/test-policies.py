@@ -27,11 +27,22 @@ print("ok   runner-compute policy identical in control.yaml and byoc-role.yaml")
 byoc = open(os.path.join(HERE, "byoc-role.yaml")).read()
 before = byoc[:byoc.find("# runner-compute:begin")]
 after = byoc[byoc.find("# runner-compute:end"):]
-if before.count("- Effect: Allow") != 1 or "- Effect" in after:  # the one before is the trust policy
+if before.count("- Effect: Allow") != 1 or "- Effect: Allow" in after:  # the one before is the trust policy
     sys.exit("FAIL byoc-role.yaml has statements outside the runner-compute block")
+print("ok   byoc-role.yaml grants only the runner-compute policy")
+
+# The block's SSM grant covers the whole prefix, where a control VM in the
+# same account keeps its GitHub credentials; the cross-account role must be
+# denied them.
+deny = '''              - Effect: Deny
+                Action: "ssm:*"
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/control/*"'''
+if deny not in after or after.count("- Effect") != 1:
+    sys.exit("FAIL byoc-role.yaml must deny exactly <prefix>/control/*, after the runner-compute block")
+print("ok   byoc-role.yaml is denied the control VM's parameters")
 if byoc.count("PolicyName:") != 1 or "ManagedPolicyArns" in byoc:
     sys.exit("FAIL byoc-role.yaml grants more than its one runner-compute policy")
-print("ok   byoc-role.yaml grants only the runner-compute policy")
+print("ok   byoc-role.yaml has its one runner-compute policy")
 
 # A tenant's instances carry <owner>/<id>, so every grant on the owner tag must
 # reach them, or its launches are denied while its scale sets look healthy.
