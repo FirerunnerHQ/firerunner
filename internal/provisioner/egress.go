@@ -247,7 +247,92 @@ func buildNFTRuleset(cfg egressRuleset) (string, error) {
 		fmt.Fprintf(&b, "\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n\t\tiifname \"%s\" drop\n\t}\n", iface)
 		b.WriteString("}\n")
 	}
+	writeConnLimit(&b, table, iface, cfg)
 	return b.String(), nil
+}
+
+const (
+	// DefaultGuestConnLimit is how many tracked connections one guest may hold
+	// at once by default. A job rarely holds more than a few hundred.
+	DefaultGuestConnLimit = 4096
+	// DefaultGuestConnRate is how many new connections per second one guest
+	// may open by default, with bursts of ten times that.
+	DefaultGuestConnRate = 100
+
+	// conntrackTimeWait is how long, in seconds, the kernel keeps a closed TCP
+	// connection (nf_conntrack_tcp_timeout_time_wait). The count limit no
+	// longer sees such a connection, so only the rate bounds them.
+	conntrackTimeWait = 120
+	// conntrackHostReserve is room in the table for the host's own traffic.
+	conntrackHostReserve = 65536
+)
+
+// MaxGuestConnLimit bounds --guest-conn-limit and --guest-conn-rate, well
+// inside the 32 bits nftables gives a count and a burst (ten times the rate).
+const MaxGuestConnLimit = 1 << 20
+
+// conntrackEntries is how many conntrack entries maxVMs guests can occupy
+// under the limits, plus conntrackHostReserve: each guest's open connections,
+// and the closed ones its rate and burst leave behind for conntrackTimeWait
+// seconds. 0 means a limit is off, and so no bound.
+func conntrackEntries(maxVMs, limit, rate int) int {
+	if limit == 0 || rate == 0 {
+		return 0
+	}
+	return maxVMs*(limit+rate*conntrackTimeWait+10*rate) + conntrackHostReserve
+}
+
+// writeConnLimit bounds what one guest can put in the host's conntrack
+// table. That table is shared by every guest and the host: once it is full,
+// new connections are dropped for all of them, the daemon's own GitHub and
+// AWS traffic included. Two rules cover new connections in any protocol, in
+// both directions a guest can open one (forwarded, and to the host):
+//
+//   - a count: at most ConnLimit tracked connections per guest address. The
+//     kernel stops counting a TCP connection once it closes, but keeps its
+//     entry for conntrackTimeWait seconds;
+//   - a rate: at most ConnRate new connections per second, which bounds those
+//     closed entries to ConnRate * conntrackTimeWait.
+//
+// They live in their own table, <table>_conns, written with add commands that
+// leave an existing one in place: the main table is deleted and rebuilt on
+// every allowlist refresh, and with it any count of the connections a guest
+// already holds, which would hand the guest a fresh allowance each time. The
+// first write of a process passes ResetConnLimit to rebuild it, so a changed
+// limit or layout takes effect. Its chains run after the main table's
+// (priority 1), so a spoofed source is dropped there before it can be counted
+// against the guest it names.
+func writeConnLimit(b *strings.Builder, table, iface string, cfg egressRuleset) {
+	t := table + "_conns"
+	if cfg.ResetConnLimit {
+		fmt.Fprintf(b, "add table ip %s\n", t)
+		fmt.Fprintf(b, "delete table ip %s\n", t)
+	}
+	if cfg.ConnLimit <= 0 && cfg.ConnRate <= 0 {
+		return
+	}
+	fmt.Fprintf(b, "add table ip %s\n", t)
+	var rules []string
+	if cfg.ConnRate > 0 {
+		fmt.Fprintf(b, "add set ip %s guest_rate { type ipv4_addr; size 65536; flags dynamic; }\n", t)
+		fmt.Fprintf(b, "add counter ip %s guest_rate_drop\n", t)
+		rules = append(rules, fmt.Sprintf("ct state new add @guest_rate { ip saddr limit rate over %d/second burst %d packets } counter name guest_rate_drop drop", cfg.ConnRate, 10*cfg.ConnRate))
+	}
+	if cfg.ConnLimit > 0 {
+		fmt.Fprintf(b, "add set ip %s guest_conns { type ipv4_addr; size 65536; flags dynamic; }\n", t)
+		fmt.Fprintf(b, "add counter ip %s guest_conn_drop\n", t)
+		rules = append(rules, fmt.Sprintf("ct state new add @guest_conns { ip saddr ct count over %d } counter name guest_conn_drop drop", cfg.ConnLimit))
+	}
+	fmt.Fprintf(b, "add chain ip %s forward { type filter hook forward priority 1; policy accept; }\n", t)
+	fmt.Fprintf(b, "flush chain ip %s forward\n", t)
+	fmt.Fprintf(b, "add chain ip %s input { type filter hook input priority 1; policy accept; }\n", t)
+	fmt.Fprintf(b, "flush chain ip %s input\n", t)
+	for _, rule := range rules {
+		fmt.Fprintf(b, "add rule ip %s forward ip saddr %s %s\n", t, cfg.VMCidr, rule)
+		if iface != "" {
+			fmt.Fprintf(b, "add rule ip %s input iifname \"%s\" ip saddr %s %s\n", t, iface, cfg.VMCidr, rule)
+		}
+	}
 }
 
 // nonPublicNets are the IPv4 ranges that are not globally reachable (RFC 6890):
@@ -315,4 +400,10 @@ type egressRuleset struct {
 	AllowDNS  bool
 	AllowNTP  bool
 	Open      bool
+	// ConnLimit caps each guest's tracked connections and ConnRate its new
+	// connections per second; 0 writes no such limit. ResetConnLimit rebuilds
+	// the limit table rather than keeping its counts. See writeConnLimit.
+	ConnLimit      int
+	ConnRate       int
+	ResetConnLimit bool
 }

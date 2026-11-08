@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/firerunnerhq/firerunner/internal/provisioner"
 )
 
 // baseArgs is a minimal valid flag set; individual tests mutate a copy.
@@ -251,6 +253,30 @@ func TestFromFlags_NetNS(t *testing.T) {
 	}
 	if !c.Firecracker.NetNS {
 		t.Fatal("NetNS should be true")
+	}
+}
+
+func TestFromFlags_GuestConnLimits(t *testing.T) {
+	c, err := FromFlags(baseArgs())
+	if err != nil {
+		t.Fatalf("FromFlags: %v", err)
+	}
+	if c.Firecracker.GuestConnLimit != provisioner.DefaultGuestConnLimit || c.Firecracker.GuestConnRate != provisioner.DefaultGuestConnRate {
+		t.Fatalf("defaults: limit %d rate %d", c.Firecracker.GuestConnLimit, c.Firecracker.GuestConnRate)
+	}
+	c, err = FromFlags(append(baseArgs(), "--guest-conn-limit", "0", "--guest-conn-rate", "0"))
+	if err != nil || c.Firecracker.GuestConnLimit != 0 || c.Firecracker.GuestConnRate != 0 {
+		t.Fatalf("0 should turn the limits off: %v", err)
+	}
+	for _, args := range [][]string{
+		{"--guest-conn-limit", "-1"},
+		{"--guest-conn-rate", "-1"},
+		{"--guest-conn-limit", "1048577"},
+		{"--guest-conn-rate", "1048577"},
+	} {
+		if _, err := FromFlags(append(baseArgs(), args...)); err == nil {
+			t.Errorf("%v: expected an error", args)
+		}
 	}
 }
 

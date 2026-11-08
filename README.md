@@ -93,6 +93,25 @@ drops any guest packet whose source is outside the VM range; and a companion
 these are scoped to firerunner's own tap/veth interfaces, so the host's other
 traffic is untouched. This protection applies even in `--egress open` mode.
 
+The kernel's conntrack table is shared by every guest and the host, so one
+guest filling it would stall everyone's new connections, the daemon's
+included. Each guest may hold at most `--guest-conn-limit` (default 4096)
+tracked connections at once, and open at most `--guest-conn-rate` (default
+100) new ones per second, with bursts of ten times that. The rate matters
+because conntrack keeps a closed TCP connection for two minutes after the
+count stops seeing it. Both apply to every protocol and to both directions a
+guest can open a connection in. firerunner removes a guest's entries when its
+VM ends, so connections a job left open neither linger nor count against the
+next guest on its address. It also raises `net.netfilter.nf_conntrack_max`
+(never lowers it) to fit every guest at its limits. The limits live in a
+separate table, `<table>_conns`, which allowlist refreshes leave in place, so a
+guest's counts survive them. A connection over a limit is dropped: a job that
+needs more sees connect timeouts, and should raise the flags, or set them to 0
+to turn a limit off. The rate counts packets that start a connection, so a
+one-way UDP stream that never gets a reply counts each of its packets. An
+earlier firerunner does not know the `_conns` table: after a downgrade, remove
+it with `nft delete table ip <table>_conns`.
+
 ### Logs
 
 Because the microVM is destroyed after its one job, its serial console (which
