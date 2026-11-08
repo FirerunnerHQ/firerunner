@@ -21,7 +21,7 @@ func privateDir(t *testing.T) string {
 }
 
 func identity() Identity {
-	return Identity{IP: "172.16.0.2", Runner: "runner", Generation: "generation", Repository: "owner/repo", WriteRef: "refs/pull/1/merge", ReadRefs: []string{"refs/pull/1/merge", "refs/heads/main"}, RunID: 1, JobID: "job", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	return Identity{IP: "172.16.0.2", Runner: "runner", Generation: "generation", Repository: "owner/repo", RepositoryID: 77, WriteRef: "refs/pull/1/merge", ReadRefs: []string{"refs/pull/1/merge", "refs/heads/main"}, RunID: 1, JobID: "job", ExpiresAt: time.Now().Add(time.Hour).Unix()}
 }
 
 func TestIdentityValidation(t *testing.T) {
@@ -30,6 +30,7 @@ func TestIdentityValidation(t *testing.T) {
 		change func(*Identity)
 	}{
 		{"no repo", func(i *Identity) { i.Repository = "" }}, {"path traversal", func(i *Identity) { i.Repository = "../repo" }},
+		{"no repository ID", func(i *Identity) { i.RepositoryID = 0 }},
 		{"expired", func(i *Identity) { i.ExpiresAt = time.Now().Unix() }}, {"no generation", func(i *Identity) { i.Generation = "" }},
 		{"no job", func(i *Identity) { i.JobID = "" }}, {"no run", func(i *Identity) { i.RunID = 0 }}, {"no runner", func(i *Identity) { i.Runner = "" }},
 		{"bad write ref", func(i *Identity) { i.WriteRef = "main" }}, {"no reads", func(i *Identity) { i.ReadRefs = nil }},
@@ -309,7 +310,7 @@ func TestPendingLease(t *testing.T) {
 			t.Errorf("%s: pending", name)
 		}
 	}
-	resolved := Identity{Repository: "o/r", Runner: "r", Generation: "g", JobID: "j", RunID: 1, ExpiresAt: live.ExpiresAt, WriteRef: "refs/heads/main", ReadRefs: []string{"refs/heads/main"}}
+	resolved := Identity{Repository: "o/r", RepositoryID: 1, Runner: "r", Generation: "g", JobID: "j", RunID: 1, ExpiresAt: live.ExpiresAt, WriteRef: "refs/heads/main", ReadRefs: []string{"refs/heads/main"}}
 	if err := resolved.Validate(now); err != nil {
 		t.Fatal(err)
 	}

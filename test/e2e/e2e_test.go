@@ -166,10 +166,10 @@ func TestCacheScopesAcrossMicroVMs(t *testing.T) {
 			cfg := config(t, kernel, golden)
 			jobs := fixtureJobs{registry: registry, reader: reader}
 			if len(tt.reads) > 0 {
-				jobs.identity = &jobidentity.Identity{Repository: "owner/repo", Event: "fixture", WriteRef: tt.write, ReadRefs: tt.reads, RunID: int64(n + 1), JobID: tt.mode}
+				jobs.identity = &jobidentity.Identity{Repository: "owner/repo", RepositoryID: 77, Event: "fixture", WriteRef: tt.write, ReadRefs: tt.reads, RunID: int64(n + 1), JobID: tt.mode}
 			}
 			if tt.mode == "repo-b" {
-				jobs.identity.Repository = "owner/other"
+				jobs.identity.Repository, jobs.identity.RepositoryID = "owner/other", 78
 			}
 			cfg.Jobs = jobs
 			cfg.CachePort = port

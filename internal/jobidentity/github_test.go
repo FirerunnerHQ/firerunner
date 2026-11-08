@@ -35,6 +35,23 @@ type apiFixture struct {
 	failPath                                  string
 	status                                    int
 	corrupt                                   bool
+	// repoIDOverride and runRepoIDOverride replace the repository's ID (77)
+	// as /repos and the run report it; -1 leaves it out.
+	repoIDOverride, runRepoIDOverride int64
+}
+
+const fixtureRepoID = 77
+
+func (f *apiFixture) repoID() any    { return idOr(f.repoIDOverride) }
+func (f *apiFixture) runRepoID() any { return idOr(f.runRepoIDOverride) }
+func idOr(override int64) any {
+	switch override {
+	case 0:
+		return fixtureRepoID
+	case -1:
+		return nil
+	}
+	return override
 }
 
 func fixture() *apiFixture {
@@ -70,9 +87,9 @@ func (f *apiFixture) server(t *testing.T) *httptest.Server {
 			for _, n := range f.candidates {
 				candidates = append(candidates, map[string]any{"number": n, "base": map[string]any{"ref": f.runBases[n]}})
 			}
-			out = map[string]any{"id": 42, "event": f.event, "head_branch": f.head, "head_sha": f.sha, "repository": map[string]any{"full_name": "owner/repo"}, "head_repository": map[string]any{"full_name": f.headRepo}, "pull_requests": candidates}
+			out = map[string]any{"id": 42, "event": f.event, "head_branch": f.head, "head_sha": f.sha, "repository": map[string]any{"id": f.runRepoID(), "full_name": "owner/repo"}, "head_repository": map[string]any{"full_name": f.headRepo}, "pull_requests": candidates}
 		case r.URL.Path == "/repos/owner/repo":
-			out = map[string]any{"full_name": "owner/repo", "default_branch": f.defaultBranch}
+			out = map[string]any{"id": f.repoID(), "full_name": "owner/repo", "default_branch": f.defaultBranch}
 		case strings.Contains(r.URL.Path, "/commits/"):
 			candidates := []map[string]any{}
 			for _, p := range f.prs {
@@ -290,6 +307,37 @@ func TestResolveGitHubPolicy(t *testing.T) {
 			}
 			if i.Fork != (f.headRepo != "owner/repo") {
 				t.Fatal("wrong fork flag")
+			}
+		})
+	}
+}
+
+// The identity carries the repository's ID, which cache scope is keyed by, and
+// resolution fails closed when GitHub gives none or the run names another.
+func TestResolveCarriesTheRepositoryID(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		repo, runRepo int64
+		ok            bool
+	}{
+		{"both report it", 0, 0, true},
+		{"the run leaves it out", 0, -1, false},
+		{"the repository leaves it out", -1, 0, false},
+		{"the run names another repository", 0, 99, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := fixture()
+			f.event, f.headRepo = "push", "owner/repo"
+			f.repoIDOverride, f.runRepoIDOverride = tc.repo, tc.runRepo
+			srv := f.server(t)
+			defer srv.Close()
+			g := &GitHub{base: srv.URL, pat: "pat", client: srv.Client()}
+			i, err := g.Resolve(context.Background(), Job{Repository: "owner/repo", RunID: 42, JobID: "job", Event: f.event})
+			if tc.ok != (err == nil) {
+				t.Fatalf("resolved = %v (%v), want %v", err == nil, err, tc.ok)
+			}
+			if tc.ok && i.RepositoryID != fixtureRepoID {
+				t.Fatalf("repository ID %d, want %d", i.RepositoryID, fixtureRepoID)
 			}
 		})
 	}
