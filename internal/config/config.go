@@ -401,6 +401,8 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.StringVar(&c.Firecracker.TapPrefix, "tap-prefix", env("FR_TAP_PREFIX", "fr"), "prefix for per-job tap devices; must be unique per instance when several firerunners share a host")
 	fs.IntVar(&c.Firecracker.NetBase, "net-base", er.int("FR_NET_BASE", 16), "second octet of the per-microVM /16 (172.<base>.x); must differ per instance sharing a host")
 	fs.StringVar(&c.Firecracker.NFTTable, "nft-table", env("FR_NFT_TABLE", "firerunner"), "nftables table name; must be unique per instance when several firerunners share a host")
+	fs.IntVar(&c.Firecracker.GuestConnLimit, "guest-conn-limit", er.int("FR_GUEST_CONN_LIMIT", provisioner.DefaultGuestConnLimit), "most tracked connections one microVM may hold at once, so one guest cannot fill the host's shared conntrack table (0 = no limit)")
+	fs.IntVar(&c.Firecracker.GuestConnRate, "guest-conn-rate", er.int("FR_GUEST_CONN_RATE", provisioner.DefaultGuestConnRate), "most new connections per second one microVM may open, with bursts of ten times that; bounds the closed connections conntrack keeps for two minutes (counts packets that start a connection, so each packet of a one-way UDP stream; 0 = no limit)")
 	fs.StringVar(&c.Firecracker.BootArgs, "boot-args", env("FR_BOOT_ARGS", ""), "kernel command line (default keeps reboot=k)")
 	fs.StringVar(&c.Firecracker.ExtIface, "ext-iface", env("FR_EXT_IFACE", ""), "host external interface for microVM egress NAT (required)")
 	fs.StringVar(&c.Firecracker.LogDir, "log-dir", env("FR_LOG_DIR", ""), "directory for per-runner console logs (off-VM log forwarding)")
@@ -595,6 +597,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("--app-kms-key needs --app-client-id")
 	case c.Token == "" && c.AppInstallID == 0:
 		return fmt.Errorf("--app-installation-id is required with --app-client-id (or set --token)")
+	case c.Firecracker.GuestConnLimit < 0 || c.Firecracker.GuestConnRate < 0 ||
+		c.Firecracker.GuestConnLimit > provisioner.MaxGuestConnLimit || c.Firecracker.GuestConnRate > provisioner.MaxGuestConnLimit:
+		return fmt.Errorf("--guest-conn-limit and --guest-conn-rate must be 0..%d (0 = no limit)", provisioner.MaxGuestConnLimit)
 	case c.Firecracker.Jailer && (c.Firecracker.JailUID < 1 || c.Firecracker.JailGID < 1):
 		return fmt.Errorf("--jail-uid and --jail-gid (>0) are required when --jailer is set")
 	case len(c.Firecracker.CgroupLimits) > 0 && !c.Firecracker.Jailer:

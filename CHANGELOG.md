@@ -8,12 +8,24 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- Firecracker guests now have connection limits, on by default, so one guest
+  can no longer fill the host's shared conntrack table. Each guest may hold at
+  most `--guest-conn-limit` connections at once (default 4096) and open at most
+  `--guest-conn-rate` new ones per second (default 100, with bursts of ten
+  times that). A guest's entries are removed when its VM ends. firerunner raises
+  `net.netfilter.nf_conntrack_max` to fit every guest at these limits. Set
+  `FR_GUEST_CONN_LIMIT=0` and `FR_GUEST_CONN_RATE=0` to turn the limits off.
+  They are kept in a separate nftables table, `<table>_conns`. After a
+  downgrade to an earlier version, remove that table by hand with
+  `nft delete table ip firerunner_conns`.
+
 ### Fixed
 
 - The cache server limits request bodies: 64 KiB for cache RPCs and 8 MiB for
   a block list. A larger body gets `413`. A block list may name at most
   50,000 blocks, and a block id at most 88 characters, as in Azure.
-
 - The cache server counts uploads that are not yet finalized toward
   `--max-size`, so its disk use stays within the cap. An upload that would go
   past it while other uploads are unfinished gets `507 Insufficient Storage`.

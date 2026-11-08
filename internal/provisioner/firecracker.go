@@ -54,6 +54,13 @@ type FirecrackerConfig struct {
 	// A second instance must use a distinct name so the two rulesets do not
 	// clobber each other.
 	NFTTable string
+	// GuestConnLimit caps the tracked connections one guest may hold at once,
+	// and GuestConnRate the new connections it may open per second (bursts of
+	// ten times that). 0 means no limit, so a config built outside
+	// internal/config, which fills in DefaultGuestConnLimit and
+	// DefaultGuestConnRate, has none. See writeConnLimit.
+	GuestConnLimit int
+	GuestConnRate  int
 	// ExtIface is the host's external interface used for microVM egress NAT
 	// (e.g. eth0, enp2s0). Required for the guest to reach GitHub.
 	ExtIface string
@@ -173,6 +180,12 @@ type Firecracker struct {
 	ipam    *ipam
 	netOnce sync.Once
 	netErr  error
+	// netApplied is set once a ruleset has been applied, so later applies
+	// keep the connection-limit table and the counts in it.
+	netApplied atomic.Bool
+	// flushConntrack removes the host's conntrack entries for a guest
+	// address; see flushGuestConntrack.
+	flushConntrack func(guestIPs ...string) error
 }
 
 // NewFirecracker returns a Firecracker provisioner, filling in defaults.
@@ -205,12 +218,13 @@ func NewFirecracker(cfg FirecrackerConfig, log *slog.Logger) *Firecracker {
 		cfg.MaxVMs = 64
 	}
 	return &Firecracker{
-		cfg:    cfg,
-		log:    log,
-		run:    execRun,
-		runOut: execRunOut,
-		http:   &http.Client{Timeout: 30 * time.Second},
-		ipam:   newIPAM(cfg.MaxVMs),
+		cfg:            cfg,
+		log:            log,
+		run:            execRun,
+		runOut:         execRunOut,
+		http:           &http.Client{Timeout: 30 * time.Second},
+		ipam:           newIPAM(cfg.MaxVMs),
+		flushConntrack: flushGuestConntrack,
 	}
 }
 
@@ -436,6 +450,10 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 		AllowDNS:    f.cfg.Egress.has("dns"),
 		AllowNTP:    f.cfg.Egress.has("ntp"),
 		Open:        f.cfg.Egress.open(),
+
+		ConnLimit:      f.cfg.GuestConnLimit,
+		ConnRate:       f.cfg.GuestConnRate,
+		ResetConnLimit: !f.netApplied.Load(),
 	}
 	if !rs.Open {
 		cidrs, err := fetchMetaCIDRs(ctx, f.http, metaURL, f.cfg.Egress.metaCats())
@@ -463,6 +481,8 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 	if err := f.run(ctx, "nft", "-f", path); err != nil {
 		return err
 	}
+	f.netApplied.Store(true)
+	f.ensureConntrackRoom(ctx)
 	if err := f.ensureHostForward(ctx); err != nil {
 		return err
 	}
@@ -471,6 +491,32 @@ func (f *Firecracker) applyNetwork(ctx context.Context) error {
 	}
 	f.log.Info("egress network applied", "extIface", f.cfg.ExtIface, "open", rs.Open, "allowedCIDRs", len(rs.Allowed))
 	return nil
+}
+
+// ensureConntrackRoom raises nf_conntrack_max, never lowers it, to what
+// MaxVMs guests can occupy under the connection limits (conntrackEntries), so
+// guests at their limits cannot fill the table the host shares with them. It
+// is best-effort: a failure is logged, and the limits still bound each guest.
+func (f *Firecracker) ensureConntrackRoom(ctx context.Context) {
+	need := conntrackEntries(f.cfg.MaxVMs, f.cfg.GuestConnLimit, f.cfg.GuestConnRate)
+	if need == 0 {
+		return
+	}
+	out, err := f.runOut(ctx, "sysctl", "-n", "net.netfilter.nf_conntrack_max")
+	if err != nil {
+		f.log.Warn("read nf_conntrack_max", "err", err)
+		return
+	}
+	have, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || have >= need {
+		return
+	}
+	if err := f.run(ctx, "sysctl", "-w", fmt.Sprintf("net.netfilter.nf_conntrack_max=%d", need)); err != nil {
+		f.log.Warn("raise nf_conntrack_max", "from", have, "to", need, "err", err)
+		return
+	}
+	// About 300 bytes of kernel memory per entry, used only as it fills.
+	f.log.Info("raised nf_conntrack_max for the guest connection limits", "from", have, "to", need, "max_kernel_mib", need*300>>20)
 }
 
 // forwardComment tags the FORWARD accept rules firerunner adds to a foreign
@@ -1115,6 +1161,13 @@ func sanitizedEnv() []string {
 // eventually exhaust the slot space) and per-job work dirs (reflink rootfs clones
 // and sockets whose teardown defer never ran).
 func (f *Firecracker) CleanupStale(ctx context.Context) {
+	// Entries a guest left in the host's conntrack table outlive its tap and
+	// would count against the next guest on its address.
+	guests := make([]string, 0, f.cfg.MaxVMs)
+	for slot := 0; slot < f.cfg.MaxVMs; slot++ {
+		guests = append(guests, slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase).guestIP)
+	}
+	f.forgetGuestConns(guests...)
 	for slot := 0; slot < f.cfg.MaxVMs; slot++ {
 		vnet := slotNet(slot, f.cfg.TapPrefix, f.cfg.NetBase)
 		if f.cfg.NetNS {
@@ -1202,11 +1255,28 @@ func (f *Firecracker) setupNet(ctx context.Context, n vmNet) error {
 	return nil
 }
 
+// forgetGuestConns removes the host's conntrack entries for a guest address
+// once its VM is gone. An idle established connection would otherwise stay in
+// the shared table for days (nf_conntrack_tcp_timeout_established) and count
+// against the next guest given the address. It is best-effort.
+// Each call lists the whole table, so it runs once per VM, at teardown, and
+// once for every slot at startup (CleanupStale), for entries a daemon that
+// died mid-job left behind.
+func (f *Firecracker) forgetGuestConns(guestIPs ...string) {
+	if f.cfg.GuestConnLimit <= 0 && f.cfg.GuestConnRate <= 0 {
+		return
+	}
+	if err := f.flushConntrack(guestIPs...); err != nil {
+		f.log.Warn("remove guest conntrack entries", "guests", guestIPs, "err", err)
+	}
+}
+
 // teardownNet reverses setupNet. In NetNS mode deleting the namespace cascades
 // to the tap and the netns veth end (its host peer is auto-removed, taking the
 // guest route with it); the host-side link and route deletions are best-effort
 // belt-and-suspenders. Otherwise it removes the host tap.
 func (f *Firecracker) teardownNet(ctx context.Context, n vmNet) error {
+	defer f.forgetGuestConns(n.guestIP)
 	if f.cfg.NetNS {
 		s := slotNetNS(n, f.cfg.NetBase, f.cfg.TapPrefix)
 		err := f.run(ctx, "ip", "netns", "del", s.ns)

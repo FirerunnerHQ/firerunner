@@ -11,6 +11,7 @@
 package provisioner
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -332,5 +333,162 @@ func TestEgressNetNSSourceSpoofing(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// start runs a long-lived command in a namespace, waits for the first line it
+// prints and stops it when the test ends.
+func (l lab) start(t *testing.T, ns string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("ip", append([]string{"netns", "exec", ns}, args...)...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatalf("%s: no ready line: %v", strings.Join(args, " "), err)
+	}
+	if strings.TrimSpace(line) != "ready" {
+		t.Fatalf("%s: %q", strings.Join(args, " "), line)
+	}
+}
+
+// A guest holding its limit of connections cannot open another, while a
+// different guest still can, and an allowlist refresh, which rebuilds the
+// main table, does not hand it a fresh allowance.
+func TestEgressNetNSConnLimit(t *testing.T) {
+	requireNetNS(t)
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Fatal("python3 required for held connections")
+	}
+	const limit = 5
+	l := newLab(t)
+	cfg := egressRuleset{
+		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
+		VMCidr: labCIDR, CachePort: labCache, Allowed: []string{"1.0.0.0/24"},
+		ConnLimit: limit,
+	}
+	l.load(t, "firerunner.nft", mustNFTRuleset(t, cfg))
+	// The kernel completes handshakes into the backlog, so the listener never
+	// needs to accept.
+	l.start(t, l.wan, "python3", "-c", `import socket,time
+s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("1.0.0.1",8080));s.listen(128);print("ready",flush=True);time.sleep(600)`)
+	if !l.reachable(t, l.guest1, "1.0.0.1", 8080) {
+		t.Fatal("listener unreachable before any limit applies")
+	}
+	l.start(t, l.guest0, "python3", "-c", fmt.Sprintf(`import socket,time
+held=[socket.create_connection(("1.0.0.1",8080),timeout=5) for _ in range(%d)]
+print("ready",flush=True);time.sleep(600)`, limit))
+
+	if l.reachable(t, l.guest0, "1.0.0.1", 8080) {
+		t.Fatalf("guest opened connection %d past its limit of %d", limit+1, limit)
+	}
+	if !l.reachable(t, l.guest1, "1.0.0.1", 8080) {
+		t.Fatal("another guest's limit blocked this guest")
+	}
+	l.load(t, "firerunner.nft", mustNFTRuleset(t, cfg))
+	if l.reachable(t, l.guest0, "1.0.0.1", 8080) {
+		t.Fatal("a ruleset refresh reset the guest's connection count")
+	}
+
+	// Removing the guest's conntrack entries, as teardown does, frees its
+	// allowance even while the connections it held are still open on its side.
+	fd, err := os.Open("/var/run/netns/" + l.router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+	if err := flushConntrackIn(int(fd.Fd()), "172.19.0.2"); err != nil {
+		t.Fatalf("flush guest conntrack: %v", err)
+	}
+	if !l.reachable(t, l.guest0, "1.0.0.1", 8080) {
+		t.Fatal("guest still at its limit after its conntrack entries were removed")
+	}
+}
+
+// listen starts a listener on the WAN's public address 1.0.0.1:port.
+func (l lab) listen(t *testing.T, port int) {
+	t.Helper()
+	l.start(t, l.wan, "python3", "-c", fmt.Sprintf(`import socket,time
+s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("1.0.0.1",%d));s.listen(4096);print("ready",flush=True)
+while True: s.accept()[0].close()`, port))
+}
+
+// churn opens and closes n connections from a namespace as fast as it can,
+// and returns how many connected and how many seconds that took.
+func (l lab) churn(t *testing.T, ns string, n int) (ok int, secs float64) {
+	t.Helper()
+	out, err := exec.Command("ip", "netns", "exec", ns, "python3", "-c", fmt.Sprintf(`import socket,time
+ok=0;start=time.monotonic()
+for _ in range(%d):
+    try: socket.create_connection(("1.0.0.1",8080),timeout=0.2).close();ok+=1
+    except OSError: pass
+print(ok,time.monotonic()-start)`, n)).Output()
+	if err != nil {
+		t.Fatalf("churn from %s: %v", ns, err)
+	}
+	if _, err := fmt.Sscan(string(out), &ok, &secs); err != nil {
+		t.Fatalf("churn output %q: %v", out, err)
+	}
+	return ok, secs
+}
+
+// Opening and closing connections in a loop slips past the count, since a
+// closed connection is not counted while conntrack still keeps it; the rate
+// limit bounds it, for that guest only.
+func TestEgressNetNSConnRate(t *testing.T) {
+	requireNetNS(t)
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Fatal("python3 required")
+	}
+	l := newLab(t)
+	l.load(t, "firerunner.nft", mustNFTRuleset(t, egressRuleset{
+		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
+		VMCidr: labCIDR, CachePort: labCache, Allowed: []string{"1.0.0.0/24"},
+		ConnLimit: 1000, ConnRate: 5,
+	}))
+	l.listen(t, 8080)
+	// A burst of 50 passes, then 5 a second.
+	ok, secs := l.churn(t, l.guest0, 200)
+	if most := 50 + int(5*secs) + 5; ok > most {
+		t.Fatalf("%d of 200 connections in %.1fs, want at most %d at 5/s after a burst of 50", ok, secs, most)
+	}
+	if ok < 50 {
+		t.Fatalf("only %d connections passed, want the burst of 50", ok)
+	}
+	if ok, _ := l.churn(t, l.guest1, 10); ok != 10 {
+		t.Fatalf("another guest's rate limited this guest: %d of 10 connected", ok)
+	}
+}
+
+// Packets that spoof another guest's address are dropped by the main table
+// before the limit chains see them (priority 1), so they cannot spend that
+// guest's allowance.
+func TestEgressNetNSSpoofedSourceSpendsNoAllowance(t *testing.T) {
+	requireNetNS(t)
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Fatal("python3 required for packet injection")
+	}
+	l := newLab(t)
+	sh(t, l.in(l.router, "sysctl", "-q", "-w", "net.ipv4.conf.all.rp_filter=0", "net.ipv4.conf.fk0.rp_filter=0")...)
+	l.load(t, "firerunner.nft", mustNFTRuleset(t, egressRuleset{
+		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
+		VMCidr: labCIDR, CachePort: labCache, MaxVMs: 2, Allowed: []string{"1.0.0.0/24"},
+		ConnLimit: 1000, ConnRate: 1, // a burst of 10
+	}))
+	l.listen(t, 8080)
+	for range 30 {
+		l.sourceProbe(t, "172.19.1.2", "1.0.0.1")
+	}
+	if ok, _ := l.churn(t, l.guest1, 5); ok != 5 {
+		t.Fatalf("spoofed packets spent the guest's allowance: %d of 5 connected", ok)
 	}
 }
