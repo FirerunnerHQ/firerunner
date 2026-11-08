@@ -1,8 +1,9 @@
 #!/bin/sh
+# firerunner: commit-msg hook installed by make setup
 # commit-msg: sign off every commit, as the dco workflow requires, so a
-# forgotten `git commit -s` cannot block a PR. Installed by `make setup`
-# (git config core.hooksPath .githooks), never automatically. Installing it
-# means you certify the DCO for every commit you make in this clone.
+# forgotten `git commit -s` cannot block a PR. `make setup` copies it into
+# .git/hooks, never automatically. Installing it means you certify the DCO
+# for every commit you make in this clone.
 #
 # Appends "Signed-off-by: <author>" unless that exact trailer is already
 # there, so `git commit -s` does not produce a duplicate, and another

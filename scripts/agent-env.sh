@@ -94,7 +94,10 @@ if [ "${#missing[@]}" -gt 0 ]; then
 	echo "# agent-env: not found on PATH or in ${dirs[*]}: ${missing[*]}"
 fi
 
-if [ "$(git config --get core.hooksPath 2>/dev/null)" != .githooks ]; then
+hook="$(git rev-parse --git-path hooks 2>/dev/null)/commit-msg"
+if [ "$(git config --get core.hooksPath 2>/dev/null)" = .githooks ]; then
+	echo "# agent-env: run \`make setup\`: core.hooksPath=.githooks runs each branch's own hooks"
+elif ! cmp -s .githooks/commit-msg "$hook" 2>/dev/null; then
 	echo "# agent-env: run \`make setup\` to sign off commits automatically"
 fi
 exit 0
