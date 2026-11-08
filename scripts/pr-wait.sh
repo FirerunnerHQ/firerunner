@@ -6,7 +6,8 @@
 #   PR          number, URL or branch, as gh accepts
 #   --deadline  give up after S seconds (default 1800)
 #   --sha       wait for this head commit (say, `git rev-parse HEAD` after a
-#               push) while GitHub still shows the PR at an older one
+#               push) while GitHub still shows the PR at an older one; an
+#               abbreviated id of 7 or more hex digits matches as a prefix
 #   --repo      default: the repository of the current directory
 #
 # It looks only at the check runs of the PR's current head commit, read again
@@ -82,7 +83,12 @@ log_lines="${FR_PR_WAIT_LOG_LINES:-60}"
 for v in "$deadline" "$poll" "$log_lines"; do
 	case "$v" in '' | *[!0-9]*) die 2 "not a number of seconds or lines: '$v'" ;; esac
 done
-case "$want" in *[!0-9a-f]*) die 2 "--sha needs a full hex commit id, not '$want'" ;; esac
+# An abbreviated id (git log --oneline's) is a prefix of the head; a full one
+# matches exactly. Fewer than 7 digits could match a commit not meant.
+case "$want" in *[!0-9a-f]*) die 2 "--sha needs a hex commit id, not '$want'" ;; esac
+if [ -n "$want" ] && [ "${#want}" -lt 7 ]; then
+	die 2 "--sha needs at least 7 hex digits, not '$want'"
+fi
 command -v gh >/dev/null || die 2 "gh not found"
 command -v jq >/dev/null || die 2 "jq not found"
 
@@ -149,7 +155,7 @@ while :; do
 	fi
 	first=0
 
-	if [ -n "$want" ] && [ "$head" != "$want" ]; then
+	if [ -n "$want" ] && [ "${head#"$want"}" = "$head" ]; then
 		log "waiting for head $want; the PR is at $head"
 		checks='[]'
 		missing="$required"
@@ -183,7 +189,7 @@ while :; do
 		break
 	fi
 	if [ "$(now)" -ge "$give_up" ]; then
-		if [ -n "$want" ] && [ "$head" != "$want" ]; then
+		if [ -n "$want" ] && [ "${head#"$want"}" = "$head" ]; then
 			log "PR #$number never reached head $want within ${deadline}s"
 		elif [ "$total" = 0 ]; then
 			log "no check reported on $head of PR #$number within ${deadline}s"
