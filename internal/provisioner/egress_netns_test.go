@@ -126,6 +126,17 @@ const guestDNAT = `table ip guest_dns {
 }
 `
 
+// publishedPort mirrors a host service that rewrites a port to a private
+// address, as Docker or Kubernetes publish a container's port. Only the host's
+// DNS redirect is exempt from the non-public drop; this one must not be.
+const publishedPort = `table ip published {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    tcp dport 8080 dnat to 10.0.0.5:443
+  }
+}
+`
+
 // reachable dials ip:port over TCP from a namespace. Nothing listens anywhere,
 // so a packet that arrives is answered with a RST (connection refused) while a
 // dropped one times out: the two outcomes separate "delivered" from "filtered"
@@ -219,6 +230,7 @@ func TestEgressNetNSOpen(t *testing.T) {
 	requireNetNS(t)
 	l := newLab(t)
 	l.load(t, "guest-dns.nft", guestDNAT)
+	l.load(t, "published.nft", publishedPort)
 	l.load(t, "firerunner.nft", mustNFTRuleset(t, egressRuleset{
 		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
 		VMCidr: labCIDR, CachePort: labCache, Open: true,
@@ -229,12 +241,14 @@ func TestEgressNetNSOpen(t *testing.T) {
 		// 8.8.8.8 is routed nowhere in the lab: only the host's DNAT to the
 		// private resolver can deliver it.
 		{"host-DNAT'd DNS", "8.8.8.8", 53, true},
+		{"a host's published port to a private address", "9.9.9.9", 8080, false},
 	}, guestBoundaries...))
 }
 
 func TestEgressNetNSAllowlist(t *testing.T) {
 	requireNetNS(t)
 	l := newLab(t)
+	l.load(t, "published.nft", publishedPort)
 	l.load(t, "firerunner.nft", mustNFTRuleset(t, egressRuleset{
 		Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
 		VMCidr: labCIDR, CachePort: labCache,
@@ -249,6 +263,8 @@ func TestEgressNetNSAllowlist(t *testing.T) {
 		// An explicitly configured resolver stays reachable on 53 even when it
 		// is on the LAN, and only on 53.
 		{"configured LAN resolver", "192.168.4.10", 53, true},
+		// The host rewrites this allowlisted address's port to a private one.
+		{"a host's published port to a private address", "1.0.0.1", 8080, false},
 	}, guestBoundaries...))
 }
 
@@ -257,22 +273,35 @@ func TestEgressNetNSAllowlist(t *testing.T) {
 // otherwise make a broken firewall look correct. No packet leaves the lab.
 func (l lab) sourceProbe(t *testing.T, source, destination string) {
 	t.Helper()
+	l.tcpProbe(t, source, destination, 2) // SYN
+}
+
+// tcpProbe sends one TCP segment with the given flags from guest0, with an
+// explicit source address, to destination port 8099.
+func (l lab) tcpProbe(t *testing.T, source, destination string, flags int) {
+	t.Helper()
 	const script = `import socket,struct,sys
-src,dst=sys.argv[1:]
+src,dst,flags=sys.argv[1],sys.argv[2],int(sys.argv[3])
 def checksum(b):
  s=sum(struct.unpack('!%dH'%(len(b)//2),b));s=(s>>16)+(s&65535);s+=(s>>16);return (~s)&65535
-tcp=struct.pack('!HHLLBBHHH',42345,8099,1,0,80,2,65535,0,0)
+tcp=struct.pack('!HHLLBBHHH',42345,8099,1,0,80,flags,65535,0,0)
 pseudo=socket.inet_aton(src)+socket.inet_aton(dst)+struct.pack('!BBH',0,6,len(tcp))
 tcp=tcp[:16]+struct.pack('!H',checksum(pseudo+tcp))+tcp[18:]
 ip=struct.pack('!BBHHHBBH4s4s',69,0,40,1,0,64,6,0,socket.inet_aton(src),socket.inet_aton(dst))
 s=socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_RAW)
 s.sendto(ip+tcp,(dst,0))
 `
-	sh(t, l.in(l.guest0, "python3", "-c", script, source, destination)...)
+	sh(t, l.in(l.guest0, "python3", "-c", script, source, destination, fmt.Sprint(flags))...)
 }
 func (l lab) spoofCount(t *testing.T) uint64 {
 	t.Helper()
-	out, err := exec.Command("ip", "netns", "exec", l.router, "nft", "-j", "list", "counter", "ip", "fr_test", "guest_spoof_drop").CombinedOutput()
+	return l.counter(t, "guest_spoof_drop")
+}
+
+// counter reads a named nft counter in the router's fr_test table.
+func (l lab) counter(t *testing.T, name string) uint64 {
+	t.Helper()
+	out, err := exec.Command("ip", "netns", "exec", l.router, "nft", "-j", "list", "counter", "ip", "fr_test", name).CombinedOutput()
 	if err != nil {
 		t.Fatalf("counter: %v %s", err, out)
 	}
@@ -291,8 +320,32 @@ func (l lab) spoofCount(t *testing.T) uint64 {
 			return entry.Counter.Packets
 		}
 	}
-	t.Fatalf("missing spoof counter: %s", out)
+	t.Fatalf("missing counter %s: %s", name, out)
 	return 0
+}
+
+// A packet conntrack marks invalid (here SYN and FIN together) matches no ct
+// expression. The non-public guard must drop it anyway, in open mode where
+// the forward policy would otherwise accept it.
+func TestEgressNetNSInvalidPacketToNonPublicIsDropped(t *testing.T) {
+	requireNetNS(t)
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Fatal("python3 required for packet injection")
+	}
+	for _, open := range []bool{true, false} {
+		t.Run(fmt.Sprintf("open=%t", open), func(t *testing.T) {
+			l := newLab(t)
+			l.load(t, "firerunner.nft", mustNFTRuleset(t, egressRuleset{
+				Table: "fr_test", IfacePrefix: labPrefix, ExtIface: "ext0",
+				VMCidr: labCIDR, CachePort: labCache, MaxVMs: 2, Open: open, Allowed: []string{"1.0.0.0/24"},
+			}))
+			before := l.counter(t, "nonpublic_drop")
+			l.tcpProbe(t, "172.19.0.2", "10.0.0.5", 3) // SYN+FIN
+			if after := l.counter(t, "nonpublic_drop"); after <= before {
+				t.Fatalf("an invalid packet to a private address passed the guard (%d -> %d)", before, after)
+			}
+		})
+	}
 }
 
 func TestEgressNetNSSourceSpoofing(t *testing.T) {

@@ -202,6 +202,7 @@ func buildNFTRuleset(cfg egressRuleset) (string, error) {
 		b.WriteString("\t}\n")
 	}
 
+	writeNonPublicGuard(&b)
 	b.WriteString("\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n")
 	if iface != "" {
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" ip saddr != %s drop\n", iface, cfg.VMCidr)
@@ -363,19 +364,41 @@ var nonPublicNets = []string{
 const mailPorts = "25, 465, 587, 2525"
 
 // guestEgressGuards writes the forward rules that hold in every egress mode:
-// guests reach no non-public network and no mail port. The forward hook sees a
-// packet after prerouting DNAT, so a destination the HOST rewrote (the CI
-// hosts redirect guest DNS to a resolver on a private veth) is exempt from the
-// non-public drop: a guest cannot create a DNAT entry, only the host's own
-// rules can. In allowlist mode these come after the explicit resolver accept,
-// so a configured LAN resolver stays reachable on port 53 only.
-//
-// ⚠️ The exemption must test the dnat BIT: "ct status != dnat" compiles to an
-// exact compare against 0x20, which every real connection (confirmed, seen-
-// reply, ...) fails, so it would drop host-DNAT'd traffic too.
+// guests reach no non-public network and no mail port. Every guest packet to a
+// non-public address goes through the nonpublic_guard chain (see
+// writeNonPublicGuard). In allowlist mode these come after the explicit
+// resolver accept, so a configured LAN resolver stays reachable on port 53
+// only.
 func guestEgressGuards(b *strings.Builder, vmCidr string) {
-	fmt.Fprintf(b, "\t\tip saddr %s ip daddr @nonpublic ct status & dnat == 0 drop\n", vmCidr)
+	fmt.Fprintf(b, "\t\tip saddr %s ip daddr @nonpublic jump nonpublic_guard\n", vmCidr)
 	fmt.Fprintf(b, "\t\tip saddr %s tcp dport { %s } drop\n", vmCidr, mailPorts)
+}
+
+// writeNonPublicGuard writes the chain a guest packet to a non-public address
+// jumps to. It drops everything except DNS the HOST rewrote: the forward hook
+// sees a packet after prerouting DNAT, the CI hosts redirect guest DNS to a
+// resolver on a private veth, and a guest cannot create a DNAT entry, only
+// the host's own rules can. The exemption is DNAT'd TCP or UDP whose original
+// destination port, as the guest sent it, is 53. A host has other DNAT rules
+// (Docker's or Kubernetes' published ports rewrite to private container
+// addresses), and exempting every DNAT'd flow let a guest reach what is
+// behind them. The chain returns on that one match and drops the rest, so it
+// fails closed: a packet conntrack marks invalid, which matches no ct
+// expression, is dropped rather than slipping past every guard.
+//
+// Any host DNAT of port 53 is still exempt, whatever it rewrites to, such as
+// kube-proxy's cluster DNS address on a Kubernetes host: a guest can reach DNS
+// there, and nothing else.
+//
+// ⚠️ The exemption must test the dnat BIT: "ct status dnat" as an exact
+// compare against 0x20 fails for every real connection (confirmed, seen-
+// reply, ...), so it would drop host-DNAT'd traffic too.
+func writeNonPublicGuard(b *strings.Builder) {
+	b.WriteString("\tcounter nonpublic_drop { }\n")
+	b.WriteString("\tchain nonpublic_guard {\n")
+	b.WriteString("\t\tct status & dnat == dnat meta l4proto { tcp, udp } ct original proto-dst 53 return\n")
+	b.WriteString("\t\tcounter name nonpublic_drop drop\n")
+	b.WriteString("\t}\n")
 }
 
 // egressRuleset is the fully-resolved input to buildNFTRuleset.
