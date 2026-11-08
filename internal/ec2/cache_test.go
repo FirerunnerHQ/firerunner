@@ -60,6 +60,16 @@ func cacheOpts(t *testing.T, jobs VMJobs) *CacheOptions {
 	return &CacheOptions{CA: ca, Upstream: "10.0.0.5:8099", Jobs: jobs, LeafTTL: 7 * time.Hour}
 }
 
+// cacheBundleCode asks for the instance's bundle without fetching its config
+// first, and returns only the status.
+func (h *harness) cacheBundleCode(ip string) (int, string) {
+	req := httptest.NewRequest(http.MethodGet, jitserver.CachePath, nil)
+	req.RemoteAddr = ip + ":40000"
+	rec := httptest.NewRecorder()
+	h.jit.ServeHTTP(rec, req)
+	return rec.Code, ""
+}
+
 // cacheBundle fetches the instance's bundle as its boot script would, after
 // its config.
 func (h *harness) cacheBundle(t *testing.T, ip string) (int, cachetls.Bundle) {
