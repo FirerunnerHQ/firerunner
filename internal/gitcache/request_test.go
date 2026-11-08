@@ -152,8 +152,32 @@ func TestKey_IgnoresWhatDoesNotChangeTheObjects(t *testing.T) {
 			t.Errorf("%s changed the key", name)
 		}
 	}
-	if !strings.HasPrefix(base, "git/") || len(base) != 68 {
+	if !strings.HasPrefix(base, "git/o/r/") || len(base) != 72 {
 		t.Fatalf("key = %q", base)
+	}
+	if repo, ok := KeyRepository(base); !ok || repo != "o/r" {
+		t.Fatalf("KeyRepository(%q) = %q, %v; want o/r", base, repo, ok)
+	}
+}
+
+// KeyRepository reads only well-formed keys: the repository in lower case,
+// then a 64-digit hash.
+func TestKeyRepository(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	for key, want := range map[string]string{
+		"git/owner/repo/" + hash:   "owner/repo",
+		"git/Owner/repo/" + hash:   "",
+		"git/owner/repo/abc":       "",
+		"git/owner/" + hash:        "",
+		"git/../repo/" + hash:      "",
+		"git/owner/repo/x/" + hash: "",
+		"cache/owner/repo/" + hash: "",
+		"git/" + hash:              "",
+	} {
+		got, ok := KeyRepository(key)
+		if got != want || ok != (want != "") {
+			t.Errorf("KeyRepository(%q) = %q, %v; want %q", key, got, ok, want)
+		}
 	}
 }
 
