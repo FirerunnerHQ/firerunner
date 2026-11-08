@@ -8,6 +8,12 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- The cache server counts uploads that are not yet finalized toward
+  `--max-size`, so its disk use stays within the cap. An upload that would go
+  past it while other uploads are unfinished gets `507 Insufficient Storage`.
+
 ## [0.1.8] - 2026-11-07
 
 ### Added

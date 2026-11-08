@@ -971,8 +971,12 @@ responsibility). Never leave `0.0.0.0:8099` reachable from an untrusted network.
 
 By default the store is capped at 50 GB; once a newly finalized entry pushes the
 total over the cap, the least-recently-used entries are evicted until it fits
-(mirroring GitHub's per-repo LRU). Tune it with `--max-size` (e.g. `--max-size
-100GB`, or `--max-size 0` for unlimited):
+(mirroring GitHub's per-repo LRU). Uploads still in flight count toward the cap
+as their bytes arrive: they first evict completed entries to make room, and are
+refused with `507 Insufficient Storage` when other unfinished uploads already
+fill it, so reserving keys and never finalizing them cannot fill the disk. Tune
+it with `--max-size` (e.g. `--max-size 100GB`, or `--max-size 0` for
+unlimited):
 
 ```bash
 firerunner cache-server --dir /var/lib/firerunner/cache --max-size 50GB
@@ -994,6 +998,10 @@ firerunner cache-server --dir /var/lib/firerunner/cache \
   the server fetches it into a local copy in the background for the next
   restore. Dropping a local copy never loses data, because S3 keeps every
   blob.
+- **Staging disk.** Uploads not yet finalized are staged in `--dir` and count
+  toward `--max-size`, which also caps what S3 holds. Size `--dir` for
+  `--max-size` plus `--s3-local-cache-size`, or keep `--max-size` within the
+  local disk; with `--max-size 0` staged uploads are not bounded.
 - **Replacing the server.** A new cache-server whose local index is empty loads
   the index from the bucket, so it serves everything its predecessor finalized.
 - **A blob missing from the bucket**, for example after a lifecycle rule or

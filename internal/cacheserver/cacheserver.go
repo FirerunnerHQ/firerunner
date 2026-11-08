@@ -571,7 +571,16 @@ func (s *Server) uploadSingle(w http.ResponseWriter, r *http.Request, e *Entry) 
 	if cap := s.entryCap(); cap > 0 {
 		body = http.MaxBytesReader(w, r.Body, cap)
 	}
-	n, err := writeFile(s.blobPath(e.ID), body)
+	// A single PUT replaces whatever the entry held, as in Azure. Drop staged
+	// blocks and an earlier blob first, so the bytes counted are the bytes on
+	// disk: finishUpload records only this blob, and left behind, the blocks
+	// would sit on disk uncounted.
+	_ = os.RemoveAll(s.tmpDir(e.ID))
+	_ = os.Remove(s.blobPath(e.ID))
+	s.clearStaged(e.ID)
+	br := &budgetReader{r: body, s: s, e: e}
+	n, err := writeFile(s.blobPath(e.ID), br)
+	br.settle(err != nil)
 	if err != nil {
 		_ = os.Remove(s.blobPath(e.ID)) // don't leave an oversized/partial blob squatting disk
 		s.clearStaged(e.ID)
@@ -608,14 +617,16 @@ func (s *Server) uploadBlock(w http.ResponseWriter, r *http.Request, e *Entry) {
 		body = http.MaxBytesReader(w, r.Body, remaining)
 	}
 	blockPath := filepath.Join(dir, hex.EncodeToString([]byte(blockID)))
-	n, err := writeFile(blockPath, body)
+	br := &budgetReader{r: body, s: s, e: e}
+	_, err := writeFile(blockPath, br)
+	br.settle(err != nil)
 	if err != nil {
 		_ = os.Remove(blockPath)
 		code, msg := uploadStatus(err)
 		http.Error(w, msg, code)
 		return
 	}
-	if !s.addStaged(e, n) {
+	if !s.reserved(e) {
 		// Reclaimed while the block streamed in (see finishUpload).
 		_ = os.RemoveAll(dir)
 		http.Error(w, "cache reservation expired", http.StatusNotFound)
@@ -659,6 +670,9 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 		return
 	}
 	cap := s.entryCap()
+	// The assembled blob sits beside its blocks until they are removed, so it
+	// is claimed too; finishUpload then records only the blob.
+	br := &budgetReader{s: s, e: e}
 	var total int64
 	for _, id := range ids {
 		blockPath := filepath.Join(dir, hex.EncodeToString([]byte(id)))
@@ -666,16 +680,20 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 		if err != nil {
 			out.Close()
 			_ = os.Remove(tmp)
+			br.settle(true)
 			http.Error(w, "missing staged block: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		n, err := io.Copy(out, f)
+		br.r = f
+		n, err := io.Copy(out, br)
 		f.Close()
 		total += n
 		if err != nil {
 			out.Close()
 			_ = os.Remove(tmp)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			br.settle(true)
+			code, msg := uploadStatus(err)
+			http.Error(w, msg, code)
 			return
 		}
 		if cap > 0 && total > cap {
@@ -689,11 +707,13 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(tmp)
+		br.settle(true)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if err := os.Rename(tmp, s.blobPath(e.ID)); err != nil {
 		_ = os.Remove(tmp)
+		br.settle(true)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -930,15 +950,7 @@ func (s *Server) evictLRU(keepID uint64) {
 	if s.maxSize <= 0 {
 		return
 	}
-	var total int64
-	for _, e := range s.entries {
-		if e.Complete {
-			total += e.Size
-		}
-	}
-	for _, n := range s.staged {
-		total += n
-	}
+	total := s.bytesUsed()
 	for total > s.maxSize {
 		var victim *Entry
 		for _, e := range s.entries {
@@ -960,6 +972,144 @@ func (s *Server) evictLRU(keepID uint64) {
 		s.evictions++
 		s.log.Info("evicted cache entry (size cap)", "id", victim.ID, "key", victim.Key, "size", victim.Size)
 	}
+}
+
+// bytesUsed is the size of all completed blobs plus every in-flight upload's
+// staged bytes. The caller must hold s.mu.
+func (s *Server) bytesUsed() int64 {
+	var total int64
+	for _, e := range s.entries {
+		if e.Complete {
+			total += e.Size
+		}
+	}
+	for _, n := range s.staged {
+		total += n
+	}
+	return total
+}
+
+// claimChunk is the most an upload claims ahead of its reads, so a streaming
+// upload takes s.mu once per chunk rather than once per read.
+const claimChunk = 8 << 20
+
+// claimStep is how far ahead of its reads an upload claims. A claim can evict
+// completed entries for bytes that never arrive, so the step stays a small
+// share of maxSize.
+func (s *Server) claimStep() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxSize <= 0 {
+		return claimChunk
+	}
+	return min(claimChunk, max(s.maxSize/64, 1))
+}
+
+var (
+	errCacheFull       = errors.New("cache is full")
+	errReservationGone = errors.New("cache reservation expired")
+)
+
+// claim counts n more in-flight bytes for e before they reach the disk.
+// Eviction only removes completed entries, so without this a job could
+// reserve many keys, stream into each and never finalize, filling the disk
+// past maxSize for as long as the janitor leaves the reservations. claim
+// refuses with errCacheFull when in-flight bytes would exceed maxSize and
+// other uploads hold part of them; otherwise it evicts least-recently-used
+// completed entries to make room. An entry alone may still exceed maxSize, as
+// evictLRU allows, so disk use stays within the larger of maxSize and one
+// entry's cap. It refuses with errReservationGone once e is no longer the
+// reserved entry.
+func (s *Server) claim(e *Entry, n int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.entries[e.ID] != e {
+		return errReservationGone
+	}
+	s.staged[e.ID] += n
+	if s.maxSize <= 0 {
+		return nil
+	}
+	// Refuse before evicting: when in-flight bytes alone are over the cap,
+	// evicting completed entries cannot make room, only lose them.
+	var inFlight int64
+	for _, b := range s.staged {
+		inFlight += b
+	}
+	if inFlight > s.maxSize && inFlight > s.staged[e.ID] {
+		if s.staged[e.ID] -= n; s.staged[e.ID] <= 0 {
+			delete(s.staged, e.ID)
+		}
+		return errCacheFull
+	}
+	evictions := s.evictions
+	s.evictLRU(0) // IDs start at 1, so every completed entry is a candidate
+	if s.evictions != evictions {
+		if err := s.save(); err != nil {
+			s.log.Warn("cache index save failed", "err", err)
+		}
+	}
+	return nil
+}
+
+// release returns n claimed bytes that never reached the disk, or that a
+// failed upload removed.
+func (s *Server) release(e *Entry, n int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.entries[e.ID] != e {
+		return
+	}
+	if s.staged[e.ID] -= n; s.staged[e.ID] <= 0 {
+		delete(s.staged, e.ID)
+	}
+}
+
+// budgetReader claims bytes for e as an upload streams through it, ahead of
+// the write, in claimChunk steps. It fails the read, writing nothing more,
+// when a claim is refused.
+type budgetReader struct {
+	r       io.Reader
+	s       *Server
+	e       *Entry
+	claimed int64 // bytes claimed for e so far
+	read    int64 // bytes passed on to the writer
+	step    int64 // claim-ahead size, from claimStep on the first read
+}
+
+func (b *budgetReader) Read(p []byte) (int, error) {
+	if b.step == 0 {
+		b.step = b.s.claimStep()
+	}
+	n, err := b.r.Read(p)
+	if need := b.read + int64(n) - b.claimed; need > 0 {
+		// Claim ahead, and fall back to the exact need near a full cache.
+		cerr := b.s.claim(b.e, max(need, b.step))
+		if cerr == errCacheFull && need < b.step {
+			cerr = b.s.claim(b.e, need)
+		} else if cerr == nil {
+			need = max(need, b.step)
+		}
+		if cerr != nil {
+			return 0, cerr
+		}
+		b.claimed += need
+	}
+	b.read += int64(n)
+	return n, err
+}
+
+// settle returns what was claimed beyond the bytes read; failed releases all
+// of it, for an upload whose bytes were removed.
+func (b *budgetReader) settle(failed bool) {
+	extra := b.claimed - b.read
+	if failed {
+		extra = b.claimed
+	}
+	if extra > 0 {
+		b.s.release(b.e, extra)
+	}
+	b.claimed -= extra
 }
 
 // lessRecentlyUsed reports whether a is a better eviction victim than b: older
@@ -1062,27 +1212,29 @@ func writeFile(path string, r io.Reader) (int64, error) {
 }
 
 // uploadStatus maps an upload write error to an HTTP status: an over-cap body
-// (http.MaxBytesError) is a 413, anything else a 500.
+// (http.MaxBytesError) is a 413, a full cache a 507, a reclaimed reservation a
+// 404, anything else a 500.
 func uploadStatus(err error) (int, string) {
 	var mbe *http.MaxBytesError
-	if errors.As(err, &mbe) {
+	switch {
+	case errors.As(err, &mbe):
 		return http.StatusRequestEntityTooLarge, "cache entry exceeds max entry size"
+	case errors.Is(err, errCacheFull):
+		return http.StatusInsufficientStorage, err.Error()
+	case errors.Is(err, errReservationGone):
+		return http.StatusNotFound, err.Error()
 	}
 	return http.StatusInternalServerError, err.Error()
 }
 
-// staged-byte accounting bounds the disk a not-yet-finalized entry occupies;
-// finishUpload records an assembled blob.
-// addStaged reports false, recording nothing, once e is no longer the
-// reserved entry.
-func (s *Server) addStaged(e *Entry, n int64) bool {
+// staged-byte accounting bounds the disk a not-yet-finalized entry occupies:
+// uploads claim their bytes as they stream (see claim), and finishUpload
+// records an assembled blob.
+// reserved reports whether e is still the reserved entry for its ID.
+func (s *Server) reserved(e *Entry) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.entries[e.ID] != e {
-		return false
-	}
-	s.staged[e.ID] += n
-	return true
+	return s.entries[e.ID] == e
 }
 func (s *Server) stagedBytes(id uint64) int64 {
 	s.mu.Lock()
