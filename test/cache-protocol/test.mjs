@@ -55,9 +55,16 @@ async function lease() {
   await record({runner: job, generation: job});
   return job;
 }
+// repositoryID gives each repository name a stable GitHub ID, which cache
+// scope is keyed by along with the name.
+const repositoryIDs = new Map();
+function repositoryID(name) {
+  if (!repositoryIDs.has(name)) repositoryIDs.set(name, 1000 + repositoryIDs.size);
+  return repositoryIDs.get(name);
+}
 async function identity(ref, reads = [ref, main], repository = 'owner/repo', job = `job-${++generation}`) {
   await record({
-    runner: job, generation: job, repository,
+    runner: job, generation: job, repository, repository_id: repositoryID(repository),
     event: ref.startsWith('refs/pull/') ? 'pull_request' : 'push',
     write_ref: ref, read_refs: [...new Set(reads)], run_id: generation, job_id: job
   });

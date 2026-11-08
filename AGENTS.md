@@ -10,9 +10,12 @@ make check                      # everything CI's test job checks, with a PASS/F
 make check CHECK_ARGS=--fast    # same, without the slow race/coverage run
 ```
 
-A `SKIP` line always says why; for example, `docker-shim` needs Linux. CI also
-runs jobs `make check` cannot: `netns` (root, nftables), `cache-protocol` (npm)
-and `e2e` (a KVM host).
+A `SKIP` line always says why; for example, `docker-shim` needs Linux. CI's
+`cache-protocol` job, the real `@actions/cache` toolkit against cache-server,
+runs in `make check` once its toolkit is installed (`npm ci --prefix
+test/cache-protocol --ignore-scripts`); run it after changing cache-server or
+job identity. CI also runs jobs `make check` cannot: `netns` (root, nftables;
+see `check-remote` below) and `e2e` (a KVM host).
 
 On macOS, run the Linux-only steps before you push, not after the merge:
 `FR_REMOTE_HOST=user@linux-host make check-remote` copies the working tree to

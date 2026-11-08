@@ -333,6 +333,33 @@ func TestScopeMatchingDecisionTable(t *testing.T) {
 	}
 }
 
+// An index saved before entries were scoped by repository ID keeps its
+// name-only scope, which no identity matches any more: after an upgrade those
+// entries are never restored, even through an empty restore prefix.
+func TestNameScopedEntriesAreNotRestoredAfterUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	old := `[{"id":5,"sig":"tok","ref":"refs/heads/main","repo_id":"owner/repo","key":"git/abc","version":"v","size":4,"complete":true}]`
+	if err := os.WriteFile(filepath.Join(dir, "index.json"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.blobPath(5), []byte("pack"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetScope(func(string) (jobidentity.Identity, error) { return testIdentity("owner/repo", mainRef, "job"), nil }); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	if b, _ := restore(t, ts.URL, "git/abc", ""); b != "" {
+		t.Fatalf("a name-scoped entry was restored: %q", b)
+	}
+	wantStatus(t, "GET", ts.URL+"/download/5?sig=tok", nil, 403)
+}
+
 func TestLegacyEntriesNeverAuthorized(t *testing.T) {
 	dir := t.TempDir()
 	legacy := `[{"id":90,"sig":"old-token","repo_id":"owner/repo","key":"legacy","version":"v","size":3,"complete":true}]`
@@ -622,8 +649,38 @@ func TestMultiRepositoryAndUnresolvedIsolation(t *testing.T) {
 	}
 }
 
+// A repository created under a name another one gave up (renamed or deleted)
+// reads none of its predecessor's caches, even with an empty restore prefix:
+// scope is keyed by GitHub's repository ID, not the name. An identity without
+// an ID has no authority at all.
+func TestRecreatedRepositoryCannotReadItsPredecessor(t *testing.T) {
+	l := newScopeLab(t)
+	old := testIdentity("owner/repo", "refs/heads/main", "old")
+	l.set("172.16.1.2", old)
+	before := l.guest(t, "172.16.1.2", "", "")
+	l.save(t, before, "git/abc", "private pack")
+
+	successor := testIdentity("owner/repo", "refs/heads/main", "new")
+	successor.RepositoryID = old.RepositoryID + 1
+	l.set("172.16.2.2", successor)
+	after := l.guest(t, "172.16.2.2", "", "")
+	if got, _ := restore(t, after, "git/abc", ""); got != "" {
+		t.Fatalf("a recreated repository read its predecessor's entry: %q", got)
+	}
+	if got, _ := restore(t, before, "git/abc"); got != "private pack" {
+		t.Fatalf("the repository itself lost its entry: %q", got)
+	}
+
+	noID := testIdentity("owner/repo", "refs/heads/main", "noid")
+	noID.RepositoryID = 0
+	l.set("172.16.3.2", noID)
+	if got, _ := restore(t, l.guest(t, "172.16.3.2", "", ""), "git/abc", ""); got != "" {
+		t.Fatalf("an identity without a repository ID read an entry: %q", got)
+	}
+}
+
 func pendingIdentity(repo, generation string) jobidentity.Identity {
-	return jobidentity.Identity{Repository: repo, Runner: "test-runner", Generation: generation, ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	return jobidentity.Identity{Repository: repo, RepositoryID: testRepoID(repo), Runner: "test-runner", Generation: generation, ExpiresAt: time.Now().Add(time.Hour).Unix()}
 }
 
 func TestPendingIdentityWaitsForResolution(t *testing.T) {

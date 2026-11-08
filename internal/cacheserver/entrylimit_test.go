@@ -94,7 +94,7 @@ func TestRepoEntryCapEvictsOnlyThatRepo(t *testing.T) {
 	defer l.s.mu.Unlock()
 	mine := 0
 	for _, e := range l.s.entries {
-		if e.RepoID == "owner/repo" {
+		if e.RepoID == testIdentity("owner/repo", "", "").ScopeKey() {
 			mine++
 		}
 	}

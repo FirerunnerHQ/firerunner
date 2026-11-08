@@ -64,10 +64,22 @@ check "show merges CHANGELOG.md's lines and the fragments, by section" test "$ou
 - A guard."
 check "show --json lists the fragments" grep -q '"changelog.d/feature.md"' <<<"$(cl show --json)"
 cl release 0.2.0 2026-02-02 >/dev/null
-check "release writes the version under an empty Unreleased" \
-	grep -qz '## \[Unreleased\]\n\n## \[0.2.0\] - 2026-02-02\n\n### Added\n\n- A feature.' "$T/CHANGELOG.md"
+# has <file> <text>: the file holds text, which may span lines. Newlines are
+# folded to "|" on both sides, since "\n" in a pattern means a newline to BSD
+# grep -z but not to GNU grep.
+# shellcheck disable=SC2329 # called through check
+has() { grep -qF -- "$(printf '%s' "$2" | tr '\n' '|')" <<<"$(tr '\n' '|' <"$1")"; }
+check "release writes the version under an empty Unreleased" has "$T/CHANGELOG.md" "## [Unreleased]
+
+## [0.2.0] - 2026-02-02
+
+### Added
+
+- A feature."
 check "release keeps the earlier release" grep -q '## \[0.1.0\] - 2026-01-01' "$T/CHANGELOG.md"
-check "release updates the compare links" grep -qz 'compare/v0.2.0...HEAD\n\[0.2.0\]: .*releases/tag/v0.2.0\n\[0.1.0\]' "$T/CHANGELOG.md"
+check "release updates the compare links" has "$T/CHANGELOG.md" "compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.2.0
+[0.1.0]"
 check "release deletes the fragments it folded in" test ! -e "$T/changelog.d/fix.md" -a ! -e "$T/changelog.d/feature.md"
 check "show after release has nothing" test "$(cl show)" = "(no unreleased changes)"
 check "a second release of the same version is refused" not quiet cl release 0.2.0
