@@ -80,10 +80,15 @@ reachable IPv4 range (RFC1918 — so the host's LAN — the `100.64.0.0/10` tail
 range, link-local `169.254.0.0/16` metadata, loopback, documentation, multicast, reserved) and
 to TCP ports 25, 465, 587 and 2525. Two exceptions, both chosen by the host
 rather than the guest: a resolver listed in `--dns-servers` stays reachable on
-port 53 in allowlist mode even on the LAN, and a destination the host itself
-rewrote with DNAT (for example, redirecting guest DNS to a local resolver) is
-not treated as a guest-chosen private address. `make netns-test` proves this
-against the real kernel in throwaway network namespaces.
+port 53 in allowlist mode even on the LAN, and DNS the host itself rewrote
+with DNAT (for example, redirecting guest DNS to a local resolver: TCP or UDP
+the guest sent to port 53) is not treated as a guest-chosen private address.
+No other DNAT is exempt, so a host's published ports (Docker's, Kubernetes')
+that rewrite to private container addresses stay out of reach. Any host DNAT
+of port 53 is exempt whatever its target, such as a Kubernetes host's cluster
+DNS, so a guest there can reach DNS and nothing else. Packets conntrack marks
+invalid are dropped too. `make netns-test` proves this against the real
+kernel in throwaway network namespaces.
 
 The same table also protects the **host itself**: an `input` chain drops
 guest→host traffic (so a guest cannot reach host-local services), allowing only

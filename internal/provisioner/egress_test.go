@@ -308,10 +308,14 @@ func TestBuildNFTRulesetGuestEgressGuards(t *testing.T) {
 				}
 			}
 			rules := forwardChain(t, out)
-			ruleIndex(t, rules, "ip saddr "+vmCIDR+" ip daddr @nonpublic ct status & dnat == 0 drop")
-			ruleIndex(t, rules, "ip saddr "+vmCIDR+" ip daddr @nonpublic meta l4proto != { tcp, udp } drop")
-			ruleIndex(t, rules, "ip saddr "+vmCIDR+" ip daddr @nonpublic ct original proto-dst != 53 drop")
+			ruleIndex(t, rules, "ip saddr "+vmCIDR+" ip daddr @nonpublic jump nonpublic_guard")
 			ruleIndex(t, rules, "ip saddr "+vmCIDR+" tcp dport { 25, 465, 587, 2525 } drop")
+			// The guard returns only for host-DNAT'd DNS and drops the rest,
+			// so a packet no ct expression matches (invalid) is dropped.
+			guard := "\tchain nonpublic_guard {\n\t\tct status & dnat == dnat meta l4proto { tcp, udp } ct original proto-dst 53 return\n\t\tcounter name nonpublic_drop drop\n\t}\n"
+			if !strings.Contains(out, guard) {
+				t.Errorf("nonpublic_guard chain is not exactly:\n%s\nin:\n%s", guard, out)
+			}
 		})
 	}
 }
@@ -322,8 +326,8 @@ func TestBuildNFTRulesetGuestEgressGuards(t *testing.T) {
 // CI hosts redirect it to a resolver on a private veth).
 func TestBuildNFTRulesetDNATExemptionTestsTheBit(t *testing.T) {
 	out := mustNFTRuleset(t, egressRuleset{ExtIface: "eth0", VMCidr: vmCIDR, Open: true})
-	if strings.Contains(out, "!= dnat") {
-		t.Fatalf("dnat exemption must test the bit (& dnat == 0), not compare the whole status:\n%s", out)
+	if strings.Contains(out, "!= dnat") || !strings.Contains(out, "ct status & dnat == dnat") {
+		t.Fatalf("dnat exemption must test the bit (& dnat == dnat), not compare the whole status:\n%s", out)
 	}
 }
 
@@ -371,9 +375,7 @@ func TestBuildNFTRulesetOpenOrder(t *testing.T) {
 		"ip saddr != " + vmCIDR + " drop",
 		"iifname . ip saddr != @guest_sources",
 		"ip daddr " + vmCIDR + " drop",
-		"@nonpublic ct status & dnat == 0 drop",
-		"@nonpublic meta l4proto != { tcp, udp } drop",
-		"@nonpublic ct original proto-dst != 53 drop",
+		"@nonpublic jump nonpublic_guard",
 		"dport { 25, 465, 587, 2525 } drop",
 	}
 	prev := -1
