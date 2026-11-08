@@ -103,8 +103,8 @@ check() { # check <name> <command...>
 }
 
 URL=https://github.com/o/r/actions/runs
-H1=a1a1a1 # the PR's head, unless a test moves it
-H2=b2b2b2
+H1=a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1 # the PR's head, unless a test moves it
+H2=b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2
 # c <name> <bucket> [job]: one check run, as the REST API returns it.
 c() {
 	local done=2026-10-23T10:00:42Z status=completed conclusion
@@ -353,6 +353,15 @@ check "sha: a head that never arrives ends in the deadline" test "$rc:$(summary 
 check "sha: and names it" grep -q "never reached head $H2" <<<"$errout"
 run_it 5 --sha HEAD
 check "sha: a ref name is a usage error" test "$rc" = 2
+run_it 5 --sha "${H2:0:6}"
+check "sha: fewer than 7 digits is a usage error" test "$rc" = 2
+# An abbreviated id, as git log --oneline prints it, used to wait out the
+# whole deadline: it never equalled the full head.
+setup sha-short
+printf '%s\n' "$H1" "$H2" >"$STATE/heads"
+snap_at "$H2" 1 "$(c test pass)"
+run_it 5 --sha "${H2:0:7}"
+check "sha: an abbreviated id matches the full head" test "$rc:$(summary .head)" = "0:$H2"
 
 # --- required checks that have not started yet -------------------------------
 
