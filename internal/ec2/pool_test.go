@@ -702,3 +702,32 @@ func TestPool_ShrinkKeepsReadyWhileOthersWarm(t *testing.T) {
 		return r == 2 && w == 0 && len(h.f.terminatedIDs()) == 3
 	})
 }
+
+// A pool instance whose address is already registered, held back after a
+// failed release say, is discarded and the job cold-launches on another
+// address instead of failing.
+func TestLaunch_PoolAddressTakenFallsBackCold(t *testing.T) {
+	h := readyPool(t, 1)
+	pooled := h.f.launched()[0]
+	if err := h.jit.Register(netip.MustParseAddr(pooled.ip), "held", "held", nil); err != nil {
+		t.Fatal(err)
+	}
+	errc := h.launch(context.Background())
+	var cold *fakeInstance
+	eventually(t, "a cold instance for the job", func() bool {
+		for _, i := range h.f.launched() {
+			if i.tags[TagRunner] == "runner-1" && i.tags[TagPool] == "" {
+				cold = i
+				return h.jit.Pending(netip.MustParseAddr(i.ip))
+			}
+		}
+		return false
+	})
+	if cold.ip == pooled.ip {
+		t.Fatal("the cold instance got the held address")
+	}
+	h.f.setState(cold.id, types.InstanceStateNameTerminated)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatalf("Launch = %v", err)
+	}
+}

@@ -2,6 +2,7 @@ package ec2
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/netip"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
 	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/jitserver"
+	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 )
 
 // Two tenants' tiers share one JIT server, as on a shard. When AWS gives tenant
@@ -89,5 +92,43 @@ func TestTenantReusingAnotherTenantsAddressGetsOnlyItsOwn(t *testing.T) {
 	a.f.setStateFor(instB.id, types.InstanceStateNameTerminated, "Client.UserInitiatedShutdown")
 	if err := waitErr(t, errB); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A cache identity that could not be released may still be read at its address,
+// so the address is held, refused to any other instance, until no lease can
+// outlive it (jobidentity.Release's contract).
+func TestUnreleasedIdentityHoldsItsAddress(t *testing.T) {
+	jobs := &fakeJobs{bound: map[string]string{}, releaseFail: errors.New("remove identity file: EIO")}
+	a := newHarness(t, func(o *Options) {
+		o.EC2.Cache = true
+		o.Cache = cacheOpts(t, jobs)
+	})
+	held := make(chan func(), 1)
+	a.p.after = func(d time.Duration, f func()) {
+		if d < 2*jobidentity.LeaseTTL {
+			t.Errorf("held for %v, less than two leases", d)
+		}
+		held <- f
+	}
+	errA := a.launch(context.Background())
+	inst := a.instance(t)
+	if code, _ := a.fetch(inst.ip); code != http.StatusOK {
+		t.Fatalf("fetch = %d", code)
+	}
+	a.f.setStateFor(inst.id, types.InstanceStateNameTerminated, "Client.UserInitiatedShutdown")
+	if err := waitErr(t, errA); err != nil {
+		t.Fatal(err)
+	}
+	ip := netip.MustParseAddr(inst.ip)
+	if err := a.jit.Register(ip, "runner-b", "b", nil); !errors.Is(err, jitserver.ErrRegistered) {
+		t.Fatalf("another instance could register the address at once: %v", err)
+	}
+	if code, _ := a.fetch(inst.ip); code != http.StatusNotFound {
+		t.Fatalf("a held address answers %d, want its tombstone's 404", code)
+	}
+	(<-held)() // the quarantine ends
+	if code, _ := a.fetch(inst.ip); code != http.StatusForbidden {
+		t.Fatalf("after the quarantine the address answers %d, want 403", code)
 	}
 }
