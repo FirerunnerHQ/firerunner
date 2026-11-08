@@ -13,6 +13,7 @@ import (
 
 	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/jitserver"
+	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 )
 
 // Two tenants' tiers share one JIT server, as on a shard. When AWS gives tenant
@@ -103,7 +104,13 @@ func TestUnreleasedIdentityHoldsItsAddress(t *testing.T) {
 		o.EC2.Cache = true
 		o.Cache = cacheOpts(t, jobs)
 	})
-	a.p.quarantine = 200 * time.Millisecond
+	held := make(chan func(), 1)
+	a.p.after = func(d time.Duration, f func()) {
+		if d < 2*jobidentity.LeaseTTL {
+			t.Errorf("held for %v, less than two leases", d)
+		}
+		held <- f
+	}
 	errA := a.launch(context.Background())
 	inst := a.instance(t)
 	if code, _ := a.fetch(inst.ip); code != http.StatusOK {
@@ -117,8 +124,11 @@ func TestUnreleasedIdentityHoldsItsAddress(t *testing.T) {
 	if err := a.jit.Register(ip, "runner-b", "b", nil); !errors.Is(err, jitserver.ErrRegistered) {
 		t.Fatalf("another instance could register the address at once: %v", err)
 	}
-	eventually(t, "the address freed after the quarantine", func() bool {
-		code, _ := a.fetch(inst.ip)
-		return code == http.StatusForbidden
-	})
+	if code, _ := a.fetch(inst.ip); code != http.StatusNotFound {
+		t.Fatalf("a held address answers %d, want its tombstone's 404", code)
+	}
+	(<-held)() // the quarantine ends
+	if code, _ := a.fetch(inst.ip); code != http.StatusForbidden {
+		t.Fatalf("after the quarantine the address answers %d, want 403", code)
+	}
 }
