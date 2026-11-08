@@ -224,7 +224,30 @@ func (f Fetch) Key(repository string) string {
 		}
 		h.Write([]byte{'\n'})
 	}
-	return "git/" + hex.EncodeToString(h.Sum(nil))
+	return "git/" + repository + "/" + hex.EncodeToString(h.Sum(nil))
+}
+
+// EntryVersion is the cache version git fetches are saved under, apart from
+// actions/cache's entries.
+const EntryVersion = "firerunner-git-v1"
+
+// KeyRepository returns the repository a git cache key (see Fetch.Key) names
+// in clear, so cache-server can keep a job from saving another repository's
+// objects under its own scope.
+func KeyRepository(key string) (string, bool) {
+	rest, ok := strings.CutPrefix(key, "git/")
+	if !ok {
+		return "", false
+	}
+	i := strings.LastIndexByte(rest, '/')
+	if i < 0 || !isOID(rest[i+1:], 64) {
+		return "", false
+	}
+	owner, name, ok := strings.Cut(rest[:i], "/")
+	if !ok || !validName(owner) || !validName(name) || strings.ToLower(rest[:i]) != rest[:i] {
+		return "", false
+	}
+	return rest[:i], true
 }
 
 // Repository returns the lower-case owner/name of a git-upload-pack request's

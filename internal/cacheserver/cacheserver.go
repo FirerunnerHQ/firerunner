@@ -72,6 +72,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/firerunnerhq/firerunner/internal/gitcache"
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 )
 
@@ -366,6 +367,13 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	key := strings.ToLower(req.Key)
 	if identity.WriteRef == "" {
 		writeJSON(w, http.StatusOK, createResp{OK: false, Message: "job has no cache write scope"})
+		return
+	}
+	if req.Version == gitcache.EntryVersion && !ownGitEntry(key, repo) {
+		// A job that fetched another private repository would otherwise
+		// store its objects under this repository's scope, where a fork PR
+		// reading the default branch's caches could restore them.
+		writeJSON(w, http.StatusOK, createResp{OK: false, Message: "git cache entries are for the job's own repository"})
 		return
 	}
 
@@ -903,6 +911,14 @@ const (
 	maxJobReservations = 64
 )
 
+// ownGitEntry reports whether a git cache key (lower-cased) names the
+// repository of scope, the identity's ScopeKey: "<name>#<id>".
+func ownGitEntry(key, scope string) bool {
+	repo, ok := gitcache.KeyRepository(key)
+	name, _, _ := strings.Cut(scope, "#")
+	return ok && repo == name
+}
+
 // checkKeys returns why a request's keys are refused, or "" when they are
 // within the toolkit's limits. Lengths are in characters, never stricter
 // than the toolkit, which counts UTF-16 units.
@@ -1024,10 +1040,17 @@ func (s *Server) match(repo string, readRefs []string, key string, restoreKeys [
 	return nil
 }
 
+// restorable reports whether a lookup by repo may return e. A git entry must
+// name repo itself: one saved before git entries did (or naming another
+// repository) could hold another private repository's objects.
+func restorable(e *Entry, repo string) bool {
+	return e.Version != gitcache.EntryVersion || ownGitEntry(e.Key, repo)
+}
+
 func (s *Server) completeExact(repo, ref, key, version string) *Entry {
 	var best *Entry
 	for _, e := range s.entries {
-		if e.Complete && ref != "" && e.Ref == ref && e.RepoID == repo && e.Version == version && e.Key == key {
+		if e.Complete && ref != "" && e.Ref == ref && e.RepoID == repo && e.Version == version && e.Key == key && restorable(e, repo) {
 			if newer(best, e) {
 				best = e
 			}
@@ -1039,7 +1062,7 @@ func (s *Server) completeExact(repo, ref, key, version string) *Entry {
 func (s *Server) completePrefix(repo, ref, prefix, version string) *Entry {
 	var best *Entry
 	for _, e := range s.entries {
-		if e.Complete && ref != "" && e.Ref == ref && e.RepoID == repo && e.Version == version && strings.HasPrefix(e.Key, prefix) {
+		if e.Complete && ref != "" && e.Ref == ref && e.RepoID == repo && e.Version == version && strings.HasPrefix(e.Key, prefix) && restorable(e, repo) {
 			if newer(best, e) {
 				best = e
 			}

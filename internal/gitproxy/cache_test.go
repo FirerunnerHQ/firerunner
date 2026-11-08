@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +53,32 @@ func job(repo, ref string, reads ...string) jobidentity.Identity {
 	}
 }
 
+// gitKey is a well-formed git cache key for repo: cache-server saves git
+// entries only under the repository their key names.
+func gitKey(repo, tag string) string {
+	return "git/" + repo + "/" + strings.Repeat(tag, 64/len(tag))
+}
+
+var (
+	keyAbc = gitKey("o/r", "ab")
+	keyK   = gitKey("o/r", "cd")
+	keyPR  = gitKey("o/r", "ef")
+)
+
+// A job saves git entries only for its own repository: one that fetched
+// another private repository must not store it where a fork PR reading the
+// default branch's caches could restore it.
+func TestCacheServer_SavesOnlyTheJobsOwnRepository(t *testing.T) {
+	f := newCacheFixture(t, job("o/r", "refs/heads/main"))
+	c := &CacheServer{URL: f.url}
+	other := gitKey("o/private", "12")
+	saveFile(t, c, other, goodPack)
+	*f.who = job("o/r", "refs/pull/7/merge", "refs/heads/main")
+	if _, err := read(t, c, other); !errors.Is(err, ErrMiss) {
+		t.Fatalf("another repository's objects were saved under this one: %v", err)
+	}
+}
+
 func saveFile(t *testing.T, c *CacheServer, key, content string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "entry")
@@ -77,16 +104,16 @@ func read(t *testing.T, c *CacheServer, key string) (string, error) {
 func TestCacheServer_RoundTrip(t *testing.T) {
 	f := newCacheFixture(t, job("o/r", "refs/heads/main"))
 	c := &CacheServer{URL: f.url}
-	if _, err := read(t, c, "git/abc"); !errors.Is(err, ErrMiss) {
+	if _, err := read(t, c, keyAbc); !errors.Is(err, ErrMiss) {
 		t.Fatalf("empty cache: %v", err)
 	}
-	saveFile(t, c, "git/abc", goodPack)
-	got, err := read(t, c, "git/abc")
+	saveFile(t, c, keyAbc, goodPack)
+	got, err := read(t, c, keyAbc)
 	if err != nil || got != goodPack {
 		t.Fatalf("read = %q, %v", got, err)
 	}
 	// A second job storing the same key is not an error.
-	saveFile(t, c, "git/abc", goodPack)
+	saveFile(t, c, keyAbc, goodPack)
 }
 
 // Isolation is cache-server's, by the job's identity. A client cannot ask for
@@ -94,25 +121,25 @@ func TestCacheServer_RoundTrip(t *testing.T) {
 func TestCacheServer_Isolation(t *testing.T) {
 	f := newCacheFixture(t, job("o/r", "refs/heads/main"))
 	c := &CacheServer{URL: f.url}
-	saveFile(t, c, "git/k", goodPack)
+	saveFile(t, c, keyK, goodPack)
 
 	*f.who = job("o/other", "refs/heads/main")
-	if _, err := read(t, c, "git/k"); !errors.Is(err, ErrMiss) {
+	if _, err := read(t, c, keyK); !errors.Is(err, ErrMiss) {
 		t.Fatalf("another repository read the entry: %v", err)
 	}
 
 	// A pull request's writes stay on its ref, and the default branch never
 	// reads them, so a pull request cannot poison main.
 	*f.who = job("o/r", "refs/pull/7/merge", "refs/heads/main")
-	saveFile(t, c, "git/pr", "written by a pull request")
+	saveFile(t, c, keyPR, "written by a pull request")
 	*f.who = job("o/r", "refs/heads/main")
-	if _, err := read(t, c, "git/pr"); !errors.Is(err, ErrMiss) {
+	if _, err := read(t, c, keyPR); !errors.Is(err, ErrMiss) {
 		t.Fatalf("main read a pull request's entry: %v", err)
 	}
 
 	// The pull request can read main's.
 	*f.who = job("o/r", "refs/pull/7/merge", "refs/heads/main")
-	if got, err := read(t, c, "git/k"); err != nil || got != goodPack {
+	if got, err := read(t, c, keyK); err != nil || got != goodPack {
 		t.Fatalf("a pull request could not read main: %q, %v", got, err)
 	}
 }
@@ -122,10 +149,10 @@ func TestCacheServer_Unreachable(t *testing.T) {
 	url := ts.URL
 	ts.Close()
 	c := &CacheServer{URL: url}
-	if _, err := c.Open(context.Background(), "git/k"); err == nil || errors.Is(err, ErrMiss) {
+	if _, err := c.Open(context.Background(), keyK); err == nil || errors.Is(err, ErrMiss) {
 		t.Fatalf("Open = %v, want a failure that is not a miss", err)
 	}
-	if err := c.Save(context.Background(), "git/k", "/nonexistent", 1); err == nil {
+	if err := c.Save(context.Background(), keyK, "/nonexistent", 1); err == nil {
 		t.Fatal("Save reported success")
 	}
 }

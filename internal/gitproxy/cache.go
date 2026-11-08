@@ -10,12 +10,15 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+
+	"github.com/firerunnerhq/firerunner/internal/gitcache"
 )
 
 // entryVersion keeps these entries apart from actions/cache's. An actions/cache
 // client that chooses the same key and version reaches no more than this
-// proxy does: its own repository and refs, as cache-server decides.
-const entryVersion = "firerunner-git-v1"
+// proxy does: its own repository and refs, as cache-server decides, which
+// also saves an entry only for the job's own repository.
+const entryVersion = gitcache.EntryVersion
 
 const twirpBase = "/twirp/github.actions.results.api.v1.CacheService/"
 
