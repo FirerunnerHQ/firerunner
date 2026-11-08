@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- The cache server limits request bodies: 64 KiB for cache RPCs and 8 MiB for
+  a block list. A larger body gets `413`. A block list may name at most
+  50,000 blocks, and a block id at most 88 characters, as in Azure.
+
 - The cache server counts uploads that are not yet finalized toward
   `--max-size`, so its disk use stays within the cap. An upload that would go
   past it while other uploads are unfinished gets `507 Insufficient Storage`.
