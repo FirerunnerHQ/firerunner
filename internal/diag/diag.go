@@ -136,6 +136,12 @@ type NetInfo struct {
 	Subnet     string `json:"subnet"`
 	TapPrefix  string `json:"tap_prefix"`
 	NFTTable   string `json:"nft_table"`
+	// Drops counts guest packets the firewall dropped since the daemon applied
+	// its network, by reason: spoof, nonpublic, conn_limit, conn_rate. It is
+	// absent when the counters cannot be read; DropsError then says why
+	// (usually: not root).
+	Drops      map[string]uint64 `json:"drops,omitempty"`
+	DropsError string            `json:"drops_error,omitempty"`
 }
 
 // WorkdirInfo describes the per-job rootfs work directory.
@@ -239,6 +245,11 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 		f := statFile(fc.ToolCacheImage)
 		r.ToolCache = &f
 	}
+	if drops, err := firewallDrops(fc.NFTTable); err != nil {
+		r.Network.DropsError = err.Error()
+	} else {
+		r.Network.Drops = drops
+	}
 	switch {
 	case fc.CacheURL != "":
 		r.Cache = &CacheInfo{Mode: "url", URL: fc.CacheURL}
@@ -318,6 +329,13 @@ func renderStatusText(r StatusReport, w io.Writer) {
 	fmt.Fprintf(tw, "isolation\t%s\n", r.Isolation)
 	fmt.Fprintf(tw, "network\text-iface=%s  egress=%s  subnet=%s  tap=%s*  nft-table=%s\n",
 		ifaceStateStr(r.Network.ExtIface, r.Network.ExtIfaceUp), r.Network.Egress, r.Network.Subnet, r.Network.TapPrefix, r.Network.NFTTable)
+	switch {
+	case r.Network.DropsError != "":
+		fmt.Fprintf(tw, "guest drops\t(unreadable: %s)\n", r.Network.DropsError)
+	case r.Network.Drops != nil:
+		fmt.Fprintf(tw, "guest drops\tspoof=%d  nonpublic=%d  conn-limit=%d  conn-rate=%d\n",
+			r.Network.Drops["spoof"], r.Network.Drops["nonpublic"], r.Network.Drops["conn_limit"], r.Network.Drops["conn_rate"])
+	}
 	if r.Cache != nil {
 		if r.Cache.Mode == "url" {
 			fmt.Fprintf(tw, "dep cache\tself-hosted %s\n", r.Cache.URL)

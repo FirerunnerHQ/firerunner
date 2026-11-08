@@ -112,7 +112,9 @@ next guest on its address. It also raises `net.netfilter.nf_conntrack_max`
 separate table, `<table>_conns`, which allowlist refreshes leave in place, so a
 guest's counts survive them. A connection over a limit is dropped: a job that
 needs more sees connect timeouts, and should raise the flags, or set them to 0
-to turn a limit off. The rate counts packets that start a connection, so a
+to turn a limit off. `firerunner status` (as root) counts what the firewall
+dropped, by reason: `drops.conn_limit`, `drops.conn_rate`, `drops.nonpublic`
+and `drops.spoof` under `network` in `--json`. The rate counts packets that start a connection, so a
 one-way UDP stream that never gets a reply counts each of its packets. An
 earlier firerunner does not know the `_conns` table: after a downgrade, remove
 it with `nft delete table ip <table>_conns`.

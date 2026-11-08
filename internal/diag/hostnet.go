@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -49,6 +50,47 @@ var lookupVia = func(ns, name string) error {
 	defer cancel()
 	_, err := r.LookupHost(ctx, name)
 	return err
+}
+
+// firewallDrops reads the packet counts of the guest firewall's drop counters:
+// guests sending as another address (spoof), to a non-public address
+// (nonpublic), past their tracked-connection limit (conn_limit) or their
+// new-connection rate (conn_rate). A job that hits a limit sees only
+// connect timeouts, so these say why. A counter of a table that does not
+// exist (the limits are off, or the daemon has not applied its network) is
+// left out. Reading needs root.
+func firewallDrops(table string) (map[string]uint64, error) {
+	names := map[string]string{
+		"guest_spoof_drop": "spoof", "nonpublic_drop": "nonpublic",
+		"guest_conn_drop": "conn_limit", "guest_rate_drop": "conn_rate",
+	}
+	drops := map[string]uint64{}
+	for _, t := range []string{table, table + "_conns"} {
+		out, _, err := runCmd("nft", "-j", "list", "counters", "table", "ip", t)
+		if err != nil {
+			if strings.Contains(err.Error(), "No such file or directory") {
+				continue
+			}
+			return nil, err
+		}
+		var doc struct {
+			NFTables []struct {
+				Counter *struct {
+					Name    string `json:"name"`
+					Packets uint64 `json:"packets"`
+				} `json:"counter"`
+			} `json:"nftables"`
+		}
+		if err := json.Unmarshal([]byte(out), &doc); err != nil {
+			return nil, fmt.Errorf("parse nft counters of %s: %w", t, err)
+		}
+		for _, e := range doc.NFTables {
+			if e.Counter != nil && names[e.Counter.Name] != "" {
+				drops[names[e.Counter.Name]] = e.Counter.Packets
+			}
+		}
+	}
+	return drops, nil
 }
 
 // forwardChecks look for a forward policy that drops guest egress. Docker and

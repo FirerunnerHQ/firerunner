@@ -2,6 +2,7 @@ package diag
 
 import (
 	"errors"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -195,4 +196,33 @@ func TestResolvChecks(t *testing.T) {
 			t.Fatalf("resolv = %+v, want a warning that debugfs is missing", f)
 		}
 	})
+}
+
+// The firewall's drop counters, from both tables, named by reason. A table
+// that does not exist (limits off) adds nothing; any other error is returned.
+func TestFirewallDrops(t *testing.T) {
+	main := `{"nftables":[{"metainfo":{}},{"counter":{"family":"ip","name":"guest_spoof_drop","table":"fr","packets":3,"bytes":120}},{"counter":{"family":"ip","name":"nonpublic_drop","table":"fr","packets":7,"bytes":420}}]}`
+	conns := `{"nftables":[{"counter":{"family":"ip","name":"guest_conn_drop","table":"fr_conns","packets":11,"bytes":0}},{"counter":{"family":"ip","name":"guest_rate_drop","table":"fr_conns","packets":13,"bytes":0}},{"counter":{"family":"ip","name":"someone_elses","table":"fr_conns","packets":99,"bytes":0}}]}`
+	fakeHost(t, map[string]cmdResult{
+		"nft -j list counters table ip fr":       {stdout: main},
+		"nft -j list counters table ip fr_conns": {stdout: conns},
+	}, nil, nil)
+	got, err := firewallDrops("fr")
+	want := map[string]uint64{"spoof": 3, "nonpublic": 7, "conn_limit": 11, "conn_rate": 13}
+	if err != nil || !maps.Equal(got, want) {
+		t.Fatalf("firewallDrops = %v, %v; want %v", got, err, want)
+	}
+
+	fakeHost(t, map[string]cmdResult{
+		"nft -j list counters table ip fr":       {stdout: main},
+		"nft -j list counters table ip fr_conns": {err: errors.New("Error: No such file or directory; did you mean table 'fr' in family ip?")},
+	}, nil, nil)
+	if got, err := firewallDrops("fr"); err != nil || len(got) != 2 {
+		t.Fatalf("without the limit table: %v, %v; want spoof and nonpublic only", got, err)
+	}
+
+	fakeHost(t, map[string]cmdResult{"nft -j list counters": {err: errors.New("Error: Operation not permitted")}}, nil, nil)
+	if _, err := firewallDrops("fr"); err == nil || !strings.Contains(err.Error(), "not permitted") {
+		t.Fatalf("not root: %v, want the error", err)
+	}
 }
