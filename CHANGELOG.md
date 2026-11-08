@@ -23,6 +23,9 @@ and this project adheres to
 
 ### Fixed
 
+- A runner still running two minutes after GitHub reports its job completed
+  is stopped, so a guest that disables its own shutdown no longer holds its
+  slot or instance until `--max-vm-lifetime`.
 - The cache server limits request bodies: 64 KiB for cache RPCs and 8 MiB for
   a block list. A larger body gets `413`. A block list may name at most
   50,000 blocks, and a block id at most 88 characters, as in Azure.

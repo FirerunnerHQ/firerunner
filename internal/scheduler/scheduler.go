@@ -55,7 +55,17 @@ type Options struct {
 	// but the provisioner has not yet drawn a slot for. nil gives the
 	// Scheduler a private counter.
 	Pending *PendingLaunches
+	// CompletedGrace is how long a runner may keep running after GitHub
+	// reports its job completed before the scheduler stops it. The guest is
+	// meant to shut itself down at once, but the job ran as root in it and
+	// can stop that, holding the slot (or the instance) until its lifetime
+	// ends. 0 means DefaultCompletedGrace; negative never stops it.
+	CompletedGrace time.Duration
 }
+
+// DefaultCompletedGrace is Options.CompletedGrace's default: far longer than
+// a runner takes to report and exit after its job.
+const DefaultCompletedGrace = 2 * time.Minute
 
 // PendingLaunches counts microVMs a Scheduler has added to its running total
 // whose Launch has not yet been entered, so they are in neither the
@@ -74,10 +84,11 @@ func (p *PendingLaunches) Count() int { return int(p.n.Load()) }
 // Scheduler launches one ephemeral microVM per assigned job, up to Max
 // concurrently.
 type Scheduler struct {
-	opts    Options
-	mu      sync.Mutex
-	running int
-	wg      sync.WaitGroup
+	opts      Options
+	afterFunc func(time.Duration, func())
+	mu        sync.Mutex
+	running   int
+	wg        sync.WaitGroup
 	// active tracks in-flight microVMs by runner name so a shutdown drain can
 	// tell an idle warm-pool VM (cancel it immediately) from one running a job
 	// (let it finish). MarkBusy flips a VM to busy when its guest dequeues a job.
@@ -148,8 +159,15 @@ func New(o Options) *Scheduler {
 	if o.Pending == nil {
 		o.Pending = &PendingLaunches{}
 	}
-	return &Scheduler{opts: o, active: make(map[string]*vmHandle)}
+	if o.CompletedGrace == 0 {
+		o.CompletedGrace = DefaultCompletedGrace
+	}
+	return &Scheduler{opts: o, active: make(map[string]*vmHandle), afterFunc: afterFunc}
 }
+
+// afterFunc is time.AfterFunc without its *Timer; tests replace it to run
+// the function when they choose.
+func afterFunc(d time.Duration, f func()) { time.AfterFunc(d, f) }
 
 // plan returns how many new runners to launch given the desired count reported
 // by GitHub, the number of microVMs able to take a job (live), the number of
@@ -728,14 +746,41 @@ func (s *Scheduler) MarkBusy(name string) {
 // re-plan for the jobs queued behind it (see replan). A completed runner is
 // also busy: it ran a job and will not take another. It no-ops for a runner
 // that has already exited, whose exit then did not re-plan.
+//
+// A runner that had started its job and is still running CompletedGrace
+// later is stopped: see stopCompleted.
 func (s *Scheduler) MarkCompleted(name string) {
 	s.mu.Lock()
-	if h := s.active[name]; h != nil {
-		h.busy = true
-		h.completed = true
-		h.completedAt = s.reconciles
+	defer s.mu.Unlock()
+	h := s.active[name]
+	if h == nil || h.completed {
+		return
 	}
-	s.mu.Unlock()
+	// Only a runner that started the job is stopped: a job cancelled before
+	// it started is reported completed too, and its idle runner may still get
+	// the next one.
+	started := h.busy
+	h.busy = true
+	h.completed = true
+	h.completedAt = s.reconciles
+	if started && s.opts.CompletedGrace > 0 {
+		s.afterFunc(s.opts.CompletedGrace, func() { s.stopCompleted(name, h) })
+	}
+}
+
+// stopCompleted cancels a runner whose job completed CompletedGrace ago and
+// that is still running. Its job is over, so nothing is lost; the guest
+// should have shut itself down, and a job that stops that would otherwise
+// keep the slot, or the instance, until its lifetime ends.
+func (s *Scheduler) stopCompleted(name string, h *vmHandle) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active[name] != h || h.cancelled {
+		return
+	}
+	h.cancelled = true
+	h.cancel()
+	s.opts.Logger.Warn("stopping a runner still running after its job completed", "runner", name, "grace", s.opts.CompletedGrace)
 }
 
 // IdleRunners returns the runners launched more than olderThan ago that have

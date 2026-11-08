@@ -883,8 +883,13 @@ concurrency — `--max-runners` still caps the total.
 
 **Stuck-VM backstops.** A healthy microVM self-destructs the instant its one job
 ends, so a VM that is still alive when it should not be is holding a slot
-hostage. Two host-side deadlines reclaim it:
+hostage. Three host-side deadlines reclaim it:
 
+- Two minutes after GitHub reports a runner's job completed, a runner that
+  started that job and is still running is stopped. The job ran as root in
+  the guest, so it can disable the guest's own shutdown. A runner whose job was
+  cancelled before it started is left alone, since it may still get the next
+  job. This applies to every provisioner, EC2 included.
 - `--vm-connect-timeout` (env `FR_VM_CONNECT_TIMEOUT`, default `5m`) kills a
   booted VM whose runner has not registered with GitHub — the console never
   shows `Listening for Jobs` (or `Running job:`). This is the fast path for a
@@ -897,7 +902,7 @@ hostage. Two host-side deadlines reclaim it:
   still running after this long, however it got there (hung guest, wedged job).
   Keep it longer than your longest real job.
 
-Both are `0` to disable. When both are set, the connect timeout must be shorter
+The last two are `0` to disable. When both are set, the connect timeout must be shorter
 than the lifetime (otherwise it could never fire first).
 
 ### Pre-seeded tool cache (`--toolcache`, opt-in)
