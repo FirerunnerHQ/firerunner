@@ -154,7 +154,9 @@ that reaches and how long it lasts:
   A Firecracker guest has its own tap device and subnet, and it can't reach
   the host's private networks.
 - **No cloud identity.** EC2 runners get no instance role. IMDSv2 is
-  required with a hop limit of 1, so job containers cannot reach it.
+  required with a hop limit of 1, so job containers cannot reach it. A job
+  step running on the instance itself can read that instance's metadata and
+  user-data, which hold no credential.
 - **No secret at boot.** EC2 user-data carries only the JIT endpoint. The
   JIT config is served once, to the instance's own private IP.
 - **No job logs kept.** firerunner keeps no job output; GitHub holds the job
@@ -164,6 +166,32 @@ that reaches and how long it lasts:
 In your workflows, grant `GITHUB_TOKEN` the least it needs (start from
 `permissions: {}` and add per job). Prefer OIDC with narrowly scoped cloud
 roles over long-lived secrets.
+
+### Sharing an AWS account
+
+One daemon can serve several installations of its GitHub App (`FR_TENANTS`),
+and their EC2 runners then share its account, VPC and runner security group.
+What keeps one installation's jobs from another's:
+
+- **No path between runners.** The shared group has no inbound rule, so no
+  runner accepts a connection from another. A runner reaches the control VM
+  only on the JIT port, and the cache port when the cache is on.
+- **Identity by address, served once.** The JIT server hands a config only to
+  the private address it was registered for, once, and forgets it when the
+  instance goes. An instance given an address another installation's just
+  released gets its own config and nothing of the other's.
+- **No shared cache.** The cache server, too, knows a job by its address. Extra
+  installations' tiers run with the cache off until it separates them. If an
+  identity cannot be removed, its address is held back from other instances
+  for twice the identity's lifetime.
+- **Separate machines.** Each installation's instances carry their own owner
+  tag (`<owner>/<id>`), which scopes the reaper and stopped pools, so a pool
+  instance never moves between them.
+
+What it does not separate: the daemon itself, which holds every installation's
+App access and signs for them all, and the account's API limits and quotas.
+For a boundary between those too, run each installation's runners in its own
+account.
 
 ## Requirements
 

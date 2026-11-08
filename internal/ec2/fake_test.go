@@ -140,6 +140,9 @@ type fakeEC2 struct {
 	instances map[string]*fakeInstance
 	order     []string
 	next      int
+	// nextIP, when set, is the private IP of the next instance launched, as
+	// when AWS hands a released address to another instance.
+	nextIP string
 	// noIPInRun leaves PrivateIpAddress out of the RunInstances response, as
 	// AWS may, so the launcher has to describe the instance for it.
 	noIPInRun   bool
@@ -246,9 +249,13 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, opt
 		}
 	}
 	f.next++
+	ip := fmt.Sprintf("10.0.1.%d", f.next)
+	if f.nextIP != "" {
+		ip, f.nextIP = f.nextIP, ""
+	}
 	inst := &fakeInstance{
 		id:         fmt.Sprintf("i-%04d", f.next),
-		ip:         fmt.Sprintf("10.0.1.%d", f.next),
+		ip:         ip,
 		itype:      itype,
 		subnet:     subnet,
 		spot:       mkt == "spot",
