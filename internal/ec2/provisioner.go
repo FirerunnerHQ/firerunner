@@ -223,7 +223,7 @@ func (p *Provisioner) register(ip netip.Addr, name, jit string) (release func(),
 			// registration, which refuses the address to anyone else, until no
 			// lease can outlive it.
 			p.log.Warn("could not release cache identity; holding its address", "runner", name, "ip", ip, "for", p.quarantine, "err", err)
-			time.AfterFunc(p.quarantine, func() { p.o.JIT.Revoke(ip) })
+			p.after(p.quarantine, func() { p.o.JIT.Revoke(ip) })
 			return
 		}
 		p.o.JIT.Revoke(ip)
@@ -257,6 +257,8 @@ type Provisioner struct {
 	// quarantine is how long an address whose cache identity could not be
 	// released stays held; tests shorten it.
 	quarantine time.Duration
+	// after runs f once d has passed; tests run it when they choose.
+	after func(d time.Duration, f func())
 }
 
 // Tier returns the provisioner for one EC2 tier.
@@ -268,6 +270,7 @@ func (c *Client) Tier(o Options) *Provisioner {
 	p := &Provisioner{
 		c: c, o: o, log: log.With("provisioner", "ec2"), now: time.Now, tick: time.Second,
 		termWait: terminateWait, termRetry: terminateRetry, quarantine: 2 * jobidentity.LeaseTTL,
+		after: func(d time.Duration, f func()) { time.AfterFunc(d, f) },
 	}
 	if o.EC2.Pool > 0 || o.Pooled {
 		p.pool = newPool(p, o.EC2.Pool)
@@ -391,7 +394,9 @@ func (p *Provisioner) launchPooled(ctx context.Context, name, jit string, onStar
 	release, err := p.register(ip, name, jit)
 	if err != nil {
 		p.pool.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
-		return fmt.Errorf("register jit config for %s at %s: %w", in.id, ip, err)
+		// Its address is taken, held back after a failed release say: a cold
+		// launch gets another, so the job need not wait.
+		return fmt.Errorf("%w: register jit config for %s at %s: %w", errPoolStart, in.id, ip, err)
 	}
 	defer release()
 	claimed := time.Now()
