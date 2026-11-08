@@ -49,9 +49,10 @@ func TestTenantReusingAnotherTenantsAddressGetsOnlyItsOwn(t *testing.T) {
 	b.tick = 5 * time.Millisecond
 	b.termWait, b.termRetry = 300*time.Millisecond, 20*time.Millisecond
 
-	// Before B registers, the address holds nothing at all.
-	if code, _ := a.fetch(instA.ip); code == http.StatusOK {
-		t.Fatal("a released address still serves a config")
+	// Before B registers, the address holds nothing at all: 403, as for an
+	// address never registered, not 404, a tombstone of A's.
+	if code, _ := a.fetch(instA.ip); code != http.StatusForbidden {
+		t.Fatalf("a released address answers %d, want 403", code)
 	}
 
 	a.f.mu.Lock()
