@@ -1343,7 +1343,13 @@ job records.
   elsewhere or learn anything about the host.
 
 Uploads are bounded per-entry (`--max-entry-size`, default 10GB) and in total
-(`--max-size`), and finalized entries are immutable.
+(`--max-size`), and finalized entries are immutable. The number of entries is
+bounded too, since empty ones cost no bytes: a repository holds at most
+`--max-repo-entries` (default 2000), and past it a new reservation evicts that
+repository's own least-recently-used entry, so one repository cannot flush the
+others; the host holds at most `--max-entries` (default 20000). A job may hold
+at most 64 unfinished uploads. Requests keep to the toolkit's own limits, at
+most ten keys of at most 512 characters each.
 
 The cache is a pure accelerator — every job still passes with caching disabled,
 so when in doubt, leave it off.
