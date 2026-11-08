@@ -49,7 +49,7 @@ signoffs() { # signoffs <repo>: the Signed-off-by values of HEAD, one per line
 
 R="$TMP/hook"
 newrepo "$R"
-git -C "$R" config core.hooksPath .githooks
+"$R/scripts/setup-dev.sh" --quiet >/dev/null
 me="Ada Tester <ada@example.com>"
 
 git -C "$R" commit -q --allow-empty -m "pkg: plain commit"
@@ -93,13 +93,38 @@ fi
 R="$TMP/setup"
 newrepo "$R"
 out="$("$R/scripts/setup-dev.sh")"
-check "setup installs the hooks" \
-	test "$(git -C "$R" config core.hooksPath)" = .githooks
-check "setup says it installed them" grep -q "installed git hooks" <<<"$out"
+check "setup installs a copy of the hook" cmp -s "$R/.githooks/commit-msg" "$R/.git/hooks/commit-msg"
+check "setup sets no core.hooksPath" test -z "$(git -C "$R" config core.hooksPath || true)"
+check "setup says it installed it" grep -q "installed .*commit-msg" <<<"$out"
 check "setup is quiet the second time with --quiet" \
 	test -z "$("$R/scripts/setup-dev.sh" --quiet)"
 git -C "$R" commit -q --allow-empty -m "pkg: after setup"
 check "a commit after setup is signed off" test "$(signoffs "$R")" = "$me"
+
+# A branch's own .githooks/commit-msg never runs: the installed copy does.
+git -C "$R" add .githooks scripts
+git -C "$R" commit -q -m "pkg: base"
+git -C "$R" switch -q -c theirs
+printf '#!/bin/sh\ntouch "%s/ran"\n' "$TMP" >"$R/.githooks/commit-msg"
+git -C "$R" commit -q -am "pkg: their hook"
+git -C "$R" commit -q --allow-empty -m "pkg: on their branch"
+check "a branch's own hook does not run on commit" test ! -e "$TMP/ran"
+check "the installed hook still signs off on that branch" test "$(signoffs "$R")" = "$me"
+git -C "$R" switch -q -
+
+# A newer hook is picked up by rerunning setup.
+printf '\n# a later change\n' >>"$R/.githooks/commit-msg"
+out="$("$R/scripts/setup-dev.sh")"
+check "setup updates an older copy" cmp -s "$R/.githooks/commit-msg" "$R/.git/hooks/commit-msg"
+
+R="$TMP/setup-migrate"
+newrepo "$R"
+git -C "$R" config core.hooksPath .githooks
+out="$("$R/scripts/setup-dev.sh")"
+check "setup removes the old core.hooksPath=.githooks" \
+	test -z "$(git -C "$R" config core.hooksPath || true)"
+check "setup installs the copy in its place" cmp -s "$R/.githooks/commit-msg" "$R/.git/hooks/commit-msg"
+check "setup says why it removed the setting" grep -q "removed core.hooksPath" <<<"$out"
 
 R="$TMP/setup-other"
 newrepo "$R"
@@ -111,19 +136,25 @@ check "setup says why it did nothing" grep -q "not changing it" "$TMP/err"
 
 R="$TMP/setup-own"
 newrepo "$R"
+printf '#!/bin/sh\nexit 0\n' >"$R/.git/hooks/commit-msg"
+chmod +x "$R/.git/hooks/commit-msg"
+"$R/scripts/setup-dev.sh" 2>"$TMP/err"
+check "setup does not replace a commit-msg hook of the user's own" \
+	test "$(cat "$R/.git/hooks/commit-msg")" = "$(printf '#!/bin/sh\nexit 0')"
+check "setup says why it did nothing" grep -q "hook of your own" "$TMP/err"
 printf '#!/bin/sh\nexit 0\n' >"$R/.git/hooks/pre-commit"
 chmod +x "$R/.git/hooks/pre-commit"
-"$R/scripts/setup-dev.sh" 2>"$TMP/err"
-check "setup does not disable hooks of the user's own" \
-	test -z "$(git -C "$R" config core.hooksPath || true)"
-check "setup names the hook it would disable" grep -q "pre-commit" "$TMP/err"
+rm "$R/.git/hooks/commit-msg"
+"$R/scripts/setup-dev.sh" >/dev/null
+check "setup installs beside other hooks of the user's own" \
+	test -x "$R/.git/hooks/pre-commit" -a -x "$R/.git/hooks/commit-msg"
 
 # --- agent-env.sh ------------------------------------------------------------
 
 # A PATH with only what the script itself needs, and no go/gh/shellcheck.
 SYS="$TMP/sys"
 mkdir -p "$SYS"
-for t in bash env git sed dirname cat; do
+for t in bash env git sed dirname cat cmp; do
 	ln -s "$(command -v "$t")" "$SYS/$t"
 done
 # fake <dir> <tool...>: executables that print their own path.
@@ -159,7 +190,7 @@ $TMP/later/shellcheck"
 check "agent-env reports what it added, as a comment" \
 	grep -q "^# agent-env: added to PATH: $TMP/brew $TMP/later\$" <<<"$out"
 check "agent-env does not install the git hooks" \
-	test -z "$(git -C "$R" config core.hooksPath || true)"
+	test ! -e "$R/.git/hooks/commit-msg"
 check "agent-env leaves git config unchanged" \
 	test "$(git -C "$R" config --list --show-origin)" = "$config_before"
 check "agent-env suggests make setup while the hook is not installed" \
@@ -170,6 +201,10 @@ check "agent-env prints only comments under Claude Code" \
 : >"$envfile"
 fake "$TMP/onpath" go gh shellcheck
 git -C "$R" config core.hooksPath .githooks
+out="$(PATH="$SYS:$TMP/onpath" CLAUDE_ENV_FILE="$envfile" FR_AGENT_ENV_DIRS="$dirs" "$R/scripts/agent-env.sh")"
+check "agent-env flags the old core.hooksPath=.githooks" grep -q "runs each branch's own hooks" <<<"$out"
+git -C "$R" config --unset core.hooksPath
+"$R/scripts/setup-dev.sh" --quiet >/dev/null
 out="$(PATH="$SYS:$TMP/onpath" CLAUDE_ENV_FILE="$envfile" FR_AGENT_ENV_DIRS="$dirs" "$R/scripts/agent-env.sh")"
 check "agent-env never shadows a tool already on PATH" test ! -s "$envfile"
 check "agent-env is silent with the tools on PATH and the hook installed" test -z "$out"

@@ -31,10 +31,16 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
 
 - **Sign off every commit** with `git commit -s`. The `dco` workflow rejects a PR
   with any commit lacking a `Signed-off-by` that matches its author email.
-  `make setup` installs a `commit-msg` hook that adds it for you; installing it
-  means you certify the DCO for every commit you make in this clone. `make
-  check` checks it locally; to fix a branch, run
-  `git rebase --signoff origin/main`.
+  `make setup` copies a `commit-msg` hook that adds it for you into
+  `.git/hooks`; installing it means you certify the DCO for every commit you
+  make in this clone. It is a copy so that a branch's own `.githooks/` never
+  runs; rerun `make setup` after the hook changes. `make check` checks it
+  locally; to fix a branch, run `git rebase --signoff origin/main`.
+- **Review an outside contributor's branch without running it.** Read it
+  with `gh pr diff`, or check it out in a separate clone you have not
+  trusted in Claude Code. In your own clone, its `.claude/settings.json`
+  hooks run at your next session start, and its `Makefile` and scripts run
+  with your credentials.
 - One topic per commit. Use the subject style `pkg: what changed`, in the
   imperative, with a body that says why. Look at `git log` for the house style.
 - One issue per PR, linked with `Closes #N`. Every behaviour change ships with
