@@ -45,10 +45,15 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
   imperative, with a body that says why. Look at `git log` for the house style.
 - One issue per PR, linked with `Closes #N`. Every behaviour change ships with
   tests.
-- A change a user can see adds a line under `Unreleased` in `CHANGELOG.md`
-  ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/)), in the same PR.
-  Write what changed for them, not the commit. A release moves those lines
-  under a new version and date before tagging.
+- A change a user can see adds a file under `changelog.d/`, in the same PR,
+  never a line in `CHANGELOG.md`: parallel PRs that all appended under
+  `Unreleased` conflicted with each other. The file holds a
+  [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) section such as
+  `### Fixed` and its entries; see [`changelog.d/README.md`](changelog.d/README.md).
+  Write what changed for them, not the commit. `make check` validates the
+  files; `scripts/changelog.py show` prints what is unreleased, and
+  `scripts/changelog.py release VERSION` folds it into `CHANGELOG.md` before
+  tagging.
 - **Wait with `scripts/pr-wait.sh PR`**, not by polling `gh pr checks` or
   `gh run watch`. It returns as soon as a check fails, with the failed log's
   relevant lines, the reviews and every unresolved review thread, as JSON

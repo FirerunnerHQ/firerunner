@@ -121,6 +121,8 @@ fi
 step ec2-ami-build images/test-build-ec2-ami.sh
 step ec2-ami-layer images/test-layer-ec2-ami.sh
 step mutate-script scripts/test-mutate.sh
+step changelog-tool scripts/test-changelog.sh
+step changelog python3 -I scripts/changelog.py check
 if command -v jq >/dev/null; then
 	step merge-stack scripts/test-merge-stack.sh
 	step pr-wait scripts/test-pr-wait.sh
@@ -152,7 +154,7 @@ if command -v shellcheck >/dev/null; then
 		images/assets/firerunner-git-config.sh images/test-git-config.sh \
 		images/ec2/install-firerunner.sh images/test-install-firerunner.sh \
 		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh images/layer-ec2-ami.sh images/test-layer-ec2-ami.sh scripts/check.sh \
-		scripts/mutate.sh scripts/test-mutate.sh \
+		scripts/mutate.sh scripts/test-mutate.sh scripts/test-changelog.sh \
 		scripts/merge-stack.sh scripts/test-merge-stack.sh \
 		scripts/pr-wait.sh scripts/test-pr-wait.sh \
 		scripts/check-remote.sh scripts/test-check-remote.sh \
