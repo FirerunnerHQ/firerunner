@@ -25,6 +25,8 @@ type fakeJobs struct {
 	bound    map[string]string // runner -> ip
 	released []string
 	fail     error
+	// releaseFail fails Release, as a failed removal of the identity file.
+	releaseFail error
 }
 
 func (j *fakeJobs) Register(runner, ip string) error {
@@ -40,6 +42,9 @@ func (j *fakeJobs) Register(runner, ip string) error {
 func (j *fakeJobs) Release(runner string) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.releaseFail != nil {
+		return j.releaseFail
+	}
 	delete(j.bound, runner)
 	j.released = append(j.released, runner)
 	return nil

@@ -19,6 +19,10 @@ import (
 
 const leaseTTL = 90 * time.Second
 
+// LeaseTTL is how long an identity, once written, may still be read: the time
+// an address must be held back after its Release fails.
+const LeaseTTL = leaseTTL
+
 type Resolver interface {
 	Resolve(context.Context, Job) (Identity, error)
 }
