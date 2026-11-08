@@ -23,6 +23,9 @@ and this project adheres to
 
 ### Fixed
 
+- The cross-account role in `deploy/cloudformation/byoc-role.yaml` can no
+  longer read `<prefix>/control/*`, where a control VM in the same account
+  keeps its GitHub credentials. Update the stack to apply it.
 - The cache server limits request bodies: 64 KiB for cache RPCs and 8 MiB for
   a block list. A larger body gets `413`. A block list may name at most
   50,000 blocks, and a block id at most 88 characters, as in Azure.
