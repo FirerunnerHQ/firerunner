@@ -92,6 +92,19 @@ signed_off() {
 	return "$missing"
 }
 
+# cache_protocol: CI's cache-protocol job, the real @actions/cache toolkit
+# saving and restoring through a freshly built cache-server.
+# shellcheck disable=SC2329 # called through step
+cache_protocol() {
+	local bin rc
+	bin="$(mktemp -d)/firerunner"
+	go build -o "$bin" ./cmd/firerunner || return 1
+	FIRERUNNER_BINARY="$bin" npm test --silent --prefix test/cache-protocol
+	rc=$?
+	rm -rf "$(dirname "$bin")"
+	return "$rc"
+}
+
 step gofmt gofmt_clean
 step build go build ./...
 step vet go vet ./...
@@ -121,6 +134,11 @@ fi
 step ec2-ami-build images/test-build-ec2-ami.sh
 step ec2-ami-layer images/test-layer-ec2-ami.sh
 step mutate-script scripts/test-mutate.sh
+if [ -d test/cache-protocol/node_modules ] && command -v npm >/dev/null; then
+	step cache-protocol cache_protocol
+else
+	skip cache-protocol "toolkit not installed: npm ci --prefix test/cache-protocol --ignore-scripts"
+fi
 step changelog-tool scripts/test-changelog.sh
 step changelog python3 -I scripts/changelog.py check
 if command -v jq >/dev/null; then
