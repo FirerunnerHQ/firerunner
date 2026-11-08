@@ -158,6 +158,7 @@ func diagnose(cmd string, args []string) error {
 func cacheServe(args []string) error {
 	fs, o := newCacheFlagSet()
 	addr, dir, maxSize, maxEntry := o.addr, o.dir, o.maxSize, o.maxEntry
+	maxEntries, maxRepoEntries := o.maxEntries, o.maxRepoEntries
 	jobsDir, jobsOwner, identityWait, artifactUpstream := o.jobsDir, o.jobsOwner, o.identityWait, o.artifactUpstream
 	s3Bucket, s3Prefix, s3Region := o.s3Bucket, o.s3Prefix, o.s3Region
 	s3LocalCache := o.s3LocalCache
@@ -184,6 +185,10 @@ func cacheServe(args []string) error {
 	}
 	srv.SetMaxSize(maxBytes)
 	srv.SetMaxEntrySize(maxEntryBytes)
+	if *maxEntries < 0 || *maxRepoEntries < 0 {
+		return fmt.Errorf("--max-entries and --max-repo-entries must be >= 0 (0 = unlimited)")
+	}
+	srv.SetMaxEntries(*maxEntries, *maxRepoEntries)
 	if *s3Bucket != "" {
 		store, err := s3store.New(context.Background(), *s3Bucket, *s3Prefix, *s3Region)
 		if err != nil {
@@ -257,7 +262,7 @@ func cacheServe(args []string) error {
 type cacheFlags struct {
 	addr, dir, maxSize, maxEntry, jobsDir, artifactUpstream *string
 	s3Bucket, s3Prefix, s3Region, s3LocalCache              *string
-	jobsOwner                                               *int
+	jobsOwner, maxEntries, maxRepoEntries                   *int
 	identityWait                                            *time.Duration
 }
 
@@ -269,6 +274,8 @@ func newCacheFlagSet() (*flag.FlagSet, cacheFlags) {
 		dir:              fs.String("dir", "/var/lib/firerunner/cache", "cache storage directory"),
 		maxSize:          fs.String("max-size", "50GB", "evict least-recently-used entries above this total size (e.g. 50GB, 0 for unlimited)"),
 		maxEntry:         fs.String("max-entry-size", "10GB", "refuse any single cache entry larger than this (e.g. 10GB, 0 for unlimited)"),
+		maxEntries:       fs.Int("max-entries", cacheserver.DefaultMaxEntries, "keep at most this many entries, completed and reserved, evicting least-recently-used ones first (0 for unlimited)"),
+		maxRepoEntries:   fs.Int("max-repo-entries", cacheserver.DefaultMaxRepoEntries, "keep at most this many entries for one repository, evicting its own least-recently-used ones first (0 for unlimited)"),
 		jobsDir:          fs.String("jobs-dir", jobidentity.DefaultDir, "private identity directory written by the local daemon"),
 		jobsOwner:        fs.Int("jobs-owner-uid", os.Getuid(), "UID of the daemon that owns job records (default current UID)"),
 		identityWait:     fs.Duration("identity-wait", cacheserver.DefaultIdentityWait, "how long a request from a VM whose job identity is still pending waits for it before being denied (0 denies at once)"),
@@ -341,6 +348,8 @@ cache-server flags:
   --dir string       cache storage directory (default "/var/lib/firerunner/cache")
   --max-size string  evict LRU entries above this total size (default "50GB"; 0 = unlimited)
   --max-entry-size string  refuse any single entry larger than this (default "10GB"; 0 = unlimited)
+  --max-entries int  keep at most this many entries, evicting LRU ones first (default 20000; 0 = unlimited)
+  --max-repo-entries int  the same for one repository, evicting its own first (default 2000; 0 = unlimited)
   --jobs-owner-uid int  daemon UID that owns the records (default current UID)
   --jobs-dir string  daemon's private job identity directory (default "/run/firerunner/jobs")
   --artifact-upstream string  forward ArtifactService RPCs (upload/download-

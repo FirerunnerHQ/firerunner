@@ -70,6 +70,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 )
@@ -118,6 +119,8 @@ type Server struct {
 	nextID            uint64
 	maxSize           int64            // 0 = unlimited; total completed-blob bytes to keep
 	maxEntry          int64            // 0 = unlimited; hard cap on a single entry's blob
+	maxEntries        int              // 0 = unlimited; entries, completed and reserved
+	maxRepoEntries    int              // 0 = unlimited; the same, for one repository
 	staged            map[uint64]int64 // bytes written so far for a not-yet-finalized entry
 	identityMu        sync.Mutex
 	identityDenied    map[string]uint64 // by reason, under identityMu
@@ -166,7 +169,7 @@ type Stats struct {
 	Hits                   uint64            `json:"hits"`                  // download-URL lookups that matched
 	Misses                 uint64            `json:"misses"`                // download-URL lookups that did not
 	Saves                  uint64            `json:"saves"`                 // entries finalized
-	Evictions              uint64            `json:"evictions"`             // entries removed by the size cap
+	Evictions              uint64            `json:"evictions"`             // entries removed by the size or entry caps
 	ArtifactRPCs           uint64            `json:"artifact_rpcs"`         // ArtifactService RPCs forwarded upstream
 	ArtifactErrors         uint64            `json:"artifact_errors"`       // artifact RPCs refused, failed, or answered 5xx
 }
@@ -354,6 +357,10 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		twirpError(w, http.StatusBadRequest, "invalid_argument", "key and version are required")
 		return
 	}
+	if msg := checkKeys(req.Key, nil, req.Version); msg != "" {
+		twirpError(w, http.StatusBadRequest, "invalid_argument", msg)
+		return
+	}
 	identity := s.identity(r)
 	repo := identity.Repository
 	key := strings.ToLower(req.Key)
@@ -387,6 +394,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		_ = os.RemoveAll(s.tmpDir(e.ID))
 		delete(s.entries, e.ID)
 		delete(s.staged, e.ID)
+	}
+	if msg := s.roomForEntry(identity); msg != "" {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, createResp{OK: false, Message: msg})
+		return
 	}
 	e := &Entry{
 		ID:         s.nextID,
@@ -485,6 +497,11 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	var req getReq
 	if !decodeTwirp(w, r, &req) {
+		return
+	}
+	// Each restore key costs two scans of every entry under the lock.
+	if msg := checkKeys(req.Key, req.RestoreKeys, req.Version); msg != "" {
+		twirpError(w, http.StatusBadRequest, "invalid_argument", msg)
 		return
 	}
 	identity := s.identity(r)
@@ -803,7 +820,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE firerunner_cache_misses_total counter\nfirerunner_cache_misses_total %d\n", st.Misses)
 	fmt.Fprintf(w, "# HELP firerunner_cache_saves_total Entries finalized.\n")
 	fmt.Fprintf(w, "# TYPE firerunner_cache_saves_total counter\nfirerunner_cache_saves_total %d\n", st.Saves)
-	fmt.Fprintf(w, "# HELP firerunner_cache_evictions_total Entries removed by the size cap.\n")
+	fmt.Fprintf(w, "# HELP firerunner_cache_evictions_total Entries removed by the size or entry caps.\n")
 	fmt.Fprintf(w, "# TYPE firerunner_cache_evictions_total counter\nfirerunner_cache_evictions_total %d\n", st.Evictions)
 	fmt.Fprintf(w, "# HELP firerunner_artifact_rpcs_total ArtifactService RPCs forwarded to the upstream.\n")
 	fmt.Fprintf(w, "# TYPE firerunner_artifact_rpcs_total counter\nfirerunner_artifact_rpcs_total %d\n", st.ArtifactRPCs)
@@ -869,6 +886,117 @@ func (s *Server) findReserved(repo, ref, key, version string) *Entry {
 		}
 	}
 	return best
+}
+
+const (
+	// maxKeys and maxKeyLen are @actions/cache's own limits: a key and its
+	// restore keys, at most ten in all, each at most 512 characters.
+	maxKeys   = 10
+	maxKeyLen = 512
+	// DefaultMaxEntries and DefaultMaxRepoEntries are the cache-server
+	// command's defaults for SetMaxEntries: far more than a busy host or repo
+	// keeps, few enough that scanning them all under the lock stays cheap.
+	DefaultMaxEntries     = 20000
+	DefaultMaxRepoEntries = 2000
+	// maxJobReservations is how many unfinished uploads one job may hold.
+	// The toolkit saves one cache at a time per step.
+	maxJobReservations = 64
+)
+
+// checkKeys returns why a request's keys are refused, or "" when they are
+// within the toolkit's limits. Lengths are in characters, never stricter
+// than the toolkit, which counts UTF-16 units.
+func checkKeys(key string, restoreKeys []string, version string) string {
+	if 1+len(restoreKeys) > maxKeys {
+		return fmt.Sprintf("at most %d keys, the key and its restore keys", maxKeys)
+	}
+	for _, k := range append([]string{key, version}, restoreKeys...) {
+		if utf8.RuneCountInString(k) > maxKeyLen {
+			return fmt.Sprintf("keys and versions are at most %d characters", maxKeyLen)
+		}
+	}
+	return ""
+}
+
+// SetMaxEntries caps how many entries, completed and reserved, the cache
+// holds in all and for one repository. Byte caps alone let a job finalize any
+// number of empty entries, each kept in the index and scanned on every
+// lookup. A new reservation past the repository's cap evicts that
+// repository's least-recently-used completed entry, so one repository cannot
+// flush the others; past the total it evicts the host's. Either is refused
+// when only reservations are left. A non-positive value means unlimited.
+// Call before serving.
+func (s *Server) SetMaxEntries(total, perRepo int) {
+	s.mu.Lock()
+	s.maxEntries, s.maxRepoEntries = total, perRepo
+	s.mu.Unlock()
+}
+
+// roomForEntry makes room for one more entry for the job identity holds, and
+// returns why it cannot, or "". The caller holds s.mu.
+func (s *Server) roomForEntry(identity jobidentity.Identity) string {
+	var repo []*Entry
+	reserved := 0
+	for _, e := range s.entries {
+		if e.RepoID == identity.Repository {
+			repo = append(repo, e)
+			if !e.Complete && e.JobID == identity.JobID && e.RunID == identity.RunID && e.Generation == identity.Generation {
+				reserved++
+			}
+		}
+	}
+	if reserved >= maxJobReservations {
+		return "job has too many unfinished cache uploads"
+	}
+	evicted := 0
+	defer func() {
+		if evicted > 0 {
+			s.log.Info("evicted cache entries (entry cap)", "count", evicted)
+			if err := s.save(); err != nil {
+				s.log.Warn("cache index save failed", "err", err)
+			}
+		}
+	}()
+	if s.maxRepoEntries > 0 && len(repo) >= s.maxRepoEntries {
+		evicted += s.evictOldest(repo, len(repo)-s.maxRepoEntries+1)
+		if len(repo)-evicted >= s.maxRepoEntries {
+			return "repository has too many cache entries"
+		}
+	}
+	if s.maxEntries > 0 && len(s.entries) >= s.maxEntries {
+		all := make([]*Entry, 0, len(s.entries))
+		for _, e := range s.entries {
+			all = append(all, e)
+		}
+		evicted += s.evictOldest(all, len(s.entries)-s.maxEntries+1)
+		if len(s.entries) >= s.maxEntries {
+			return "cache has too many entries"
+		}
+	}
+	return ""
+}
+
+// evictOldest removes up to n of entries' completed ones, least recently used
+// first, and returns how many it removed. It sorts once, so trimming a large
+// index (after --max-entries is lowered) is not quadratic. The caller holds
+// s.mu and saves the index.
+func (s *Server) evictOldest(entries []*Entry, n int) int {
+	done := entries[:0:0]
+	for _, e := range entries {
+		if e.Complete {
+			done = append(done, e)
+		}
+	}
+	sort.Slice(done, func(i, j int) bool { return lessRecentlyUsed(done[i], done[j]) })
+	n = min(n, len(done))
+	for _, e := range done[:n] {
+		s.removeBlob(e.ID)
+		_ = os.RemoveAll(s.tmpDir(e.ID))
+		delete(s.entries, e.ID)
+		delete(s.staged, e.ID)
+		s.evictions++
+	}
+	return n
 }
 
 // match exhausts each scope before trying the next. Within a scope an exact
