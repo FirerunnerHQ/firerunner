@@ -1019,7 +1019,10 @@ It implements the three Twirp methods plus the Azure block-blob upload
 tags each blob URL with a per-entry token, and persists an index so caches
 survive restarts. Host-owned job records authorize each connection by its guest
 source address, repository and ref. One server supports all repositories served
-by its daemon, with the namespace derived exclusively from the job record.
+by its daemon, with the namespace derived exclusively from the job record. The
+repository is identified by GitHub's repository ID as well as its name, so a
+repository created later under a name another one gave up (renamed or deleted)
+reads none of the earlier one's caches.
 
 It binds `127.0.0.1:8099` by default. Because each microVM slot reaches the host
 on its own per-slot gateway IP (`172.16.<slot>.1`), serving guests means binding

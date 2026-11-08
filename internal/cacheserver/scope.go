@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
@@ -90,7 +89,10 @@ func (s *Server) identity(r *http.Request) jobidentity.Identity {
 	s.identityMu.Lock()
 	delete(s.identityFailures, host)
 	s.identityMu.Unlock()
-	i.Repository = strings.ToLower(i.Repository)
+	// Entries are scoped by name and ID, so a repository created later under
+	// a name another one gave up reads none of its caches. Entries saved
+	// under the name alone, before the ID, match no identity.
+	i.Repository = i.ScopeKey()
 	return i
 }
 

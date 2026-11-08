@@ -172,6 +172,7 @@ func (g *GitHub) getPage(ctx context.Context, path string, out any) (string, err
 }
 
 type repository struct {
+	ID            int64  `json:"id"`
 	FullName      string `json:"full_name"`
 	DefaultBranch string `json:"default_branch"`
 }
@@ -298,7 +299,12 @@ func (g *GitHub) resolve(ctx context.Context, j Job) (Identity, error) {
 	if !strings.EqualFold(repo.FullName, j.Repository) || !ValidRef(def) {
 		return i, errors.New("repository default branch unavailable")
 	}
-	i = Identity{Repository: strings.ToLower(repo.FullName), Event: run.Event, RunID: j.RunID, JobID: j.JobID, ReadRefs: []string{def}, Fork: !strings.EqualFold(run.HeadRepository.FullName, repo.FullName)}
+	// A name can be reused by a different repository once its first owner
+	// deletes or renames it; the ID cannot. Cache scope is keyed by it.
+	if repo.ID <= 0 || run.Repository.ID != repo.ID {
+		return Identity{}, errors.New("repository ID unavailable or does not match the run")
+	}
+	i = Identity{Repository: strings.ToLower(repo.FullName), RepositoryID: repo.ID, Event: run.Event, RunID: j.RunID, JobID: j.JobID, ReadRefs: []string{def}, Fork: !strings.EqualFold(run.HeadRepository.FullName, repo.FullName)}
 	switch run.Event {
 	case "pull_request":
 		candidates := run.PullRequests

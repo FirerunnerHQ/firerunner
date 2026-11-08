@@ -30,17 +30,21 @@ type Job struct {
 // Identity is published by the daemon. Generation changes on EVERY slot reuse.
 // ExpiresAt is renewed while the daemon owns the VM, bounding crash leftovers.
 type Identity struct {
-	IP         string   `json:"ip"`
-	Runner     string   `json:"runner"`
-	Generation string   `json:"generation"`
-	Repository string   `json:"repository"`
-	Event      string   `json:"event"`
-	WriteRef   string   `json:"write_ref"`
-	ReadRefs   []string `json:"read_refs"`
-	Fork       bool     `json:"fork"`
-	RunID      int64    `json:"run_id"`
-	JobID      string   `json:"job_id"`
-	ExpiresAt  int64    `json:"expires_at"`
+	IP         string `json:"ip"`
+	Runner     string `json:"runner"`
+	Generation string `json:"generation"`
+	Repository string `json:"repository"`
+	// RepositoryID is GitHub's ID for Repository. A name can pass to a
+	// different repository after a rename or delete; the ID never does, so
+	// cache scope is keyed by it (see ScopeKey).
+	RepositoryID int64    `json:"repository_id"`
+	Event        string   `json:"event"`
+	WriteRef     string   `json:"write_ref"`
+	ReadRefs     []string `json:"read_refs"`
+	Fork         bool     `json:"fork"`
+	RunID        int64    `json:"run_id"`
+	JobID        string   `json:"job_id"`
+	ExpiresAt    int64    `json:"expires_at"`
 	// Unresolved is terminal: resolution gave up, so readers must stop waiting.
 	Unresolved bool `json:"unresolved,omitempty"`
 }
@@ -70,12 +74,19 @@ func ValidRepository(repo string) bool {
 	return true
 }
 
+// ScopeKey is the repository a cache entry belongs to: the lower-cased name,
+// for people reading the index, and the ID, which tells a repository from a
+// later one under the same name.
+func (i Identity) ScopeKey() string {
+	return fmt.Sprintf("%s#%d", strings.ToLower(i.Repository), i.RepositoryID)
+}
+
 // Validate checks a resolved record. Pending records deliberately fail this.
 func (i Identity) Validate(now time.Time) error {
 	if i.Unresolved {
 		return errors.New("job identity unresolved")
 	}
-	if !ValidRepository(i.Repository) || i.Runner == "" || i.Generation == "" || i.JobID == "" || i.RunID <= 0 || i.ExpiresAt <= now.Unix() {
+	if !ValidRepository(i.Repository) || i.RepositoryID <= 0 || i.Runner == "" || i.Generation == "" || i.JobID == "" || i.RunID <= 0 || i.ExpiresAt <= now.Unix() {
 		return errors.New("missing or expired job identity")
 	}
 	if i.WriteRef != "" && !ValidRef(i.WriteRef) {

@@ -16,8 +16,17 @@ import (
 	"time"
 )
 
+// testRepoID gives each test repository name its own stable ID.
+func testRepoID(repo string) int64 {
+	var id int64 = 1
+	for _, c := range strings.ToLower(repo) {
+		id = id*31 + int64(c)
+	}
+	return id&0x7fffffff + 1
+}
+
 func testIdentity(repo, ref, job string) jobidentity.Identity {
-	return jobidentity.Identity{Repository: repo, WriteRef: ref, ReadRefs: []string{ref}, Runner: "test-runner", Generation: job, JobID: job, RunID: 1, ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	return jobidentity.Identity{Repository: repo, RepositoryID: testRepoID(repo), WriteRef: ref, ReadRefs: []string{ref}, Runner: "test-runner", Generation: job, JobID: job, RunID: 1, ExpiresAt: time.Now().Add(time.Hour).Unix()}
 }
 func newAuthorizedStore(dir string, log *slog.Logger) (*Server, error) {
 	s, err := New(dir, log)

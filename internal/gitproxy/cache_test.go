@@ -46,7 +46,7 @@ func newCacheFixture(t *testing.T, who jobidentity.Identity) *cacheFixture {
 
 func job(repo, ref string, reads ...string) jobidentity.Identity {
 	return jobidentity.Identity{
-		Runner: "runner-1", Generation: "g1", Repository: repo, WriteRef: ref,
+		Runner: "runner-1", Generation: "g1", Repository: repo, RepositoryID: int64(len(repo)) + 1000, WriteRef: ref,
 		ReadRefs: append([]string{ref}, reads...), RunID: 1, JobID: "j1",
 		ExpiresAt: time.Now().Add(time.Hour).Unix(),
 	}
