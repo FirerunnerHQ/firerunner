@@ -347,8 +347,7 @@ type getResp struct {
 // GitHub's "another job may be creating this cache".
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var req createReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		twirpError(w, http.StatusBadRequest, "malformed", err.Error())
+	if !decodeTwirp(w, r, &req) {
 		return
 	}
 	if req.Key == "" || req.Version == "" {
@@ -423,8 +422,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 // handleFinalize marks a reserved entry complete once its blob is on disk.
 func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 	var req finalizeReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		twirpError(w, http.StatusBadRequest, "malformed", err.Error())
+	if !decodeTwirp(w, r, &req) {
 		return
 	}
 	identity := s.identity(r)
@@ -486,8 +484,7 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 // URL, or ok:false on a miss.
 func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	var req getReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		twirpError(w, http.StatusBadRequest, "malformed", err.Error())
+	if !decodeTwirp(w, r, &req) {
 		return
 	}
 	identity := s.identity(r)
@@ -601,6 +598,10 @@ func (s *Server) uploadBlock(w http.ResponseWriter, r *http.Request, e *Entry) {
 		http.Error(w, "missing blockid", http.StatusBadRequest)
 		return
 	}
+	if len(blockID) > maxBlockIDLen {
+		http.Error(w, "blockid too long", http.StatusBadRequest)
+		return
+	}
 	dir := s.tmpDir(e.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -641,8 +642,13 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 		Uncommitted []string `xml:"Uncommitted"`
 		Committed   []string `xml:"Committed"`
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBlockListBody))
 	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			http.Error(w, "block list too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -655,6 +661,12 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 	ids = append(ids, list.Committed...)
 	if len(ids) == 0 {
 		http.Error(w, "empty block list", http.StatusBadRequest)
+		return
+	}
+	if len(ids) > maxBlocks {
+		// Each id costs an open and a copy, so a list of one id repeated
+		// would otherwise multiply work without adding bytes.
+		http.Error(w, "too many blocks", http.StatusBadRequest)
 		return
 	}
 
@@ -1269,4 +1281,35 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // misses and reservation conflicts are ok:false 200s handled inline.
 func twirpError(w http.ResponseWriter, code int, twirpCode, msg string) {
 	writeJSON(w, code, map[string]string{"code": twirpCode, "msg": msg})
+}
+
+const (
+	// maxTwirpBody bounds a cache RPC's JSON body. The toolkit sends a key,
+	// up to ten restore keys and a version, each a few hundred bytes at most.
+	maxTwirpBody = 64 << 10
+	// maxBlocks is Azure's limit on blocks in one blob, and maxBlockIDLen the
+	// longest block id it accepts: 64 bytes before base64, 88 characters after.
+	maxBlocks     = 50000
+	maxBlockIDLen = 88
+	// maxBlockListBody bounds a block list: maxBlocks ids of maxBlockIDLen
+	// inside their XML tags.
+	maxBlockListBody = 8 << 20
+)
+
+// decodeTwirp decodes a cache RPC body into v, answering a 400 or, over
+// maxTwirpBody, a 413 itself and reporting false. The bound applies before
+// any identity lookup, so a guest cannot make the server buffer an
+// arbitrarily large JSON value.
+func decodeTwirp(w http.ResponseWriter, r *http.Request, v any) bool {
+	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxTwirpBody)).Decode(v)
+	if err == nil {
+		return true
+	}
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		twirpError(w, http.StatusRequestEntityTooLarge, "invalid_argument", "request body too large")
+	} else {
+		twirpError(w, http.StatusBadRequest, "malformed", err.Error())
+	}
+	return false
 }
