@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,6 +71,10 @@ type FirecrackerConfig struct {
 	// guest serial console. Because the microVM is destroyed after its single
 	// job, this is how runner logs are forwarded off the ephemeral VM.
 	LogDir string
+	// LogMaxBytes caps each runner's log file, and LogDirMaxBytes all of
+	// them together, the oldest removed first; 0 means no cap.
+	LogMaxBytes    int64
+	LogDirMaxBytes int64
 	// MaxVMs bounds concurrent microVMs and sizes the per-VM network pool.
 	MaxVMs int
 
@@ -718,14 +723,18 @@ func (f *Firecracker) openConsole(name string, onBusy, onConnected func()) (io.W
 	writers = append(writers, &logWriter{log: f.log, runner: name, stream: "console"})
 	closeFn := func() {}
 	if f.cfg.LogDir != "" {
-		if err := os.MkdirAll(f.cfg.LogDir, 0o755); err != nil {
+		if err := os.MkdirAll(f.cfg.LogDir, 0o700); err != nil {
 			return nil, nil, err
 		}
-		file, err := os.Create(filepath.Join(f.cfg.LogDir, name+".log"))
+		// The guest writes what it likes to its console, so each file has a
+		// cap and the directory a budget, or one job could fill the host disk.
+		f.pruneLogs(f.cfg.LogDirMaxBytes - f.cfg.LogMaxBytes)
+		// 0600: the console can carry whatever a job printed to it.
+		file, err := os.OpenFile(filepath.Join(f.cfg.LogDir, name+".log"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 		if err != nil {
 			return nil, nil, err
 		}
-		writers = append(writers, tolerantWriter{w: file})
+		writers = append(writers, tolerantWriter{w: newCappedWriter(file, f.cfg.LogMaxBytes)})
 		closeFn = func() { _ = file.Close() }
 	}
 	if len(writers) == 1 {
@@ -744,6 +753,82 @@ type tolerantWriter struct{ w io.Writer }
 func (t tolerantWriter) Write(p []byte) (int, error) {
 	_, _ = t.w.Write(p)
 	return len(p), nil
+}
+
+// newCappedWriter passes at most limit bytes to w, then one line saying the
+// rest was dropped, then nothing. limit <= 0 passes everything.
+func newCappedWriter(w io.Writer, limit int64) io.Writer {
+	if limit <= 0 {
+		return w
+	}
+	return &cappedWriter{w: w, left: limit}
+}
+
+type cappedWriter struct {
+	w    io.Writer
+	left int64
+	cut  bool
+}
+
+// consoleCutNote ends a console log that reached its cap.
+const consoleCutNote = "\n[firerunner: console log reached --log-max-mib; the rest was dropped]\n"
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	if c.cut {
+		return len(p), nil
+	}
+	if int64(len(p)) <= c.left {
+		c.left -= int64(len(p))
+		return c.w.Write(p)
+	}
+	_, err := c.w.Write(p[:c.left])
+	c.left, c.cut = 0, true
+	_, _ = io.WriteString(c.w, consoleCutNote)
+	return len(p), err
+}
+
+// pruneLogs removes the oldest per-runner logs in LogDir until the rest take
+// at most budget bytes, leaving room for the one about to be created. It does
+// nothing when LogDirMaxBytes is unset. It is best-effort: a failure is
+// logged.
+func (f *Firecracker) pruneLogs(budget int64) {
+	if f.cfg.LogDirMaxBytes <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(f.cfg.LogDir)
+	if err != nil {
+		f.log.Warn("list runner logs", "dir", f.cfg.LogDir, "err", err)
+		return
+	}
+	type logFile struct {
+		path string
+		size int64
+		mod  time.Time
+	}
+	var logs []logFile
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		logs = append(logs, logFile{filepath.Join(f.cfg.LogDir, e.Name()), info.Size(), info.ModTime()})
+		total += info.Size()
+	}
+	sort.Slice(logs, func(i, j int) bool { return logs[i].mod.Before(logs[j].mod) })
+	for _, l := range logs {
+		if total <= budget {
+			return
+		}
+		if err := os.Remove(l.path); err != nil {
+			f.log.Warn("remove old runner log", "path", l.path, "err", err)
+			continue
+		}
+		total -= l.size
+	}
 }
 
 // busyMarker is printed by the in-guest Actions runner to the serial console

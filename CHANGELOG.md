@@ -26,6 +26,9 @@ and this project adheres to
 - The cross-account role in `deploy/cloudformation/byoc-role.yaml` can no
   longer read `<prefix>/control/*`, where a control VM in the same account
   keeps its GitHub credentials. Update the stack to apply it.
+- Firecracker console logs under `--log-dir` are capped: each keeps at most
+  `--log-max-mib` (default 64), and all of them at most `--log-dir-max-mib`
+  (default 2048), the oldest removed first. They are created mode 0600.
 - A runner still running two minutes after GitHub reports its job completed
   is stopped, so a guest that disables its own shutdown no longer holds its
   slot or instance until `--max-vm-lifetime`.
