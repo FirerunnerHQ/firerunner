@@ -17,9 +17,10 @@ for t in gpg gpgv gpgconf; do
 done
 GPG_RELEASE="$(mktemp -d /tmp/frgpg.XXXXXX)"
 GPG_STRANGER="$(mktemp -d /tmp/frgpg.XXXXXX)"
+GPG_REVOKED="$(mktemp -d /tmp/frgpg.XXXXXX)"
 cleanup() {
-	for h in "$GPG_RELEASE" "$GPG_STRANGER"; do gpgconf --homedir "$h" --kill gpg-agent 2>/dev/null || true; done
-	rm -rf "$TMP" "$GPG_RELEASE" "$GPG_STRANGER"
+	for h in "$GPG_RELEASE" "$GPG_STRANGER" "$GPG_REVOKED"; do gpgconf --homedir "$h" --kill gpg-agent 2>/dev/null || true; done
+	rm -rf "$TMP" "$GPG_RELEASE" "$GPG_STRANGER" "$GPG_REVOKED"
 }
 trap cleanup EXIT
 BIN="$TMP/bin"
@@ -153,7 +154,7 @@ release release-nosha.json ""
 printf '%s  %s\n%s  node-v%s-darwin-arm64.tar.gz\n' "$NODE_SHA" "$NODE_TGZ" "$(printf '%064d' 1)" "$NV" >"$REMOTE/SHASUMS256.txt"
 printf '%s  node-v%s-darwin-arm64.tar.gz\n' "$(printf '%064d' 1)" "$NV" >"$REMOTE/SHASUMS256-other.txt"
 # A release key the builders trust (NODE_KEYRING), and a stranger's.
-for h in "$GPG_RELEASE" "$GPG_STRANGER"; do
+for h in "$GPG_RELEASE" "$GPG_STRANGER" "$GPG_REVOKED"; do
 	chmod 700 "$h"
 	gpg --homedir "$h" --batch --quiet --passphrase '' --quick-gen-key "test <$(basename "$h")@example.com>" ed25519 sign never 2>/dev/null
 done
@@ -166,6 +167,11 @@ sign() { # HOME FILE OUT: OUT is FILE's detached signature by HOME's key.
 sign "$GPG_RELEASE" "$REMOTE/SHASUMS256.txt" "$REMOTE/SHASUMS256.txt.sig"
 sign "$GPG_RELEASE" "$REMOTE/SHASUMS256-other.txt" "$REMOTE/SHASUMS256-other.txt.sig"
 sign "$GPG_STRANGER" "$REMOTE/SHASUMS256.txt" "$REMOTE/SHASUMS256-stranger.txt.sig"
+# A release key that signed, and was revoked since: gpg keeps a revocation
+# certificate for every key it makes, its armor escaped with a leading ":".
+sign "$GPG_REVOKED" "$REMOTE/SHASUMS256.txt" "$REMOTE/SHASUMS256-revoked.txt.sig"
+sed 's/^://' "$GPG_REVOKED"/openpgp-revocs.d/*.rev | gpg --homedir "$GPG_REVOKED" --batch --quiet --import 2>/dev/null
+gpg --homedir "$GPG_REVOKED" --batch --armor --export >"$TMP/node-keys-revoked.asc"
 # A SHASUMS256.txt that lists a tampered archive, under the real signature.
 printf '%s  %s\n' "$(sha "$REMOTE/evil-node.tar.gz")" "$NODE_TGZ" >"$REMOTE/SHASUMS256-forged.txt"
 
@@ -308,6 +314,16 @@ expect "no checksum: downloads nothing" lacks urls "$RUNNER_URL"
 ROOTFS="$HERE/build-rootfs.sh"
 OUT="$TMP/out/golden.ext4"
 
+echo "== keys/nodejs-release-keys"
+STATE="$TMP/state-keys"
+mkdir -p "$STATE"
+gpg --show-keys --with-colons "$HERE/keys/nodejs-release-keys.asc" 2>/dev/null |
+	awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { print $10; p = 0 }' | sort >"$STATE/keyring"
+awk '!/^#/ && NF { print $1 }' "$HERE/keys/nodejs-release-keys.list" | sort >"$STATE/list"
+: >"$STATE/err"
+expect "the keyring holds exactly the keys its list names" cmp -s "$STATE/keyring" "$STATE/list"
+expect "the list names keys" test -s "$STATE/list"
+
 echo "== build-rootfs.sh"
 routes
 run rootfs-latest "$ROOTFS" --out "$OUT"
@@ -387,12 +403,22 @@ reroute "https://nodejs.org/dist/v$NV/SHASUMS256.txt.sig" "$REMOTE/SHASUMS256-st
 run rootfs-node-stranger "$ROOTFS" --out "$OUT" --tier firerunner-node
 expect "signed by a stranger: fails" has err "is not signed by a Node.js release key"
 expect "signed by a stranger: no image" lacks calls mkfs.ext4
+expect "signed by a stranger: the archive is never fetched" lacks urls "$NODE_URL"
+
+routes
+reroute "https://nodejs.org/dist/v$NV/SHASUMS256.txt.sig" "$REMOTE/SHASUMS256-revoked.txt.sig"
+NODE_KEYRING="$TMP/node-keys-revoked.asc"
+run rootfs-node-revoked "$ROOTFS" --out "$OUT" --tier firerunner-node
+NODE_KEYRING="$TMP/node-keys.asc"
+expect "signed by a revoked key: fails" has err "is signed by a revoked release key"
+expect "signed by a revoked key: the archive is never fetched" lacks urls "$NODE_URL"
 
 routes
 reroute "https://nodejs.org/dist/v$NV/SHASUMS256.txt.sig" "$REMOTE/missing"
 run rootfs-node-unsigned "$ROOTFS" --out "$OUT" --tier firerunner-node
 expect "no signature: fails" has err "could not read https://nodejs.org/dist/v$NV/SHASUMS256.txt and its .sig"
 expect "no signature: no image" lacks calls mkfs.ext4
+expect "no signature: the archive is never fetched" lacks urls "$NODE_URL"
 
 routes
 run rootfs-node-pinned "$ROOTFS" --out "$OUT" --tier firerunner-node --node-sha256 "$NODE_SHA"

@@ -9,7 +9,7 @@
 # fingerprint in its keys.list, and refuses unless each key file holds exactly
 # that key and the list matches the release keys nodejs/node's README names,
 # a second source in a different repository. It then writes, beside itself:
-#   nodejs-release-keys.asc   the keys, ASCII-armored, in keys.list order
+#   nodejs-release-keys.asc   the keys, exported by gpg as one armored block
 #   nodejs-release-keys.list  the source commit, and one fingerprint and name
 #                             per key, so a refresh reviews as a short diff
 # Run it when a build fails because a release is signed by a key it lacks
@@ -60,7 +60,6 @@ if ! diff -u "$work/readme" "$work/listed.sorted" >"$work/diff"; then
 	die "release-keys $commit and nodejs/node's README name different keys (- README, + keys.list)"
 fi
 
-: >"$work/keys.asc"
 {
 	echo "# Node.js release keys, from nodejs/release-keys $commit."
 	echo "# Written by update-nodejs-keys.sh; checked against nodejs/node's README."
@@ -70,10 +69,25 @@ while read -r fpr; do
 	[ -f "$f" ] || die "keys.list names $fpr, but keys/$fpr.asc is missing"
 	got="$(gpg --show-keys --with-colons "$f" 2>/dev/null | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { print $10; p = 0 }')"
 	[ "$got" = "$fpr" ] || die "keys/$fpr.asc holds ${got:-no key} instead"
+	# A key revoked (as compromised, say) would still check signatures in gpgv.
+	revoked="$(gpg --show-keys --with-colons "$f" 2>/dev/null | awk -F: '$1 == "pub" { print $2; exit }')"
+	[ "$revoked" != r ] || die "keys/$fpr.asc is revoked; drop it from the list upstream first"
 	name="$(gpg --show-keys --with-colons "$f" 2>/dev/null | awk -F: '$1 == "uid" { print $10; exit }')"
-	cat "$f" >>"$work/keys.asc"
+	# Imported one by one: upstream files need not end in a newline, and
+	# concatenating them dropped a key.
+	gpg --batch --quiet --import "$f" 2>/dev/null
 	echo "$fpr $name" >>"$work/keys.list"
 done <"$work/listed"
+# shellcheck disable=SC2046 # one argument per fingerprint
+gpg --batch --armor --export $(cat "$work/listed") >"$work/keys.asc"
+
+# The keyring as written must hold exactly the listed keys.
+gpg --show-keys --with-colons "$work/keys.asc" 2>/dev/null |
+	awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { print $10; p = 0 }' | sort >"$work/written"
+if ! diff -u "$work/listed.sorted" "$work/written" >"$work/diff"; then
+	cat "$work/diff" >&2
+	die "the keyring written does not hold exactly the listed keys (- listed, + written)"
+fi
 
 install -m 0644 "$work/keys.asc" "$here/nodejs-release-keys.asc"
 install -m 0644 "$work/keys.list" "$here/nodejs-release-keys.list"

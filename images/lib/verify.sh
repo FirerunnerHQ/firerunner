@@ -97,7 +97,7 @@ node_sha256() {
 	command -v gpgv >/dev/null && command -v gpg >/dev/null ||
 		verify_error "Node v$1: checking SHASUMS256.txt's signature needs gpg and gpgv (gnupg); install them, or pin the archive's SHA-256" || return
 	[[ -r "$NODE_KEYRING" ]] || verify_error "Node v$1: no release keys at $NODE_KEYRING" || return
-	dir="$(mktemp -d)"
+	dir="$(mktemp -d)" || verify_error "Node v$1: could not make a temporary directory" || return
 	# gpgv reads only a binary keyring; the armored one is what the repo reviews.
 	if ! curl -fsSL --retry 3 -o "$dir/SHASUMS256.txt" "$url" ||
 		! curl -fsSL --retry 3 -o "$dir/SHASUMS256.txt.sig" "$url.sig"; then
@@ -110,6 +110,11 @@ node_sha256() {
 		sed 's/^/   /' "$dir/err" >&2
 		rm -rf "$dir"
 		verify_error "Node v$1: $url is not signed by a Node.js release key; if a new releaser signed it, run images/keys/update-nodejs-keys.sh" || return
+	fi
+	# gpgv accepts a revoked key's signature; a revoked release key is not one.
+	if grep -q '^\[GNUPG:\] REVKEYSIG ' "$dir/status"; then
+		rm -rf "$dir"
+		verify_error "Node v$1: $url is signed by a revoked release key" || return
 	fi
 	signer="$(awk '$2 == "VALIDSIG" { print $NF; exit }' "$dir/status")"
 	echo ">> Node v$1 SHASUMS256.txt signed by release key $signer" >&2

@@ -120,7 +120,11 @@ if [ "$(uname -s)" = Linux ]; then
 else
 	skip docker-shim "needs Linux (/proc)"
 fi
-step image-downloads images/test-verify-downloads.sh
+if command -v gpg >/dev/null && command -v gpgv >/dev/null; then
+	step image-downloads images/test-verify-downloads.sh
+else
+	skip image-downloads "gpg/gpgv not installed (gnupg)"
+fi
 step ec2-boot-script images/test-ec2-run.sh
 step ec2-boot-tuning images/test-ec2-tune.sh
 step ec2-toolset images/test-runner-images.sh
