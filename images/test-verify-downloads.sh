@@ -33,11 +33,35 @@ FAKE
 # Linux, root, and no real disks.
 printf '#!/bin/sh\necho Linux\n' >"$BIN/uname"
 printf '#!/bin/sh\necho 0\n' >"$BIN/id"
-for t in mkfs.ext4 truncate mount umount e2label; do
+for t in truncate mount umount e2label; do
 	# shellcheck disable=SC2016 # the fake expands it
 	printf '#!/bin/sh\necho "%s $*" >>"$STATE/calls"\n' "$t" >"$BIN/$t"
 done
 printf '#!/bin/sh\nexit 1\n' >"$BIN/mountpoint"
+# mkfs.ext4 [-d DIR] ...: keeps the record of downloads DIR holds.
+cat >"$BIN/mkfs.ext4" <<'FAKE'
+#!/bin/sh
+echo "mkfs.ext4 $*" >>"$STATE/calls"
+while [ $# -gt 1 ]; do
+	[ "$1" != -d ] || [ ! -f "$2/etc/firerunner/downloads.sha256" ] || cp "$2/etc/firerunner/downloads.sha256" "$STATE/"
+	shift
+done
+FAKE
+# docker: build keeps a copy of its context; export streams a bare tree.
+cat >"$BIN/docker" <<'FAKE'
+#!/bin/sh
+echo "docker $*" >>"$STATE/calls"
+case "$1" in
+build)
+	for ctx; do :; done
+	cp -R "$ctx" "$STATE/ctx"
+	;;
+export)
+	mkdir -p "$STATE/rootfs/etc"
+	tar -cf - -C "$STATE/rootfs" .
+	;;
+esac
+FAKE
 # debootstrap ... SUITE TARGET MIRROR: the directories the builder writes into.
 cat >"$BIN/debootstrap" <<'FAKE'
 #!/bin/sh
@@ -102,6 +126,31 @@ release release-nosha.json ""
 printf '%s  %s\n%s  node-v%s-darwin-arm64.tar.gz\n' "$NODE_SHA" "$NODE_TGZ" "$(printf '%064d' 1)" "$NV" >"$REMOTE/SHASUMS256.txt"
 printf '%s  node-v%s-darwin-arm64.tar.gz\n' "$(printf '%064d' 1)" "$NV" >"$REMOTE/SHASUMS256-other.txt"
 
+printf 'not the real package\n' >"$REMOTE/pmc.deb"
+PMC_SHA="$(sha "$REMOTE/pmc.deb")"
+PMC_URL=https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+
+# actions/runner-images, served by real git from a local directory: commit
+# RI_A, then RI_B, to which the tag has since moved.
+export GITHUB_GIT="file://$TMP/git" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+RI="$TMP/git/actions/runner-images"
+mkdir -p "$RI/images/ubuntu/scripts/helpers" "$RI/images/ubuntu/scripts/tests" \
+	"$RI/images/ubuntu/scripts/build" "$RI/images/ubuntu/toolsets"
+echo '{}' >"$RI/images/ubuntu/toolsets/toolset-2404.json"
+: >"$RI/images/ubuntu/scripts/helpers/install.sh"
+: >"$RI/images/ubuntu/scripts/tests/none.sh"
+ri_commit() {
+	echo "$1" >"$RI/images/ubuntu/scripts/build/which.sh"
+	git -C "$RI" add -A
+	git -C "$RI" -c user.name=t -c user.email=t@example.com commit -q -m "$1"
+	git -C "$RI" rev-parse HEAD
+}
+git -C "$RI" init -q
+RI_A="$(ri_commit A)"
+RI_B="$(ri_commit B)"
+printf '%s' "$RI_B" >"$REMOTE/ri-tag"
+printf '{"message": "No commit found for SHA: ubuntu24/bad"}' >"$REMOTE/ri-bad"
+
 # routes: the honest upstream.
 routes() {
 	: >"$REMOTE/routes"
@@ -110,6 +159,9 @@ routes() {
 	serve "$RUNNER_URL" "$REMOTE/$RUNNER_TGZ"
 	serve "https://nodejs.org/dist/v$NV/SHASUMS256.txt" "$REMOTE/SHASUMS256.txt"
 	serve "$NODE_URL" "$REMOTE/$NODE_TGZ"
+	serve "$PMC_URL" "$REMOTE/pmc.deb"
+	serve https://api.github.com/repos/actions/runner-images/commits/ubuntu24/test "$REMOTE/ri-tag"
+	serve https://api.github.com/repos/actions/runner-images/commits/ubuntu24/bad "$REMOTE/ri-bad"
 }
 # reroute URL FILE: serve FILE at URL instead.
 reroute() {
@@ -229,6 +281,87 @@ expect "node missing from SHASUMS256.txt: no image" lacks calls mkfs.ext4
 run rootfs-node-pinned "$ROOTFS" --out "$OUT" --tier firerunner-node --node-sha256 "$NODE_SHA"
 expect "node pinned: builds without SHASUMS256.txt" passed
 expect "node pinned: installs node" exists node-installed
+
+UBUNTU="$HERE/build-ubuntu-rootfs.sh"
+OUT="$TMP/out/ubuntu.ext4"
+same() { cmp -s "$STATE/$1" "$2"; }
+ri_at() { [ "$(cat "$STATE/ctx/imagegeneration/installers/which.sh")" = "$1" ]; }
+
+echo "== build-ubuntu-rootfs.sh"
+routes
+run ubuntu-minimal "$UBUNTU" --out "$OUT" --toolset minimal
+expect "minimal: builds" passed
+expect "minimal: the build gets the checked runner" same ctx/actions-runner.tar.gz "$REMOTE/$RUNNER_TGZ"
+expect "minimal: the build gets the checked node" same ctx/node.tar.gz "$REMOTE/$NODE_TGZ"
+expect "minimal: the Dockerfile downloads no runner" lacks ctx/Dockerfile releases/download
+expect "minimal: the Dockerfile downloads no node" lacks ctx/Dockerfile nodejs.org
+expect "minimal: prints the version and checksum it used" has out "actions/runner $RV linux-x64 sha256 $RUNNER_SHA"
+expect "minimal: the image records the runner" has downloads.sha256 "$RUNNER_SHA  $RUNNER_TGZ"
+expect "minimal: the image records node" has downloads.sha256 "$NODE_SHA  $NODE_TGZ"
+
+routes
+reroute "$RUNNER_URL" "$REMOTE/evil-runner.tar.gz"
+run ubuntu-tampered-runner "$UBUNTU" --out "$OUT" --toolset minimal
+expect "tampered runner: fails" failed
+expect "tampered runner: says why" has err "$RUNNER_TGZ: SHA-256 mismatch"
+expect "tampered runner: nothing is built" lacks calls "docker build"
+
+routes
+reroute "$NODE_URL" "$REMOTE/evil-node.tar.gz"
+run ubuntu-tampered-node "$UBUNTU" --out "$OUT" --toolset minimal
+expect "tampered node: fails" failed
+expect "tampered node: says why" has err "$NODE_TGZ: SHA-256 mismatch"
+expect "tampered node: nothing is built" lacks calls "docker build"
+
+routes
+run ubuntu-pinned "$UBUNTU" --out "$OUT" --toolset minimal \
+	--runner-version "$RV" --runner-sha256 "$RUNNER_SHA" --node-sha256 "$NODE_SHA"
+expect "pinned: builds" passed
+expect "pinned: reads no release notes" lacks urls api.github.com
+expect "pinned: reads no SHASUMS256.txt" lacks urls SHASUMS256.txt
+
+routes
+run ubuntu-full-tag "$UBUNTU" --out "$OUT" --toolset full --runner-images-ref ubuntu24/test --pmc-sha256 "$PMC_SHA"
+expect "full, tag: builds" passed
+expect "full, tag: resolves the tag once and says how to pin it" has out "resolved runner-images ubuntu24/test to commit $RI_B; pass --runner-images-commit $RI_B"
+expect "full, tag: vendors that commit" ri_at B
+expect "full, tag: the build gets the checked package" same ctx/packages-microsoft-prod.deb "$REMOTE/pmc.deb"
+expect "full, tag: the Dockerfile downloads no package" lacks ctx/Dockerfile packages.microsoft.com
+expect "full, tag: the image records the commit" has downloads.sha256 "$RI_B  actions/runner-images (git commit)"
+expect "full, tag: the image records the package" has downloads.sha256 "$PMC_SHA  packages-microsoft-prod.deb"
+
+run ubuntu-full-commit "$UBUNTU" --out "$OUT" --toolset full --runner-images-ref ubuntu24/test \
+	--runner-images-commit "$RI_A" --pmc-sha256 "$PMC_SHA"
+expect "full, commit: builds" passed
+expect "full, commit: vendors the pinned commit, not the moved tag" ri_at A
+expect "full, commit: does not resolve the tag" lacks urls runner-images/commits
+
+run ubuntu-full-default "$UBUNTU" --out "$OUT" --toolset full --pmc-sha256 "$PMC_SHA"
+expect "full, default ref: fetches its pinned commit" has err "could not fetch actions/runner-images at commit 3b5f596ffecb076aa5f3c3ded95b145f6daeb016"
+expect "full, default ref: does not resolve the tag" lacks urls runner-images/commits
+
+run ubuntu-full-unknown "$UBUNTU" --out "$OUT" --toolset full --runner-images-commit "$(printf '%040d' 9)" --pmc-sha256 "$PMC_SHA"
+expect "full, unknown commit: fails at the fetch" has err "could not fetch actions/runner-images at commit $(printf '%040d' 9)"
+expect "full, unknown commit: goes no further" lacks err layout
+expect "full, unknown commit: nothing is built" lacks calls "docker build"
+
+run ubuntu-full-branch "$UBUNTU" --out "$OUT" --toolset full --runner-images-commit "$(git -C "$RI" branch --show-current)" --pmc-sha256 "$PMC_SHA"
+expect "full, a branch as the commit: refused" has err "is not a commit SHA"
+expect "full, a branch as the commit: nothing is built" lacks calls "docker build"
+
+run ubuntu-full-badref "$UBUNTU" --out "$OUT" --toolset full --runner-images-ref ubuntu24/bad --pmc-sha256 "$PMC_SHA"
+expect "full, a tag the API cannot resolve: fails" has err "actions/runner-images ubuntu24/bad resolved to"
+expect "full, a tag the API cannot resolve: fetches nothing" lacks err "could not fetch"
+
+run ubuntu-pin-no-version "$UBUNTU" --out "$OUT" --runner-sha256 "$RUNNER_SHA"
+expect "a pin without a version: refused" has err "--runner-sha256 needs --runner-version"
+
+run ubuntu-full-pmc "$UBUNTU" --out "$OUT" --toolset full --runner-images-commit "$RI_A"
+expect "full, package: fails against the pinned checksum" has err "packages-microsoft-prod.deb (ubuntu 24.04): SHA-256 mismatch: expected c13f01ac"
+expect "full, package: nothing is built" lacks calls "docker build"
+
+run ubuntu-full-pmc-tag "$UBUNTU" --out "$OUT" --toolset full --ubuntu-tag 22.04 --runner-images-commit "$RI_A"
+expect "full, package for another release: needs a pin" has err "pass --pmc-sha256"
 
 if [ "$fails" -ne 0 ]; then
 	echo "$fails failure(s)"

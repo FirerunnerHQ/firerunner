@@ -307,11 +307,28 @@ prints the checksums it used, and a rootfs keeps them in
 
 | download | checked against | pin it with |
 |---|---|---|
-| `actions/runner` (`build-rootfs.sh`) | the SHA-256 in the release's notes, read through the GitHub API | `--runner-version` and `--runner-sha256` |
-| Node.js (`build-rootfs.sh`, node tier) | `SHASUMS256.txt` in the same nodejs.org release directory | `--node-sha256` |
+| `actions/runner` (`build-rootfs.sh`, `build-ubuntu-rootfs.sh`) | the SHA-256 in the release's notes, read through the GitHub API | `--runner-version` and `--runner-sha256` |
+| Node.js (`build-rootfs.sh` node tier, `build-ubuntu-rootfs.sh`) | `SHASUMS256.txt` in the same nodejs.org release directory | `--node-sha256` |
+| actions/runner-images (`build-ubuntu-rootfs.sh --toolset full`) | a commit SHA, fetched with git | `--runner-images-commit` |
+| `packages-microsoft-prod.deb` (`build-ubuntu-rootfs.sh --toolset full`) | a SHA-256 pinned in the script for Ubuntu 24.04 | `--pmc-sha256` |
 
 An empty `--runner-version` resolves the latest release once, and the build
 prints the version and checksum it took. A pinned checksum skips the lookup.
+`build-ubuntu-rootfs.sh` downloads and checks everything on the host, and its
+Dockerfile only copies the checked files in.
+
+A runner-images tag can move, so the build fetches a commit. The default
+`--runner-images-ref` comes with the commit it named when it was pinned; bump
+both together, taking the commit from
+`gh api repos/actions/runner-images/commits/TAG --jq .sha`. Any other
+`--runner-images-ref` is resolved to a commit once, through the GitHub API,
+and the build prints it so `--runner-images-commit` can pin it. git checks
+every object it fetches against its hash.
+
+To pin `packages-microsoft-prod.deb` for another Ubuntu release, download it,
+check that the key it installs has the fingerprint
+`BC52 8686 B50D 79E3 39D3 721C EB3E 94AD BE12 29CF`, and pass its `sha256sum`
+as `--pmc-sha256`, or add it to the script's table.
 `SHASUMS256.txt` comes from the same origin as the tarball, and its GPG
 signature is not checked; for a stronger guarantee, pin `--node-sha256` from a
 `SHASUMS256.txt.asc` you verified.

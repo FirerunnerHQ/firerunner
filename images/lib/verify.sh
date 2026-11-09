@@ -1,18 +1,20 @@
 # shellcheck shell=bash
 # verify.sh — checks what the image builders download before they use it.
-# build-rootfs.sh sources it.
+# build-rootfs.sh and build-ubuntu-rootfs.sh source it.
 #
 # Every archive a builder executes or bakes into an image is checked against a
 # SHA-256 that is pinned, or read from a source other than the download itself:
 #   actions/runner   the release notes ("<!-- BEGIN SHA linux-x64 -->…")
 #   Node.js          SHASUMS256.txt in the same nodejs.org release directory
-# Each function prints an error saying what failed and returns non-zero; the
+# and a git repository is fetched at a commit SHA, with git, which hashes each
+# object it receives. Each function prints an error saying what failed and returns non-zero; the
 # callers stop on that.
 #
 # VERIFIED_LOG, when set, receives one "SHA  WHAT" line per verified download:
 # the record of what an image was built from.
 
 GITHUB_API="${GITHUB_API:-https://api.github.com}"
+GITHUB_GIT="${GITHUB_GIT:-https://github.com}"
 
 verify_error() {
 	echo "error: $*" >&2
@@ -87,4 +89,31 @@ node_sha256() {
 	sha="$(printf '%s\n' "$sums" | awk -v f="$2" '$2 == f { print $1; exit }')"
 	[[ -n "$sha" ]] || verify_error "Node v$1: $url lists no $2" || return
 	echo "$sha"
+}
+
+# resolve_commit REPO REF prints the commit SHA that REF (a tag or branch) names
+# in github.com/REPO now. A full commit SHA is its own answer.
+resolve_commit() {
+	local sha
+	if [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then
+		echo "$2"
+		return
+	fi
+	sha="$(curl -fsSL --retry 3 -H 'Accept: application/vnd.github.sha' "$GITHUB_API/repos/$1/commits/$2")" ||
+		verify_error "could not resolve $1 $2 to a commit" || return
+	[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || verify_error "$1 $2 resolved to '$sha', not a commit SHA" || return
+	echo "$sha"
+}
+
+# fetch_commit REPO COMMIT DIR checks out github.com/REPO at COMMIT into the
+# empty directory DIR. git hashes every object it receives, and FETCH_HEAD is
+# the object asked for by its full SHA, so the tree is the commit's, whatever a
+# tag says now.
+fetch_commit() {
+	[[ "$2" =~ ^[0-9a-f]{40}$ ]] || verify_error "$1: '$2' is not a commit SHA" || return
+	git -C "$3" init -q &&
+		git -C "$3" fetch -q --depth 1 "$GITHUB_GIT/$1" "$2" &&
+		git -C "$3" -c advice.detachedHead=false checkout -q FETCH_HEAD ||
+		verify_error "could not fetch $1 at commit $2" || return
+	record_verified "$2" "$1 (git commit)"
 }
