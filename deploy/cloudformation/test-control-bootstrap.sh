@@ -188,7 +188,7 @@ for want in RuntimeDirectory=firerunner RuntimeDirectoryMode=0750 RuntimeDirecto
 done
 expect "cache s3: cache-server on the VPC address, reading the daemon's identities, in S3" "$(cat "$units/firerunner-cache.service" 2>/dev/null)" \
 	grep -q 'cache-server --addr 10.1.2.3:8099 --dir /var/lib/firerunner-cache --jobs-dir /run/firerunner/jobs --jobs-owner-uid 0 --max-entry-size 15GB --s3-bucket fr-cache-bucket --s3-prefix firerunner-cache/ --s3-region us-west-2 --s3-local-cache-size 30GB --s3-credentials-file /run/firerunner/cache-s3-credentials.json$' "$units/firerunner-cache.service"
-expect "cache s3: no IMDS, so never the control role's credentials" "" grep -qx 'IPAddressDeny=169.254.169.254/32' "$units/firerunner-cache.service"
+expect "cache s3: no IMDS, so never the control role's credentials" "" grep -qx 'IPAddressDeny=169.254.169.254/32 fd00:ec2::254/128' "$units/firerunner-cache.service"
 expect "cache s3: cache-server starts after the daemon that writes its credentials" "" \
 	bash -c "grep -qx 'After=firerunner.service' '$units/firerunner-cache.service' && grep -qx 'Wants=firerunner.service' '$units/firerunner-cache.service'"
 expect "cache s3: cache-server as its own user, away from the secrets" "" \
@@ -216,7 +216,7 @@ echo "$cachetiers" > "$STATE/ssm/tiers"
 expect "cache disk: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "cache disk: blobs on disk, capped to a share of the root volume" "$(cat "$units/firerunner-cache.service" 2>/dev/null)" \
 	bash -c "grep -q -- '--jobs-owner-uid 0 --max-size 20GB --max-entry-size 7GB$' '$units/firerunner-cache.service' && ! grep -q -- --s3-bucket '$units/firerunner-cache.service'"
-expect "cache disk: no IMDS, so no role credentials" "" grep -qx 'IPAddressDeny=169.254.169.254/32' "$units/firerunner-cache.service"
+expect "cache disk: no IMDS, so no role credentials" "" grep -qx 'IPAddressDeny=169.254.169.254/32 fd00:ec2::254/128' "$units/firerunner-cache.service"
 
 setup
 printf 'FR_CACHE=disk\n' >> "$FR_ROOT/etc/firerunner/bootstrap.env"
@@ -349,6 +349,8 @@ export -f userdata
 	expect "user-data: bootstrap env written" "" grep -qx 'FR_JIT_HOST=control.fr.internal' "$FR_ROOT/etc/firerunner/bootstrap.env"
 	expect "user-data: bootstrap env names the cache mode and bucket" "$(cat "$FR_ROOT/etc/firerunner/bootstrap.env")" \
 		bash -c "grep -qx 'FR_CACHE=s3' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_CACHE_PORT=8099' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_CACHE_BUCKET=fr-cache-bucket' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_ROOT_GIB=30' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_CACHE_ROLE_ARN=arn:aws:iam::123456789012:role/fr-CacheRole-0aaa' '$FR_ROOT/etc/firerunner/bootstrap.env'"
+	expect "user-data: the launch template serves IMDS on IPv4 only" "" \
+		grep -q 'MetadataOptions: {.*HttpProtocolIpv6: disabled' "$HERE/control.yaml"
 	expect "user-data: bootstrap ran with the verified binary" "$(cat "$STATE/bootstrapped" 2>/dev/null)" \
 		cmp -s "$STATE/release/firerunner_linux_arm64" "$(cat "$STATE/bootstrapped" 2>/dev/null)/firerunner"
 	expect "user-data: healthy" "" test ! -f "$STATE/autoscaling"

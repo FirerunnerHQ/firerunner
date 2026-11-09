@@ -297,7 +297,8 @@ Resources:
         ImageId: !Ref ImageId
         InstanceType: !Ref InstanceType
         IamInstanceProfile: { Arn: !GetAtt ControlProfile.Arn }
-        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
+        # IMDS on IPv4 only; the cache unit denies both addresses all the same.
+        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled, HttpProtocolIpv6: disabled }
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs: { VolumeSize: !Ref RootVolumeGiB, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }

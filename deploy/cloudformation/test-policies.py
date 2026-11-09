@@ -92,6 +92,12 @@ if "Condition: CacheS3" not in assume or "RoleName: !Ref ControlRole" not in ass
     sys.exit("FAIL control.yaml: CacheAssume must let the control role assume CacheRole and nothing else")
 print("ok   control.yaml: the control role may assume only CacheRole")
 
+# Instance metadata only where the cache unit's IPv4 deny covers it.
+options = re.search(r"MetadataOptions: \{(.*)\}", resource("LaunchTemplate"))
+if not options or "HttpProtocolIpv6: disabled" not in options.group(1):
+    sys.exit("FAIL control.yaml: the launch template must disable IMDS over IPv6")
+print("ok   control.yaml: IMDS is IPv4 only")
+
 # A tenant's instances carry <owner>/<id>, so every grant on the owner tag must
 # reach them, or its launches are denied while its scale sets look healthy.
 for name in ("control.yaml", "byoc-role.yaml", "reaper.yaml"):

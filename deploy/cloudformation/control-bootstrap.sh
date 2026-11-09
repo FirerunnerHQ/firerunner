@@ -222,7 +222,8 @@ elif [ "$cache" != off ]; then
 	# 30% (S3 holds the rest). One upload stages at most 15%.
 	gib="${FR_ROOT_GIB:-8}"
 	caps=" --max-size $((gib * 40 / 100))GB --max-entry-size $((gib * 15 / 100))GB"
-	imds="IPAddressDeny=169.254.169.254/32"
+	# Both of IMDS's addresses: IPv4, and IPv6 should a launch template enable it.
+	imds="IPAddressDeny=169.254.169.254/32 fd00:ec2::254/128"
 	if [ "$cache" = s3 ]; then
 		caps=" --max-entry-size $((gib * 15 / 100))GB --s3-bucket $FR_CACHE_BUCKET --s3-prefix firerunner-cache/ --s3-region $AWS_REGION --s3-local-cache-size $((gib * 30 / 100))GB"
 		if [ -n "${FR_CACHE_ROLE_ARN:-}" ]; then
