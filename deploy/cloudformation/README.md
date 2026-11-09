@@ -159,7 +159,11 @@ control VM also runs `firerunner cache-server` for EC2 tiers that set
   `/run/firerunner/cache-s3-credentials.json`, readable by the cache user,
   rewriting them every 15 minutes. cache-server signs with them
   (`--s3-credentials-file`) and, as with `disk`, cannot reach instance
-  metadata, so it never holds the control role's credentials. A
+  metadata, so it never holds the control role's credentials. `firerunner
+  status --json` shows the refresh under `listeners.cache_credentials`
+  (file, last refresh, expiry, last error), and `doctor`'s
+  `cache-credentials` check fails when the file is missing or expired or the
+  latest refresh failed. A
   replacement VM serves what its predecessor saved. The bucket is **kept**
   when the stack is deleted; empty and delete it by hand (the `CacheBucket`
   output names it). A lifecycle rule aborts multipart uploads left

@@ -621,6 +621,19 @@ func healthBreakers(bs []ec2.Breaker) []health.Breaker {
 	return out
 }
 
+// healthCacheCredentials is the refresher's state for the health file, nil
+// without one.
+func healthCacheCredentials(r *awscreds.Refresher) *health.CacheCredentials {
+	if r == nil {
+		return nil
+	}
+	st := r.Status()
+	return &health.CacheCredentials{
+		File: st.File, LastRefresh: st.LastRefresh, Expires: st.Expires,
+		LastError: st.LastError, LastErrorAt: st.LastErrorAt,
+	}
+}
+
 // healthInterval is how often the listener health file is rewritten.
 const healthInterval = 10 * time.Second
 
@@ -900,7 +913,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// The local cache-server's S3 credentials, from a role that holds only
 	// the bucket's policy, so it needs neither this host's role nor
 	// instance metadata.
-	_, stopCreds, err := startCacheCredentials(ctx, cfg, func() (awscreds.STSAPI, error) {
+	cacheCreds, stopCreds, err := startCacheCredentials(ctx, cfg, func() (awscreds.STSAPI, error) {
 		awsCfg, err := loadAWSConfig(ctx, cfg)
 		if err != nil {
 			return nil, err
@@ -1005,6 +1018,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if s.ec2Client != nil {
 			f.EC2Breakers = healthBreakers(s.ec2Client.Breakers())
 		}
+		f.CacheCredentials = healthCacheCredentials(cacheCreds)
 	}, log)
 
 	// Drive every tier's listener concurrently. A listener reconnects its own

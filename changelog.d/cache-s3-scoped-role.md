@@ -3,7 +3,10 @@
 - `cache-server --s3-credentials-file` signs S3 requests with the credentials
   in a file instead of the default AWS chain, and the daemon's
   `--cache-role-arn` (`FR_CACHE_ROLE_ARN`) keeps such a file fresh from a
-  role it assumes, written to `--cache-credentials-file`.
+  role it assumes, written to `--cache-credentials-file`. `status --json`
+  reports the refresh as `listeners.cache_credentials`, and `doctor` fails its
+  `cache-credentials` check when the file is missing or expired or the latest
+  refresh failed.
 
 ### Security
 

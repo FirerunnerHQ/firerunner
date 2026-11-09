@@ -213,6 +213,23 @@ func TestCacheCredentialsWiring(t *testing.T) {
 	}
 }
 
+// The health file carries the refresher's state, and nothing without one.
+func TestHealthCacheCredentials(t *testing.T) {
+	if got := healthCacheCredentials(nil); got != nil {
+		t.Fatalf("no refresher: %+v", got)
+	}
+	path := filepath.Join(t.TempDir(), "creds.json")
+	r := cacheCredentials(&config.Config{CacheRoleARN: "arn:aws:iam::123456789012:role/cache", CacheCredentialsFile: path}, &fakeSTS{}, slog.New(slog.DiscardHandler))
+	exp, err := r.Refresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := healthCacheCredentials(r)
+	if got == nil || got.File != path || got.LastRefresh.IsZero() || !got.Expires.Equal(exp.UTC()) || got.Failing() {
+		t.Fatalf("health: %+v", got)
+	}
+}
+
 // cache-server --s3-credentials-file signs its S3 requests with the file's
 // key: its first, loading the index, reaches a fake S3 before the missing
 // job identity directory stops the start.

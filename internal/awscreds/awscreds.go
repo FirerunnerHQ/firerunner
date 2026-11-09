@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -181,6 +182,42 @@ type Refresher struct {
 	// MinBackoff and MaxBackoff bound the wait after a failed refresh.
 	MinBackoff, MaxBackoff time.Duration
 	Log                    *slog.Logger
+
+	mu     sync.Mutex
+	status Status
+}
+
+// Status is what a Refresher has done, for status and doctor.
+type Status struct {
+	File string
+	// LastRefresh is when the file was last rewritten, and Expires when the
+	// credentials in it expire; both zero before the first success.
+	LastRefresh time.Time
+	Expires     time.Time
+	// LastError is the latest failed refresh's, at LastErrorAt; it stays
+	// after a later success, which LastRefresh then shows.
+	LastError   string
+	LastErrorAt time.Time
+}
+
+// Status returns a copy of the refresher's state.
+func (r *Refresher) Status() Status {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.status
+	s.File = r.Path
+	return s
+}
+
+func (r *Refresher) record(exp time.Time, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now().UTC()
+	if err != nil {
+		r.status.LastError, r.status.LastErrorAt = err.Error(), now
+		return
+	}
+	r.status.LastRefresh, r.status.Expires = now, exp.UTC()
 }
 
 func (r *Refresher) defaults() {
@@ -204,8 +241,15 @@ func (r *Refresher) defaults() {
 	}
 }
 
-// Refresh assumes the role once and writes the credentials.
+// Refresh assumes the role once and writes the credentials, recording the
+// outcome in Status.
 func (r *Refresher) Refresh(ctx context.Context) (time.Time, error) {
+	exp, err := r.refresh(ctx)
+	r.record(exp, err)
+	return exp, err
+}
+
+func (r *Refresher) refresh(ctx context.Context) (time.Time, error) {
 	r.defaults()
 	out, err := r.API.AssumeRole(ctx, &sts.AssumeRoleInput{
 		RoleArn:         aws.String(r.RoleARN),

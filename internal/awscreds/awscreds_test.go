@@ -321,6 +321,31 @@ func TestRefreshWritesAssumedCredentials(t *testing.T) {
 	}
 }
 
+// Status shows the last success and the last failure, and which came last.
+func TestRefreshStatus(t *testing.T) {
+	f := newFakeSTS(2)
+	path := filepath.Join(t.TempDir(), "creds.json")
+	r := &Refresher{API: f, RoleARN: "arn:aws:iam::123456789012:role/cache", Path: path, Log: quiet}
+	if s := r.Status(); s.File != path || !s.LastRefresh.IsZero() || s.LastError != "" {
+		t.Fatalf("before any refresh: %+v", s)
+	}
+	exp, err := r.Refresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := r.Status()
+	if s.LastRefresh.IsZero() || !s.Expires.Equal(exp) || s.LastError != "" {
+		t.Fatalf("after a success: %+v", s)
+	}
+	if _, err := r.Refresh(context.Background()); err == nil {
+		t.Fatal("call 2 should fail")
+	}
+	s2 := r.Status()
+	if !strings.Contains(s2.LastError, "throttled") || s2.LastErrorAt.Before(s2.LastRefresh) || !s2.LastRefresh.Equal(s.LastRefresh) || !s2.Expires.Equal(exp) {
+		t.Fatalf("after a failure: %+v", s2)
+	}
+}
+
 func TestRefreshKeepsFileOnError(t *testing.T) {
 	f := newFakeSTS(2)
 	path := filepath.Join(t.TempDir(), "creds.json")
