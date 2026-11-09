@@ -1,11 +1,16 @@
 name: build-image
 
-# Rebuilds every shipped firerunner image. GitHub only accepts self-hosted
-# runner agents released in the last 30 days, so the rootfs tiers (which bake
-# actions/runner) are rebuilt monthly — well within the window — and on demand.
-# Rebuilding also folds in base-OS security updates. The tool-cache drive bakes
-# no runner agent (it is a pure accelerator), but is rebuilt on the same cadence
-# to refresh its toolchains and picked-up CVEs.
+# Rebuilds every shipped firerunner image, on manual dispatch. GitHub only
+# accepts self-hosted runner agents released in the last 30 days, so the rootfs
+# tiers (which bake actions/runner) need a rebuild at least monthly; that also
+# folds in base-OS security updates. The tool-cache drive bakes no runner agent
+# (it is a pure accelerator), but is rebuilt with them to refresh its
+# toolchains.
+#
+# It runs on a [self-hosted, kvm] runner, which this repository does not keep
+# registered, so it has no schedule: a scheduled run would wait a day for a
+# runner and be cancelled. Run it where such a runner serves the repository,
+# and add a schedule there if you want one.
 #
 # Every tier in the shipped catalog (examples/tiers.json) is covered:
 #   golden.ext4            firerunner / firerunner-8c16g   (build-rootfs.sh)
@@ -16,9 +21,6 @@ name: build-image
 #   toolcache.ext4         attached via --toolcache        (build-toolcache.sh)
 
 on:
-  schedule:
-    # 03:17 on the 1st of every month (off-peak, avoids the top-of-hour rush).
-    - cron: "17 3 1 * *"
   workflow_dispatch:
     inputs:
       runner_version:

@@ -372,14 +372,17 @@ that serves tampered archives.
 ## Rebuild policy
 
 GitHub only supports self-hosted runner agents released within the **last 30
-days**. `.github/workflows/build-image.yml` rebuilds **every** shipped image on a
-schedule (monthly, well within the window) and on manual dispatch, pinning the
-latest `actions/runner` release. Its matrix covers all five rootfs tiers —
+days**, so rebuild at least monthly. `.github/workflows/build-image.yml` rebuilds
+**every** shipped image on manual dispatch, pinning the latest `actions/runner`
+release. It needs a `[self-hosted, kvm]` runner, and has no schedule because
+this repository keeps none registered; where one serves your copy, run it
+monthly or add a schedule. Its matrix covers all five rootfs tiers —
 `golden` (shared by `firerunner` / `firerunner-8c16g`), `golden-docker`,
-`golden-node`, and the two `ubuntu-rootfs-*` goldens — so none falls out of the
-30-day window. The same run also rebuilds the [`--toolcache` drive](#building-the-tool-cache-drive):
+`golden-node`, and the two `ubuntu-rootfs-*` goldens — so one run brings them
+all back within the 30-day window. The same run also rebuilds the [`--toolcache` drive](#building-the-tool-cache-drive):
 it bakes no runner agent (so it is exempt from the 30-day rule) but is refreshed
 on the same cadence to pick up toolchain and base-OS updates. Rebuilding the
 rootfs images also folds in OS security updates so every microVM starts patched.
 The publish directory defaults to `/var/lib/firerunner` and can be overridden via
-the `image_dir` dispatch input.
+the `image_dir` dispatch input; the tool-cache drive's contents, via
+`toolcache_tools`.
