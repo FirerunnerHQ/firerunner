@@ -38,11 +38,17 @@ for t in truncate mount umount e2label; do
 	printf '#!/bin/sh\necho "%s $*" >>"$STATE/calls"\n' "$t" >"$BIN/$t"
 done
 printf '#!/bin/sh\nexit 1\n' >"$BIN/mountpoint"
-# mkfs.ext4 [-d DIR] ...: keeps the record of downloads DIR holds, and its
-# listing.
+# e2label fails on request: the last step before a builder renames its image.
+# shellcheck disable=SC2016 # the fake expands it
+printf '#!/bin/sh\n[ -z "${FAIL_E2LABEL:-}" ] || exit 1\n' >>"$BIN/e2label"
+# mkfs.ext4 [-d DIR] ... IMAGE ...: writes IMAGE, and keeps the record of
+# downloads DIR holds, and its listing.
 cat >"$BIN/mkfs.ext4" <<'FAKE'
 #!/bin/sh
 echo "mkfs.ext4 $*" >>"$STATE/calls"
+for a; do
+	case "$a" in *.ext4 | *.partial) echo new >"$a" ;; esac
+done
 while [ $# -gt 1 ]; do
 	if [ "$1" = -d ]; then
 		for f in "$2/etc/firerunner/downloads.sha256" "$2/downloads.sha256"; do
@@ -88,6 +94,7 @@ echo "$*" >>"$STATE/chroot"
 [ ! -f "$root/opt/runner/bin/installdependencies.sh" ] || touch "$STATE/runner-installed"
 [ ! -f "$root/usr/local/bin/node" ] || touch "$STATE/node-installed"
 [ ! -f "$root/etc/firerunner/downloads.sha256" ] || cp "$root/etc/firerunner/downloads.sha256" "$STATE/"
+[ -z "${FAIL_CHROOT:-}" ] || exit 1
 FAKE
 # The fakes are POSIX sh: run them with dash where there is one, as Ubuntu does.
 if SH="$(command -v dash)"; then
@@ -175,16 +182,21 @@ GO_SHA="$(sha "$REMOTE/$GO_TGZ")"
 printf '[{"version": "go%s", "files": [{"filename": "go%s.src.tar.gz", "sha256": "%s"}, {"filename": "%s", "sha256": "%s"}]}]\n' \
 	"$GV" "$GV" "$(printf '%064d' 5)" "$GO_TGZ" "$GO_SHA" >"$REMOTE/go.json"
 echo '[]' >"$REMOTE/go-empty.json"
-PY_TAG=3.12.9-123
-PY_TGZ="python-3.12.9-linux-24.04-x64.tar.gz"
+PY_TAG=3.12.10-123
+PY_TGZ="python-3.12.10-linux-24.04-x64.tar.gz"
 PY_URL="https://github.com/actions/python-versions/releases/download/$PY_TAG/$PY_TGZ"
 PY_API="https://api.github.com/repos/actions/python-versions/releases/tags/$PY_TAG"
 PY_MANIFEST=https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
 archive "$PY_TGZ" . setup.sh
 archive evil-python.tar.gz . setup.sh backdoor
 PY_SHA="$(sha "$REMOTE/$PY_TGZ")"
+# Beside the wanted 3.12.10, decoys a careless pick would take: 3.12.9 wins a
+# string sort, 3.12.11 is a pre-release, 3.120.0 merely starts with "3.12".
+PY_DECOY="https://github.com/actions/python-versions/releases/download/decoy/evil-python.tar.gz"
 py_manifest() { # FILE URL
-	printf '[{"version": "3.12.9", "files": [{"platform": "linux", "arch": "x64", "platform_version": "24.04", "download_url": "%s"}, {"platform": "darwin", "arch": "x64", "platform_version": "14", "download_url": "https://example.com/other"}]}, {"version": "3.13.0", "files": []}]\n' "$2" >"$REMOTE/$1"
+	local linux='"platform": "linux", "arch": "x64", "platform_version": "24.04"'
+	printf '[{"version": "3.120.0", "stable": true, "files": [{%s, "download_url": "%s"}]}, {"version": "3.13.0", "stable": true, "files": []}, {"version": "3.12.11", "stable": false, "files": [{%s, "download_url": "%s"}]}, {"version": "3.12.10", "stable": true, "files": [{%s, "download_url": "%s"}, {"platform": "darwin", "arch": "x64", "platform_version": "14", "download_url": "https://example.com/other"}]}, {"version": "3.12.9", "stable": true, "files": [{%s, "download_url": "%s"}]}]\n' \
+		"$linux" "$PY_DECOY" "$linux" "$PY_DECOY" "$linux" "$2" "$linux" "$PY_DECOY" >"$REMOTE/$1"
 }
 py_manifest python.json "$PY_URL"
 py_manifest python-outside.json "https://example.com/$PY_TGZ"
@@ -281,6 +293,8 @@ echo "== build-rootfs.sh"
 routes
 run rootfs-latest "$ROOTFS" --out "$OUT"
 expect "latest: builds" passed
+expect "latest: writes the image" grep -qx new "$OUT"
+expect "latest: leaves no partial image" test ! -e "$OUT.partial"
 expect "latest: resolves the version once" has urls https://api.github.com/repos/actions/runner/releases/latest
 expect "latest: installs the runner" exists runner-installed
 expect "latest: prints the version and checksum it used" has out "actions/runner $RV linux-x64 sha256 $RUNNER_SHA"
@@ -293,6 +307,18 @@ expect "tampered runner: fails" failed
 expect "tampered runner: says why" has err "$RUNNER_TGZ: SHA-256 mismatch: expected $RUNNER_SHA"
 expect "tampered runner: never unpacked" absent runner-installed
 expect "tampered runner: nothing runs in the image" lacks chroot installdependencies
+expect "tampered runner: fails before building" lacks calls mkfs.ext4
+
+# A build that fails partway leaves the previous image as it was.
+echo old >"$OUT"
+routes
+export FAIL_CHROOT=1
+run rootfs-midway "$ROOTFS" --out "$OUT"
+unset FAIL_CHROOT
+expect "failed midway: fails" failed
+expect "failed midway: had begun the image" has calls mkfs.ext4
+expect "failed midway: keeps the previous image" grep -qx old "$OUT"
+expect "failed midway: leaves no partial image" test ! -e "$OUT.partial"
 
 routes
 reroute "https://api.github.com/repos/actions/runner/releases/tags/v$RV" "$REMOTE/release-nosha.json"
@@ -428,12 +454,22 @@ echo "== build-toolcache.sh"
 routes
 run tc-node-go "$TOOLCACHE" --out "$OUT" --node "$NV" --go "$GV"
 expect "node and go: builds" passed
+expect "node and go: leaves no partial drive" test ! -e "$OUT.partial"
 expect "node and go: node is on the drive" has drive "./node/$NV/x64/bin/node"
 expect "node and go: go is on the drive" has drive "./go/$GV/x64/bin/go"
 expect "node and go: go is checked against the download index" has urls "$GO_INDEX"
 expect "node and go: the drive records node" has downloads.sha256 "$NODE_SHA  $NODE_TGZ"
 expect "node and go: the drive records go" has downloads.sha256 "$GO_SHA  $GO_TGZ"
 expect "node and go: no archive on the drive" lacks drive .tar.gz
+
+echo old >"$OUT"
+routes
+export FAIL_E2LABEL=1
+run tc-midway "$TOOLCACHE" --out "$OUT" --node "$NV"
+unset FAIL_E2LABEL
+expect "drive failed at the label: fails" failed
+expect "drive failed at the label: keeps the previous drive" grep -qx old "$OUT"
+expect "drive failed at the label: leaves no partial drive" test ! -e "$OUT.partial"
 
 for tool in node go; do
 	routes
@@ -455,6 +491,7 @@ routes
 run tc-python "$TOOLCACHE" --out "$OUT" --python 3.12
 expect "python: builds" passed
 expect "python: checks the asset's digest" has urls "$PY_API"
+expect "python: picks the newest stable 3.12 by number" lacks urls "$PY_DECOY"
 expect "python: the container gets the checked tarball" has python-dl "$PY_TGZ"
 expect "python: the container downloads nothing" lacks calls "$PY_URL"
 expect "python: the drive records it" has downloads.sha256 "$PY_SHA  $PY_TGZ"

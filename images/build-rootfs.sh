@@ -86,22 +86,40 @@ MNT="$WORK/mnt"
 mkdir -p "$MNT"
 export VERIFIED_LOG="$WORK/downloads.sha256"
 : >"$VERIFIED_LOG"
+# The image is built beside --out and renamed over it only when complete, so
+# a failed build leaves the previous image in place, never a half-built one.
+PART="$OUT.partial"
 cleanup() {
   for m in dev/pts dev proc sys; do
     mountpoint -q "$MNT/$m" && umount -l "$MNT/$m" || true
   done
   mountpoint -q "$MNT" && umount "$MNT" || true
   rm -rf "$WORK"
+  rm -f "$PART"
 }
 trap cleanup EXIT
 
 in_chroot() { chroot "$MNT" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive "$@"; }
 
+# 0. Download and check everything first: a bad download fails in seconds,
+#    before the slow bootstrap.
+arch="x64"
+runner_tgz="actions-runner-linux-${arch}-${RUNNER_VERSION}.tar.gz"
+runner_url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${runner_tgz}"
+echo ">> downloading actions/runner v$RUNNER_VERSION"
+fetch_checked "$runner_url" "$WORK/$runner_tgz" "$RUNNER_SHA256" "$runner_tgz" || exit 1
+if [[ "$TIER" == "firerunner-node" ]]; then
+  node_tgz="node-v${NODE_VERSION}-linux-x64.tar.gz"
+  node_url="https://nodejs.org/dist/v${NODE_VERSION}/${node_tgz}"
+  fetch_checked "$node_url" "$WORK/$node_tgz" "$NODE_SHA256" "$node_tgz" || exit 1
+fi
+
 # 1. Create + format the ext4 image and mount it.
 mkdir -p "$(dirname "$OUT")"
-truncate -s "${SIZE_MB}M" "$OUT"
-mkfs.ext4 -q -F "$OUT"
-mount -o loop "$OUT" "$MNT"
+rm -f "$PART"
+truncate -s "${SIZE_MB}M" "$PART"
+mkfs.ext4 -q -F "$PART"
+mount -o loop "$PART" "$MNT"
 
 # 2. Bootstrap a minimal Debian base with an init and the tools the runner and
 #    the boot service need.
@@ -122,13 +140,8 @@ rm -f "$MNT/etc/resolv.conf"
   for ns in $DNS_SERVERS; do echo "nameserver $ns"; done
 } > "$MNT/etc/resolv.conf"
 
-# 3. Install the official actions/runner agent.
-arch="x64"
-runner_tgz="actions-runner-linux-${arch}-${RUNNER_VERSION}.tar.gz"
-runner_url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${runner_tgz}"
+# 3. Install the official actions/runner agent, checked in step 0.
 install -d "$MNT/opt/runner"
-echo ">> downloading actions/runner v$RUNNER_VERSION"
-fetch_checked "$runner_url" "$WORK/$runner_tgz" "$RUNNER_SHA256" "$runner_tgz" || exit 1
 tar -xzf "$WORK/$runner_tgz" -C "$MNT/opt/runner"
 rm -f "$WORK/$runner_tgz"
 in_chroot /opt/runner/bin/installdependencies.sh
@@ -140,12 +153,6 @@ install -m 0644 "$ASSETS/firerunner-runner.service" "$MNT/etc/systemd/system/fir
 in_chroot systemctl enable firerunner-runner.service
 # Disable getty/login prompts -- the microVM is headless and single-purpose.
 in_chroot systemctl mask serial-getty@ttyS0.service || true
-
-# 5. Bake a static resolv.conf matching the egress allowlist's --dns-servers.
-rm -f "$MNT/etc/resolv.conf"
-{
-  for ns in $DNS_SERVERS; do echo "nameserver $ns"; done
-} > "$MNT/etc/resolv.conf"
 
 # 5. Bake a static resolv.conf matching the egress allowlist's --dns-servers.
 rm -f "$MNT/etc/resolv.conf"
@@ -168,9 +175,6 @@ fi
 #     /usr/local/bin.
 if [[ "$TIER" == "firerunner-node" ]]; then
   echo ">> installing Node.js v$NODE_VERSION for the node tier"
-  node_tgz="node-v${NODE_VERSION}-linux-x64.tar.gz"
-  node_url="https://nodejs.org/dist/v${NODE_VERSION}/${node_tgz}"
-  fetch_checked "$node_url" "$WORK/$node_tgz" "$NODE_SHA256" "$node_tgz" || exit 1
   tar -xzf "$WORK/$node_tgz" -C "$MNT/usr/local" --strip-components=1
   rm -f "$WORK/$node_tgz"
   in_chroot /usr/local/bin/node --version
@@ -185,4 +189,7 @@ in_chroot apt-get clean || true
 rm -rf "$MNT/var/lib/apt/lists/"* "$MNT/var/cache/apt/archives/"*.deb
 
 sync
+for m in dev/pts dev proc sys; do umount "$MNT/$m"; done
+umount "$MNT"
+mv -f "$PART" "$OUT"
 echo ">> golden image written: $OUT"

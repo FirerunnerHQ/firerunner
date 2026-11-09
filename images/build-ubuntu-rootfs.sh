@@ -139,7 +139,7 @@ WORK="$(mktemp -d)"
 CTX="$WORK/ctx"
 ROOT="$WORK/root"
 mkdir -p "$CTX" "$ROOT"
-cleanup() { rm -rf "$WORK"; docker rm -f fr-rootfs-export >/dev/null 2>&1 || true; }
+cleanup() { rm -rf "$WORK"; rm -f "$OUT.partial"; docker rm -f fr-rootfs-export >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 export VERIFIED_LOG="$WORK/downloads.sha256"
 : >"$VERIFIED_LOG"
@@ -423,13 +423,16 @@ fi
 echo ">> rootfs sized ${SIZE_MB}MB (used ${used_mb:-?}MB + free scratch)"
 
 mkdir -p "$(dirname "$OUT")"
-rm -f "$OUT"
-mkfs.ext4 -q -F -d "$ROOT" "$OUT" "${SIZE_MB}M"
+# Written beside --out and renamed over it when complete, so a reader of
+# --out never sees a half-written image.
+rm -f "$OUT.partial"
+mkfs.ext4 -q -F -d "$ROOT" "$OUT.partial" "${SIZE_MB}M"
 # ext4 volume labels are capped at 16 bytes, so keep this short (avoid silent
 # truncation). It is cosmetic — firerunner boots the rootfs via is_root_device /
 # root=/dev/vda, not by label — so a stable role name is enough for every tier.
-e2label "$OUT" firerunner-root || true
+e2label "$OUT.partial" firerunner-root || true
 
 sync
+mv -f "$OUT.partial" "$OUT"
 echo ">> rootfs image written: $OUT ($(du -h "$OUT" | awk '{print $1}'))"
 echo ">> next: boot-test in firecracker, then deploy as a tier image"
