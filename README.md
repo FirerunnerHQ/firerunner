@@ -777,8 +777,12 @@ Every 5 minutes each tier, EC2 or Firecracker, lists its scale set's runners:
 ### Inspecting a deployment (`status`, `doctor`)
 
 Two read-only subcommands help operators inspect and diagnose a runner host.
-Both read the same flags / `FR_*` environment as the daemon, so run them with
-the same environment as the service (e.g. via the systemd `EnvironmentFile`):
+Both read the same flags / `FR_*` environment as the daemon. The daemon gets
+its settings from its systemd `EnvironmentFile`, so when no `FR_*` variable is
+set they read that file, `/etc/firerunner/firerunner.env`, and say so on
+stderr: run as root from a shell on the host, they describe the running
+deployment. `--env-file FILE` reads another file (a jailer instance's
+`/etc/firerunner/<name>.env`), and `--env-file none` reads none:
 
 ```bash
 firerunner status   # config, kernel/golden images, network wiring, live microVMs

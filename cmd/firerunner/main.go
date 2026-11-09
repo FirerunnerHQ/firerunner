@@ -129,6 +129,11 @@ func main() {
 // config leniently (config.Parse) so it can report on a partial or broken
 // deployment instead of refusing to start on a missing required field.
 func diagnose(cmd string, args []string) error {
+	args, err := diagEnv(cmd, args, os.Stderr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "configuration error:", err)
+		return err
+	}
 	asJSON := false
 	rest := make([]string, 0, len(args))
 	for _, a := range args {
@@ -363,9 +368,10 @@ Usage:
   firerunner version      print the version
   firerunner help         show this help
 
-status and doctor read the same FR_* env / flags as the daemon, so run them
-with the same environment (e.g. the systemd EnvironmentFile) as the service.
-Pass --json to either for machine-readable output.
+status and doctor read the same FR_* env / flags as the daemon. With no FR_*
+variable set they read the daemon's /etc/firerunner/firerunner.env and say
+so; --env-file FILE reads another (a jailer instance's), --env-file none
+none. Pass --json to either for machine-readable output.
 
 cache-server flags:
   --addr string      listen address (default "127.0.0.1:8099"; bind to a
