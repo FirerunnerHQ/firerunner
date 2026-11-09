@@ -92,6 +92,19 @@ if "Condition: CacheS3" not in assume or "RoleName: !Ref ControlRole" not in ass
     sys.exit("FAIL control.yaml: CacheAssume must let the control role assume CacheRole and nothing else")
 print("ok   control.yaml: the control role may assume only CacheRole")
 
+# Nothing else widens the control role: no wildcard grants in it, and no
+# other policy resource attached to it.
+if re.search(r"""\bsts:\*|Action: *\[?["']?\*["']?\]?\s*$|Action:.*["']\*["']""", control_role, re.M):
+    sys.exit("FAIL control.yaml: the control role has a wildcard action")
+refs = sorted(name for name in re.findall(r"^  (\w+):\n", control, re.M)
+              if name != "ControlRole" and re.search(r"!Ref ControlRole\b|ControlRole\.Arn|!GetAtt ControlRole\b", resource(name)))
+if refs != ["CacheAssume", "CacheRole", "ControlProfile"]:
+    sys.exit(f"FAIL control.yaml: only CacheAssume, CacheRole's trust and ControlProfile may name the control role; so do {refs}")
+policies = re.findall(r"^  (\w+):\n    Type: AWS::IAM::(?:Policy|RolePolicy|ManagedPolicy)\b", control, re.M)
+if policies != ["CacheAssume"]:
+    sys.exit(f"FAIL control.yaml: the IAM policy resources are {policies}, want only CacheAssume")
+print("ok   control.yaml: nothing else grants the control role more")
+
 # Instance metadata only where the cache unit's IPv4 deny covers it.
 options = re.search(r"MetadataOptions: \{(.*)\}", resource("LaunchTemplate"))
 if not options or "HttpProtocolIpv6: disabled" not in options.group(1):
