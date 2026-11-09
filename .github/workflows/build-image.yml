@@ -29,6 +29,10 @@ on:
         description: "Directory to publish the images into"
         required: false
         default: "/var/lib/firerunner"
+      toolcache_tools:
+        description: "build-toolcache.sh tool flags (blank = the TOOLCACHE_TOOLS default below)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -37,6 +41,10 @@ env:
   # workflow_dispatch supplies image_dir; the scheduled run has no inputs, so
   # fall back to the documented default from examples/tiers.json.
   IMAGE_DIR: ${{ inputs.image_dir || '/var/lib/firerunner' }}
+  # What the tool-cache drive holds. build-toolcache.sh builds nothing without
+  # at least one tool. Node and Go take exact versions, Python a prefix; bump
+  # them to the versions the repositories you serve use.
+  TOOLCACHE_TOOLS: ${{ inputs.toolcache_tools || '--node 22.22.2 --go 1.27.0 --python 3.12 --codeql latest' }}
 
 jobs:
   build:
@@ -85,6 +93,10 @@ jobs:
           extra=()
           if [ "${{ matrix.runner_pinned }}" = "true" ] && [ -n "${RUNNER_VERSION}" ]; then
             extra+=(--runner-version "${RUNNER_VERSION}")
+          fi
+          if [ "${{ matrix.name }}" = "toolcache" ]; then
+            read -ra tools <<<"$TOOLCACHE_TOOLS"
+            extra+=("${tools[@]}")
           fi
           sudo ${{ matrix.build }} "${extra[@]}" --out "$out"
 
