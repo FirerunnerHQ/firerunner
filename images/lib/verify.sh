@@ -1,11 +1,14 @@
 # shellcheck shell=bash
 # verify.sh — checks what the image builders download before they use it.
-# build-rootfs.sh and build-ubuntu-rootfs.sh source it.
+# build-rootfs.sh, build-ubuntu-rootfs.sh and build-toolcache.sh source it.
 #
 # Every archive a builder executes or bakes into an image is checked against a
 # SHA-256 that is pinned, or read from a source other than the download itself:
 #   actions/runner   the release notes ("<!-- BEGIN SHA linux-x64 -->…")
 #   Node.js          SHASUMS256.txt in the same nodejs.org release directory
+#   Go               the go.dev download index (?mode=json)
+#   GitHub releases  the asset's digest in the GitHub API (python-versions,
+#                    the CodeQL bundle)
 # and a git repository is fetched at a commit SHA, with git, which hashes each
 # object it receives. Each function prints an error saying what failed and returns non-zero; the
 # callers stop on that.
@@ -89,6 +92,30 @@ node_sha256() {
 	sha="$(printf '%s\n' "$sums" | awk -v f="$2" '$2 == f { print $1; exit }')"
 	[[ -n "$sha" ]] || verify_error "Node v$1: $url lists no $2" || return
 	echo "$sha"
+}
+
+# go_sha256 FILE prints FILE's SHA-256 from the go.dev download index, which is
+# served apart from the archive (dl.google.com). Needs jq.
+go_sha256() {
+	local url sha
+	url="https://go.dev/dl/?mode=json&include=all"
+	sha="$(curl -fsSL --retry 3 "$url" | jq -r --arg f "$1" '[.[].files[] | select(.filename == $f) | .sha256] | first // empty')" ||
+		verify_error "could not read the Go download index $url" || return
+	[[ -n "$sha" ]] || verify_error "the Go download index $url lists no $1" || return
+	echo "$sha"
+}
+
+# github_asset_sha256 REPO TAG NAME prints the SHA-256 that GitHub recorded when
+# release TAG's asset NAME was uploaded, as the API reports it. Assets uploaded
+# before mid-2025 have none. Needs jq.
+github_asset_sha256() {
+	local url digest
+	url="$GITHUB_API/repos/$1/releases/tags/$2"
+	digest="$(curl -fsSL --retry 3 "$url" | jq -r --arg n "$3" '[.assets[] | select(.name == $n) | .digest // empty] | first // empty')" ||
+		verify_error "could not read release $2 of $1 from $url" || return
+	[[ "$digest" == sha256:* ]] ||
+		verify_error "$1 $2: GitHub records no SHA-256 for $3; pin it with --checksums" || return
+	echo "${digest#sha256:}"
 }
 
 # resolve_commit REPO REF prints the commit SHA that REF (a tag or branch) names

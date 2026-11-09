@@ -282,7 +282,7 @@ sudo ./build-toolcache.sh --out /var/lib/firerunner/toolcache.ext4 \
 sudo ./build-toolcache.sh --out toolcache.ext4 --python 3.12
 
 # CodeQL: bakes the github/codeql-action bundle exactly as runner-images does
-# (self-contained, no Docker; needs jq). `latest` tracks the version the newest
+# (self-contained, no Docker; needs jq, as Go and Python do). `latest` tracks the version the newest
 # codeql-action pins; pass a CLI version (e.g. 2.26.3) to pin it.
 sudo ./build-toolcache.sh --out toolcache.ext4 --codeql latest
 ```
@@ -311,6 +311,9 @@ prints the checksums it used, and a rootfs keeps them in
 | Node.js (`build-rootfs.sh` node tier, `build-ubuntu-rootfs.sh`) | `SHASUMS256.txt` in the same nodejs.org release directory | `--node-sha256` |
 | actions/runner-images (`build-ubuntu-rootfs.sh --toolset full`) | a commit SHA, fetched with git | `--runner-images-commit` |
 | `packages-microsoft-prod.deb` (`build-ubuntu-rootfs.sh --toolset full`) | a SHA-256 pinned in the script for Ubuntu 24.04 | `--pmc-sha256` |
+| Node.js (`build-toolcache.sh`) | `SHASUMS256.txt`, as above | `--checksums` |
+| Go (`build-toolcache.sh`) | the go.dev download index (`?mode=json`), served apart from the archive | `--checksums` |
+| Python, CodeQL (`build-toolcache.sh`) | the SHA-256 the GitHub API reports for the release asset | `--checksums` |
 
 An empty `--runner-version` resolves the latest release once, and the build
 prints the version and checksum it took. A pinned checksum skips the lookup.
@@ -329,6 +332,17 @@ To pin `packages-microsoft-prod.deb` for another Ubuntu release, download it,
 check that the key it installs has the fingerprint
 `BC52 8686 B50D 79E3 39D3 721C EB3E 94AD BE12 29CF`, and pass its `sha256sum`
 as `--pmc-sha256`, or add it to the script's table.
+
+`build-toolcache.sh --checksums FILE` pins its archives: FILE holds
+`SHA256  ARCHIVE-NAME` lines, as `sha256sum` prints them, and an archive it
+lists is checked against its line instead of upstream. Each drive keeps the
+checksums it was built from in `/downloads.sha256` in the same format, so
+`--checksums` with that file rebuilds the same drive. GitHub reports a
+checksum only for assets uploaded since mid-2025; an older Python or CodeQL
+release needs a `--checksums` line. The toolcache drive picks a Python build
+from the python-versions manifest and accepts only an asset of a
+python-versions release. Its `setup.sh` still upgrades pip from PyPI inside
+the container, which this does not check.
 `SHASUMS256.txt` comes from the same origin as the tarball, and its GPG
 signature is not checked; for a stronger guarantee, pin `--node-sha256` from a
 `SHASUMS256.txt.asc` you verified.

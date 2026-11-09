@@ -12,3 +12,8 @@
   actions/runner-images at a commit instead of a tag that can move: the
   default tag comes with its pinned commit, another `--runner-images-ref` is
   resolved to one and printed, and `--runner-images-commit` pins it.
+- `images/build-toolcache.sh` checks Node.js against `SHASUMS256.txt`, Go
+  against the go.dev download index, and Python and CodeQL against the
+  SHA-256 the GitHub API reports for the release asset. `--checksums FILE`
+  pins them, and each drive records its checksums in `/downloads.sha256`.
+  `--go` and `--python` now need `jq`.

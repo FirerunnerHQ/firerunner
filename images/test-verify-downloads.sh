@@ -38,16 +38,23 @@ for t in truncate mount umount e2label; do
 	printf '#!/bin/sh\necho "%s $*" >>"$STATE/calls"\n' "$t" >"$BIN/$t"
 done
 printf '#!/bin/sh\nexit 1\n' >"$BIN/mountpoint"
-# mkfs.ext4 [-d DIR] ...: keeps the record of downloads DIR holds.
+# mkfs.ext4 [-d DIR] ...: keeps the record of downloads DIR holds, and its
+# listing.
 cat >"$BIN/mkfs.ext4" <<'FAKE'
 #!/bin/sh
 echo "mkfs.ext4 $*" >>"$STATE/calls"
 while [ $# -gt 1 ]; do
-	[ "$1" != -d ] || [ ! -f "$2/etc/firerunner/downloads.sha256" ] || cp "$2/etc/firerunner/downloads.sha256" "$STATE/"
+	if [ "$1" = -d ]; then
+		for f in "$2/etc/firerunner/downloads.sha256" "$2/downloads.sha256"; do
+			[ ! -f "$f" ] || cp "$f" "$STATE/"
+		done
+		(cd "$2" && find . -type f) >"$STATE/drive"
+	fi
 	shift
 done
 FAKE
-# docker: build keeps a copy of its context; export streams a bare tree.
+# docker: build keeps a copy of its context; export streams a bare tree; run
+# lists what is mounted at /dl.
 cat >"$BIN/docker" <<'FAKE'
 #!/bin/sh
 echo "docker $*" >>"$STATE/calls"
@@ -59,6 +66,11 @@ build)
 export)
 	mkdir -p "$STATE/rootfs/etc"
 	tar -cf - -C "$STATE/rootfs" .
+	;;
+run)
+	for a; do
+		case "$a" in *:/dl:ro) ls "${a%:/dl:ro}" >"$STATE/python-dl" ;; esac
+	done
 	;;
 esac
 FAKE
@@ -98,6 +110,7 @@ archive() {
 	for f; do
 		mkdir -p "$src/$top/$(dirname "$f")"
 		printf '#!/bin/sh\necho %s\n' "$name" >"$src/$top/$f"
+		chmod +x "$src/$top/$f"
 	done
 	tar -czf "$REMOTE/$name" -C "$src" "$top"
 }
@@ -151,6 +164,44 @@ RI_B="$(ri_commit B)"
 printf '%s' "$RI_B" >"$REMOTE/ri-tag"
 printf '{"message": "No commit found for SHA: ubuntu24/bad"}' >"$REMOTE/ri-bad"
 
+# The tool-cache drive's sources.
+GV=1.26.7
+GO_TGZ="go$GV.linux-amd64.tar.gz"
+GO_URL="https://go.dev/dl/$GO_TGZ"
+GO_INDEX="https://go.dev/dl/?mode=json&include=all"
+archive "$GO_TGZ" go bin/go
+archive evil-go.tar.gz go bin/go bin/backdoor
+GO_SHA="$(sha "$REMOTE/$GO_TGZ")"
+printf '[{"version": "go%s", "files": [{"filename": "go%s.src.tar.gz", "sha256": "%s"}, {"filename": "%s", "sha256": "%s"}]}]\n' \
+	"$GV" "$GV" "$(printf '%064d' 5)" "$GO_TGZ" "$GO_SHA" >"$REMOTE/go.json"
+echo '[]' >"$REMOTE/go-empty.json"
+PY_TAG=3.12.9-123
+PY_TGZ="python-3.12.9-linux-24.04-x64.tar.gz"
+PY_URL="https://github.com/actions/python-versions/releases/download/$PY_TAG/$PY_TGZ"
+PY_API="https://api.github.com/repos/actions/python-versions/releases/tags/$PY_TAG"
+PY_MANIFEST=https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
+archive "$PY_TGZ" . setup.sh
+archive evil-python.tar.gz . setup.sh backdoor
+PY_SHA="$(sha "$REMOTE/$PY_TGZ")"
+py_manifest() { # FILE URL
+	printf '[{"version": "3.12.9", "files": [{"platform": "linux", "arch": "x64", "platform_version": "24.04", "download_url": "%s"}, {"platform": "darwin", "arch": "x64", "platform_version": "14", "download_url": "https://example.com/other"}]}, {"version": "3.13.0", "files": []}]\n' "$2" >"$REMOTE/$1"
+}
+py_manifest python.json "$PY_URL"
+py_manifest python-outside.json "https://example.com/$PY_TGZ"
+asset() { # FILE NAME DIGEST
+	printf '{"tag_name": "x", "assets": [{"name": "other.tar.gz", "digest": "sha256:%s"}, {"name": "%s", "digest": %s}]}\n' \
+		"$(printf '%064d' 6)" "$2" "$3" >"$REMOTE/$1"
+}
+asset python-release.json "$PY_TGZ" "\"sha256:$PY_SHA\""
+asset python-release-old.json "$PY_TGZ" null
+CQ=2.27.4
+CQ_URL="https://github.com/github/codeql-action/releases/download/codeql-bundle-v$CQ/codeql-bundle-linux64.tar.gz"
+CQ_API="https://api.github.com/repos/github/codeql-action/releases/tags/codeql-bundle-v$CQ"
+archive codeql.tar.gz codeql codeql
+archive evil-codeql.tar.gz codeql codeql backdoor
+CQ_SHA="$(sha "$REMOTE/codeql.tar.gz")"
+asset codeql-release.json codeql-bundle-linux64.tar.gz "\"sha256:$CQ_SHA\""
+
 # routes: the honest upstream.
 routes() {
 	: >"$REMOTE/routes"
@@ -162,6 +213,13 @@ routes() {
 	serve "$PMC_URL" "$REMOTE/pmc.deb"
 	serve https://api.github.com/repos/actions/runner-images/commits/ubuntu24/test "$REMOTE/ri-tag"
 	serve https://api.github.com/repos/actions/runner-images/commits/ubuntu24/bad "$REMOTE/ri-bad"
+	serve "$GO_INDEX" "$REMOTE/go.json"
+	serve "$GO_URL" "$REMOTE/$GO_TGZ"
+	serve "$PY_MANIFEST" "$REMOTE/python.json"
+	serve "$PY_API" "$REMOTE/python-release.json"
+	serve "$PY_URL" "$REMOTE/$PY_TGZ"
+	serve "$CQ_API" "$REMOTE/codeql-release.json"
+	serve "$CQ_URL" "$REMOTE/codeql.tar.gz"
 }
 # reroute URL FILE: serve FILE at URL instead.
 reroute() {
@@ -362,6 +420,87 @@ expect "full, package: nothing is built" lacks calls "docker build"
 
 run ubuntu-full-pmc-tag "$UBUNTU" --out "$OUT" --toolset full --ubuntu-tag 22.04 --runner-images-commit "$RI_A"
 expect "full, package for another release: needs a pin" has err "pass --pmc-sha256"
+
+TOOLCACHE="$HERE/build-toolcache.sh"
+OUT="$TMP/out/toolcache.ext4"
+
+echo "== build-toolcache.sh"
+routes
+run tc-node-go "$TOOLCACHE" --out "$OUT" --node "$NV" --go "$GV"
+expect "node and go: builds" passed
+expect "node and go: node is on the drive" has drive "./node/$NV/x64/bin/node"
+expect "node and go: go is on the drive" has drive "./go/$GV/x64/bin/go"
+expect "node and go: go is checked against the download index" has urls "$GO_INDEX"
+expect "node and go: the drive records node" has downloads.sha256 "$NODE_SHA  $NODE_TGZ"
+expect "node and go: the drive records go" has downloads.sha256 "$GO_SHA  $GO_TGZ"
+expect "node and go: no archive on the drive" lacks drive .tar.gz
+
+for tool in node go; do
+	routes
+	if [ "$tool" = node ]; then reroute "$NODE_URL" "$REMOTE/evil-node.tar.gz"; else reroute "$GO_URL" "$REMOTE/evil-go.tar.gz"; fi
+	run "tc-tampered-$tool" "$TOOLCACHE" --out "$OUT" --node "$NV" --go "$GV"
+	expect "tampered $tool: fails" failed
+	expect "tampered $tool: says why" has err ": SHA-256 mismatch"
+	expect "tampered $tool: no drive" lacks calls mkfs.ext4
+done
+
+routes
+reroute "$GO_INDEX" "$REMOTE/go-empty.json"
+run tc-go-unlisted "$TOOLCACHE" --out "$OUT" --go "$GV"
+expect "go missing from the index: fails" has err "lists no $GO_TGZ"
+expect "go missing from the index: stops there" lacks err "no SHA-256 to check it against"
+expect "go missing from the index: downloads nothing" lacks urls "$GO_URL"
+
+routes
+run tc-python "$TOOLCACHE" --out "$OUT" --python 3.12
+expect "python: builds" passed
+expect "python: checks the asset's digest" has urls "$PY_API"
+expect "python: the container gets the checked tarball" has python-dl "$PY_TGZ"
+expect "python: the container downloads nothing" lacks calls "$PY_URL"
+expect "python: the drive records it" has downloads.sha256 "$PY_SHA  $PY_TGZ"
+
+routes
+reroute "$PY_URL" "$REMOTE/evil-python.tar.gz"
+run tc-python-tampered "$TOOLCACHE" --out "$OUT" --python 3.12
+expect "tampered python: fails" has err "$PY_TGZ: SHA-256 mismatch"
+expect "tampered python: never reaches the container" lacks calls "docker run"
+
+routes
+reroute "$PY_API" "$REMOTE/python-release-old.json"
+run tc-python-nodigest "$TOOLCACHE" --out "$OUT" --python 3.12
+expect "python without a digest: fails and says how to pin" has err "GitHub records no SHA-256 for $PY_TGZ; pin it with --checksums"
+expect "python without a digest: never reaches the container" lacks calls "docker run"
+
+printf '%s  %s\n' "$PY_SHA" "$PY_TGZ" >"$TMP/pins"
+run tc-python-pinned "$TOOLCACHE" --out "$OUT" --python 3.12 --checksums "$TMP/pins"
+expect "python pinned: builds" passed
+expect "python pinned: asks no API" lacks urls "$PY_API"
+
+routes
+reroute "$PY_MANIFEST" "$REMOTE/python-outside.json"
+run tc-python-outside "$TOOLCACHE" --out "$OUT" --python 3.12
+expect "python from elsewhere: refused" has err "the manifest points outside"
+expect "python from elsewhere: downloads nothing" lacks urls example.com
+
+routes
+run tc-codeql "$TOOLCACHE" --out "$OUT" --codeql "$CQ"
+expect "codeql: builds" passed
+expect "codeql: the bundle is on the drive" has drive "./CodeQL/$CQ/x64/codeql/codeql"
+expect "codeql: the drive records it" has downloads.sha256 "$CQ_SHA  codeql-bundle-v$CQ-linux64.tar.gz"
+
+reroute "$CQ_URL" "$REMOTE/evil-codeql.tar.gz"
+run tc-codeql-tampered "$TOOLCACHE" --out "$OUT" --codeql "$CQ"
+expect "tampered codeql: fails" has err "codeql-bundle-v$CQ-linux64.tar.gz: SHA-256 mismatch"
+expect "tampered codeql: no drive" lacks calls mkfs.ext4
+
+routes
+printf '%s *%s\n' "$(printf '%064d' 4)" "$NODE_TGZ" >"$TMP/pins-wrong"
+run tc-pinned-wrong "$TOOLCACHE" --out "$OUT" --node "$NV" --checksums "$TMP/pins-wrong"
+expect "a wrong pin wins over upstream: fails" has err "$NODE_TGZ: SHA-256 mismatch: expected $(printf '%064d' 4)"
+expect "a wrong pin: upstream not asked" lacks urls SHASUMS256.txt
+
+run tc-pins-missing "$TOOLCACHE" --out "$OUT" --node "$NV" --checksums "$TMP/no-such-file"
+expect "a missing --checksums file: refused" has err "no such file"
 
 if [ "$fails" -ne 0 ]; then
 	echo "$fails failure(s)"
