@@ -844,6 +844,21 @@ func cacheCredentials(cfg *config.Config, api awscreds.STSAPI, log *slog.Logger)
 	}
 }
 
+// startCacheCredentials starts keeping --cache-credentials-file fresh when
+// --cache-role-arn is set, with an STS client from newSTS. It returns the
+// refresher, nil when the role is unset, and a stop that waits for it.
+func startCacheCredentials(ctx context.Context, cfg *config.Config, newSTS func() (awscreds.STSAPI, error), log *slog.Logger) (*awscreds.Refresher, func(), error) {
+	if cfg.CacheRoleARN == "" {
+		return nil, func() {}, nil
+	}
+	api, err := newSTS()
+	if err != nil {
+		return nil, nil, fmt.Errorf("--cache-role-arn: %w", err)
+	}
+	r := cacheCredentials(cfg, api, log)
+	return r, runInBackground(ctx, r.Run), nil
+}
+
 // runInBackground runs f until ctx ends or the returned stop is called;
 // stop returns once f has.
 func runInBackground(ctx context.Context, f func(context.Context)) (stop func()) {
@@ -885,14 +900,17 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// The local cache-server's S3 credentials, from a role that holds only
 	// the bucket's policy, so it needs neither this host's role nor
 	// instance metadata.
-	if cfg.CacheRoleARN != "" {
+	_, stopCreds, err := startCacheCredentials(ctx, cfg, func() (awscreds.STSAPI, error) {
 		awsCfg, err := loadAWSConfig(ctx, cfg)
 		if err != nil {
-			return fmt.Errorf("--cache-role-arn: %w", err)
+			return nil, err
 		}
-		stopCreds := runInBackground(ctx, cacheCredentials(cfg, awssts.NewFromConfig(awsCfg), log).Run)
-		defer stopCreds()
+		return awssts.NewFromConfig(awsCfg), nil
+	}, log)
+	if err != nil {
+		return err
 	}
+	defer stopCreds()
 
 	// A static install is one tenant, made from its flags.
 	t := tenant{

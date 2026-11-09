@@ -9,11 +9,14 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/reconcile"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -172,21 +175,89 @@ func (f *fakeSTS) AssumeRole(_ context.Context, in *sts.AssumeRoleInput, _ ...fu
 // refresher: it assumes that role and writes that file, and stops with the
 // daemon.
 func TestCacheCredentialsWiring(t *testing.T) {
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "creds.json")
+
+	// No role: no STS client, nothing running.
+	called := false
+	newSTS := func() (awscreds.STSAPI, error) { called = true; return &fakeSTS{}, nil }
+	r, stop, err := startCacheCredentials(ctx, &config.Config{CacheCredentialsFile: path}, newSTS, quiet)
+	if err != nil || r != nil || called {
+		t.Fatalf("no role: refresher %v, STS made %v, err %v", r, called, err)
+	}
+	stop()
+
+	// A client that cannot be made fails the start.
 	cfg := &config.Config{CacheRoleARN: "arn:aws:iam::123456789012:role/cache", CacheCredentialsFile: path}
+	if _, _, err := startCacheCredentials(ctx, cfg, func() (awscreds.STSAPI, error) { return nil, errors.New("no region") }, quiet); err == nil {
+		t.Fatal("an STS client error was not returned")
+	}
+
+	// With the role, it assumes it and writes the file, until stopped.
 	api := &fakeSTS{}
-	r := cacheCredentials(cfg, api, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	stop := runInBackground(context.Background(), r.Run)
-	if err := awscreds.Wait(context.Background(), path, time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+	r, stop, err = startCacheCredentials(ctx, cfg, func() (awscreds.STSAPI, error) { return api, nil }, quiet)
+	if err != nil || r == nil {
+		t.Fatalf("with a role: %v, %v", r, err)
+	}
+	if err := awscreds.Wait(ctx, path, time.Millisecond, quiet); err != nil {
 		t.Fatal(err)
 	}
 	stop() // returns only once Run has
 	if got := aws.ToString(api.in.RoleArn); got != cfg.CacheRoleARN {
 		t.Fatalf("assumed %q", got)
 	}
-	c, err := awscreds.FileProvider{Path: path}.Retrieve(context.Background())
+	c, err := awscreds.FileProvider{Path: path}.Retrieve(ctx)
 	if err != nil || c.AccessKeyID != "AKIAROLE" {
 		t.Fatalf("file holds %q, %v", c.AccessKeyID, err)
+	}
+}
+
+// cache-server --s3-credentials-file signs its S3 requests with the file's
+// key: its first, loading the index, reaches a fake S3 before the missing
+// job identity directory stops the start.
+func TestCacheServerSignsS3WithTheCredentialsFile(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := ""
+		if _, rest, ok := strings.Cut(r.Header.Get("Authorization"), "Credential="); ok {
+			key, _, _ = strings.Cut(rest, "/")
+		}
+		mu.Lock()
+		keys = append(keys, key)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`<Error><Code>NoSuchKey</Code></Error>`))
+	}))
+	defer s3.Close()
+	// Ambient credentials would sign too; none may stand in for the file.
+	t.Setenv("AWS_ENDPOINT_URL_S3", s3.URL)
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAAMBIENT")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "s")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "none"))
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	creds := filepath.Join(t.TempDir(), "creds.json")
+	if err := awscreds.Write(creds, aws.Credentials{AccessKeyID: "AKIAFILE", SecretAccessKey: "s", SessionToken: "t", CanExpire: true, Expires: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	err := cacheServe([]string{"--dir", t.TempDir(), "--jobs-dir", filepath.Join(t.TempDir(), "missing"),
+		"--s3-bucket", "bucket", "--s3-region", "us-west-2", "--s3-credentials-file", creds})
+	if err == nil || !strings.Contains(err.Error(), "job identity directory") {
+		t.Fatalf("start: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) == 0 {
+		t.Fatal("cache-server sent no S3 request")
+	}
+	for _, k := range keys {
+		if k != "AKIAFILE" {
+			t.Fatalf("signed with %q, want the file's AKIAFILE (all: %v)", k, keys)
+		}
 	}
 }
 
