@@ -405,6 +405,33 @@ check "never-required: ends in the deadline" test "$rc:$(summary .verdict)" = 12
 check "never-required: names the missing check" grep -q 'never reported on .*: sign-off' <<<"$errout"
 check "never-required: and lists it in the summary" test "$(summary '.missing_required | join(",")')" = sign-off
 
+# Every run on the head finished, and a required check never came: a run that
+# failed without its jobs, as in a GitHub Actions incident.
+setup stalled
+rules test shell
+snap 1 "$(c test pass)"
+echo '{"workflow_runs": [{"id": 100, "name": "ci", "status": "completed", "conclusion": "failure"}]}' >"$STATE/workflows.json"
+FR_PR_WAIT_STALL=0 run_it 5
+check "stalled: stops instead of waiting out the deadline" test "$rc:$(summary .verdict)" = 1:missing_required
+check "stalled: names the missing check and the runs" grep -q 'ci: failure), yet required check(s) never reported: shell' <<<"$errout"
+check "stalled: says what to look at" grep -q 'githubstatus.com' <<<"$errout"
+check "stalled: lists it in the summary" test "$(summary '.missing_required | join(",")')" = shell
+
+setup stalled-running
+rules test shell
+snap 1 "$(c test pass)"
+echo '{"workflow_runs": [{"id": 100, "name": "ci", "status": "in_progress", "conclusion": null}]}' >"$STATE/workflows.json"
+FR_PR_WAIT_STALL=0 run_it 5 --deadline 0
+check "stalled-running: a run still going is waited for" test "$rc:$(summary .verdict)" = 124:deadline
+
+setup stalled-grace
+rules test shell
+snap 1 "$(c test pass)"
+echo '{"workflow_runs": [{"id": 100, "name": "ci", "status": "completed", "conclusion": "failure"}]}' >"$STATE/workflows.json"
+echo 1000 >"$STATE/clock"
+FR_PR_WAIT_STALL=100000 run_it 5 --deadline 30
+check "stalled-grace: within the grace period it keeps waiting" test "$rc:$(summary .verdict)" = 124:deadline
+
 setup rules-error
 touch "$STATE/rules.err"
 snap 1 "$(c test pass)"
