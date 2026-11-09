@@ -177,6 +177,9 @@ func cacheServe(args []string) error {
 	if !filepath.IsAbs(*jobsDir) {
 		return fmt.Errorf("--jobs-dir must be an absolute path")
 	}
+	if *o.bodyIdle < 0 {
+		return fmt.Errorf("--body-idle-timeout must be >= 0 (0 = no bound)")
+	}
 	maxBytes, err := parseSize(*maxSize)
 	if err != nil {
 		return fmt.Errorf("--max-size: %w", err)
@@ -228,9 +231,6 @@ func cacheServe(args []string) error {
 		return err
 	}
 	srv.SetIdentityWait(*identityWait)
-	if *o.bodyIdle < 0 {
-		return fmt.Errorf("--body-idle-timeout must be >= 0 (0 = no bound)")
-	}
 	srv.SetBodyIdle(*o.bodyIdle)
 	if err := srv.SetArtifactUpstream(*artifactUpstream); err != nil {
 		return fmt.Errorf("--artifact-upstream: %w", err)

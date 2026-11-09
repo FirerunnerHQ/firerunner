@@ -319,15 +319,23 @@ type idleBody struct {
 	io.ReadCloser
 	rc   *http.ResponseController
 	idle time.Duration
+	done bool // the body has returned an error, such as io.EOF
 }
 
 func (b *idleBody) Read(p []byte) (int, error) {
-	// HTTP/2 does not support per-request deadlines; the read then runs
-	// under the server's own timeouts, as it did before.
+	if b.done {
+		// At EOF net/http clears the deadline and starts reading the
+		// connection in the background to notice a client that leaves.
+		// A deadline set again here would expire in that read and cancel
+		// the request while the handler still works (TestBodyIdleEndsAtEOF).
+		return b.ReadCloser.Read(p)
+	}
+	// A connection that cannot take a deadline keeps the server's own
+	// timeouts, as it did before.
 	_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
-	// No need to clear it at EOF: net/http does, when it starts reading the
-	// connection in the background (TestBodyIdleEndsAtEOF).
-	return b.ReadCloser.Read(p)
+	n, err := b.ReadCloser.Read(p)
+	b.done = err != nil
+	return n, err
 }
 
 // StartJanitor runs a background loop that reclaims abandoned (reserved but
@@ -720,6 +728,10 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			azureError(w, http.StatusRequestEntityTooLarge, azTooLarge, "block list too large")
+			return
+		}
+		if clientGone(err) {
+			azureError(w, http.StatusBadRequest, "IncompleteBody", "the request body ended early")
 			return
 		}
 		s.blobInternalError(w, e, err)
@@ -1457,10 +1469,12 @@ func (s *Server) uploadError(w http.ResponseWriter, e *Entry, err error) {
 }
 
 // clientGone reports whether err means the client went away while sending:
-// its connection closed or reset, or the request was cancelled.
+// its connection closed or reset, the request was cancelled, or its body
+// stopped sending for longer than SetBodyIdle allows.
 func clientGone(err error) bool {
 	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.Canceled) ||
-		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed)
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrDeadlineExceeded)
 }
 
 // staged-byte accounting bounds the disk a not-yet-finalized entry occupies:

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// putPaced uploads one block through a pipe, steps bytes written gap apart,
+// putPaced sends a PUT body to url through a pipe, steps bytes written gap apart,
 // and returns the status, or 0 when the server dropped the connection. The
 // sleeps pace the client; nothing is asserted on timing.
 func putPaced(t *testing.T, url string, steps int, gap time.Duration) int {
@@ -24,7 +24,7 @@ func putPaced(t *testing.T, url string, steps int, gap time.Duration) int {
 		}
 		pw.Close()
 	}()
-	req, _ := http.NewRequest(http.MethodPut, url+"&comp=block&blockid=YjA=", pr)
+	req, _ := http.NewRequest(http.MethodPut, url, pr)
 	resp, err := http.DefaultClient.Do(req)
 	pr.CloseWithError(io.ErrClosedPipe) // stop the writer whatever happened
 	if err != nil {
@@ -34,15 +34,16 @@ func putPaced(t *testing.T, url string, steps int, gap time.Duration) int {
 	return resp.StatusCode
 }
 
-// A body that stops sending is cut after the idle bound, and the same pause
-// passes when the bound is off.
+// A body that stops sending is cut after the idle bound and answered as an
+// incomplete upload, not a server error; the same pause passes when the
+// bound is off.
 func TestStalledBodyIsCut(t *testing.T) {
 	for _, tc := range []struct {
 		idle time.Duration
-		ok   bool
+		want int
 	}{
-		{100 * time.Millisecond, false},
-		{0, true},
+		{100 * time.Millisecond, http.StatusBadRequest},
+		{0, http.StatusCreated},
 	} {
 		s, err := newAuthorizedStore(t.TempDir(), nil)
 		if err != nil {
@@ -51,11 +52,26 @@ func TestStalledBodyIsCut(t *testing.T) {
 		s.SetBodyIdle(tc.idle)
 		ts := httptest.NewServer(s)
 		url := reserve(t, ts.URL, "a")
-		code := putPaced(t, url, 2, 600*time.Millisecond)
+		code := putPaced(t, url+"&comp=block&blockid=YjA=", 2, 600*time.Millisecond)
 		ts.Close()
-		if got := code == http.StatusCreated; got != tc.ok {
-			t.Errorf("idle %v, body pausing 600ms -> status %d, want success %v", tc.idle, code, tc.ok)
+		if code != tc.want {
+			t.Errorf("idle %v, body pausing 600ms -> status %d, want %d", tc.idle, code, tc.want)
 		}
+	}
+}
+
+// A stalled block list is an incomplete upload too, not a server error.
+func TestStalledBlockListIsCut(t *testing.T) {
+	s, err := newAuthorizedStore(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s.SetBodyIdle(100 * time.Millisecond)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	url := reserve(t, ts.URL, "a")
+	if code := putPaced(t, url+"&comp=blocklist", 2, 600*time.Millisecond); code != http.StatusBadRequest {
+		t.Fatalf("block list pausing 600ms with a 100ms idle bound -> %d, want 400", code)
 	}
 }
 
@@ -66,12 +82,12 @@ func TestSteadyBodyOutlastsIdleBound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	s.SetBodyIdle(300 * time.Millisecond)
+	s.SetBodyIdle(time.Second)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 	url := reserve(t, ts.URL, "a")
-	if code := putPaced(t, url, 12, 50*time.Millisecond); code != http.StatusCreated {
-		t.Fatalf("steady 600ms upload with a 300ms idle bound -> %d, want 201", code)
+	if code := putPaced(t, url+"&comp=block&blockid=YjA=", 20, 100*time.Millisecond); code != http.StatusCreated {
+		t.Fatalf("steady 2s upload with a 1s idle bound -> %d, want 201", code)
 	}
 }
 
@@ -84,7 +100,13 @@ func TestBodyIdleEndsAtEOF(t *testing.T) {
 	ctxErr := make(chan error, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b := &idleBody{ReadCloser: r.Body, rc: http.NewResponseController(w), idle: idle}
-		if _, err := io.Copy(io.Discard, b); err != nil {
+		if _, err := io.ReadAll(b); err != nil {
+			ctxErr <- err
+			return
+		}
+		// A reader that checks for more after EOF must not set the
+		// deadline again on the connection net/http is now reading.
+		if _, err := b.Read(make([]byte, 1)); err != io.EOF {
 			ctxErr <- err
 			return
 		}
