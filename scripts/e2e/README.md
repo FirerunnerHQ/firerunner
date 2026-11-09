@@ -184,6 +184,10 @@ gh workflow run e2e-selftest.yml --repo "$FR_E2E_REPO"
 run_id=$(gh run list --repo "$FR_E2E_REPO" --workflow e2e-selftest.yml --limit 1 --json databaseId --jq '.[0].databaseId')
 scripts/e2e/watch-run.sh "$run_id"
 
+#    The dependency cache, on a tier that sets ec2.cache: one runner saves,
+#    another restores and compares (start the VM with --cache disk or s3).
+gh workflow run e2e-cache.yml --repo "$FR_E2E_REPO" -f runner=<tier name>
+
 # 3. What do I have running?
 scripts/e2e/inventory.sh
 
