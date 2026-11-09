@@ -172,7 +172,10 @@ control VM also runs `firerunner cache-server` for EC2 tiers that set
   that has `--s3-credentials-file` first, then update the stack and refresh
   the VM (`deploy-control.sh`). An older release on the new stack has no S3
   access; a newer release on an older stack keeps using the instance role
-  and says so in the boot log.
+  and says so in the boot log. Between the stack update and the refresh,
+  the running VM's cache-server still signs with the instance role, which
+  has lost its S3 access: every restore misses and every save fails until
+  the new VM is up, so refresh right after the update.
 - **The address.** The bootstrap tells runners the cache-server address
   (`FR_EC2_CACHE_ADDR=<jit name>:<port>`) only when a tier sets
   `ec2.cache`. Such a tier with `Cache=off` fails `config check`.
