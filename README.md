@@ -233,6 +233,22 @@ and an `httptest` server over a unix socket), and real microVM boots live in
 `test/e2e` behind the `e2e` build tag. CI (`.github/workflows/ci.yml`) runs
 build, vet and the coverage gate on every push and PR.
 
+### Verifying a release
+
+A `v*` tag's workflow publishes the Linux binaries, the control-VM bootstrap
+script and `SHA256SUMS`, with signed [build provenance] for each file. Check a
+download came from this repository's release workflow at that tag:
+
+```bash
+gh attestation verify firerunner_linux_amd64 --repo FirerunnerHQ/firerunner
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+Releases are immutable once published, and only repository admins can create,
+move or delete a `v*` tag.
+
+[build provenance]: https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations
+
 ## Usage
 
 ```bash
