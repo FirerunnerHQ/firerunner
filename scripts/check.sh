@@ -120,6 +120,7 @@ if [ "$(uname -s)" = Linux ]; then
 else
 	skip docker-shim "needs Linux (/proc)"
 fi
+step image-downloads images/test-verify-downloads.sh
 step ec2-boot-script images/test-ec2-run.sh
 step ec2-boot-tuning images/test-ec2-tune.sh
 step ec2-toolset images/test-runner-images.sh
@@ -172,6 +173,7 @@ if command -v shellcheck >/dev/null; then
 		images/assets/firerunner-git-config.sh images/test-git-config.sh \
 		images/ec2/install-firerunner.sh images/test-install-firerunner.sh \
 		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh images/layer-ec2-ami.sh images/test-layer-ec2-ami.sh scripts/check.sh \
+		images/lib/verify.sh images/build-rootfs.sh images/test-verify-downloads.sh \
 		scripts/mutate.sh scripts/test-mutate.sh scripts/test-changelog.sh \
 		scripts/merge-stack.sh scripts/test-merge-stack.sh \
 		scripts/pr-wait.sh scripts/test-pr-wait.sh \

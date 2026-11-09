@@ -296,6 +296,29 @@ just means `setup-*` downloads it and the job still passes. Tailor the version
 list to the repos you serve by reading their `go.mod` / `.nvmrc` /
 `.python-version`.
 
+## Verified downloads
+
+Every archive a builder runs or bakes into an image is checked before it is
+used, against a SHA-256 that is pinned or that comes from a source other than
+the download itself. A mismatch stops the build with an error that names the
+file and both checksums, and nothing from the file is unpacked. Each build
+prints the checksums it used, and a rootfs keeps them in
+`/etc/firerunner/downloads.sha256`.
+
+| download | checked against | pin it with |
+|---|---|---|
+| `actions/runner` (`build-rootfs.sh`) | the SHA-256 in the release's notes, read through the GitHub API | `--runner-version` and `--runner-sha256` |
+| Node.js (`build-rootfs.sh`, node tier) | `SHASUMS256.txt` in the same nodejs.org release directory | `--node-sha256` |
+
+An empty `--runner-version` resolves the latest release once, and the build
+prints the version and checksum it took. A pinned checksum skips the lookup.
+`SHASUMS256.txt` comes from the same origin as the tarball, and its GPG
+signature is not checked; for a stronger guarantee, pin `--node-sha256` from a
+`SHASUMS256.txt.asc` you verified.
+
+`images/test-verify-downloads.sh` runs the builders against a fake network
+that serves tampered archives.
+
 ## Rebuild policy
 
 GitHub only supports self-hosted runner agents released within the **last 30
