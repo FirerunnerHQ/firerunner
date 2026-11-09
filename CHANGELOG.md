@@ -8,6 +8,27 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-09
+
+### Added
+
+- `cache-server --s3-credentials-file` signs S3 requests with the credentials
+  in a file instead of the default AWS chain, and the daemon's
+  `--cache-role-arn` (`FR_CACHE_ROLE_ARN`) keeps such a file fresh from a
+  role it assumes, written to `--cache-credentials-file`. `status --json`
+  reports the refresh as `listeners.cache_credentials`, and `doctor` fails its
+  `cache-credentials` check when the file is missing or expired or the latest
+  refresh failed.
+- Release files carry signed build provenance: `gh attestation verify FILE
+  --repo FirerunnerHQ/firerunner` checks a download came from the release
+  workflow at its tag. Releases are immutable once published, and only
+  repository admins can create, move or delete a `v*` tag.
+- `firerunner status` reports what the guest firewall dropped since the
+  network was applied, by reason: past the connection limit or rate, to a
+  non-public address, or with a spoofed source. In `--json` it is
+  `network.drops`, or `network.drops_error` when the counters cannot be read
+  (they need root).
+
 ### Changed
 
 - Firecracker guests now have connection limits, on by default, so one guest
@@ -20,6 +41,21 @@ and this project adheres to
   They are kept in a separate nftables table, `<table>_conns`. After a
   downgrade to an earlier version, remove that table by hand with
   `nft delete table ip firerunner_conns`.
+- The cache server's errors follow the protocols it speaks. Cache RPCs answer
+  each Twirp error code at the HTTP status the Twirp specification gives it (an
+  oversized body is now `400 invalid_argument`, not 413), and an unknown
+  service or method, a non-POST request or a body not sent as JSON is a
+  `404 bad_route` in JSON, where Go's plain-text 404 or 405 used to make the
+  toolkit retry. Blob uploads and downloads fail as Azure Storage does, with
+  the code in `x-ms-error-code` and an XML `Error` body, including
+  `416 InvalidRange` and `405 UnsupportedHttpVerb`; a full cache and a store
+  outage stay `507`, which clients do not retry. Errors no longer carry host
+  paths, and the server's own log names the entry.
+- `firerunner status` and `doctor` read the daemon's settings from
+  `/etc/firerunner/firerunner.env` when no `FR_*` variable is set, and say so,
+  so run from a shell on the host they describe the running deployment rather
+  than a default one. `--env-file FILE` reads another file, `--env-file none`
+  none.
 
 ### Fixed
 
@@ -38,6 +74,39 @@ and this project adheres to
 - The cache server counts uploads that are not yet finalized toward
   `--max-size`, so its disk use stays within the cap. An upload that would go
   past it while other uploads are unfinished gets `507 Insufficient Storage`.
+- The cache server bounds its number of entries, not only their bytes: a
+  repository keeps at most `--max-repo-entries` (default 2000), evicting its
+  own least-recently-used first, and the host at most `--max-entries` (default
+  20000). A job may hold at most 64 unfinished uploads, and requests with more
+  than ten keys or a key longer than 512 characters are refused, as
+  `@actions/cache` does.
+- Cache entries are scoped by GitHub's repository ID as well as its name, so a
+  repository created later under a name another one gave up reads none of the
+  earlier one's caches. Entries saved before this version are no longer
+  restored, and age out under the size and entry caps; the first jobs after an
+  upgrade miss the cache once, as do a repository's first jobs after it is
+  renamed or transferred. Upgrade the daemon and cache-server together.
+- Firecracker guests no longer reach private addresses through a host's own
+  DNAT rules, such as Docker's or Kubernetes' published ports, in any egress
+  mode. Only the host's redirect of guest DNS (TCP or UDP to port 53) is still
+  exempt from the non-public drop, and packets conntrack marks invalid are
+  dropped.
+- `git_cache` saves only the job's own repository. A fetch of another one, such
+  as a second checkout or a submodule, was stored under the job's repository
+  and default branch, where a fork PR could restore it. Git cache keys now
+  name their repository; entries saved before this version are never restored,
+  to the proxy or any other client. Images built before this version keep
+  fetching from GitHub but no longer save to the git cache; rebuild them to
+  get it back.
+
+### Security
+
+- With the control stack's `Cache=s3`, cache-server no longer uses the control
+  VM's instance role. The stack adds a cache role holding only the bucket's
+  prefix, which the daemon assumes and hands to cache-server in a file;
+  cache-server cannot reach instance metadata, as with `Cache=disk`, and the
+  control role loses its S3 access. Deploy this release before updating the
+  stack, then refresh the VM.
 
 ## [0.1.8] - 2026-11-07
 
@@ -186,7 +255,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.9
 [0.1.8]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.8
 [0.1.7]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.7
 [0.1.6]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.6
