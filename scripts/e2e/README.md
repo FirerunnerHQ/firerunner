@@ -75,7 +75,9 @@ lines. No default names an account, a host or a repository:
 # .claude/e2e.env in the main checkout: read by every worktree of it
 AWS_REGION=…              # region of the control VMs and the runners
 AWS_PROFILE=…             # optional; otherwise the default credential chain
-FR_E2E_REPO=OWNER/REPO    # where the e2e workflows run
+FR_E2E_REPO=OWNER/REPO    # where the e2e workflows run: a private repository
+                          # (runner groups serve no public one by default)
+                          # holding them, e.g. cache.yml for a tier's cache
 FR_E2E_STACK=…            # the shared deploy/cloudformation/control.yaml stack (control-vm.sh)
 FR_E2E_BUCKET=…           # optional: for control-vm.sh install
 ```
@@ -183,10 +185,6 @@ scripts/e2e/remote-exec.sh i-… -- firerunner status --json
 gh workflow run e2e-selftest.yml --repo "$FR_E2E_REPO"
 run_id=$(gh run list --repo "$FR_E2E_REPO" --workflow e2e-selftest.yml --limit 1 --json databaseId --jq '.[0].databaseId')
 scripts/e2e/watch-run.sh "$run_id"
-
-#    The dependency cache, on a tier that sets ec2.cache: one runner saves,
-#    another restores and compares (start the VM with --cache disk or s3).
-gh workflow run e2e-cache.yml --repo "$FR_E2E_REPO" -f runner=<tier name>
 
 # 3. What do I have running?
 scripts/e2e/inventory.sh
