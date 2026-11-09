@@ -67,8 +67,8 @@ for t in mkfs.ext4 curl tar debootstrap; do
 done
 
 # Resolve the latest runner release when not pinned, once, with the SHA-256 its
-# release notes give the tarball. Kept within GitHub's 30-day support window by
-# the scheduled rebuild workflow.
+# release notes give the tarball. Rebuild at least monthly to stay within
+# GitHub's 30-day support window (images/README.md, Rebuild policy).
 if [[ -n "$RUNNER_SHA256" ]]; then
   [[ -n "$RUNNER_VERSION" ]] || die "--runner-sha256 needs --runner-version"
 else
