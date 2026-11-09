@@ -171,7 +171,7 @@ if command -v shellcheck >/dev/null; then
 	step shellcheck shellcheck images/assets/firerunner-ec2-run.sh images/test-ec2-run.sh images/assets/firerunner-ec2-tune.sh images/test-ec2-tune.sh images/test-ec2-vm.sh images/ec2/install-runner-images.sh images/test-runner-images.sh \
 		images/assets/firerunner-cache-setup.sh images/test-cache-setup.sh images/test-nodewrap.sh \
 		images/assets/firerunner-git-config.sh images/test-git-config.sh \
-		images/ec2/install-firerunner.sh images/test-install-firerunner.sh \
+		images/ec2/install-firerunner.sh images/test-install-firerunner.sh images/ec2/fetch-checked.sh \
 		images/build-ec2-ami.sh images/ec2/provision.sh images/test-build-ec2-ami.sh images/layer-ec2-ami.sh images/test-layer-ec2-ami.sh scripts/check.sh \
 		images/lib/verify.sh images/build-rootfs.sh images/build-ubuntu-rootfs.sh images/build-toolcache.sh images/test-verify-downloads.sh \
 		scripts/mutate.sh scripts/test-mutate.sh scripts/test-changelog.sh \

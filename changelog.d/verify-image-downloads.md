@@ -17,3 +17,10 @@
   SHA-256 the GitHub API reports for the release asset. `--checksums FILE`
   pins them, and each drive records its checksums in `/downloads.sha256`.
   `--go` and `--python` now need `jq`.
+- `images/build-ec2-ami.sh` reads the runner's SHA-256 from its release
+  notes (or `--runner-sha256`) before launching the build instance, which
+  checks the download against it. runner-images is fetched at a commit:
+  pinned for the default `--runner-images-ref`, resolved and printed for
+  another, or given with `--runner-images-commit`. PowerShell modules are
+  checked against the SHA-512 the PowerShell Gallery lists. A failed check
+  fails the build, and the JSON output adds `runner_sha256`.

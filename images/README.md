@@ -145,7 +145,7 @@ parameter:
 images/build-ec2-ami.sh \
   --subnet subnet-0aaa… --security-group sg-0bbb… \
   --ssm-param /firerunner/ami/runner --tag team=ci
-# {"ami":"ami-…","ssm_param":"/firerunner/ami/runner","runner_version":"2.338.1","arch":"x64"}
+# {"ami":"ami-…","ssm_param":"/firerunner/ami/runner","runner_version":"2.338.1","runner_sha256":"…","arch":"x64"}
 ```
 
 It launches a build instance with `images/ec2/provision.sh` as user-data,
@@ -173,7 +173,8 @@ build instance on every exit path.
 `standard` and `full` run the installers of an
 [actions/runner-images](https://github.com/actions/runner-images) release, in
 the order its Packer template lists them, so a new release needs only
-`--runner-images-ref`. Each toolset picks a build instance, volume and timeout
+`--runner-images-ref` (see [Verified downloads](#verified-downloads) for the
+commit it is fetched at). Each toolset picks a build instance, volume and timeout
 that fit it, which `--instance-type`, `--volume-gib` and `--timeout` override.
 
 `standard` keeps the latest version of most tools, plus defaults that system
@@ -311,6 +312,9 @@ prints the checksums it used, and a rootfs keeps them in
 | Node.js (`build-rootfs.sh` node tier, `build-ubuntu-rootfs.sh`) | `SHASUMS256.txt` in the same nodejs.org release directory | `--node-sha256` |
 | actions/runner-images (`build-ubuntu-rootfs.sh --toolset full`) | a commit SHA, fetched with git | `--runner-images-commit` |
 | `packages-microsoft-prod.deb` (`build-ubuntu-rootfs.sh --toolset full`) | a SHA-256 pinned in the script for Ubuntu 24.04 | `--pmc-sha256` |
+| `actions/runner` (`build-ec2-ami.sh`) | the release notes, read on the operator's machine; the build instance checks the download | `--runner-version` and `--runner-sha256` |
+| actions/runner-images (`build-ec2-ami.sh`) | a commit SHA, fetched with git on the build instance | `--runner-images-commit` |
+| PowerShell modules (`build-ec2-ami.sh --toolset standard`) | the SHA-512 the PowerShell Gallery's API lists for the package | — |
 | Node.js (`build-toolcache.sh`) | `SHASUMS256.txt`, as above | `--checksums` |
 | Go (`build-toolcache.sh`) | the go.dev download index (`?mode=json`), served apart from the archive | `--checksums` |
 | Python, CodeQL (`build-toolcache.sh`) | the SHA-256 the GitHub API reports for the release asset | `--checksums` |
@@ -320,9 +324,15 @@ prints the version and checksum it took. A pinned checksum skips the lookup.
 `build-ubuntu-rootfs.sh` downloads and checks everything on the host, and its
 Dockerfile only copies the checked files in.
 
-A runner-images tag can move, so the build fetches a commit. The default
-`--runner-images-ref` comes with the commit it named when it was pinned; bump
-both together, taking the commit from
+`build-ec2-ami.sh` resolves the runner's checksum and the runner-images
+commit before it launches anything, logs them, passes them to the build
+instance in its user-data, and adds `runner_sha256` to its JSON output. A
+failed check powers the build instance off with a `FAILED` mark that names
+the download, and nothing is imaged.
+
+A runner-images tag can move, so the builds fetch a commit. Each script's
+default `--runner-images-ref` comes with the commit it named when it was
+pinned; bump both together, taking the commit from
 `gh api repos/actions/runner-images/commits/TAG --jq .sha`. Any other
 `--runner-images-ref` is resolved to a commit once, through the GitHub API,
 and the build prints it so `--runner-images-commit` can pin it. git checks

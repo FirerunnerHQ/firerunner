@@ -35,10 +35,25 @@ case "$*" in
 *) echo "unexpected aws call: $*" >&2; exit 1 ;;
 esac
 FAKE
+# Fake curl: the GitHub API. A runner release's notes carry a SHA-256 per
+# asset (aaa… for x64, bbb… for arm64), except v0.0.1's; a runner-images tag
+# resolves to 000…7.
 cat >"$TMP/bin/curl" <<'FAKE'
 #!/usr/bin/env bash
-echo '{"tag_name":"v9.9.9"}'
+for last; do :; done
+echo "$last" >>"$STATE/curl"
+case "$last" in
+*/repos/actions/runner/releases/latest) v=9.9.9 ;;
+*/repos/actions/runner/releases/tags/v*) v="${last##*/v}" ;;
+*/repos/actions/runner-images/commits/*) printf '%040d' 7; exit 0 ;;
+*) exit 22 ;;
+esac
+a="$(printf '%064d' 0 | tr 0 a)" b="$(printf '%064d' 0 | tr 0 b)"
+[ "$v" != 0.0.1 ] || a="" b=""
+printf '{\n  "tag_name": "v%s",\n  "body": "- <!-- BEGIN SHA linux-x64 -->%s<!-- END SHA linux-x64 -->\\r\\n- <!-- BEGIN SHA linux-arm64 -->%s<!-- END SHA linux-arm64 -->"\n}\n' "$v" "$a" "$b"
 FAKE
+A64="$(printf '%064d' 0 | tr 0 a)"
+B64="$(printf '%064d' 0 | tr 0 b)"
 cat >"$TMP/bin/sleep" <<'FAKE'
 #!/bin/sh
 FAKE
@@ -69,13 +84,27 @@ fresh ok
 build --tag team=ci
 expect "exit 0" "$(cat "$STATE/err")" [ "$(cat "$STATE/rc")" = 0 ]
 expect "JSON result" "$(cat "$STATE/out")" \
-	[ "$(cat "$STATE/out")" = '{"ami":"ami-0new","ssm_param":"/firerunner/ami","runner_version":"9.9.9","arch":"x64"}' ]
+	[ "$(cat "$STATE/out")" = '{"ami":"ami-0new","ssm_param":"/firerunner/ami","runner_version":"9.9.9","runner_sha256":"'"$A64"'","arch":"x64"}' ]
 expect "publishes to the parameter" "$(cat "$STATE/calls")" called "ssm put-parameter --name /firerunner/ami --type String --value ami-0new --overwrite"
 expect "terminates the build instance" "" called "ec2 terminate-instances --instance-ids i-0build"
 expect "tags everything" "" called "Key=team,Value=ci"
 expect "IMDSv2 on the build instance" "" called "HttpTokens=required"
 expect "user-data is valid bash" "" bash -n "$STATE/user-data"
 expect "user-data pins the runner" "" grep -q '^RUNNER_VERSION=9.9.9$' "$STATE/user-data"
+expect "user-data pins the runner's checksum, from the release notes" "" grep -q "^RUNNER_SHA256=$A64\$" "$STATE/user-data"
+expect "the runner's version and checksum are logged" "" grep -q "actions/runner 9.9.9 linux-x64 sha256 $A64" "$STATE/err"
+# shellcheck disable=SC2016 # a literal $RUNNER_SHA256 in the user-data
+expect "user-data checks the runner it downloads" "" \
+	bash -c "grep -q '^fetch_checked \"https://github.com/actions/runner/releases/download/' '$STATE/user-data' && grep -q '^	runner.tgz \"\$RUNNER_SHA256\" ||' '$STATE/user-data'"
+expect "user-data carries the checks" "" grep -q '^fetch_checked() {$' "$STATE/user-data"
+# The build instance cannot run here (images/test-ec2-vm.sh boots one): these
+# check that a failed check stops it.
+# shellcheck disable=SC2016 # literal $RUNNER_SHA256 and $src in the user-data
+expect "a runner that fails its check stops the build" "" grep -qx '	runner.tgz "$RUNNER_SHA256" || {' "$STATE/user-data"
+# shellcheck disable=SC2016 # as above
+expect "a runner-images fetch that fails stops the build" "" grep -qx '	fetch_runner_images "$src" || return 1' "$STATE/user-data"
+expect "user-data pins the default runner-images tag's commit" "" grep -q '^RI_COMMIT=add4380b0d6685806e9192c33c37359ee0aa4023$' "$STATE/user-data"
+expect "the default tag is not resolved" "" bash -c "! grep -q runner-images/commits '$STATE/curl'"
 expect "user-data installs the boot unit" "" grep -q 'FIRERUNNER_JIT_URL' "$STATE/user-data"
 expect "user-data drops cloud-init's netplan" "" grep -q 'rm -f /etc/netplan/50-cloud-init.yaml' "$STATE/user-data"
 expect "user-data resets the hostname" "" grep -q 'truncate -s 0 /etc/hostname' "$STATE/user-data"
@@ -162,6 +191,36 @@ PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --firerunner-vers
 expect "bad firerunner version: refused" "rc=$rc" [ "$rc" != 0 ]
 PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --firerunner-version v0.1.1 >"$STATE/out"
 expect "firerunner version: reaches the build" "" grep -q '^FR_VERSION=v0.1.1$' "$STATE/out"
+
+# 5b. What the build instance checks its downloads against.
+fresh checks
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --arch arm64 >"$STATE/out" 2>"$STATE/err"
+expect "arm64 takes the arm64 checksum" "" grep -q "^RUNNER_SHA256=$B64\$" "$STATE/out"
+expect "minimal fetches no runner-images" "" grep -q "^RI_COMMIT=''\$" "$STATE/out"
+: >"$STATE/curl"
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --runner-sha256 "$B64" >"$STATE/out" 2>"$STATE/err"
+expect "a pinned checksum is used" "" grep -q "^RUNNER_SHA256=$B64\$" "$STATE/out"
+expect "a pinned checksum reads no release notes" "" bash -c "! grep -q actions/runner/releases '$STATE/curl'"
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --runner-images-ref ubuntu24/other >"$STATE/out" 2>"$STATE/err"
+expect "another tag is resolved to its commit" "" grep -q "^RI_COMMIT=$(printf '%040d' 7)\$" "$STATE/out"
+expect "and the build says how to pin it" "" grep -q -- "--runner-images-commit $(printf '%040d' 7)" "$STATE/err"
+: >"$STATE/curl"
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --runner-images-ref ubuntu24/other --runner-images-commit "$(printf '%040d' 3)" >"$STATE/out" 2>"$STATE/err"
+expect "a pinned commit is used" "" grep -q "^RI_COMMIT=$(printf '%040d' 3)\$" "$STATE/out"
+expect "a pinned commit resolves no tag" "" bash -c "! grep -q runner-images/commits '$STATE/curl'"
+for args in "--runner-sha256 $A64" "--runner-version 1.2.3 --runner-sha256 nothex" \
+	"--runner-version 1.2.3 --runner-images-commit main" "--runner-version 0.0.1"; do
+	rc=0
+	# shellcheck disable=SC2086 # split the case's words on purpose
+	PATH="$TMP/bin:$PATH" "$BUILD" --render $args >"$STATE/out" 2>"$STATE/err" || rc=$?
+	expect "refuses $args" "rc=$rc $(cat "$STATE/err")" [ "$rc" = 2 ]
+	expect "renders nothing for $args" "" [ ! -s "$STATE/out" ]
+done
+expect "notes without a checksum: says so" "" grep -q "carry no SHA-256 for linux-x64" "$STATE/err"
+expect "notes without a checksum: stops there" "" grep -q "cannot check the runner download" "$STATE/err"
+rc=0
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-sha256 "$A64" >"$STATE/out" 2>"$STATE/err" || rc=$?
+expect "a checksum without a version: says why" "" grep -q -- "--runner-sha256 needs --runner-version" "$STATE/err"
 
 # 6. standard is the default, and full keeps what it skips.
 fresh toolset
