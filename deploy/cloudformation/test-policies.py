@@ -105,6 +105,11 @@ if policies != ["CacheAssume"]:
     sys.exit(f"FAIL control.yaml: the IAM policy resources are {policies}, want only CacheAssume")
 print("ok   control.yaml: nothing else grants the control role more")
 
+# The first VM boots only once the control role may assume the cache role.
+if "CacheAssume: !If [CacheS3, !Ref CacheAssume, \"\"]" not in resource("ControlGroup").split("Properties:", 1)[0]:
+    sys.exit("FAIL control.yaml: ControlGroup must wait for CacheAssume")
+print("ok   control.yaml: the control VM waits for CacheAssume")
+
 # Instance metadata only where the cache unit's IPv4 deny covers it.
 options = re.search(r"MetadataOptions: \{(.*)\}", resource("LaunchTemplate"))
 if not options or "HttpProtocolIpv6: disabled" not in options.group(1):

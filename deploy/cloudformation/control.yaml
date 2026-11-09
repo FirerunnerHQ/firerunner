@@ -358,12 +358,17 @@ Resources:
               bash firerunner-control-bootstrap.sh "$d"
             - ZoneId: !If [CreateZone, !Ref Zone, !Ref HostedZoneId]
               CacheBucketName: !If [CacheS3, !Ref CacheBucket, ""]
-              # A VM may boot before CacheAssume exists, or IAM shows it; the
-              # daemon retries until it may assume the role.
+              # IAM may show CacheAssume a little after it exists; the daemon
+              # retries until it may assume the role.
               CacheRoleArn: !If [CacheS3, !GetAtt CacheRole.Arn, ""]
 
   ControlGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
+    # After CacheAssume, so a new stack's first VM may assume the cache role
+    # when it boots. DependsOn cannot name a resource that may not exist;
+    # a reference in Metadata orders the two all the same.
+    Metadata:
+      CacheAssume: !If [CacheS3, !Ref CacheAssume, ""]
     Properties:
       AutoScalingGroupName: !Sub "${AWS::StackName}-control"
       MinSize: "1"
