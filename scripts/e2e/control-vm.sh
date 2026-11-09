@@ -192,7 +192,7 @@ not_shared_owner() {
 # --- up ----------------------------------------------------------------------
 
 seed_and_create() {
-	local b base_prefix prefix zone_id jit zone repo base_version sums env key token tiers suffix keys a
+	local b base_prefix prefix zone_id jit zone repo base_version sums env kms key token tiers suffix keys a
 	b="$(stack_json "$base")"
 	[ -n "$b" ] || e2e_die 2 "FR_E2E_STACK=$base: no such stack"
 	not_shared_owner "$b"
@@ -219,10 +219,16 @@ seed_and_create() {
 
 	env="$(ssm_get "$base_prefix/control/env")"
 	[ -n "$env" ] || e2e_die 1 "$base_prefix/control/env is missing"
-	key="$(ssm_get "$base_prefix/control/app-private-key")"
-	token=""
-	[ -n "$key" ] || token="$(ssm_get "$base_prefix/control/token")"
-	[ -n "$key$token" ] || e2e_die 1 "neither $base_prefix/control/app-private-key nor token exists"
+	# The App's credential: a key in KMS (the AppKMSKeyArn parameter, which
+	# the session stack takes over with the others), else a private key or a
+	# token to copy.
+	kms="$(param "$b" AppKMSKeyArn)"
+	key="" token=""
+	if [ -z "$kms" ]; then
+		key="$(ssm_get "$base_prefix/control/app-private-key")"
+		[ -n "$key" ] || token="$(ssm_get "$base_prefix/control/token")"
+		[ -n "$key$token" ] || e2e_die 1 "neither AppKMSKeyArn nor $base_prefix/control/app-private-key or token is set"
+	fi
 	if [ -n "$tiers_file" ]; then
 		[ -f "$tiers_file" ] || e2e_die 2 "--tiers $tiers_file: no such file"
 		tiers="$(cat "$tiers_file")"
@@ -253,7 +259,7 @@ seed_and_create() {
 	ssm_put "$prefix/control/tiers" String "$tiers"
 	if [ -n "$key" ]; then
 		ssm_put "$prefix/control/app-private-key" SecureString "$key"
-	else
+	elif [ -n "$token" ]; then
 		ssm_put "$prefix/control/token" SecureString "$token"
 	fi
 	ssm_put "$prefix/control/sha256sums" String "$sums"

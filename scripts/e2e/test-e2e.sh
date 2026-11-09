@@ -941,6 +941,31 @@ expect "up: pins the shared release and its checksums" "" [ "$(ssm_val $S/contro
 expect "up: needs no download for the shared release" "" not_called "curl "
 expect "up: waits for firerunner to be active" "" [ "$(calls_of get-command-invocation)" = 2 ]
 
+# A shared stack that keeps the App key in KMS has no key or token in SSM:
+# the session signs with the same key, through the AppKMSKeyArn it takes over.
+vm_fresh vm-up-kms
+KMS_ARN=arn:aws:kms:region-1:000000000000:key/0aaaaaaa-0000-0000-0000-000000000000
+answer stack-st 1 "$(base_stack | jq -c --arg k "$KMS_ARN" '.Stacks[0].Parameters += [{ParameterKey: "AppKMSKeyArn", ParameterValue: $k}]')"
+rm "$STATE/ssm/fr/e2e/control/app-private-key"
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack CREATE_COMPLETE)"
+answer asg 1 i-0ctl
+answer invocation 1 "$(inv Success 0 $'active\nfirerunner v1.2.0\n' '')"
+run control-vm.sh up
+expect "up with a KMS key: exit 0" "$(dump)" rc_is 0
+# shellcheck disable=SC2016 # $k is jq's
+expect "up with a KMS key: passes AppKMSKeyArn to the session" "$(cat "$STATE/create-params.json")" \
+	jqe --arg k "$KMS_ARN" 'map({key: .ParameterKey, value: .ParameterValue}) | from_entries | .AppKMSKeyArn == $k' "$STATE/create-params.json"
+expect "up with a KMS key: writes no key or token" "" \
+	test ! -e "$STATE/ssm/fr/e2e/sessions/e2e-test/control/app-private-key" -a ! -e "$STATE/ssm/fr/e2e/sessions/e2e-test/control/token"
+
+vm_fresh vm-up-no-credential
+rm "$STATE/ssm/fr/e2e/control/app-private-key"
+answer stack-st-e2e-test 1 "$NOSTACK"
+run control-vm.sh up
+expect "up with no key, token or KMS key: refuses" "$(dump)" rc_is 1
+expect "up with no key, token or KMS key: says what is missing" "" err_has "neither AppKMSKeyArn"
+
 vm_fresh vm-up-tiers-file
 answer stack-st-e2e-test 1 "$NOSTACK"
 answer stack-st-e2e-test 2 "$(session_stack CREATE_COMPLETE)"

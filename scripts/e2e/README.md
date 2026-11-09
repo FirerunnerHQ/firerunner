@@ -161,7 +161,9 @@ repository:
 - **GitHub, for `gh`:** your own `gh auth login`, with the Actions read and
   write permission on `FR_E2E_REPO`. Dispatching needs write access.
 - **GitHub, for firerunner:** the GitHub App private key that the deployment
-  under test uses. It lives in the shared stack's SSM parameters, and
+  under test uses. When the shared stack keeps it in KMS (`AppKMSKeyArn`),
+  the session stack takes the same key ARN and signs with it; nothing is
+  copied. Otherwise it lives in the shared stack's SSM parameters, and
   `control-vm.sh up` copies it, as a SecureString, without passing it on a
   command line. Never copy it into a repository, an issue or a log.
 
