@@ -140,10 +140,11 @@ view() {
 		author: {login: "alice"}, headRefOid: $h, baseRefName: "main",
 		files: [inputs | select(. != "") | {path: .}]}' >"$STATE/view.json"
 }
-# reviews <json-reviews> <json-threads>
+# reviews <json-reviews> <json-threads> [<json-comments>]
 reviews() {
-	jq -n --argjson r "$1" --argjson t "$2" \
-		'{data: {repository: {pullRequest: {reviewDecision: null, reviews: {nodes: $r}, reviewThreads: {nodes: $t}}}}}' \
+	jq -n --argjson r "$1" --argjson t "$2" --argjson c "${3:-[]}" \
+		'{data: {repository: {pullRequest: {reviewDecision: null, reviews: {nodes: $r},
+			comments: {nodes: $c}, reviewThreads: {nodes: $t}}}}}' \
 		>"$STATE/graphql.json"
 }
 setup() {
@@ -292,6 +293,24 @@ view internal/ec2/provisioner.go
 reviews '[{"author":{"login":"copilot-pull-request-reviewer"},"state":"COMMENTED"}]' '[]'
 run_it 5
 check "gate: an independent review satisfies it" test -z "$(of_type review_required)"
+
+setup gate-agent
+snap 1 "$(c test pass)"
+view internal/cacheserver/cacheserver.go
+reviews '[]' '[]' '[{"author":{"login":"alice"},"body":"Independent review, answered:\n<!-- firerunner:independent-review -->\n1. fixed","url":"c1"}]'
+run_it 5
+check "gate: an agent review comment satisfies it" test "$(summary .review_required)" = false
+check "gate: the review line lists the agent review" \
+	test "$(of_type review | jq -r '.agent_reviews[0] | "\(.author) \(.url)"')" = "alice c1"
+
+setup gate-comment
+snap 1 "$(c test pass)"
+view internal/cacheserver/cacheserver.go
+reviews '[]' '[]' '[{"author":{"login":"alice"},"body":"LGTM, reviewed it myself","url":"c1"}]'
+run_it 5
+check "gate: a comment without the marker does not count" test "$(summary .review_required)" = true
+check "gate: the hint names the marker" \
+	test -n "$(of_type review_required | jq -r '.hint | select(contains("<!-- firerunner:independent-review -->"))')"
 
 setup gate-untouched
 snap 1 "$(c test pass)"

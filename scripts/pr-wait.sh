@@ -21,10 +21,13 @@
 # "type":
 #   check            name, workflow, conclusion, duration_s, url
 #   failed_log       the failed job's log, trimmed to the lines that matter
-#   review           review decision and the reviews (author, state)
+#   review           review decision, the reviews (author, state) and the
+#                    agent reviews: PR comments that carry the line
+#                    <!-- firerunner:independent-review --> (author, url)
 #   thread           one per unresolved review thread: path, line, author, body
-#   review_required  the diff touches cost or security paths and nobody but
-#                    the author has reviewed it (AGENTS.md, review gate)
+#   review_required  the diff touches cost or security paths and there is
+#                    neither a review by someone other than the author nor an
+#                    agent review (AGENTS.md, review gate)
 #   summary          the verdict, the head commit and any required check that
 #                    never reported on it (missing_required), last
 # Exit status: 0 all checks passed and no thread is unresolved, 1 a check
@@ -40,6 +43,11 @@ die() {
 	log "$2"
 	exit "$1"
 }
+
+# A PR comment carrying this line records an independent reviewer agent's
+# findings and the answers to them (AGENTS.md, review gate). Posted from the
+# author's own account, it is the only trace such a review leaves.
+REVIEW_MARKER='<!-- firerunner:independent-review -->'
 
 # Paths whose changes need an independent review before merge (AGENTS.md).
 GATED_PATHS='^internal/(scheduler|ec2|jitserver|listener|cacheserver|jobidentity)/|^internal/provisioner/egress'
@@ -266,6 +274,7 @@ query='query($owner: String!, $name: String!, $number: Int!) {
     pullRequest(number: $number) {
       reviewDecision
       reviews(last: 30) { nodes { author { login } state } }
+      comments(last: 50) { nodes { author { login } body url } }
       reviewThreads(first: 100) {
         nodes {
           isResolved isOutdated path line
@@ -278,13 +287,17 @@ query='query($owner: String!, $name: String!, $number: Int!) {
 unresolved=0 reviewers=0
 if rv="$(gh api graphql -F owner="$owner" -F name="$name" -F number="$number" -f query="$query" 2>"$err")"; then
 	p="$(jq -c '.data.repository.pullRequest' <<<"$rv")"
-	jq -c '{type: "review", decision: .reviewDecision,
-		reviews: [.reviews.nodes[] | {author: (.author.login // null), state}]}' <<<"$p"
+	jq -c --arg m "$REVIEW_MARKER" '{type: "review", decision: .reviewDecision,
+		reviews: [.reviews.nodes[] | {author: (.author.login // null), state}],
+		agent_reviews: [(.comments.nodes // [])[] | select((.body // "") | contains($m))
+			| {author: (.author.login // null), url}]}' <<<"$p"
 	jq -c '.reviewThreads.nodes[] | select(.isResolved | not) | .comments.nodes[0] as $c |
 		{type: "thread", path, line, outdated: .isOutdated, author: ($c.author.login // null),
 		 body: (($c.body // "") | if length > 1000 then .[0:1000] + "…" else . end), url: $c.url}' <<<"$p"
 	unresolved="$(jq '[.reviewThreads.nodes[] | select(.isResolved | not)] | length' <<<"$p")"
-	reviewers="$(jq --arg a "$author" '[.reviews.nodes[] | select((.author.login // "") != $a)] | length' <<<"$p")"
+	reviewers="$(jq --arg a "$author" --arg m "$REVIEW_MARKER" '
+		[.reviews.nodes[] | select((.author.login // "") != $a)] +
+		[(.comments.nodes // [])[] | select((.body // "") | contains($m))] | length' <<<"$p")"
 else
 	log "review state unavailable: $(cat "$err")"
 	jq -cn --arg e "$(cat "$err")" '{type: "review", decision: null, reviews: null, note: $e}'
@@ -295,7 +308,7 @@ review_required=false
 if [ -n "$gated" ] && [ "$reviewers" = 0 ]; then
 	review_required=true
 	jq -cRn '{type: "review_required", paths: [inputs],
-		hint: "cost or security paths changed and no independent review exists: request Copilot, or give a fresh reviewer agent the diff (not your conclusions), and answer its findings before merging"}' <<<"$gated"
+		hint: "cost or security paths changed and no independent review exists: request Copilot, or give a fresh reviewer agent the diff (not your conclusions), answer its findings, and post them with the answers in a PR comment that carries the line <!-- firerunner:independent-review -->"}' <<<"$gated"
 	log "review required: this diff touches cost or security paths and has no independent review"
 fi
 
