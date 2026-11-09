@@ -177,6 +177,9 @@ func cacheServe(args []string) error {
 	if !filepath.IsAbs(*jobsDir) {
 		return fmt.Errorf("--jobs-dir must be an absolute path")
 	}
+	if *o.bodyIdle < 0 {
+		return fmt.Errorf("--body-idle-timeout must be >= 0 (0 = no bound)")
+	}
 	maxBytes, err := parseSize(*maxSize)
 	if err != nil {
 		return fmt.Errorf("--max-size: %w", err)
@@ -228,6 +231,7 @@ func cacheServe(args []string) error {
 		return err
 	}
 	srv.SetIdentityWait(*identityWait)
+	srv.SetBodyIdle(*o.bodyIdle)
 	if err := srv.SetArtifactUpstream(*artifactUpstream); err != nil {
 		return fmt.Errorf("--artifact-upstream: %w", err)
 	}
@@ -245,8 +249,8 @@ func cacheServe(args []string) error {
 		// keep a slow or stalled client from pinning a connection (and its
 		// goroutine/fd) indefinitely. Body reads are streamed to disk with no
 		// overall deadline because a large cache archive can legitimately take a
-		// while, so slow-body abuse is bounded by the per-entry upload cap
-		// instead; header and idle phases get hard limits here.
+		// while; instead a body that stalls is cut after --body-idle-timeout
+		// (srv.SetBodyIdle), and header and idle phases get hard limits here.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -293,7 +297,7 @@ type cacheFlags struct {
 	addr, dir, maxSize, maxEntry, jobsDir, artifactUpstream *string
 	s3Bucket, s3Prefix, s3Region, s3LocalCache, s3CredsFile *string
 	jobsOwner, maxEntries, maxRepoEntries                   *int
-	identityWait                                            *time.Duration
+	identityWait, bodyIdle                                  *time.Duration
 }
 
 // newCacheFlagSet registers the cache-server flags.
@@ -309,6 +313,7 @@ func newCacheFlagSet() (*flag.FlagSet, cacheFlags) {
 		jobsDir:          fs.String("jobs-dir", jobidentity.DefaultDir, "private identity directory written by the local daemon"),
 		jobsOwner:        fs.Int("jobs-owner-uid", os.Getuid(), "UID of the daemon that owns job records (default current UID)"),
 		identityWait:     fs.Duration("identity-wait", cacheserver.DefaultIdentityWait, "how long a request from a VM whose job identity is still pending waits for it before being denied (0 denies at once)"),
+		bodyIdle:         fs.Duration("body-idle-timeout", cacheserver.DefaultBodyIdle, "end a request whose body sends nothing for this long; an upload that keeps sending is never cut (0 for no bound)"),
 		artifactUpstream: fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs"),
 		s3Bucket:         fs.String("s3-bucket", "", "keep completed blobs and the index in this S3 bucket instead of --dir, which then only stages uploads; credentials come from the default AWS chain, or --s3-credentials-file"),
 		s3CredsFile:      fs.String("s3-credentials-file", "", "with --s3-bucket, sign with the credentials in this file (credential_process JSON, kept fresh by the daemon's --cache-role-arn) instead of the default AWS chain, waiting for it at start; pass --s3-region too, as instance metadata may be unreachable"),
@@ -382,6 +387,8 @@ cache-server flags:
   --max-entry-size string  refuse any single entry larger than this (default "10GB"; 0 = unlimited)
   --max-entries int  keep at most this many entries, evicting LRU ones first (default 20000; 0 = unlimited)
   --max-repo-entries int  the same for one repository, evicting its own first (default 2000; 0 = unlimited)
+  --body-idle-timeout duration  end a request whose body sends nothing this long
+                     (default 60s; 0 = no bound)
   --jobs-owner-uid int  daemon UID that owns the records (default current UID)
   --jobs-dir string  daemon's private job identity directory (default "/run/firerunner/jobs")
   --artifact-upstream string  forward ArtifactService RPCs (upload/download-

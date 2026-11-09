@@ -157,6 +157,7 @@ type Server struct {
 	// index lock, which cache hit/finalize paths hold across index writes.
 	artifactProxy   atomic.Pointer[httputil.ReverseProxy]
 	artifactTimeout time.Duration
+	bodyIdle        atomic.Int64 // a time.Duration; see SetBodyIdle
 	artifactRPCs    atomic.Uint64
 	artifactErrors  atomic.Uint64
 }
@@ -259,6 +260,7 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 		identityDenied:  make(map[string]uint64),
 		identityWait:    DefaultIdentityWait,
 	}
+	s.bodyIdle.Store(int64(DefaultBodyIdle))
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -291,7 +293,49 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Value(connectionGenerationKey{}) == nil {
 		r = r.WithContext(s.bindGeneration(r.Context(), r.RemoteAddr))
 	}
+	// The artifact proxy sets its own deadline for a whole RPC.
+	if idle := s.bodyIdle.Load(); idle > 0 && r.Body != nil && r.Body != http.NoBody && !strings.HasPrefix(r.URL.Path, artifactTwirpBase) {
+		r.Body = &idleBody{ReadCloser: r.Body, rc: http.NewResponseController(w), idle: time.Duration(idle)}
+	}
 	s.mux.ServeHTTP(w, r)
+}
+
+// DefaultBodyIdle is SetBodyIdle's default for the cache-server command.
+const DefaultBodyIdle = 60 * time.Second
+
+// SetBodyIdle bounds how long a request body may send nothing. A guest can
+// otherwise trickle a body for as long as it likes, holding a connection, a
+// goroutine and, for an upload, a reservation, since a large archive leaves
+// no overall deadline that would be safe. Each read pushes the connection's
+// read deadline idle into the future, so an upload that keeps sending is
+// never cut, however long it takes. 0 turns the bound off. Call before
+// serving.
+func (s *Server) SetBodyIdle(idle time.Duration) { s.bodyIdle.Store(int64(max(idle, 0))) }
+
+// idleBody extends the connection's read deadline before each read of the
+// request body (see SetBodyIdle). The deadline errors are the reader's: a
+// stalled body fails its upload like a dropped connection.
+type idleBody struct {
+	io.ReadCloser
+	rc   *http.ResponseController
+	idle time.Duration
+	done bool // the body has returned an error, such as io.EOF
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	if b.done {
+		// At EOF net/http clears the deadline and starts reading the
+		// connection in the background to notice a client that leaves.
+		// A deadline set again here would expire in that read and cancel
+		// the request while the handler still works (TestBodyIdleEndsAtEOF).
+		return b.ReadCloser.Read(p)
+	}
+	// A connection that cannot take a deadline keeps the server's own
+	// timeouts, as it did before.
+	_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
+	n, err := b.ReadCloser.Read(p)
+	b.done = err != nil
+	return n, err
 }
 
 // StartJanitor runs a background loop that reclaims abandoned (reserved but
@@ -684,6 +728,10 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			azureError(w, http.StatusRequestEntityTooLarge, azTooLarge, "block list too large")
+			return
+		}
+		if clientGone(err) {
+			azureError(w, http.StatusBadRequest, "IncompleteBody", "the request body ended early")
 			return
 		}
 		s.blobInternalError(w, e, err)
@@ -1421,10 +1469,12 @@ func (s *Server) uploadError(w http.ResponseWriter, e *Entry, err error) {
 }
 
 // clientGone reports whether err means the client went away while sending:
-// its connection closed or reset, or the request was cancelled.
+// its connection closed or reset, the request was cancelled, or its body
+// stopped sending for longer than SetBodyIdle allows.
 func clientGone(err error) bool {
 	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.Canceled) ||
-		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed)
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrDeadlineExceeded)
 }
 
 // staged-byte accounting bounds the disk a not-yet-finalized entry occupies:
