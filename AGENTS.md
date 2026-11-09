@@ -64,7 +64,9 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
   judges only the PR's current head and waits for every check the base
   branch's ruleset requires, so it is safe to run right after a push; pass
   `--sha "$(git rev-parse HEAD)"` to be sure it waits for the commit you
-  pushed.
+  pushed. A required check that can no longer report, because every
+  workflow run on the head has finished without it, ends the wait with the
+  verdict `missing_required`; a GitHub Actions incident is the usual cause.
 - Merge with a merge commit: `gh pr merge --auto --merge`. The repository
   deletes head branches on merge (`delete_branch_on_merge`), so
   `--delete-branch` is unnecessary. `--auto` waits for the six checks the

@@ -17,7 +17,11 @@
 # sign-off from a separate workflow) is waited for, not missed. It polls until
 # every check on the head has finished and every required check has run, or
 # stops early as soon as a required check fails (any check, when none is
-# required). Then it prints JSON lines on stdout, one object each, keyed by
+# required). It also stops when a required check is still missing although
+# every workflow run on the head has finished, and has for FR_PR_WAIT_STALL
+# seconds: a run that failed without starting the job, from a workflow file
+# problem or a GitHub Actions incident, never reports it, and waiting longer
+# changes nothing. Then it prints JSON lines on stdout, one object each, keyed by
 # "type":
 #   check            name, workflow, conclusion, duration_s, url
 #   failed_log       the failed job's log, trimmed to the lines that matter
@@ -31,9 +35,11 @@
 #   summary          the verdict, the head commit and any required check that
 #                    never reported on it (missing_required), last
 # Exit status: 0 all checks passed and no thread is unresolved, 1 a check
-# failed or a thread is unresolved, 2 usage or PR not found, 124 the deadline
+# failed, a thread is unresolved or a required check will never report
+# (verdict missing_required), 2 usage or PR not found, 124 the deadline
 # passed. Progress goes to stderr. Needs gh (authenticated) and jq.
-# Tuning: FR_PR_WAIT_POLL (10 s between polls), FR_PR_WAIT_LOG_LINES (60).
+# Tuning: FR_PR_WAIT_POLL (10 s between polls), FR_PR_WAIT_LOG_LINES (60),
+# FR_PR_WAIT_STALL (180 s; a late workflow can still start within it).
 set -euo pipefail
 
 # usage: the header above, without the comment markers.
@@ -147,6 +153,7 @@ to_checks='[.[] | {name, workflow: null,
 	link: (.details_url // .html_url // ""),
 	startedAt: (.started_at // ""), completedAt: (.completed_at // "")}]'
 
+stall="${FR_PR_WAIT_STALL:-180}" stalled_since=""
 first=1
 while :; do
 	# Read the head again on every poll but the first: a push while waiting
@@ -155,7 +162,7 @@ while :; do
 		if h="$(ghr pr view "$number" --json headRefOid --jq .headRefOid 2>"$err")" && [ -n "$h" ]; then
 			if [ "$h" != "$head" ]; then
 				log "head moved to $h"
-				head="$h" checks='[]' seen=""
+				head="$h" checks='[]' seen="" stalled_since=""
 			fi
 		else
 			log "gh pr view: $(cat "$err")"
@@ -196,6 +203,23 @@ while :; do
 		if [ -n "$failed" ]; then verdict=check_failed; else verdict=success; fi
 		break
 	fi
+	# Required checks missing, nothing pending: if every workflow run on the
+	# head has finished, nothing is left to report them.
+	stalled=""
+	if [ -n "$missing" ] && [ "$pending" = 0 ] && { [ -z "$want" ] || [ "${head#"$want"}" != "$head" ]; } &&
+		runs="$(gh api "$api/actions/runs?head_sha=$head&per_page=100" \
+			--jq '[.workflow_runs[] | {name, status, conclusion}]' 2>"$err")" &&
+		[ "$(jq 'length > 0 and all(.status == "completed")' <<<"$runs")" = true ]; then
+		stalled=1
+		[ -n "$stalled_since" ] || stalled_since="$(now)"
+		if [ $(($(now) - stalled_since)) -ge "$stall" ]; then
+			log "every workflow run on $head has finished ($(jq -r 'map("\(.name): \(.conclusion)") | join(", ")' <<<"$runs")), yet required check(s) never reported: $(tr '\n' ' ' <<<"$missing")"
+			log "a run that failed without its jobs points to a workflow file problem or a GitHub Actions incident (https://www.githubstatus.com); push again, or close and reopen the PR, once it is resolved"
+			verdict=missing_required
+			break
+		fi
+	fi
+	[ -n "$stalled" ] || stalled_since=""
 	if [ "$(now)" -ge "$give_up" ]; then
 		if [ -n "$want" ] && [ "${head#"$want"}" = "$head" ]; then
 			log "PR #$number never reached head $want within ${deadline}s"
