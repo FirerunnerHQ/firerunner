@@ -34,8 +34,8 @@ func TestTwirpBodiesAreBounded(t *testing.T) {
 			t.Fatalf("POST %s: %v", tc.method, err)
 		}
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusRequestEntityTooLarge {
-			t.Errorf("%s with a %d-byte body -> %d, want 413", tc.method, len(body), resp.StatusCode)
+		if resp.StatusCode != http.StatusBadRequest { // Twirp: invalid_argument is 400
+			t.Errorf("%s with a %d-byte body -> %d, want 400", tc.method, len(body), resp.StatusCode)
 		}
 	}
 }

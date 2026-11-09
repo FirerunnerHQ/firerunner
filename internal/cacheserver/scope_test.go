@@ -436,6 +436,7 @@ func TestFinalizeWaitsForUploadAndThenIsImmutable(t *testing.T) {
 	finResp := httptest.NewRecorder()
 	fin := httptest.NewRequest("POST", guest+twirpBase+"FinalizeCacheEntryUpload", strings.NewReader(`{"key":"stream","version":"v","size_bytes":"8"}`))
 	fin.RemoteAddr = upload.RemoteAddr
+	fin.Header.Set("Content-Type", "application/json")
 	go func() { l.s.ServeHTTP(finResp, fin); close(finalized) }()
 	select {
 	case <-finalized:
@@ -466,6 +467,7 @@ func TestGuestHeadersCannotSelectIdentity(t *testing.T) {
 	l.save(t, main, "secret", "MAIN")
 	req := httptest.NewRequest("POST", main+twirpBase+"CreateCacheEntry", strings.NewReader(`{"key":"forged","version":"v","metadata":{"repository_id":"owner/repo","ref":"refs/heads/main"}}`))
 	req.RemoteAddr = "172.16.99.2:1234"
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Forwarded-For", "172.16.0.2")
 	req.Header.Set("Authorization", "Bearer forged-claims")
 	w := httptest.NewRecorder()
@@ -532,6 +534,7 @@ func TestSlowBodyCannotAcquireReusedSlotIdentity(t *testing.T) {
 	reader, writer := io.Pipe()
 	req := httptest.NewRequest("POST", guest+twirpBase+"CreateCacheEntry", reader)
 	req.RemoteAddr = "172.16.0.2:1234"
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() { l.s.ServeHTTP(w, req); close(done) }()

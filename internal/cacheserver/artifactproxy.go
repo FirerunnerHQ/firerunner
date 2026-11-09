@@ -136,20 +136,20 @@ func (s *Server) handleArtifactProxy(w http.ResponseWriter, r *http.Request) {
 	if !artifactMethods[method] {
 		s.artifactErrors.Add(1)
 		s.log.Warn("artifact rpc refused: unknown method", "method", method)
-		twirpError(w, http.StatusNotFound, "bad_route", "unknown ArtifactService method")
+		twirpError(w, "bad_route", "unknown ArtifactService method")
 		return
 	}
 	p := s.artifactProxy.Load()
 	if p == nil {
 		s.artifactErrors.Add(1)
 		s.log.Warn("artifact rpc refused: no upstream configured", "method", method)
-		twirpError(w, http.StatusNotImplemented, "unimplemented",
+		twirpError(w, "unimplemented",
 			"artifact service forwarding is disabled on this cache-server; configure --artifact-upstream")
 		return
 	}
 	if r.ContentLength > maxArtifactRPCBody {
 		s.artifactErrors.Add(1)
-		twirpError(w, http.StatusRequestEntityTooLarge, "invalid_argument", "artifact rpc body too large")
+		twirpError(w, "invalid_argument", "artifact rpc body too large")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.artifactTimeout)
@@ -204,7 +204,7 @@ func (s *Server) artifactProxyError(w http.ResponseWriter, r *http.Request, err 
 	var mbe *http.MaxBytesError
 	switch {
 	case errors.As(err, &mbe):
-		code, twirpCode, msg = http.StatusRequestEntityTooLarge, "invalid_argument", "artifact rpc body too large"
+		code, twirpCode, msg = http.StatusBadRequest, "invalid_argument", "artifact rpc body too large"
 	case errors.Is(r.Context().Err(), context.DeadlineExceeded), rec != nil && rec.bodyTimedOut.Load():
 		// Only the RPC's own deadlines count as a timeout: the request context
 		// expiring, or the client-socket read deadline tripping on a stalled
@@ -214,7 +214,7 @@ func (s *Server) artifactProxyError(w http.ResponseWriter, r *http.Request, err 
 		code, twirpCode, msg = http.StatusGatewayTimeout, "deadline_exceeded", "artifact rpc timed out"
 	}
 	s.log.Warn("artifact rpc failed", "method", r.PathValue("method"), "err", err)
-	twirpError(w, code, twirpCode, msg)
+	twirpErrorAt(w, code, twirpCode, msg)
 }
 
 // statusRecorder captures the status the proxy wrote, and whether the reply

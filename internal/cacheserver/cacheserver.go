@@ -51,6 +51,7 @@
 package cacheserver
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -60,6 +61,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"os"
@@ -69,6 +72,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -263,6 +267,14 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 	s.mux.HandleFunc("POST "+twirpBase+"CreateCacheEntry", s.handleCreate)
 	s.mux.HandleFunc("POST "+twirpBase+"FinalizeCacheEntryUpload", s.handleFinalize)
 	s.mux.HandleFunc("POST "+twirpBase+"GetCacheEntryDownloadURL", s.handleGetDownloadURL)
+	// Any other method, or any of these by GET, is a Twirp bad_route.
+	s.mux.HandleFunc(twirpBase+"{method}", twirpBadRoute)
+	// So is anything else under /twirp/: another service, or the
+	// ArtifactService by a method other than POST.
+	s.mux.HandleFunc("/twirp/", twirpBadRoute)
+	// A blob by a method its endpoint does not serve, as Azure answers it.
+	s.mux.HandleFunc("/upload/{id}", unsupportedVerb)
+	s.mux.HandleFunc("/download/{id}", unsupportedVerb)
 	s.mux.HandleFunc("POST "+artifactTwirpBase+"{method}", s.handleArtifactProxy)
 	s.mux.HandleFunc("PUT /upload/{id}", s.handleUpload)
 	s.mux.HandleFunc("GET /download/{id}", s.handleDownload)
@@ -355,11 +367,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Key == "" || req.Version == "" {
-		twirpError(w, http.StatusBadRequest, "invalid_argument", "key and version are required")
+		twirpError(w, "invalid_argument", "key and version are required")
 		return
 	}
 	if msg := checkKeys(req.Key, nil, req.Version); msg != "" {
-		twirpError(w, http.StatusBadRequest, "invalid_argument", msg)
+		twirpError(w, "invalid_argument", msg)
 		return
 	}
 	identity := s.identity(r)
@@ -428,7 +440,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if err := s.save(); err != nil {
 		delete(s.entries, e.ID)
 		s.mu.Unlock()
-		twirpError(w, http.StatusInternalServerError, "internal", err.Error())
+		s.log.Error("cache index save failed", "err", err)
+		twirpError(w, "internal", "cache index unavailable")
 		return
 	}
 	s.mu.Unlock()
@@ -492,7 +505,8 @@ func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
 	s.saves++
 	s.evictLRU(e.ID)
 	if err := s.save(); err != nil {
-		twirpError(w, http.StatusInternalServerError, "internal", err.Error())
+		s.log.Error("cache index save failed", "err", err)
+		twirpError(w, "internal", "cache index unavailable")
 		return
 	}
 	s.log.Info("cache entry finalized", "id", e.ID, "key", e.Key, "size", e.Size)
@@ -509,7 +523,7 @@ func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	}
 	// Each restore key costs two scans of every entry under the lock.
 	if msg := checkKeys(req.Key, req.RestoreKeys, req.Version); msg != "" {
-		twirpError(w, http.StatusBadRequest, "invalid_argument", msg)
+		twirpError(w, "invalid_argument", msg)
 		return
 	}
 	identity := s.identity(r)
@@ -562,7 +576,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	e.ioMu.Lock()
 	defer e.ioMu.Unlock()
 	if !owns(s.identity(r), e) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		azureError(w, http.StatusForbidden, azNotPermitted, "this job may not access this blob")
 		return
 	}
 	// Entries are immutable once finalized: the blob token is handed out for both
@@ -573,7 +587,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	complete := e.Complete
 	s.mu.Unlock()
 	if complete {
-		http.Error(w, "cache entry already finalized", http.StatusConflict)
+		azureError(w, http.StatusConflict, azImmutable, "cache entry already finalized")
 		return
 	}
 	switch r.URL.Query().Get("comp") {
@@ -584,7 +598,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	case "":
 		s.uploadSingle(w, r, e)
 	default:
-		http.Error(w, "unsupported comp", http.StatusBadRequest)
+		azureError(w, http.StatusBadRequest, azBadQuery, "comp must be block or blocklist")
 	}
 }
 
@@ -606,12 +620,11 @@ func (s *Server) uploadSingle(w http.ResponseWriter, r *http.Request, e *Entry) 
 	if err != nil {
 		_ = os.Remove(s.blobPath(e.ID)) // don't leave an oversized/partial blob squatting disk
 		s.clearStaged(e.ID)
-		code, msg := uploadStatus(err)
-		http.Error(w, msg, code)
+		s.uploadError(w, e, err)
 		return
 	}
-	if code, err := s.finishUpload(r, e, n); err != nil {
-		http.Error(w, err.Error(), code)
+	if err := s.finishUpload(r, e, n); err != nil {
+		s.uploadError(w, e, err)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
@@ -620,16 +633,16 @@ func (s *Server) uploadSingle(w http.ResponseWriter, r *http.Request, e *Entry) 
 func (s *Server) uploadBlock(w http.ResponseWriter, r *http.Request, e *Entry) {
 	blockID := r.URL.Query().Get("blockid")
 	if blockID == "" {
-		http.Error(w, "missing blockid", http.StatusBadRequest)
+		azureError(w, http.StatusBadRequest, azMissingQuery, "blockid is required")
 		return
 	}
 	if len(blockID) > maxBlockIDLen {
-		http.Error(w, "blockid too long", http.StatusBadRequest)
+		azureError(w, http.StatusBadRequest, azBadQuery, "blockid too long")
 		return
 	}
 	dir := s.tmpDir(e.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.blobInternalError(w, e, err)
 		return
 	}
 	body := r.Body
@@ -648,14 +661,13 @@ func (s *Server) uploadBlock(w http.ResponseWriter, r *http.Request, e *Entry) {
 	br.settle(err != nil)
 	if err != nil {
 		_ = os.Remove(blockPath)
-		code, msg := uploadStatus(err)
-		http.Error(w, msg, code)
+		s.uploadError(w, e, err)
 		return
 	}
 	if !s.reserved(e) {
 		// Reclaimed while the block streamed in (see finishUpload).
 		_ = os.RemoveAll(dir)
-		http.Error(w, "cache reservation expired", http.StatusNotFound)
+		azureError(w, http.StatusNotFound, azBlobNotFound, "cache reservation expired")
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
@@ -671,27 +683,27 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
-			http.Error(w, "block list too large", http.StatusRequestEntityTooLarge)
+			azureError(w, http.StatusRequestEntityTooLarge, azTooLarge, "block list too large")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.blobInternalError(w, e, err)
 		return
 	}
 	if err := xml.Unmarshal(body, &list); err != nil {
-		http.Error(w, "bad block list: "+err.Error(), http.StatusBadRequest)
+		azureError(w, http.StatusBadRequest, azBadXML, "block list is not valid XML")
 		return
 	}
 	ids := list.Latest
 	ids = append(ids, list.Uncommitted...)
 	ids = append(ids, list.Committed...)
 	if len(ids) == 0 {
-		http.Error(w, "empty block list", http.StatusBadRequest)
+		azureError(w, http.StatusBadRequest, azBadBlockList, "empty block list")
 		return
 	}
 	if len(ids) > maxBlocks {
 		// Each id costs an open and a copy, so a list of one id repeated
 		// would otherwise multiply work without adding bytes.
-		http.Error(w, "too many blocks", http.StatusBadRequest)
+		azureError(w, http.StatusBadRequest, "BlockListTooLong", "a block list names at most 50,000 blocks")
 		return
 	}
 
@@ -703,7 +715,7 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 	tmp := s.blobPath(e.ID) + ".tmp"
 	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.blobInternalError(w, e, err)
 		return
 	}
 	cap := s.entryCap()
@@ -718,7 +730,7 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 			out.Close()
 			_ = os.Remove(tmp)
 			br.settle(true)
-			http.Error(w, "missing staged block: "+err.Error(), http.StatusBadRequest)
+			azureError(w, http.StatusBadRequest, azBadBlockList, "the block list names a block that was not uploaded")
 			return
 		}
 		br.r = f
@@ -729,8 +741,7 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 			out.Close()
 			_ = os.Remove(tmp)
 			br.settle(true)
-			code, msg := uploadStatus(err)
-			http.Error(w, msg, code)
+			s.uploadError(w, e, err)
 			return
 		}
 		if cap > 0 && total > cap {
@@ -738,25 +749,25 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 			_ = os.Remove(tmp)
 			_ = os.RemoveAll(dir)
 			s.clearStaged(e.ID)
-			http.Error(w, "cache entry exceeds max entry size", http.StatusRequestEntityTooLarge)
+			azureError(w, http.StatusRequestEntityTooLarge, azTooLarge, "cache entry exceeds max entry size")
 			return
 		}
 	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(tmp)
 		br.settle(true)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.blobInternalError(w, e, err)
 		return
 	}
 	if err := os.Rename(tmp, s.blobPath(e.ID)); err != nil {
 		_ = os.Remove(tmp)
 		br.settle(true)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.blobInternalError(w, e, err)
 		return
 	}
 	_ = os.RemoveAll(dir)
-	if code, err := s.finishUpload(r, e, total); err != nil {
-		http.Error(w, err.Error(), code)
+	if err := s.finishUpload(r, e, total); err != nil {
+		s.uploadError(w, e, err)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
@@ -773,7 +784,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	f, err := s.openLocal(e.ID)
 	if err != nil {
 		if s.store == nil {
-			http.Error(w, "not found", http.StatusNotFound)
+			azureError(w, http.StatusNotFound, azBlobNotFound, "the specified blob does not exist")
 			return
 		}
 		if r.Method == http.MethodHead || r.Header.Get("Range") == "" {
@@ -786,7 +797,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.blobInternalError(w, e, err)
 		return
 	}
 	// A restore issues one getProperties (HEAD) then many ranged GETs; log the
@@ -794,6 +805,15 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// the per-range chatter out of the default log.
 	if r.Method == http.MethodHead || r.Header.Get("Range") == "" {
 		s.log.Info("cache entry served", "id", e.ID, "key", e.Key, "size", e.Size, "method", r.Method)
+	}
+	// Refuse an unsatisfiable range Azure-shaped, as the store path does,
+	// before ServeContent would answer it in plain text.
+	if rh := r.Header.Get("Range"); rh != "" {
+		if _, _, _, ok := parseRange(rh, fi.Size()); !ok {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", fi.Size()))
+			azureError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "the range specified is invalid for the current size of the resource")
+			return
+		}
 	}
 	http.ServeContent(w, r, strconv.FormatUint(e.ID, 10), fi.ModTime(), f)
 }
@@ -840,18 +860,18 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authEntry(w http.ResponseWriter, r *http.Request) (*Entry, bool) {
 	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
 	if err != nil {
-		http.Error(w, "bad id", http.StatusBadRequest)
+		azureError(w, http.StatusBadRequest, azBadResourceName, "blob id is not a number")
 		return nil, false
 	}
 	s.mu.Lock()
 	e := s.entries[id]
 	s.mu.Unlock()
 	if e == nil {
-		http.Error(w, "not found", http.StatusNotFound)
+		azureError(w, http.StatusNotFound, azBlobNotFound, "the specified blob does not exist")
 		return nil, false
 	}
 	if subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("sig")), []byte(e.Sig)) != 1 {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		azureError(w, http.StatusForbidden, azAuthFailed, "the blob signature is missing or wrong")
 		return nil, false
 	}
 	identity := s.identity(r)
@@ -860,11 +880,11 @@ func (s *Server) authEntry(w http.ResponseWriter, r *http.Request) (*Entry, bool
 	s.mu.Unlock()
 	if r.Method == http.MethodPut {
 		if !owns(identity, e) {
-			http.Error(w, "forbidden", http.StatusForbidden)
+			azureError(w, http.StatusForbidden, azNotPermitted, "this job may not access this blob")
 			return nil, false
 		}
 	} else if !complete || e.RepoID != identity.Repository || !identity.CanRead(e.Ref) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		azureError(w, http.StatusForbidden, azNotPermitted, "this job may not access this blob")
 		return nil, false
 	}
 	return e, true
@@ -1374,20 +1394,37 @@ func writeFile(path string, r io.Reader) (int64, error) {
 	return n, f.Close()
 }
 
-// uploadStatus maps an upload write error to an HTTP status: an over-cap body
+// uploadError answers a failed upload as Azure Storage would: an over-cap body
 // (http.MaxBytesError) is a 413, a full cache a 507, a reclaimed reservation a
-// 404, anything else a 500.
-func uploadStatus(err error) (int, string) {
+// 404, a store outage a 507 (which the Azure SDK does not retry), anything
+// else a 500 that names no host detail.
+func (s *Server) uploadError(w http.ResponseWriter, e *Entry, err error) {
 	var mbe *http.MaxBytesError
 	switch {
+	case clientGone(err):
+		// The client hung up mid-upload; nobody reads this answer.
+		s.log.Warn("cache upload ended by the client", "id", e.ID, "key", e.Key, "err", err)
+		azureError(w, http.StatusBadRequest, "IncompleteBody", "the request body ended early")
 	case errors.As(err, &mbe):
-		return http.StatusRequestEntityTooLarge, "cache entry exceeds max entry size"
+		azureError(w, http.StatusRequestEntityTooLarge, azTooLarge, "cache entry exceeds max entry size")
 	case errors.Is(err, errCacheFull):
-		return http.StatusInsufficientStorage, err.Error()
+		azureError(w, http.StatusInsufficientStorage, azCacheFull, err.Error())
 	case errors.Is(err, errReservationGone):
-		return http.StatusNotFound, err.Error()
+		azureError(w, http.StatusNotFound, azBlobNotFound, err.Error())
+	case errors.Is(err, errStoreUnavailable):
+		// 507, not a retryable status: see errStoreUnavailable.
+		azureError(w, http.StatusInsufficientStorage, azStoreDown, err.Error())
+	default:
+		s.log.Error("cache upload failed", "id", e.ID, "key", e.Key, "err", err)
+		azureError(w, http.StatusInternalServerError, azInternal, "cache upload failed")
 	}
-	return http.StatusInternalServerError, err.Error()
+}
+
+// clientGone reports whether err means the client went away while sending:
+// its connection closed or reset, or the request was cancelled.
+func clientGone(err error) bool {
+	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed)
 }
 
 // staged-byte accounting bounds the disk a not-yet-finalized entry occupies:
@@ -1427,11 +1464,102 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// twirpError writes a Twirp-shaped error envelope ({code,msg}) with an HTTP
-// status. The toolkit only surfaces these for genuinely bad requests; cache
-// misses and reservation conflicts are ok:false 200s handled inline.
-func twirpError(w http.ResponseWriter, code int, twirpCode, msg string) {
-	writeJSON(w, code, map[string]string{"code": twirpCode, "msg": msg})
+// twirpStatus is the HTTP status the Twirp specification gives each error
+// code (https://twitchtv.github.io/twirp/docs/spec_v7.html#error-codes).
+var twirpStatus = map[string]int{
+	"canceled":            http.StatusRequestTimeout,
+	"unknown":             http.StatusInternalServerError,
+	"invalid_argument":    http.StatusBadRequest,
+	"malformed":           http.StatusBadRequest,
+	"deadline_exceeded":   http.StatusRequestTimeout,
+	"not_found":           http.StatusNotFound,
+	"bad_route":           http.StatusNotFound,
+	"already_exists":      http.StatusConflict,
+	"permission_denied":   http.StatusForbidden,
+	"unauthenticated":     http.StatusUnauthorized,
+	"resource_exhausted":  http.StatusTooManyRequests,
+	"failed_precondition": http.StatusPreconditionFailed,
+	"aborted":             http.StatusConflict,
+	"out_of_range":        http.StatusBadRequest,
+	"unimplemented":       http.StatusNotImplemented,
+	"internal":            http.StatusInternalServerError,
+	"unavailable":         http.StatusServiceUnavailable,
+	"dataloss":            http.StatusInternalServerError,
+}
+
+// twirpError writes a Twirp error, at the HTTP status the specification gives
+// its code. Misses and reservation conflicts are not errors to the toolkit:
+// they are ok:false 200s, written inline.
+func twirpError(w http.ResponseWriter, code, msg string) {
+	status, ok := twirpStatus[code]
+	if !ok {
+		code, status = "internal", http.StatusInternalServerError
+	}
+	twirpErrorAt(w, status, code, msg)
+}
+
+// twirpErrorAt writes a Twirp error at a status of the caller's choosing. Only
+// the artifact proxy uses it: as a gateway it answers its upstream's failures
+// with 502 and 504, which the artifact client retries, and a Twirp client reads
+// the code from the body whatever the status.
+func twirpErrorAt(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"code": code, "msg": msg})
+}
+
+// azureError writes a Blob service error as Azure Storage does
+// (https://learn.microsoft.com/rest/api/storageservices/status-and-error-codes2):
+// the code in the x-ms-error-code header, which the Azure SDK in the toolkit
+// reads first, and an XML Error body with the code and a message. Codes are
+// Azure's own where one fits.
+func azureError(w http.ResponseWriter, status int, code, msg string) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set("x-ms-error-code", code)
+	w.WriteHeader(status)
+	var body strings.Builder
+	body.WriteString(`<?xml version="1.0" encoding="utf-8"?><Error><Code>`)
+	_ = xml.EscapeText(&body, []byte(code))
+	body.WriteString("</Code><Message>")
+	_ = xml.EscapeText(&body, []byte(msg))
+	body.WriteString("</Message></Error>")
+	_, _ = io.WriteString(w, body.String())
+}
+
+// unsupportedVerb answers a blob request by a method its endpoint does not
+// serve (uploads are PUT, downloads GET or HEAD), as Azure Storage does.
+func unsupportedVerb(w http.ResponseWriter, r *http.Request) {
+	azureError(w, http.StatusMethodNotAllowed, "UnsupportedHttpVerb", "the resource does not support "+r.Method)
+}
+
+// blobInternalError logs a blob endpoint's own failure and answers with an
+// Azure InternalError that names no path or host detail.
+func (s *Server) blobInternalError(w http.ResponseWriter, e *Entry, err error) {
+	s.log.Error("cache blob request failed", "id", e.ID, "key", e.Key, "err", err)
+	azureError(w, http.StatusInternalServerError, azInternal, "the server encountered an internal error")
+}
+
+// Azure Storage error codes the blob endpoints answer with, and two of
+// firerunner's own, for a full cache and a store outage, which Azure has no
+// codes for. Both are 507, which the Azure SDK does not retry.
+const (
+	azAuthFailed      = "AuthenticationFailed"            // 403: bad or missing sig
+	azNotPermitted    = "AuthorizationPermissionMismatch" // 403: another job's reservation
+	azBlobNotFound    = "BlobNotFound"                    // 404
+	azImmutable       = "BlobImmutableDueToPolicy"        // 409: a finalized entry
+	azBadQuery        = "InvalidQueryParameterValue"      // 400
+	azMissingQuery    = "MissingRequiredQueryParameter"   // 400
+	azBadBlockList    = "InvalidBlockList"                // 400
+	azBadXML          = "InvalidXmlDocument"              // 400
+	azTooLarge        = "RequestBodyTooLarge"             // 413
+	azInternal        = "InternalError"                   // 500
+	azCacheFull       = "CacheFull"                       // 507, firerunner's
+	azStoreDown       = "CacheStoreUnavailable"           // 507, firerunner's: never retried
+	azBadResourceName = "InvalidResourceName"             // 400
+)
+
+// twirpBadRoute answers a request the CacheService does not serve: an unknown
+// method, a method other than POST, or a body that is not JSON.
+func twirpBadRoute(w http.ResponseWriter, r *http.Request) {
+	twirpError(w, "bad_route", fmt.Sprintf("no handler for %s %s", r.Method, r.URL.Path))
 }
 
 const (
@@ -1448,19 +1576,25 @@ const (
 )
 
 // decodeTwirp decodes a cache RPC body into v, answering a 400 or, over
-// maxTwirpBody, a 413 itself and reporting false. The bound applies before
+// maxTwirpBody, a 400 invalid_argument itself and reporting false. The bound applies before
 // any identity lookup, so a guest cannot make the server buffer an
 // arbitrarily large JSON value.
 func decodeTwirp(w http.ResponseWriter, r *http.Request, v any) bool {
+	// Twirp serves JSON or protobuf by Content-Type; this server speaks the
+	// toolkit's JSON only, and answers anything else as a route it lacks.
+	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt != "application/json" {
+		twirpBadRoute(w, r)
+		return false
+	}
 	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxTwirpBody)).Decode(v)
 	if err == nil {
 		return true
 	}
 	var mbe *http.MaxBytesError
 	if errors.As(err, &mbe) {
-		twirpError(w, http.StatusRequestEntityTooLarge, "invalid_argument", "request body too large")
+		twirpError(w, "invalid_argument", fmt.Sprintf("request body over %d bytes", maxTwirpBody))
 	} else {
-		twirpError(w, http.StatusBadRequest, "malformed", err.Error())
+		twirpError(w, "malformed", "request body is not valid JSON: "+err.Error())
 	}
 	return false
 }

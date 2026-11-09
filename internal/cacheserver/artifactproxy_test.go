@@ -298,14 +298,16 @@ func TestArtifactProxyIsNotAnOpenProxy(t *testing.T) {
 		t.Fatalf("other service -> %d, want 404", resp.StatusCode)
 	}
 
-	// Twirp is POST-only; a GET must not be forwarded either.
+	// Twirp is POST-only; a GET must not be forwarded either. Twirp answers
+	// a method it does not serve as bad_route, 404.
 	resp, err = http.Get(front.URL + artifactTwirpBase + "ListArtifacts")
 	if err != nil {
 		t.Fatal(err)
 	}
+	raw, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("GET -> %d, want 405", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound || !strings.Contains(string(raw), `"bad_route"`) {
+		t.Fatalf("GET -> %d %s, want 404 bad_route", resp.StatusCode, raw)
 	}
 
 	// The cache service is still answered from local disk.
@@ -357,8 +359,8 @@ func TestArtifactProxyBodyLimit(t *testing.T) {
 	}
 	raw, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413: %s", resp.StatusCode, raw)
+	if resp.StatusCode != http.StatusBadRequest { // Twirp: invalid_argument is 400
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, raw)
 	}
 	if code, _ := decodeTwirpErr(t, raw); code != "invalid_argument" {
 		t.Fatalf("envelope = %s", raw)
@@ -387,7 +389,7 @@ func TestArtifactProxyBodyLimit(t *testing.T) {
 
 // TestArtifactProxyBodyLimitChunked covers the other half of the size guard: a
 // request with no Content-Length (chunked) cannot be refused up front, so the
-// limit trips mid-stream inside the proxy hop and must still surface as a 413
+// limit trips mid-stream inside the proxy hop and must still surface as a 400 invalid_argument
 // Twirp error rather than a generic upstream failure.
 func TestArtifactProxyBodyLimitChunked(t *testing.T) {
 	up, upTS := newUpstream(t, http.StatusOK, `{}`)
@@ -404,8 +406,8 @@ func TestArtifactProxyBodyLimitChunked(t *testing.T) {
 	}
 	raw, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413: %s", resp.StatusCode, raw)
+	if resp.StatusCode != http.StatusBadRequest { // Twirp: invalid_argument is 400
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, raw)
 	}
 	if code, _ := decodeTwirpErr(t, raw); code != "invalid_argument" {
 		t.Fatalf("envelope = %s", raw)
