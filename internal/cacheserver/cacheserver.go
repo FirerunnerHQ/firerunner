@@ -157,6 +157,7 @@ type Server struct {
 	// index lock, which cache hit/finalize paths hold across index writes.
 	artifactProxy   atomic.Pointer[httputil.ReverseProxy]
 	artifactTimeout time.Duration
+	bodyIdle        atomic.Int64 // a time.Duration; see SetBodyIdle
 	artifactRPCs    atomic.Uint64
 	artifactErrors  atomic.Uint64
 }
@@ -259,6 +260,7 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 		identityDenied:  make(map[string]uint64),
 		identityWait:    DefaultIdentityWait,
 	}
+	s.bodyIdle.Store(int64(DefaultBodyIdle))
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -291,7 +293,41 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Value(connectionGenerationKey{}) == nil {
 		r = r.WithContext(s.bindGeneration(r.Context(), r.RemoteAddr))
 	}
+	// The artifact proxy sets its own deadline for a whole RPC.
+	if idle := s.bodyIdle.Load(); idle > 0 && r.Body != nil && r.Body != http.NoBody && !strings.HasPrefix(r.URL.Path, artifactTwirpBase) {
+		r.Body = &idleBody{ReadCloser: r.Body, rc: http.NewResponseController(w), idle: time.Duration(idle)}
+	}
 	s.mux.ServeHTTP(w, r)
+}
+
+// DefaultBodyIdle is SetBodyIdle's default for the cache-server command.
+const DefaultBodyIdle = 60 * time.Second
+
+// SetBodyIdle bounds how long a request body may send nothing. A guest can
+// otherwise trickle a body for as long as it likes, holding a connection, a
+// goroutine and, for an upload, a reservation, since a large archive leaves
+// no overall deadline that would be safe. Each read pushes the connection's
+// read deadline idle into the future, so an upload that keeps sending is
+// never cut, however long it takes. 0 turns the bound off. Call before
+// serving.
+func (s *Server) SetBodyIdle(idle time.Duration) { s.bodyIdle.Store(int64(max(idle, 0))) }
+
+// idleBody extends the connection's read deadline before each read of the
+// request body (see SetBodyIdle). The deadline errors are the reader's: a
+// stalled body fails its upload like a dropped connection.
+type idleBody struct {
+	io.ReadCloser
+	rc   *http.ResponseController
+	idle time.Duration
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	// HTTP/2 does not support per-request deadlines; the read then runs
+	// under the server's own timeouts, as it did before.
+	_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
+	// No need to clear it at EOF: net/http does, when it starts reading the
+	// connection in the background (TestBodyIdleEndsAtEOF).
+	return b.ReadCloser.Read(p)
 }
 
 // StartJanitor runs a background loop that reclaims abandoned (reserved but
