@@ -80,7 +80,10 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
   firewall in `internal/provisioner/egress*.go`) gets an independent review
   before merge: Copilot's, or a fresh reviewer agent given the diff and not
   the author's conclusions. Answer every finding (fix, or reply why not).
-  `pr-wait.sh` prints `review_required` while such a PR has no review.
+  An agent's review leaves no GitHub review behind, so post its findings and
+  your answers as one PR comment that carries the line
+  `<!-- firerunner:independent-review -->`. `pr-wait.sh` prints
+  `review_required` while such a PR has neither a review nor that comment.
 - **Stacked PRs:** before merging a PR that another PR is based on, retarget the
   child to `main` first (`gh pr edit <child> --base main`). Deleting a base
   branch closes, rather than retargets, the PRs on it.
