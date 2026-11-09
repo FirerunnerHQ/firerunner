@@ -21,7 +21,9 @@
 #
 # Settings (set by build-ec2-ami.sh):
 #   RUNNER_VERSION  actions/runner version, e.g. 2.338.1
+#   RUNNER_SHA256   its tarball's SHA-256, from the release notes or pinned
 #   RUNNER_ARCH     x64 or arm64
+#   RI_REF, RI_COMMIT  the runner-images tag and the commit fetched for it
 #   TOOLSET         standard (GitHub's ubuntu-24.04 tools that jobs commonly
 #                   use), full (nearly all of them) or minimal (Docker, git)
 #   FR_VERSION      firerunner release for the git cache's proxy; empty means
@@ -29,7 +31,7 @@
 #   FR_URL          take the binary from here instead, checked against FR_SHA256
 set -euxo pipefail
 
-: "${RUNNER_VERSION:?}" "${RUNNER_ARCH:?}" "${TOOLSET:?}"
+: "${RUNNER_VERSION:?}" "${RUNNER_SHA256:?}" "${RUNNER_ARCH:?}" "${TOOLSET:?}"
 
 mark() { echo "FIRERUNNER-BUILD $(date -u +%FT%TZ) $1" >/dev/console 2>/dev/null || true; }
 # Any failure powers the instance off without the "finished" mark, so the
@@ -107,8 +109,11 @@ systemctl enable docker.socket
 # image must be rebuilt monthly (see images/README.md).
 install -d /opt/runner
 cd /opt/runner
-curl -fsSL -o runner.tgz \
-	"https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
+fetch_checked "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" \
+	runner.tgz "$RUNNER_SHA256" || {
+	mark "FAILED actions/runner $RUNNER_VERSION: download failed or its SHA-256 is not $RUNNER_SHA256"
+	exit 1
+}
 tar xzf runner.tgz
 rm runner.tgz
 ./bin/installdependencies.sh

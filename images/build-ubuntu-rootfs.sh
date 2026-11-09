@@ -23,17 +23,36 @@
 #                               #        actions/cache at a self-hosted cache-
 #                               #        server; pair with firerunner --cache-port
 #
+# Every download is checked on the host before the image build uses it (see
+# lib/verify.sh): the runner against the SHA-256 in its release notes, Node
+# against the release's SHASUMS256.txt, Microsoft's repository package against
+# a pinned SHA-256, and actions/runner-images is fetched at a commit SHA. The
+# --*-sha256 and --runner-images-commit flags pin them. The checksums used are
+# printed and kept in /etc/firerunner/downloads.sha256.
+#
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ASSETS="$HERE/assets"
+# shellcheck source=lib/verify.sh disable=SC1091
+. "$HERE/lib/verify.sh"
 
 OUT=""
 TOOLSET="base"
 RUNNER_VERSION=""
+RUNNER_SHA256=""        # empty => read from the release notes
 NODE_VERSION="22.11.0"
+NODE_SHA256=""          # empty => read from the release's SHASUMS256.txt
 UBUNTU_TAG="24.04"
-RI_REF="ubuntu24/20260816.277"   # actions/runner-images pinned ref for --toolset full
+PMC_SHA256=""           # empty => the pinned checksum for UBUNTU_TAG, below
+# actions/runner-images for --toolset full: a tag, and the commit it named when
+# it was pinned, which is what the build fetches. Bump both together; the
+# commit is: gh api repos/actions/runner-images/commits/TAG --jq .sha
+RI_REF_PINNED="ubuntu24/20260816.277"
+RI_COMMIT_PINNED="3b5f596ffecb076aa5f3c3ded95b145f6daeb016"
+RI_REF="$RI_REF_PINNED"
+RI_COMMIT=""            # empty => RI_COMMIT_PINNED for the pinned RI_REF,
+                        # else RI_REF resolved through the GitHub API, once
 DNS_SERVERS="1.1.1.1 8.8.8.8"
 SIZE_MB=""              # empty => sized from rootfs du + max(margin, free floor)
 MARGIN_PCT=35
@@ -56,9 +75,13 @@ while [[ $# -gt 0 ]]; do
     --out)            OUT="$2"; shift 2 ;;
     --toolset)        TOOLSET="$2"; shift 2 ;;
     --runner-version) RUNNER_VERSION="$2"; shift 2 ;;
+    --runner-sha256)  RUNNER_SHA256="$2"; shift 2 ;;
     --node-version)   NODE_VERSION="$2"; shift 2 ;;
+    --node-sha256)    NODE_SHA256="$2"; shift 2 ;;
     --ubuntu-tag)     UBUNTU_TAG="$2"; shift 2 ;;
+    --pmc-sha256)     PMC_SHA256="$2"; shift 2 ;;
     --runner-images-ref) RI_REF="$2"; shift 2 ;;
+    --runner-images-commit) RI_COMMIT="$2"; shift 2 ;;
     --dns-servers)    DNS_SERVERS="${2//,/ }"; shift 2 ;;
     --size-mb)        SIZE_MB="$2"; shift 2 ;;
     --free-mb)        FREE_MB="$2"; shift 2 ;;
@@ -68,20 +91,48 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$(uname -s)" == "Linux" ]] || die "must run on Linux (KVM host)"
-[[ $EUID -eq 0 ]] || die "must run as root"
+[[ "$(id -u)" -eq 0 ]] || die "must run as root"
 [[ -n "$OUT" ]] || die "--out is required"
 case "$TOOLSET" in minimal|base|full) ;; *) die "--toolset must be minimal, base or full" ;; esac
-for t in docker mkfs.ext4 e2label; do command -v "$t" >/dev/null || die "missing tool: $t"; done
+for t in docker mkfs.ext4 e2label curl; do command -v "$t" >/dev/null || die "missing tool: $t"; done
+[[ "$TOOLSET" != "full" ]] || command -v git >/dev/null || die "missing tool: git (--toolset full fetches runner-images with it)"
 docker info >/dev/null 2>&1 || die "docker daemon not available"
 
-if [[ -z "$RUNNER_VERSION" ]]; then
-  RUNNER_VERSION="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest \
-    | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -n1)"
-  [[ -n "$RUNNER_VERSION" ]] || die "could not resolve latest actions/runner version"
+# Resolve every checksum before building anything. A latest runner is resolved
+# once, with the SHA-256 its release notes give the tarball.
+if [[ -n "$RUNNER_SHA256" ]]; then
+  [[ -n "$RUNNER_VERSION" ]] || die "--runner-sha256 needs --runner-version"
+else
+  release="$(runner_release "$RUNNER_VERSION" linux-x64)" || exit 1
+  RUNNER_VERSION="${release% *}" RUNNER_SHA256="${release#* }"
+fi
+NODE_TGZ="node-v${NODE_VERSION}-linux-x64.tar.gz"
+if [[ -z "$NODE_SHA256" ]]; then
+  NODE_SHA256="$(node_sha256 "$NODE_VERSION" "$NODE_TGZ")" || exit 1
+fi
+if [[ "$TOOLSET" == "full" ]]; then
+  # packages-microsoft-prod.deb installs Microsoft's apt key and source. To pin
+  # a new one, download it, check that it carries the key with fingerprint
+  # BC52 8686 B50D 79E3 39D3 721C EB3E 94AD BE12 29CF, and take its sha256sum.
+  if [[ -z "$PMC_SHA256" ]]; then
+    case "$UBUNTU_TAG" in
+      24.04) PMC_SHA256="c13f01ac7c3001b51a9281d40dde666db5e037e05512840c319832f7852bfec4" ;;
+      *) die "no pinned SHA-256 for packages-microsoft-prod.deb on ubuntu $UBUNTU_TAG; pass --pmc-sha256" ;;
+    esac
+  fi
+  if [[ -z "$RI_COMMIT" ]]; then
+    if [[ "$RI_REF" == "$RI_REF_PINNED" ]]; then
+      RI_COMMIT="$RI_COMMIT_PINNED"
+    else
+      RI_COMMIT="$(resolve_commit actions/runner-images "$RI_REF")" || exit 1
+      echo ">> resolved runner-images $RI_REF to commit $RI_COMMIT; pass --runner-images-commit $RI_COMMIT to pin it"
+    fi
+  fi
 fi
 
 echo ">> toolset=$TOOLSET ubuntu=$UBUNTU_TAG runner=$RUNNER_VERSION out=$OUT"
-[[ "$TOOLSET" == "full" ]] && echo ">> runner-images ref=$RI_REF"
+echo ">> actions/runner $RUNNER_VERSION linux-x64 sha256 $RUNNER_SHA256"
+[[ "$TOOLSET" == "full" ]] && echo ">> runner-images ref=$RI_REF commit=$RI_COMMIT"
 [[ "$CACHE_REDIRECT" == "1" ]] && echo ">> cache-redirect: runner will be patched for self-hosted actions/cache"
 
 WORK="$(mktemp -d)"
@@ -90,6 +141,19 @@ ROOT="$WORK/root"
 mkdir -p "$CTX" "$ROOT"
 cleanup() { rm -rf "$WORK"; docker rm -f fr-rootfs-export >/dev/null 2>&1 || true; }
 trap cleanup EXIT
+export VERIFIED_LOG="$WORK/downloads.sha256"
+: >"$VERIFIED_LOG"
+
+# Downloads go into the build context, checked; the Dockerfile only COPYs them.
+RUNNER_TGZ="actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+fetch_checked "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${RUNNER_TGZ}" \
+  "$CTX/actions-runner.tar.gz" "$RUNNER_SHA256" "$RUNNER_TGZ" || exit 1
+fetch_checked "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TGZ}" \
+  "$CTX/node.tar.gz" "$NODE_SHA256" "$NODE_TGZ" || exit 1
+if [[ "$TOOLSET" == "full" ]]; then
+  fetch_checked "https://packages.microsoft.com/config/ubuntu/${UBUNTU_TAG}/packages-microsoft-prod.deb" \
+    "$CTX/packages-microsoft-prod.deb" "$PMC_SHA256" "packages-microsoft-prod.deb (ubuntu $UBUNTU_TAG)" || exit 1
+fi
 
 # Boot assets go into the build context.
 cp "$ASSETS/firerunner-run.sh" "$CTX/firerunner-run.sh"
@@ -101,18 +165,14 @@ cp "$ASSETS/docker-shim.sh" "$CTX/docker-shim.sh"
 
 # ---- Stage 2: vendor actions/runner-images (only for --toolset full) --------
 # We stage the upstream build scripts + the official toolset.json into the build
-# context at a pinned ref, then run a curated, docker-safe subset inside the
+# context at a pinned commit, then run a curated, docker-safe subset inside the
 # image build. This gives real ubuntu-latest parity for the toolcache
 # (setup-python/node/go/etc.) without the Azure Packer / GUI / snap machinery.
 if [[ "$TOOLSET" == "full" ]]; then
-  echo ">> vendoring actions/runner-images @ $RI_REF"
-  RI_TGZ="$WORK/runner-images.tar.gz"
-  curl -fsSL -o "$RI_TGZ" \
-    "https://github.com/actions/runner-images/archive/refs/tags/${RI_REF}.tar.gz" \
-    || die "could not download runner-images @ $RI_REF"
+  echo ">> vendoring actions/runner-images @ $RI_REF ($RI_COMMIT)"
   RI_SRC="$WORK/ri-src"
   mkdir -p "$RI_SRC"
-  tar -xzf "$RI_TGZ" -C "$RI_SRC" --strip-components=1
+  fetch_commit actions/runner-images "$RI_COMMIT" "$RI_SRC" || exit 1
   SCRIPTS_DIR="$RI_SRC/images/ubuntu/scripts"
   TOOLSET_JSON="$RI_SRC/images/ubuntu/toolsets/toolset-2404.json"
   [[ -d "$SCRIPTS_DIR" && -f "$TOOLSET_JSON" ]] || die "unexpected runner-images layout for $RI_REF"
@@ -207,14 +267,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
       ${TOOLCHAIN_PKGS} \\
     && rm -rf /var/lib/apt/lists/*
 
-# Node.js LTS from the official static tarball (no nodesource) into /usr/local.
-RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" \\
-      | tar -xz -C /usr/local --strip-components=1 && node --version
+# Node.js LTS from the official static tarball (no nodesource) into /usr/local,
+# checked on the host before the build.
+COPY node.tar.gz /tmp/node.tar.gz
+RUN tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \\
+    && rm -f /tmp/node.tar.gz && node --version
 
-# GitHub Actions runner agent.
+# GitHub Actions runner agent, checked on the host before the build.
+COPY actions-runner.tar.gz /tmp/actions-runner.tar.gz
 RUN install -d /opt/runner \\
-    && curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \\
-      | tar -xz -C /opt/runner \\
+    && tar -xzf /tmp/actions-runner.tar.gz -C /opt/runner \\
+    && rm -f /tmp/actions-runner.tar.gz \\
     && /opt/runner/bin/installdependencies.sh \\
     && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
@@ -256,9 +319,10 @@ fi
 if [[ "$TOOLSET" == "full" ]]; then
 cat >> "$CTX/Dockerfile" <<DOCKERFILE
 
-# PowerShell (drives the upstream toolcache installers).
-RUN curl -fsSL "https://packages.microsoft.com/config/ubuntu/${UBUNTU_TAG}/packages-microsoft-prod.deb" -o /tmp/pmc.deb \\
-    && dpkg -i /tmp/pmc.deb && rm -f /tmp/pmc.deb \\
+# PowerShell (drives the upstream toolcache installers), from Microsoft's apt
+# repository, which packages-microsoft-prod.deb (checked on the host) adds.
+COPY packages-microsoft-prod.deb /tmp/pmc.deb
+RUN dpkg -i /tmp/pmc.deb && rm -f /tmp/pmc.deb \\
     && apt-get update && apt-get install -y --no-install-recommends powershell \\
     && rm -rf /var/lib/apt/lists/*
 
@@ -283,6 +347,7 @@ fi
 # starts only once dockerd is active, and not at all if Docker fails -- instead
 # of accepting a container job with no daemon. The minimal toolset has no docker,
 # so it keeps docker.service disabled.
+# shellcheck disable=SC2016 # the image build's shell expands these
 if [[ "$TOOLSET" == "minimal" ]]; then
   DOCKER_BOOT='for u in docker.service containerd.service postgresql.service mysql.service apache2.service nginx.service; do systemctl disable "$u" 2>/dev/null || true; done'
 else
@@ -345,6 +410,9 @@ cat > "$ROOT/etc/hosts" <<'HOSTS'
 ::1	localhost ip6-localhost ip6-loopback
 HOSTS
 echo firerunner > "$ROOT/etc/hostname"
+# What the image was built from, as checked above.
+install -d "$ROOT/etc/firerunner"
+install -m 0644 "$VERIFIED_LOG" "$ROOT/etc/firerunner/downloads.sha256"
 
 if [[ -z "$SIZE_MB" ]]; then
   used_mb="$(du -sm "$ROOT" | awk '{print $1}')"

@@ -20,10 +20,15 @@
 #                         c7a.large; arm64: c7g.large)
 #   --arch A              x64 (default) or arm64
 #   --runner-version V    actions/runner version (default: latest release)
+#   --runner-sha256 H     its tarball's SHA-256 (default: from the release
+#                         notes); needs --runner-version
 #   --toolset T           standard (default), full or minimal. standard and full
 #                         install GitHub's ubuntu-24.04 tools, x64 only, so arm64
 #                         defaults to minimal
 #   --runner-images-ref R actions/runner-images tag for standard and full
+#   --runner-images-commit C  the commit to fetch for it (default: the one
+#                         pinned for the default tag; another tag is resolved
+#                         to its commit now)
 #   --firerunner-version V firerunner release for the git cache's proxy, such as
 #                         v0.1.1 (default: the latest release)
 #   --firerunner-url URL  take the binary from here instead; needs
@@ -38,17 +43,26 @@
 #                         layer-ec2-ami.sh, and exit; touches no AWS
 #
 # Output: progress on stderr; on success one JSON line on stdout:
-#   {"ami":"ami-…","ssm_param":"…","runner_version":"…","arch":"…"}
+#   {"ami":"ami-…","ssm_param":"…","runner_version":"…","runner_sha256":"…","arch":"…"}
 #
 # GitHub accepts runner versions for about 30 days after their release, so
 # rebuild at least monthly; tiers that name the SSM parameter pick up the new
 # image within five minutes with no config change.
+#
+# The build instance checks what it downloads: the runner against its SHA-256,
+# runner-images by fetching a commit with git, PowerShell modules against the
+# gallery's SHA-512 (ec2/fetch-checked.sh). The default tag's commit is pinned
+# below; bump both together, the commit from
+# gh api repos/actions/runner-images/commits/TAG --jq .sha
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verify.sh disable=SC1091
+. "$HERE/lib/verify.sh"
 
-region="" subnet="" sg="" param="" itype="" arch="x64" runner_version="" volume=""
-toolset="" ri_ref="ubuntu24/20261101.360"
+region="" subnet="" sg="" param="" itype="" arch="x64" runner_version="" runner_sha256="" volume=""
+ri_ref_pinned="ubuntu24/20261101.360" ri_commit_pinned="add4380b0d6685806e9192c33c37359ee0aa4023"
+toolset="" ri_ref="$ri_ref_pinned" ri_commit=""
 fr_version="" fr_url="" fr_sha256=""
 ri_skip="configure-apt-mock.sh configure-system.sh cleanup.sh list-dpkg.sh post-build-validation.sh install-android-sdk.sh install-homebrew.sh configure-snap.sh"
 timeout_s="" render=0
@@ -69,9 +83,11 @@ while [ $# -gt 0 ]; do
 	--instance-type) itype="${2:?}"; shift ;;
 	--arch) arch="${2:?}"; shift ;;
 	--runner-version) runner_version="${2:?}"; shift ;;
+	--runner-sha256) runner_sha256="${2:?}"; shift ;;
 	--volume-gib) volume="${2:?}"; shift ;;
 	--toolset) toolset="${2:?}"; shift ;;
 	--runner-images-ref) ri_ref="${2:?}"; shift ;;
+	--runner-images-commit) ri_commit="${2:?}"; shift ;;
 	--firerunner-version) fr_version="${2:?}"; shift ;;
 	--firerunner-url) fr_url="${2:?}"; shift ;;
 	--firerunner-sha256) fr_sha256="${2:?}"; shift ;;
@@ -80,7 +96,7 @@ while [ $# -gt 0 ]; do
 	--render) render=1 ;;
 	--render-assets) render=2 ;;
 	-h | --help)
-		sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*) die "unknown argument: $1 (see --help)" ;;
@@ -114,11 +130,28 @@ for t in "${tags[@]+"${tags[@]}"}"; do
 	[[ "$t" != *[,\[\]\{\}]* ]] || die "--tag '$t' contains one of , [ ] { }, which the AWS CLI shorthand cannot carry"
 done
 
-if [ -z "$runner_version" ] && [ "$render" != 2 ]; then
-	runner_version="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name)"
-	runner_version="${runner_version#v}"
+[ -z "$runner_sha256" ] || [ -n "$runner_version" ] || die "--runner-sha256 needs --runner-version"
+[ -z "$runner_sha256" ] || [[ "$runner_sha256" =~ ^[0-9a-f]{64}$ ]] || die "bad --runner-sha256 '$runner_sha256'"
+[ -z "$runner_version" ] || [[ "$runner_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "bad runner version '$runner_version'"
+if [ "$render" != 2 ]; then
+	# A latest runner is resolved once, with the SHA-256 its release notes give
+	# the tarball; the build instance checks the download against it.
+	if [ -z "$runner_sha256" ]; then
+		release="$(runner_release "$runner_version" "linux-$arch")" || die "cannot check the runner download"
+		runner_version="${release% *}" runner_sha256="${release#* }"
+	fi
+	[[ "$runner_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "bad runner version '$runner_version'"
+	log "actions/runner $runner_version linux-$arch sha256 $runner_sha256"
+	if [ "$toolset" != minimal ] && [ -z "$ri_commit" ]; then
+		if [ "$ri_ref" = "$ri_ref_pinned" ]; then
+			ri_commit="$ri_commit_pinned"
+		else
+			ri_commit="$(resolve_commit actions/runner-images "$ri_ref")" || die "cannot pin runner-images $ri_ref"
+			log "resolved runner-images $ri_ref to commit $ri_commit; pass --runner-images-commit $ri_commit to pin it"
+		fi
+	fi
+	[ -z "$ri_commit" ] || [[ "$ri_commit" =~ ^[0-9a-f]{40}$ ]] || die "bad --runner-images-commit '$ri_commit'"
 fi
-[ "$render" = 2 ] || [[ "$runner_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "bad runner version '$runner_version'"
 [ -z "$fr_url" ] || [[ "$fr_sha256" =~ ^[0-9a-f]{64}$ ]] || die "--firerunner-url needs --firerunner-sha256"
 [ -z "$fr_version" ] || [[ "$fr_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "bad firerunner version '$fr_version'"
 
@@ -132,9 +165,10 @@ strip() {
 # installs the boot script and unit, then provision.sh's body.
 render_userdata() {
 	echo '#!/bin/bash'
-	printf 'RUNNER_VERSION=%q\nRUNNER_ARCH=%q\nTOOLSET=%q\nRI_REF=%q\nRI_SKIP=%q\nFR_VERSION=%q\nFR_URL=%q\nFR_SHA256=%q\nexport RUNNER_VERSION RUNNER_ARCH TOOLSET RI_REF RI_SKIP FR_VERSION FR_URL FR_SHA256\n' \
-		"$runner_version" "$arch" "$toolset" "$ri_ref" "$ri_skip" "$fr_version" "$fr_url" "$fr_sha256"
-	cat "$HERE/ec2/install-runner-images.sh"
+	printf 'RUNNER_VERSION=%q\nRUNNER_SHA256=%q\nRUNNER_ARCH=%q\nTOOLSET=%q\nRI_REF=%q\nRI_COMMIT=%q\nRI_SKIP=%q\nFR_VERSION=%q\nFR_URL=%q\nFR_SHA256=%q\nexport RUNNER_VERSION RUNNER_SHA256 RUNNER_ARCH TOOLSET RI_REF RI_COMMIT RI_SKIP FR_VERSION FR_URL FR_SHA256\n' \
+		"$runner_version" "$runner_sha256" "$arch" "$toolset" "$ri_ref" "$ri_commit" "$ri_skip" "$fr_version" "$fr_url" "$fr_sha256"
+	strip "$HERE/ec2/fetch-checked.sh"
+	strip "$HERE/ec2/install-runner-images.sh"
 	strip "$HERE/ec2/install-firerunner.sh"
 	render_assets
 	sed '1d' "$HERE/ec2/provision.sh"
@@ -300,4 +334,4 @@ done
 aws ssm put-parameter --name "$param" --type String --value "$ami" --overwrite >/dev/null
 log "published $ami to $param"
 
-printf '{"ami":"%s","ssm_param":"%s","runner_version":"%s","arch":"%s"}\n' "$ami" "$param" "$runner_version" "$arch"
+printf '{"ami":"%s","ssm_param":"%s","runner_version":"%s","runner_sha256":"%s","arch":"%s"}\n' "$ami" "$param" "$runner_version" "$runner_sha256" "$arch"

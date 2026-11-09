@@ -12,7 +12,9 @@
 #   - the Android SDK, the largest single install, and Homebrew, which refuses
 #     to install as root, until a job needs them.
 #
-# Settings: RI_REF, the runner-images tag; RI_SKIP, a space-separated list.
+# Settings: RI_REF, the runner-images tag, which names the image version;
+# RI_COMMIT, the commit the build fetches, as a tag can move; RI_SKIP, a
+# space-separated list. Needs fetch_commit (fetch-checked.sh).
 # curate_toolset FILE trims GitHub's toolset to what an image pays for. Older
 # versions come back through setup-* actions; the defaults stay, because tools
 # such as /usr/bin/go link to them.
@@ -40,9 +42,11 @@ curate_toolset() {
 # install_powershell_modules FILE installs the toolset's PowerShell modules from
 # the gallery's package URLs. Install-Module reads the gallery's feed, whose
 # answers sometimes name an address that does not work, and then waits five
-# minutes and fails. FILE's modules must not depend on others.
+# minutes and fails. FILE's modules must not depend on others. Each package is
+# checked against the SHA-512 the gallery's API lists for it before it is
+# unpacked; the package itself comes from the gallery's CDN.
 install_powershell_modules() {
-	local dir="${PS_MODULE_DIR:-/usr/local/share/powershell/Modules}" name want url version tmp
+	local dir="${PS_MODULE_DIR:-/usr/local/share/powershell/Modules}" name want url version tmp hash
 	tmp="$(mktemp)"
 	jq -r '.powershellModules[] | "\(.name) \((.versions // [""])[0])"' "$1" | while read -r name want; do
 		url="$(curl -fsSL --retry 5 -o "$tmp" -w '%{url_effective}' \
@@ -51,20 +55,34 @@ install_powershell_modules() {
 		version="${url##*/}"
 		version="${version%.nupkg}"
 		version="${version#"$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')".}"
+		hash="$(curl -fsSL --retry 5 "https://www.powershellgallery.com/api/v2/Packages(Id='$name',Version='$version')" |
+			sed -n 's|.*<d:PackageHash>\([^<]*\)</d:PackageHash>.*|\1|p')"
+		if [ "$(sha512sum "$tmp" | cut -d' ' -f1)" != "$(printf '%s' "$hash" | base64 -d | od -An -v -tx1 | tr -d ' \n')" ]; then
+			mark "FAILED PowerShell module $name $version: its SHA-512 is not the gallery's"
+			exit 1
+		fi
 		mkdir -p "$dir/$name/$version"
 		unzip -q -o "$tmp" -d "$dir/$name/$version"
 		pwsh -NoLogo -NoProfile -Command "Import-Module '$dir/$name/$version/$name.psd1' -ErrorAction Stop"
-	done
+	done || {
+		rm -f "$tmp"
+		return 1
+	}
 	rm -f "$tmp"
 }
 
+# fetch_runner_images DIR checks actions/runner-images out at RI_COMMIT.
+fetch_runner_images() {
+	fetch_commit "${RI_GIT:-https://github.com/actions/runner-images}" "${RI_COMMIT:-}" "$1" || {
+		mark "FAILED runner-images: could not fetch commit '${RI_COMMIT:-}' ($RI_REF)"
+		return 1
+	}
+}
+
 install_runner_images() {
-	local ig=/imagegeneration tgz src s failed="" began used
-	tgz="$(mktemp)"
-	curl -fsSL -o "$tgz" "https://github.com/actions/runner-images/archive/refs/tags/${RI_REF}.tar.gz"
+	local ig=/imagegeneration src s failed="" began used
 	src="$(mktemp -d)"
-	tar xzf "$tgz" -C "$src" --strip-components=1
-	rm -f "$tgz"
+	fetch_runner_images "$src" || return 1
 
 	install -d "$ig/helpers" "$ig/installers"
 	cp -a "$src/images/ubuntu/scripts/helpers/." "$ig/helpers/"

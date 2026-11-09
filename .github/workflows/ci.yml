@@ -107,6 +107,8 @@ jobs:
             go-shell-${{ runner.os }}-${{ steps.go.outputs.go-version }}-
       - name: Test golden docker shim
         run: images/test-docker-shim.sh
+      - name: Test image builders' download checks
+        run: images/test-verify-downloads.sh && shellcheck images/lib/verify.sh images/build-rootfs.sh images/build-ubuntu-rootfs.sh images/build-toolcache.sh images/test-verify-downloads.sh
       - name: Test EC2 runner boot script
         run: images/test-ec2-run.sh && images/test-ec2-tune.sh && images/test-runner-images.sh && shellcheck images/assets/firerunner-ec2-tune.sh images/test-ec2-tune.sh
       - name: Test EC2 cache proxy setup and nodewrap

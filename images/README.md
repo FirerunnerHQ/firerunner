@@ -145,7 +145,7 @@ parameter:
 images/build-ec2-ami.sh \
   --subnet subnet-0aaa… --security-group sg-0bbb… \
   --ssm-param /firerunner/ami/runner --tag team=ci
-# {"ami":"ami-…","ssm_param":"/firerunner/ami/runner","runner_version":"2.338.1","arch":"x64"}
+# {"ami":"ami-…","ssm_param":"/firerunner/ami/runner","runner_version":"2.338.1","runner_sha256":"…","arch":"x64"}
 ```
 
 It launches a build instance with `images/ec2/provision.sh` as user-data,
@@ -173,7 +173,8 @@ build instance on every exit path.
 `standard` and `full` run the installers of an
 [actions/runner-images](https://github.com/actions/runner-images) release, in
 the order its Packer template lists them, so a new release needs only
-`--runner-images-ref`. Each toolset picks a build instance, volume and timeout
+`--runner-images-ref` (see [Verified downloads](#verified-downloads) for the
+commit it is fetched at). Each toolset picks a build instance, volume and timeout
 that fit it, which `--instance-type`, `--volume-gib` and `--timeout` override.
 
 `standard` keeps the latest version of most tools, plus defaults that system
@@ -282,7 +283,7 @@ sudo ./build-toolcache.sh --out /var/lib/firerunner/toolcache.ext4 \
 sudo ./build-toolcache.sh --out toolcache.ext4 --python 3.12
 
 # CodeQL: bakes the github/codeql-action bundle exactly as runner-images does
-# (self-contained, no Docker; needs jq). `latest` tracks the version the newest
+# (self-contained, no Docker; needs jq, as Go and Python do). `latest` tracks the version the newest
 # codeql-action pins; pass a CLI version (e.g. 2.26.3) to pin it.
 sudo ./build-toolcache.sh --out toolcache.ext4 --codeql latest
 ```
@@ -295,6 +296,69 @@ it `hostedtoolcache`. The drive is a **pure accelerator**: a missing tool/versio
 just means `setup-*` downloads it and the job still passes. Tailor the version
 list to the repos you serve by reading their `go.mod` / `.nvmrc` /
 `.python-version`.
+
+## Verified downloads
+
+Every archive a builder runs or bakes into an image is checked before it is
+used, against a SHA-256 that is pinned or that comes from a source other than
+the download itself. A mismatch stops the build with an error that names the
+file and both checksums, and nothing from the file is unpacked. Each build
+prints the checksums it used, and a rootfs keeps them in
+`/etc/firerunner/downloads.sha256`.
+
+| download | checked against | pin it with |
+|---|---|---|
+| `actions/runner` (`build-rootfs.sh`, `build-ubuntu-rootfs.sh`) | the SHA-256 in the release's notes, read through the GitHub API | `--runner-version` and `--runner-sha256` |
+| Node.js (`build-rootfs.sh` node tier, `build-ubuntu-rootfs.sh`) | `SHASUMS256.txt` in the same nodejs.org release directory | `--node-sha256` |
+| actions/runner-images (`build-ubuntu-rootfs.sh --toolset full`) | a commit SHA, fetched with git | `--runner-images-commit` |
+| `packages-microsoft-prod.deb` (`build-ubuntu-rootfs.sh --toolset full`) | a SHA-256 pinned in the script for Ubuntu 24.04 | `--pmc-sha256` |
+| `actions/runner` (`build-ec2-ami.sh`) | the release notes, read on the operator's machine; the build instance checks the download | `--runner-version` and `--runner-sha256` |
+| actions/runner-images (`build-ec2-ami.sh`) | a commit SHA, fetched with git on the build instance | `--runner-images-commit` |
+| PowerShell modules (`build-ec2-ami.sh --toolset standard`) | the SHA-512 the PowerShell Gallery's API lists for the package | — |
+| Node.js (`build-toolcache.sh`) | `SHASUMS256.txt`, as above | `--checksums` |
+| Go (`build-toolcache.sh`) | the go.dev download index (`?mode=json`), served apart from the archive | `--checksums` |
+| Python, CodeQL (`build-toolcache.sh`) | the SHA-256 the GitHub API reports for the release asset | `--checksums` |
+
+An empty `--runner-version` resolves the latest release once, and the build
+prints the version and checksum it took. A pinned checksum skips the lookup.
+`build-ubuntu-rootfs.sh` downloads and checks everything on the host, and its
+Dockerfile only copies the checked files in.
+
+`build-ec2-ami.sh` resolves the runner's checksum and the runner-images
+commit before it launches anything, logs them, passes them to the build
+instance in its user-data, and adds `runner_sha256` to its JSON output. A
+failed check powers the build instance off with a `FAILED` mark that names
+the download, and nothing is imaged.
+
+A runner-images tag can move, so the builds fetch a commit. Each script's
+default `--runner-images-ref` comes with the commit it named when it was
+pinned; bump both together, taking the commit from
+`gh api repos/actions/runner-images/commits/TAG --jq .sha`. Any other
+`--runner-images-ref` is resolved to a commit once, through the GitHub API,
+and the build prints it so `--runner-images-commit` can pin it. git checks
+every object it fetches against its hash.
+
+To pin `packages-microsoft-prod.deb` for another Ubuntu release, download it,
+check that the key it installs has the fingerprint
+`BC52 8686 B50D 79E3 39D3 721C EB3E 94AD BE12 29CF`, and pass its `sha256sum`
+as `--pmc-sha256`, or add it to the script's table.
+
+`build-toolcache.sh --checksums FILE` pins its archives: FILE holds
+`SHA256  ARCHIVE-NAME` lines, as `sha256sum` prints them, and an archive it
+lists is checked against its line instead of upstream. Each drive keeps the
+checksums it was built from in `/downloads.sha256` in the same format, so
+`--checksums` with that file rebuilds the same drive. GitHub reports a
+checksum only for assets uploaded since mid-2025; an older Python or CodeQL
+release needs a `--checksums` line. The toolcache drive picks a Python build
+from the python-versions manifest and accepts only an asset of a
+python-versions release. Its `setup.sh` still upgrades pip from PyPI inside
+the container, which this does not check.
+`SHASUMS256.txt` comes from the same origin as the tarball, and its GPG
+signature is not checked; for a stronger guarantee, pin `--node-sha256` from a
+`SHASUMS256.txt.asc` you verified.
+
+`images/test-verify-downloads.sh` runs the builders against a fake network
+that serves tampered archives.
 
 ## Rebuild policy
 
