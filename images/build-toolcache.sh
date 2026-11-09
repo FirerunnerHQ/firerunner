@@ -107,7 +107,7 @@ fi
 
 STAGE="$(mktemp -d)"
 DL="$(mktemp -d)"     # checked archives; never part of the drive
-cleanup() { rm -rf "$STAGE" "$DL"; }
+cleanup() { rm -rf "$STAGE" "$DL"; rm -f "$OUT.partial"; }
 trap cleanup EXIT
 export VERIFIED_LOG="$STAGE/downloads.sha256"
 : >"$VERIFIED_LOG"
@@ -159,16 +159,17 @@ if (( ${#PYTHON_VERSIONS[@]} > 0 )); then
     || die "could not read the python-versions manifest"
   mkdir -p "$DL/python"
   for want in "${PYTHON_VERSIONS[@]}"; do
-    # Newest release whose version starts with the requested prefix and that
-    # ships a linux / ${UBUNTU_TAG} / x64 asset.
+    # Newest stable release matching the request (3.12 matches 3.12.16, not
+    # 3.120) that ships a linux / ${UBUNTU_TAG} / x64 asset. Versions sort as
+    # numbers: as strings, 3.12.9 would beat 3.12.16.
     url="$(printf '%s' "$manifest" | jq -r --arg v "$want" --arg pv "$UBUNTU_TAG" '
       [ .[]
-        | select(.version | startswith($v))
+        | select(.stable and (.version == $v or (.version | startswith($v + "."))))
         | . as $rel
         | $rel.files[]
         | select(.platform=="linux" and .arch=="x64" and .platform_version==$pv)
         | {version: $rel.version, url: .download_url} ]
-      | sort_by(.version) | last | .url // empty')"
+      | sort_by(.version | split(".") | map(tonumber? // 0)) | last | .url // empty')"
     [[ -n "$url" ]] || die "no python-versions asset for $want on ubuntu $UBUNTU_TAG x64"
     # Only a python-versions release asset has a checksum to check it against.
     [[ "$url" == "$PY_RELEASES"*/* ]] || die "python $want: the manifest points outside $PY_RELEASES: $url"
@@ -237,11 +238,14 @@ fi
 log "sizing drive at ${SIZE_MB}MB"
 
 mkdir -p "$(dirname "$OUT")"
-rm -f "$OUT"
-mkfs.ext4 -q -F -d "$STAGE" "$OUT" "${SIZE_MB}M"
+# Written beside --out and renamed over it when complete, so a reader of
+# --out never sees a half-written image.
+rm -f "$OUT.partial"
+mkfs.ext4 -q -F -d "$STAGE" "$OUT.partial" "${SIZE_MB}M"
 # firerunner mounts by label, so this MUST be `hostedtoolcache` (16-byte cap).
-e2label "$OUT" "$LABEL"
+e2label "$OUT.partial" "$LABEL"
 sync
+mv -f "$OUT.partial" "$OUT"
 
 log "tool-cache drive written: $OUT ($(du -h "$OUT" | awk '{print $1}'), label=$LABEL)"
 log "contents:"

@@ -357,6 +357,11 @@ the container, which this does not check.
 signature is not checked; for a stronger guarantee, pin `--node-sha256` from a
 `SHASUMS256.txt.asc` you verified.
 
+Every builder writes its image to `--out`'s name plus `.partial` and renames
+it over `--out` only when the build is complete, so a failed build, a bad
+download among them, leaves the previous image in place. Rebuilding into
+the path firerunner boots from is safe.
+
 `images/test-verify-downloads.sh` runs the builders against a fake network
 that serves tampered archives.
 
