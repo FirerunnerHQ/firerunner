@@ -13,7 +13,8 @@
 #
 # Every download is checked before it is used (see lib/verify.sh): the runner
 # against the SHA-256 in its GitHub release notes, Node against the release's
-# SHASUMS256.txt. --runner-sha256 and --node-sha256 pin them instead. The
+# SHASUMS256.txt, signed with a Node.js release key (keys/). --runner-sha256
+# and --node-sha256 pin them instead. The
 # checksums used are printed and kept in /etc/firerunner/downloads.sha256.
 #
 set -euo pipefail
