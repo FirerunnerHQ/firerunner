@@ -34,6 +34,7 @@ import (
 	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/firerunnerhq/firerunner/internal/assigned"
+	"github.com/firerunnerhq/firerunner/internal/awscreds"
 	"github.com/firerunnerhq/firerunner/internal/cacheserver"
 	"github.com/firerunnerhq/firerunner/internal/cacheserver/s3store"
 	"github.com/firerunnerhq/firerunner/internal/cachetls"
@@ -161,9 +162,12 @@ func cacheServe(args []string) error {
 	maxEntries, maxRepoEntries := o.maxEntries, o.maxRepoEntries
 	jobsDir, jobsOwner, identityWait, artifactUpstream := o.jobsDir, o.jobsOwner, o.identityWait, o.artifactUpstream
 	s3Bucket, s3Prefix, s3Region := o.s3Bucket, o.s3Prefix, o.s3Region
-	s3LocalCache := o.s3LocalCache
+	s3LocalCache, s3CredsFile := o.s3LocalCache, o.s3CredsFile
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *s3CredsFile != "" && *s3Bucket == "" {
+		return fmt.Errorf("--s3-credentials-file needs --s3-bucket")
 	}
 	if !filepath.IsAbs(*jobsDir) {
 		return fmt.Errorf("--jobs-dir must be an absolute path")
@@ -189,8 +193,14 @@ func cacheServe(args []string) error {
 		return fmt.Errorf("--max-entries and --max-repo-entries must be >= 0 (0 = unlimited)")
 	}
 	srv.SetMaxEntries(*maxEntries, *maxRepoEntries)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	if *s3Bucket != "" {
-		store, err := s3store.New(context.Background(), *s3Bucket, *s3Prefix, *s3Region)
+		creds, err := s3Credentials(ctx, *s3CredsFile, log)
+		if err != nil {
+			return err
+		}
+		store, err := s3store.New(ctx, *s3Bucket, *s3Prefix, *s3Region, creds)
 		if err != nil {
 			return err
 		}
@@ -236,8 +246,6 @@ func cacheServe(args []string) error {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	drained := make(chan struct{})
 	go func() {
 		defer close(drained)
@@ -258,10 +266,27 @@ func cacheServe(args []string) error {
 	return nil
 }
 
+// s3Credentials is what the S3 store signs with: the credentials in file,
+// read again before they expire, or nil for the default AWS chain when file
+// is empty. It waits for the file to hold credentials, as the daemon that
+// writes it may start after cache-server; only ctx ends the wait.
+func s3Credentials(ctx context.Context, file string, log *slog.Logger) (aws.CredentialsProvider, error) {
+	if file == "" {
+		return nil, nil
+	}
+	if !filepath.IsAbs(file) {
+		return nil, fmt.Errorf("--s3-credentials-file must be an absolute path")
+	}
+	if err := awscreds.Wait(ctx, file, time.Second, log); err != nil {
+		return nil, fmt.Errorf("--s3-credentials-file: %w", err)
+	}
+	return awscreds.NewFileCache(file), nil
+}
+
 // cacheFlags are the cache-server subcommand's flag values.
 type cacheFlags struct {
 	addr, dir, maxSize, maxEntry, jobsDir, artifactUpstream *string
-	s3Bucket, s3Prefix, s3Region, s3LocalCache              *string
+	s3Bucket, s3Prefix, s3Region, s3LocalCache, s3CredsFile *string
 	jobsOwner, maxEntries, maxRepoEntries                   *int
 	identityWait                                            *time.Duration
 }
@@ -280,7 +305,8 @@ func newCacheFlagSet() (*flag.FlagSet, cacheFlags) {
 		jobsOwner:        fs.Int("jobs-owner-uid", os.Getuid(), "UID of the daemon that owns job records (default current UID)"),
 		identityWait:     fs.Duration("identity-wait", cacheserver.DefaultIdentityWait, "how long a request from a VM whose job identity is still pending waits for it before being denied (0 denies at once)"),
 		artifactUpstream: fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs"),
-		s3Bucket:         fs.String("s3-bucket", "", "keep completed blobs and the index in this S3 bucket instead of --dir, which then only stages uploads; credentials come from the default AWS chain"),
+		s3Bucket:         fs.String("s3-bucket", "", "keep completed blobs and the index in this S3 bucket instead of --dir, which then only stages uploads; credentials come from the default AWS chain, or --s3-credentials-file"),
+		s3CredsFile:      fs.String("s3-credentials-file", "", "with --s3-bucket, sign with the credentials in this file (credential_process JSON, kept fresh by the daemon's --cache-role-arn) instead of the default AWS chain, waiting for it at start; pass --s3-region too, as instance metadata may be unreachable"),
 		s3Prefix:         fs.String("s3-prefix", "firerunner-cache/", "key prefix inside --s3-bucket; one live cache-server per prefix"),
 		s3Region:         fs.String("s3-region", "", "region of --s3-bucket (default: from the AWS config or instance metadata)"),
 		s3LocalCache:     fs.String("s3-local-cache-size", "20GB", "with --s3-bucket, keep up to this much of the most recently used blobs on local disk so restores skip S3 (0 keeps none)"),
@@ -358,6 +384,9 @@ cache-server flags:
                      (default github.com's results-receiver; "" refuses them)
   --s3-bucket string  keep completed blobs and the index in this S3 bucket;
                      --dir then only stages uploads (credentials: default AWS chain)
+  --s3-credentials-file string  sign S3 requests with the credentials in this
+                     file, which the daemon's --cache-role-arn keeps fresh,
+                     instead of the default AWS chain; waits for it at start
   --s3-prefix string  key prefix in --s3-bucket (default "firerunner-cache/");
                      one live cache-server per prefix
   --s3-region string  region of --s3-bucket (default from AWS config / IMDS)
@@ -804,6 +833,32 @@ func openJobEvents(cfg *config.Config, log *slog.Logger) (jobevent.Sink, func())
 	}
 }
 
+// cacheCredentials is the refresher that keeps --cache-credentials-file
+// holding the --cache-role-arn session's credentials.
+func cacheCredentials(cfg *config.Config, api awscreds.STSAPI, log *slog.Logger) *awscreds.Refresher {
+	return &awscreds.Refresher{
+		API:     api,
+		RoleARN: cfg.CacheRoleARN,
+		Path:    cfg.CacheCredentialsFile,
+		Log:     log.With("component", "cache-credentials"),
+	}
+}
+
+// runInBackground runs f until ctx ends or the returned stop is called;
+// stop returns once f has.
+func runInBackground(ctx context.Context, f func(context.Context)) (stop func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f(ctx)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	events, closeEvents := openJobEvents(cfg, log)
 	defer closeEvents()
@@ -825,6 +880,18 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	appJWT, err := newAppJWT(ctx, cfg, privateKey)
 	if err != nil {
 		return err
+	}
+
+	// The local cache-server's S3 credentials, from a role that holds only
+	// the bucket's policy, so it needs neither this host's role nor
+	// instance metadata.
+	if cfg.CacheRoleARN != "" {
+		awsCfg, err := loadAWSConfig(ctx, cfg)
+		if err != nil {
+			return fmt.Errorf("--cache-role-arn: %w", err)
+		}
+		stopCreds := runInBackground(ctx, cacheCredentials(cfg, awssts.NewFromConfig(awsCfg), log).Run)
+		defer stopCreds()
 	}
 
 	// A static install is one tenant, made from its flags.

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -64,7 +65,12 @@ type Config struct {
 	Tenants     []Tenant
 
 	CacheJobsDir string
-	Firecracker  provisioner.FirecrackerConfig
+	// CacheRoleARN, when set, is a role the daemon assumes to keep
+	// CacheCredentialsFile holding its session credentials, so a local
+	// cache-server signs S3 requests with them instead of this host's role.
+	CacheRoleARN         string
+	CacheCredentialsFile string
+	Firecracker          provisioner.FirecrackerConfig
 
 	// JITAddr is the VPC IP:port where EC2 runner instances fetch their JIT
 	// config; required when any tier uses the ec2 provisioner. JITTTL bounds
@@ -419,6 +425,8 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.BoolVar(&c.Firecracker.NetNS, "netns", er.boolean("FR_NETNS", false), "run each microVM in its own network namespace (tap lives in the netns, veth uplink to the host); strongest network isolation, requires --jailer")
 	fs.StringVar(&c.Firecracker.ToolCacheImage, "toolcache", env("FR_TOOLCACHE", ""), "path to a read-only ext4 image (labelled \"hostedtoolcache\", mirroring GitHub's tool-cache layout) attached to every microVM so setup-* actions hit a pre-seeded cache instead of downloading; opt-in accelerator, jobs fall back to downloading when unset")
 	fs.StringVar(&c.CacheJobsDir, "cache-jobs-dir", env("FR_CACHE_JOBS_DIR", "/run/firerunner/jobs"), "private job identity directory shared with the local cache server; unique per daemon")
+	fs.StringVar(&c.CacheRoleARN, "cache-role-arn", env("FR_CACHE_ROLE_ARN", ""), "IAM role holding only the cache bucket's policy: the daemon assumes it and keeps --cache-credentials-file holding its credentials, refreshed every 15 minutes, for a local cache-server's --s3-credentials-file. Off when empty")
+	fs.StringVar(&c.CacheCredentialsFile, "cache-credentials-file", "", "with --cache-role-arn, where the role's credentials are written (mode 0640, this process's group); its directory must exist. Default FR_CACHE_CREDENTIALS_FILE, else "+DefaultCacheCredentialsFile)
 	fs.IntVar(&c.Firecracker.CachePort, "cache-port", er.int("FR_CACHE_PORT", 0), "TCP port of a firerunner cache-server reachable on each microVM's host gateway; when set, microVMs use it for actions/cache (dependency caching) instead of GitHub's hosted cache. Opt-in and off by default; the guest builds the URL from its default gateway and this port")
 	fs.StringVar(&c.Firecracker.CacheURL, "cache-url", env("FR_CACHE_URL", ""), "explicit base URL of a firerunner cache-server on this host (e.g. http://host:8099); overrides --cache-port. The server must share --cache-jobs-dir and see guest source IPs unchanged, so a remote server behind SNAT or a proxy is not supported. Opt-in and off by default")
 	fs.DurationVar(&c.Firecracker.MaxVMLifetime, "max-vm-lifetime", er.duration("FR_MAX_VM_LIFETIME", 6*time.Hour), "host-side backstop: kill a microVM still running after this long to reclaim its slot (a healthy VM self-destructs when its job ends, so this only fires on a stuck VM). Keep it larger than any real job; 0 disables it")
@@ -462,6 +470,10 @@ func Parse(args []string) (*Config, error) {
 	// Not a secret, but it names a key, and credentials are never flag defaults.
 	if c.AppKMSKey == "" {
 		c.AppKMSKey = env("FR_APP_KMS_KEY", "")
+	}
+	// A path, not a secret; but it names credentials, so likewise.
+	if c.CacheCredentialsFile == "" {
+		c.CacheCredentialsFile = env("FR_CACHE_CREDENTIALS_FILE", DefaultCacheCredentialsFile)
 	}
 	c.JobEventsDSN = env("FR_JOB_EVENTS_DSN", "")
 	c.JobEventsDSNFile = env("FR_JOB_EVENTS_DSN_FILE", "")
@@ -577,6 +589,13 @@ func (c *Config) UsesFirecracker() bool {
 	return false
 }
 
+// DefaultCacheCredentialsFile is where --cache-role-arn's credentials go: the
+// runtime directory a systemd unit shares with the cache user's group.
+const DefaultCacheCredentialsFile = "/run/firerunner/cache-s3-credentials.json"
+
+// iamRoleARN matches an IAM role ARN, its path included.
+var iamRoleARN = regexp.MustCompile(`^arn:aws[a-z-]*:iam::[0-9]{12}:role/[\w+=,.@/-]{1,512}$`)
+
 func (c *Config) validate() error {
 	fc := c.UsesFirecracker()
 	switch {
@@ -675,6 +694,14 @@ func (c *Config) validate() error {
 	}
 	if (c.Firecracker.CachePort != 0 || c.Firecracker.CacheURL != "" || c.UsesEC2Cache()) && !filepath.IsAbs(c.CacheJobsDir) {
 		return fmt.Errorf("--cache-jobs-dir must be an absolute path")
+	}
+	if c.CacheRoleARN != "" {
+		if !iamRoleARN.MatchString(c.CacheRoleARN) {
+			return fmt.Errorf("--cache-role-arn %q must be an IAM role ARN (arn:<partition>:iam::<account>:role/<name>)", c.CacheRoleARN)
+		}
+		if !filepath.IsAbs(c.CacheCredentialsFile) {
+			return fmt.Errorf("--cache-credentials-file %q must be an absolute path", c.CacheCredentialsFile)
+		}
 	}
 	if c.Firecracker.CacheURL != "" {
 		u, err := url.Parse(c.Firecracker.CacheURL)

@@ -1078,8 +1078,18 @@ firerunner cache-server --dir /var/lib/firerunner/cache \
   drops the entry, so the job misses and the next save of that key succeeds.
 - **Credentials and region** come from the default AWS chain, for example an
   instance profile. Without `--s3-region` or `AWS_REGION`, the region comes
-  from instance metadata. The policy below is the least the server needs
-  (`my-ci-cache` and `firerunner-cache/` stand for your bucket and prefix):
+  from instance metadata. With `--s3-credentials-file FILE`, the server
+  signs with the credentials in FILE instead (the JSON a
+  `credential_process` prints), reads it again before they expire, and
+  waits for it at start. The daemon keeps such a file fresh with
+  `--cache-role-arn ARN` (`FR_CACHE_ROLE_ARN`): it assumes that role, one
+  hour at a time, and rewrites `--cache-credentials-file` (default
+  `/run/firerunner/cache-s3-credentials.json`, mode 0640, the daemon's
+  group) every 15 minutes. Give that role only the policy below, let the
+  daemon's role assume it, and deny the server instance metadata, so it
+  never holds the daemon's own credentials. The policy below is the least
+  the server needs (`my-ci-cache` and `firerunner-cache/` stand for your
+  bucket and prefix):
 
   ```json
   {"Version": "2012-10-17", "Statement": [

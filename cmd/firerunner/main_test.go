@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/firerunnerhq/firerunner/internal/ghrunners"
 	"github.com/firerunnerhq/firerunner/internal/reconcile"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -16,6 +17,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	ststypes "github.com/aws/aws-sdk-go-v2/service/sts/types"
+
+	"github.com/firerunnerhq/firerunner/internal/awscreds"
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/ec2"
@@ -90,6 +96,97 @@ func TestCacheServerChecksIdentityDirectoryAtStartup(t *testing.T) {
 		if err := cacheServe(args); err == nil || !strings.Contains(err.Error(), "job identity directory") {
 			t.Fatalf("startup check: %v", err)
 		}
+	}
+}
+
+func TestCacheServerCredentialsFileNeedsABucket(t *testing.T) {
+	args := []string{"--dir", t.TempDir(), "--s3-credentials-file", "/run/firerunner/cache-s3-credentials.json"}
+	if err := cacheServe(args); err == nil || !strings.Contains(err.Error(), "needs --s3-bucket") {
+		t.Fatalf("--s3-credentials-file without --s3-bucket: %v", err)
+	}
+}
+
+func TestS3Credentials(t *testing.T) {
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+	if p, err := s3Credentials(ctx, "", quiet); p != nil || err != nil {
+		t.Fatalf("no file: %v, %v; want the default chain (nil)", p, err)
+	}
+	if _, err := s3Credentials(ctx, "creds.json", quiet); err == nil {
+		t.Fatal("a relative path was accepted")
+	}
+
+	// It waits for the daemon to write the file, then signs with it.
+	path := filepath.Join(t.TempDir(), "creds.json")
+	type result struct {
+		p   aws.CredentialsProvider
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		p, err := s3Credentials(ctx, path, quiet)
+		done <- result{p, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("returned before the file existed: %v", r.err)
+	default:
+	}
+	if err := awscreds.Write(path, aws.Credentials{AccessKeyID: "AKIAFILE", SecretAccessKey: "s", CanExpire: true, Expires: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("still waiting after the file was written")
+	}
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	c, err := r.p.Retrieve(ctx)
+	if err != nil || c.AccessKeyID != "AKIAFILE" {
+		t.Fatalf("provider gave %q, %v", c.AccessKeyID, err)
+	}
+
+	// A signal ends the wait.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := s3Credentials(cctx, filepath.Join(t.TempDir(), "absent"), quiet); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled wait: %v", err)
+	}
+}
+
+// fakeSTS issues one session for any role.
+type fakeSTS struct{ in *sts.AssumeRoleInput }
+
+func (f *fakeSTS) AssumeRole(_ context.Context, in *sts.AssumeRoleInput, _ ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
+	f.in = in
+	return &sts.AssumeRoleOutput{Credentials: &ststypes.Credentials{
+		AccessKeyId: aws.String("AKIAROLE"), SecretAccessKey: aws.String("s"), SessionToken: aws.String("t"),
+		Expiration: aws.Time(time.Now().Add(time.Hour)),
+	}}, nil
+}
+
+// The daemon's --cache-role-arn and --cache-credentials-file reach the
+// refresher: it assumes that role and writes that file, and stops with the
+// daemon.
+func TestCacheCredentialsWiring(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "creds.json")
+	cfg := &config.Config{CacheRoleARN: "arn:aws:iam::123456789012:role/cache", CacheCredentialsFile: path}
+	api := &fakeSTS{}
+	r := cacheCredentials(cfg, api, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	stop := runInBackground(context.Background(), r.Run)
+	if err := awscreds.Wait(context.Background(), path, time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+	stop() // returns only once Run has
+	if got := aws.ToString(api.in.RoleArn); got != cfg.CacheRoleARN {
+		t.Fatalf("assumed %q", got)
+	}
+	c, err := awscreds.FileProvider{Path: path}.Retrieve(context.Background())
+	if err != nil || c.AccessKeyID != "AKIAROLE" {
+		t.Fatalf("file holds %q, %v", c.AccessKeyID, err)
 	}
 }
 
