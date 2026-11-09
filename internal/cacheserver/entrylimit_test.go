@@ -9,8 +9,8 @@ import (
 	"testing"
 )
 
-// twirpStatus POSTs a cache RPC and returns the response status.
-func twirpStatus(t *testing.T, base, method string, req any) int {
+// postTwirp POSTs a cache RPC and returns the response status.
+func postTwirp(t *testing.T, base, method string, req any) int {
 	t.Helper()
 	body, _ := json.Marshal(req)
 	resp, err := http.Post(base+twirpBase+method, "application/json", bytes.NewReader(body))
@@ -46,7 +46,7 @@ func TestKeysAreBounded(t *testing.T) {
 		// Characters, not bytes: 512 of them are 1536 bytes here.
 		{"multi-byte key at the limit", "CreateCacheEntry", createReq{Key: strings.Repeat("鍵", maxKeyLen), Version: "v"}, http.StatusOK},
 	} {
-		if got := twirpStatus(t, ts.URL, tc.method, tc.req); got != tc.want {
+		if got := postTwirp(t, ts.URL, tc.method, tc.req); got != tc.want {
 			t.Errorf("%s: %d, want %d", tc.name, got, tc.want)
 		}
 	}

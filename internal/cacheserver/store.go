@@ -125,17 +125,18 @@ func (s *Server) flushIndex() {
 }
 
 // finishUpload hands the assembled blob of n bytes to the store, if any, and
-// records it as staged, so finalize can complete the entry. It answers the
-// status to fail the upload with, or 0. The reservation may have been
-// reclaimed meanwhile (gc, a stale reservation taken over), neither of which
-// waits for e.ioMu: the blob then goes, rather than outliving its entry.
-func (s *Server) finishUpload(r *http.Request, e *Entry, n int64) (int, error) {
+// records it as staged, so finalize can complete the entry. It fails with
+// errStoreUnavailable or errReservationGone (see uploadError). The reservation
+// may have been reclaimed meanwhile (gc, a stale reservation taken over),
+// neither of which waits for e.ioMu: the blob then goes, rather than
+// outliving its entry.
+func (s *Server) finishUpload(r *http.Request, e *Entry, n int64) error {
 	if s.store != nil {
 		if err := s.store.Put(r.Context(), e.ID, s.blobPath(e.ID)); err != nil {
 			_ = os.Remove(s.blobPath(e.ID))
 			s.clearStaged(e.ID)
 			s.log.Warn("cache blob upload to store failed", "id", e.ID, "err", err)
-			return http.StatusInsufficientStorage, errStoreUnavailable
+			return errStoreUnavailable
 		}
 	}
 	s.mu.Lock()
@@ -143,7 +144,7 @@ func (s *Server) finishUpload(r *http.Request, e *Entry, n int64) (int, error) {
 	if s.entries[e.ID] != e {
 		s.removeBlob(e.ID)
 		delete(s.staged, e.ID)
-		return http.StatusNotFound, errors.New("cache reservation expired")
+		return errReservationGone
 	}
 	if s.store != nil {
 		if s.stored == nil {
@@ -152,7 +153,7 @@ func (s *Server) finishUpload(r *http.Request, e *Entry, n int64) (int, error) {
 		s.stored[e.ID] = n // the local file stays until finalize decides on a copy
 	}
 	s.staged[e.ID] = n
-	return 0, nil
+	return nil
 }
 
 // keepLocal records the blob at blobPath(id) of a completed entry as a local copy, or removes it when
@@ -349,18 +350,18 @@ func (s *Server) serveFromStore(w http.ResponseWriter, r *http.Request, e *Entry
 	start, end, partial, ok := parseRange(r.Header.Get("Range"), size)
 	if !ok {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
-		http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+		azureError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "the range specified is invalid for the current size of the resource")
 		return
 	}
 	body, err := s.store.Get(r.Context(), e.ID, start, end-start+1)
 	if errors.Is(err, fs.ErrNotExist) {
 		s.dropLost(e)
-		http.Error(w, "not found", http.StatusNotFound)
+		azureError(w, http.StatusNotFound, azBlobNotFound, "the specified blob does not exist")
 		return
 	}
 	if err != nil {
 		s.log.Warn("cache blob read from store failed", "id", e.ID, "err", err)
-		http.Error(w, errStoreUnavailable.Error(), http.StatusInsufficientStorage)
+		azureError(w, http.StatusInsufficientStorage, azStoreDown, errStoreUnavailable.Error())
 		return
 	}
 	defer body.Close()
