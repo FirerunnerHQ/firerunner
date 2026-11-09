@@ -19,6 +19,11 @@
 #                 default off)
 #   FR_CACHE_PORT its port (default 8099)
 #   FR_CACHE_BUCKET  with s3, the bucket (prefix firerunner-cache/)
+#   FR_CACHE_ROLE_ARN  with s3, the role holding only the bucket's policy: the
+#                 daemon assumes it and hands cache-server the session in a
+#                 file, so cache-server needs no instance metadata (a stack
+#                 made before it leaves it empty: cache-server then uses the
+#                 instance role, as before)
 #   FR_ROOT_GIB   the root volume's size, which caps the cache's local use
 #   FR_APP_KMS_KEY  a KMS key that signs for the GitHub App; set, no key is read
 #
@@ -101,6 +106,7 @@ printf '%s\n' "$tiers" > "$etc/tiers.json"
 # the address as a likely typo.
 cache="${FR_CACHE:-off}"
 cache_port="${FR_CACHE_PORT:-8099}"
+cache_creds=/run/firerunner/cache-s3-credentials.json
 case "$cache" in
 off | disk) ;;
 s3) [ -n "${FR_CACHE_BUCKET:-}" ] || { log "FR_CACHE=s3 needs FR_CACHE_BUCKET"; false; } ;;
@@ -112,6 +118,12 @@ if [ "$cache" != off ]; then
 	id -u firerunner-cache > /dev/null 2>&1 ||
 		useradd --system --no-create-home --shell /sbin/nologin firerunner-cache
 	echo "FR_CACHE_JOBS_DIR=/run/firerunner/jobs" >> "$etc/firerunner.env"
+	if [ "$cache" = s3 ] && [ -n "${FR_CACHE_ROLE_ARN:-}" ]; then
+		# In the daemon's runtime directory: the cache user's group may read it.
+		printf '%s\n' "FR_CACHE_ROLE_ARN=$FR_CACHE_ROLE_ARN" "FR_CACHE_CREDENTIALS_FILE=$cache_creds" >> "$etc/firerunner.env"
+	elif [ "$cache" = s3 ]; then
+		log "no FR_CACHE_ROLE_ARN: cache-server uses the instance role; update the stack to give it a role of its own"
+	fi
 	if [ "$cache_tier" = True ]; then
 		echo "FR_EC2_CACHE_ADDR=$FR_JIT_HOST:$cache_port" >> "$etc/firerunner.env"
 	fi
@@ -210,11 +222,17 @@ elif [ "$cache" != off ]; then
 	# 30% (S3 holds the rest). One upload stages at most 15%.
 	gib="${FR_ROOT_GIB:-8}"
 	caps=" --max-size $((gib * 40 / 100))GB --max-entry-size $((gib * 15 / 100))GB"
-	imds="IPAddressDeny=169.254.169.254/32"
+	# Both of IMDS's addresses: IPv4, and IPv6 should a launch template enable it.
+	imds="IPAddressDeny=169.254.169.254/32 fd00:ec2::254/128"
 	if [ "$cache" = s3 ]; then
-		caps=" --max-entry-size $((gib * 15 / 100))GB --s3-bucket $FR_CACHE_BUCKET --s3-prefix firerunner-cache/ --s3-local-cache-size $((gib * 30 / 100))GB"
-		# S3 needs the instance role's credentials, from IMDS.
-		imds="# IMDS stays reachable: S3 needs the instance role (see README)"
+		caps=" --max-entry-size $((gib * 15 / 100))GB --s3-bucket $FR_CACHE_BUCKET --s3-prefix firerunner-cache/ --s3-region $AWS_REGION --s3-local-cache-size $((gib * 30 / 100))GB"
+		if [ -n "${FR_CACHE_ROLE_ARN:-}" ]; then
+			# The cache role's session, from the daemon; it waits for the file.
+			caps+=" --s3-credentials-file $cache_creds"
+		else
+			# A stack without the cache role: S3 needs the instance role, from IMDS.
+			imds="# IMDS stays reachable: no cache role, S3 needs the instance role (see README)"
+		fi
 	fi
 	cat > "$units/firerunner-cache.service" <<EOF
 [Unit]
@@ -226,7 +244,8 @@ User=firerunner-cache
 Group=firerunner-cache
 # Bound to the VPC address; the control security group admits the runners'.
 ExecStart=/usr/local/bin/firerunner cache-server --addr $ip:$cache_port --dir /var/lib/firerunner-cache --jobs-dir /run/firerunner/jobs --jobs-owner-uid 0$caps
-# Without S3 it needs no AWS credentials, so it cannot fetch the role's.
+# No instance metadata, so never the control role's credentials: with S3 it
+# signs with the cache role's, which the daemon writes to /run/firerunner.
 $imds
 Restart=always
 RestartSec=5

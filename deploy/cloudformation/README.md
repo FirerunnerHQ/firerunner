@@ -150,15 +150,32 @@ control VM also runs `firerunner cache-server` for EC2 tiers that set
   and one upload stages at most 15%.
 - **`disk`.** Blobs live on the VM and go with it. cache-server cannot reach
   instance metadata, so it holds no AWS credentials.
-- **`s3`.** The stack makes a private, encrypted bucket. The role may read,
-  write and delete under `firerunner-cache/` and list only that prefix (the
-  README's least policy). A replacement VM serves what its predecessor
-  saved. The bucket is **kept** when the stack is deleted; empty and delete
-  it by hand (the `CacheBucket` output names it). A lifecycle rule aborts
-  multipart uploads left incomplete after a day. ⚠️ cache-server needs the
-  instance role's credentials for S3, so it can reach instance metadata, and
-  that role is the control plane's: a compromised cache-server could act as
-  the control VM (#138 scopes this down).
+- **`s3`.** The stack makes a private, encrypted bucket and a cache role
+  that may read, write and delete under `firerunner-cache/` and list only
+  that prefix (the README's least policy). The control role has no S3
+  access; it may assume the cache role and no other, and the cache role
+  trusts only it. The daemon assumes the cache role (`FR_CACHE_ROLE_ARN`)
+  and keeps one-hour session credentials in
+  `/run/firerunner/cache-s3-credentials.json`, readable by the cache user,
+  rewriting them every 15 minutes. cache-server signs with them
+  (`--s3-credentials-file`) and, as with `disk`, cannot reach instance
+  metadata, so it never holds the control role's credentials. `firerunner
+  status --json` shows the refresh under `listeners.cache_credentials`
+  (file, last refresh, expiry, last error), and `doctor`'s
+  `cache-credentials` check fails when the file is missing or expired or the
+  latest refresh failed. A
+  replacement VM serves what its predecessor saved. The bucket is **kept**
+  when the stack is deleted; empty and delete it by hand (the `CacheBucket`
+  output names it). A lifecycle rule aborts multipart uploads left
+  incomplete after a day.
+- **Upgrading an `s3` stack** made before the cache role: deploy a release
+  that has `--s3-credentials-file` first, then update the stack and refresh
+  the VM (`deploy-control.sh`). An older release on the new stack has no S3
+  access; a newer release on an older stack keeps using the instance role
+  and says so in the boot log. Between the stack update and the refresh,
+  the running VM's cache-server still signs with the instance role, which
+  has lost its S3 access: every restore misses and every save fails until
+  the new VM is up, so refresh right after the update.
 - **The address.** The bootstrap tells runners the cache-server address
   (`FR_EC2_CACHE_ADDR=<jit name>:<port>`) only when a tier sets
   `ec2.cache`. Such a tier with `Cache=off` fails `config check`.

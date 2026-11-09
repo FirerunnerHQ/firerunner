@@ -41,7 +41,7 @@ func TestS3StoreAgainstARealBucket(t *testing.T) {
 	prefix := fmt.Sprintf("firerunner-test/%d/", time.Now().UnixNano())
 	t.Cleanup(func() { deletePrefix(t, bucket, region, prefix) })
 
-	store, err := s3store.New(ctx, bucket, prefix, region)
+	store, err := s3store.New(ctx, bucket, prefix, region, nil)
 	if err != nil {
 		t.Fatalf("s3store.New: %v", err)
 	}

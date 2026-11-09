@@ -231,22 +231,7 @@ Resources:
                 Resource: !Sub
                   - "arn:${AWS::Partition}:route53:::hostedzone/${Z}"
                   - { Z: !If [CreateZone, !Ref Zone, !Ref HostedZoneId] }
-              # cache-server's least S3 policy (README, "Keeping the cache in
-              # S3"): objects under the prefix, and ListBucket for it, so a
-              # missing index reads as 404.
-              - !If
-                - CacheS3
-                - Effect: Allow
-                  Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:AbortMultipartUpload]
-                  Resource: !Sub "${CacheBucket.Arn}/firerunner-cache/*"
-                - !Ref AWS::NoValue
-              - !If
-                - CacheS3
-                - Effect: Allow
-                  Action: s3:ListBucket
-                  Resource: !GetAtt CacheBucket.Arn
-                  Condition: { StringLike: { "s3:prefix": ["firerunner-cache/*"] } }
-                - !Ref AWS::NoValue
+              # No S3 here: the bucket is CacheRole's alone (CacheAssume).
               # Signing only: the key cannot be read, and only this key.
               - !If
                 - AppKeyInKMS
@@ -263,6 +248,48 @@ Resources:
     Type: AWS::IAM::InstanceProfile
     Properties: { Roles: [!Ref ControlRole] }
 
+  # cache-server parses requests from job code, so it never holds the control
+  # role. The daemon assumes this role, which holds only cache-server's least
+  # S3 policy (README, "Keeping the cache in S3"): objects under the prefix,
+  # and ListBucket for it, so a missing index reads as 404. It hands the
+  # session to cache-server in a file; cache-server cannot reach IMDS.
+  CacheRole:
+    Type: AWS::IAM::Role
+    Condition: CacheS3
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { AWS: !GetAtt ControlRole.Arn }, Action: sts:AssumeRole }]
+      MaxSessionDuration: 3600
+      Policies:
+        - PolicyName: firerunner-cache
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:AbortMultipartUpload]
+                Resource: !Sub "${CacheBucket.Arn}/firerunner-cache/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt CacheBucket.Arn
+                Condition: { StringLike: { "s3:prefix": ["firerunner-cache/*"] } }
+
+  # The control role may assume CacheRole and no other. A policy of its own,
+  # as CacheRole's trust names the control role: inline, the two would
+  # depend on each other.
+  CacheAssume:
+    Type: AWS::IAM::RolePolicy
+    Condition: CacheS3
+    Properties:
+      RoleName: !Ref ControlRole
+      PolicyName: firerunner-cache-assume
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !GetAtt CacheRole.Arn
+
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -270,7 +297,8 @@ Resources:
         ImageId: !Ref ImageId
         InstanceType: !Ref InstanceType
         IamInstanceProfile: { Arn: !GetAtt ControlProfile.Arn }
-        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
+        # IMDS on IPv4 only; the cache unit denies both addresses all the same.
+        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled, HttpProtocolIpv6: disabled }
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs: { VolumeSize: !Ref RootVolumeGiB, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
@@ -309,6 +337,7 @@ Resources:
               FR_CACHE=${Cache}
               FR_CACHE_PORT=${CachePort}
               FR_CACHE_BUCKET=${CacheBucketName}
+              FR_CACHE_ROLE_ARN=${CacheRoleArn}
               FR_ROOT_GIB=${RootVolumeGiB}
               FR_APP_KMS_KEY=${AppKMSKeyArn}
               EOF
@@ -329,9 +358,17 @@ Resources:
               bash firerunner-control-bootstrap.sh "$d"
             - ZoneId: !If [CreateZone, !Ref Zone, !Ref HostedZoneId]
               CacheBucketName: !If [CacheS3, !Ref CacheBucket, ""]
+              # IAM may show CacheAssume a little after it exists; the daemon
+              # retries until it may assume the role.
+              CacheRoleArn: !If [CacheS3, !GetAtt CacheRole.Arn, ""]
 
   ControlGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
+    # After CacheAssume, so a new stack's first VM may assume the cache role
+    # when it boots. DependsOn cannot name a resource that may not exist;
+    # a reference in Metadata orders the two all the same.
+    Metadata:
+      CacheAssume: !If [CacheS3, !Ref CacheAssume, ""]
     Properties:
       AutoScalingGroupName: !Sub "${AWS::StackName}-control"
       MinSize: "1"

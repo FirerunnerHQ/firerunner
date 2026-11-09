@@ -1174,3 +1174,31 @@ func TestJobEventsDSNComesFromTheEnv(t *testing.T) {
 		t.Fatal("a password must not be a flag")
 	}
 }
+
+func TestFromFlags_CacheRole(t *testing.T) {
+	const role = "arn:aws:iam::123456789012:role/fr-CacheRole-ABC"
+	c, err := FromFlags(baseArgs())
+	if err != nil || c.CacheRoleARN != "" || c.CacheCredentialsFile != "/run/firerunner/cache-s3-credentials.json" {
+		t.Fatalf("defaults: %+v err %v", c, err)
+	}
+	c, err = FromFlags(append(baseArgs(), "--cache-role-arn", role, "--cache-credentials-file", "/run/x/creds.json"))
+	if err != nil || c.CacheRoleARN != role || c.CacheCredentialsFile != "/run/x/creds.json" {
+		t.Fatalf("flags: %+v err %v", c, err)
+	}
+	t.Setenv("FR_CACHE_ROLE_ARN", "arn:aws-us-gov:iam::123456789012:role/path/to/cache")
+	t.Setenv("FR_CACHE_CREDENTIALS_FILE", "/run/y/creds.json")
+	c, err = FromFlags(baseArgs())
+	if err != nil || c.CacheRoleARN != "arn:aws-us-gov:iam::123456789012:role/path/to/cache" || c.CacheCredentialsFile != "/run/y/creds.json" {
+		t.Fatalf("env: %+v err %v", c, err)
+	}
+	for name, extra := range map[string][]string{
+		"not a role":    {"--cache-role-arn", "arn:aws:iam::123456789012:user/cache"},
+		"no account":    {"--cache-role-arn", "arn:aws:iam:::role/cache"},
+		"bare name":     {"--cache-role-arn", "cache"},
+		"relative file": {"--cache-role-arn", role, "--cache-credentials-file", "creds.json"},
+	} {
+		if _, err := FromFlags(append(baseArgs(), extra...)); err == nil {
+			t.Errorf("%s: %v accepted", name, extra)
+		}
+	}
+}

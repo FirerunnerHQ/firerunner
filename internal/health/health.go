@@ -296,6 +296,28 @@ type File struct {
 	// EC2Breakers are the EC2 launch options backing off after a refusal,
 	// shared by every EC2 tier; launches try them last.
 	EC2Breakers []Breaker `json:"ec2_breakers,omitempty"`
+	// CacheCredentials is the cache role's credentials file, when the
+	// daemon keeps one (--cache-role-arn).
+	CacheCredentials *CacheCredentials `json:"cache_credentials,omitempty"`
+}
+
+// CacheCredentials is how the daemon's refresh of the cache role's
+// credentials file is going. It never holds the credentials.
+type CacheCredentials struct {
+	File string `json:"file"`
+	// LastRefresh is the last successful rewrite and Expires the session's
+	// end; zero before the first.
+	LastRefresh time.Time `json:"last_refresh,omitzero"`
+	Expires     time.Time `json:"expires,omitzero"`
+	// LastError is the latest failed refresh's, at LastErrorAt; a later
+	// LastRefresh means it has since recovered.
+	LastError   string    `json:"last_error,omitempty"`
+	LastErrorAt time.Time `json:"last_error_at,omitzero"`
+}
+
+// Failing reports whether the latest refresh failed.
+func (c CacheCredentials) Failing() bool {
+	return c.LastError != "" && !c.LastErrorAt.Before(c.LastRefresh)
 }
 
 // Breaker is one EC2 launch option backing off.

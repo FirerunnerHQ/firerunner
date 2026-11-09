@@ -23,6 +23,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/firerunnerhq/firerunner/internal/awscreds"
 	"github.com/firerunnerhq/firerunner/internal/cacheserver"
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/health"
@@ -454,6 +455,17 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				fmt.Fprintf(w, "  error: %s\n", truncate(rp.Error, 200))
 			}
 		}
+		if cc := l.CacheCredentials; cc != nil {
+			fmt.Fprintf(w, "\nCache credentials: %s\n", cc.File)
+			if !cc.LastRefresh.IsZero() {
+				fmt.Fprintf(w, "  refreshed %s ago, valid until %s (%s left)\n",
+					humanDuration(time.Since(cc.LastRefresh).Truncate(time.Second)), cc.Expires.Format(time.RFC3339),
+					humanDuration(time.Until(cc.Expires).Truncate(time.Second)))
+			}
+			if cc.Failing() {
+				fmt.Fprintf(w, "  last refresh failed %s ago: %s\n", humanDuration(time.Since(cc.LastErrorAt).Truncate(time.Second)), truncate(cc.LastError, 200))
+			}
+		}
 		var backingOff []health.Breaker
 		for _, b := range l.EC2Breakers {
 			if time.Until(b.Until) > 0 { // the file is up to healthInterval old
@@ -553,6 +565,9 @@ func runDoctor(cfg *config.Config, version string, extra ...Check) DoctorReport 
 
 	checks = append(checks, extra...)
 	checks = append(checks, listenerChecks(fc, time.Now())...)
+	if c := cacheCredentialsCheck(cfg, time.Now()); c != nil {
+		checks = append(checks, *c)
+	}
 
 	failed := 0
 	for _, c := range checks {
@@ -691,6 +706,42 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 		}
 	}
 	return checks
+}
+
+// cacheCredentialsLow is how little life the cache role's credentials may
+// have left before doctor warns: the daemon renews them with 45 minutes
+// or more to go, so less than this means its refreshes are failing.
+const cacheCredentialsLow = 30 * time.Minute
+
+// cacheCredentialsCheck judges the file --cache-role-arn keeps, nil without
+// that flag: FAIL when the file is missing, unreadable or expired, or the
+// daemon's latest refresh failed; WARN when it is close to expiry.
+func cacheCredentialsCheck(cfg *config.Config, now time.Time) *Check {
+	if cfg.CacheRoleARN == "" {
+		return nil
+	}
+	const name = "cache-credentials"
+	path := cfg.CacheCredentialsFile
+	creds, err := awscreds.FileProvider{Path: path, Now: func() time.Time { return now }}.Retrieve(context.Background())
+	if err != nil {
+		c := fail(name, "cache-server cannot sign S3 requests: %v", err)
+		return &c
+	}
+	if li, err := readListeners(cfg.Firecracker, now); err == nil && !li.Stale {
+		if cc := li.CacheCredentials; cc != nil && cc.Failing() {
+			c := fail(name, "the daemon's last refresh failed %s ago: %s; %s holds credentials valid for %s",
+				humanDuration(now.Sub(cc.LastErrorAt).Truncate(time.Second)), truncate(cc.LastError, 200), path,
+				humanDuration(creds.Expires.Sub(now).Truncate(time.Second)))
+			return &c
+		}
+	}
+	left := creds.Expires.Sub(now).Truncate(time.Second)
+	if creds.CanExpire && left < cacheCredentialsLow {
+		c := warn(name, "%s expires in %s; the daemon renews it at 45 minutes or more: is it running?", path, humanDuration(left))
+		return &c
+	}
+	c := pass(name, "%s valid until %s (%s left)", path, creds.Expires.Format(time.RFC3339), humanDuration(left))
+	return &c
 }
 
 // truncate shortens s to at most n runes, marking the cut.

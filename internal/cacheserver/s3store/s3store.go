@@ -33,8 +33,9 @@ type Store struct {
 	prefix   string
 }
 
-// New uses the default credential chain (an instance profile on EC2).
-func New(ctx context.Context, bucket, prefix, region string) (*Store, error) {
+// New makes a store. Credentials come from creds, or, when it is nil, the
+// default credential chain (an instance profile on EC2).
+func New(ctx context.Context, bucket, prefix, region string, creds aws.CredentialsProvider) (*Store, error) {
 	if bucket == "" {
 		return nil, errors.New("s3store: bucket is required")
 	}
@@ -49,6 +50,9 @@ func New(ctx context.Context, bucket, prefix, region string) (*Store, error) {
 	opts := []func(*config.LoadOptions) error{config.WithHTTPClient(httpClient), config.WithEC2IMDSRegion()}
 	if region != "" {
 		opts = append(opts, config.WithRegion(region))
+	}
+	if creds != nil {
+		opts = append(opts, config.WithCredentialsProvider(creds))
 	}
 	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
