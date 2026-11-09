@@ -254,7 +254,8 @@ base (systemd + git/curl/iproute2), installs `actions/runner` and runs its
 `installdependencies.sh`, drops in the boot service + a static resolv.conf,
 enables the service, and (per tier) installs Docker or bakes Node.js. The result
 is an immutable file firerunner reflink-clones per job. Requires `debootstrap`,
-`mkfs.ext4`, `curl` and `tar` on the host.
+`mkfs.ext4`, `curl` and `tar` on the host, and `gpg` and `gpgv` (Debian and
+Ubuntu: `gnupg`) wherever a builder downloads Node.js unpinned.
 
 ## Building the tool-cache drive
 
@@ -309,7 +310,7 @@ prints the checksums it used, and a rootfs keeps them in
 | download | checked against | pin it with |
 |---|---|---|
 | `actions/runner` (`build-rootfs.sh`, `build-ubuntu-rootfs.sh`) | the SHA-256 in the release's notes, read through the GitHub API | `--runner-version` and `--runner-sha256` |
-| Node.js (`build-rootfs.sh` node tier, `build-ubuntu-rootfs.sh`) | `SHASUMS256.txt` in the same nodejs.org release directory | `--node-sha256` |
+| Node.js (`build-rootfs.sh` node tier, `build-ubuntu-rootfs.sh`) | `SHASUMS256.txt` in the same nodejs.org release directory, once its signature checks out against a Node.js release key | `--node-sha256` |
 | actions/runner-images (`build-ubuntu-rootfs.sh --toolset full`) | a commit SHA, fetched with git | `--runner-images-commit` |
 | `packages-microsoft-prod.deb` (`build-ubuntu-rootfs.sh --toolset full`) | a SHA-256 pinned in the script for Ubuntu 24.04 | `--pmc-sha256` |
 | `actions/runner` (`build-ec2-ami.sh`) | the release notes, read on the operator's machine; the build instance checks the download | `--runner-version` and `--runner-sha256` |
@@ -353,9 +354,12 @@ release needs a `--checksums` line. The toolcache drive picks a Python build
 from the python-versions manifest and accepts only an asset of a
 python-versions release. Its `setup.sh` still upgrades pip from PyPI inside
 the container, which this does not check.
-`SHASUMS256.txt` comes from the same origin as the tarball, and its GPG
-signature is not checked; for a stronger guarantee, pin `--node-sha256` from a
-`SHASUMS256.txt.asc` you verified.
+Node's `SHASUMS256.txt` comes from the same server as the tarball, so the
+builders believe it only under its detached signature, `SHASUMS256.txt.sig`,
+made with a Node.js release key: `gpgv` checks it against
+[`keys/nodejs-release-keys.asc`](keys/), and the build prints which key
+signed it. That needs `gpg` and `gpgv` on the build host. A pinned checksum
+skips it.
 
 `images/test-verify-downloads.sh` runs the builders against a fake network
 that serves tampered archives.

@@ -30,7 +30,7 @@
 # (self-contained, no Docker; needs jq).
 #
 # Every archive is checked on the host before it is unpacked (see
-# lib/verify.sh): Node against the release's SHASUMS256.txt, Go against the
+# lib/verify.sh): Node against the release's signed SHASUMS256.txt, Go against the
 # go.dev download index, Python and CodeQL against the SHA-256 the GitHub API
 # reports for the release asset. `--checksums FILE` pins them instead: lines
 # of "SHA256  ARCHIVE-NAME", as sha256sum prints them; an archive it lists is

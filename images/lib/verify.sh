@@ -5,7 +5,9 @@
 # Every archive a builder executes or bakes into an image is checked against a
 # SHA-256 that is pinned, or read from a source other than the download itself:
 #   actions/runner   the release notes ("<!-- BEGIN SHA linux-x64 -->…")
-#   Node.js          SHASUMS256.txt in the same nodejs.org release directory
+#   Node.js          SHASUMS256.txt in the same nodejs.org release directory,
+#                    once its signature checks out against a release key in
+#                    keys/nodejs-release-keys.asc
 #   Go               the go.dev download index (?mode=json)
 #   GitHub releases  the asset's digest in the GitHub API (python-versions,
 #                    the CodeQL bundle)
@@ -83,12 +85,36 @@ runner_release() {
 	echo "$version $sha"
 }
 
+# The Node.js release keys SHASUMS256.txt must be signed with (keys/README.md).
+NODE_KEYRING="${NODE_KEYRING:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../keys" && pwd)/nodejs-release-keys.asc}"
+
 # node_sha256 VERSION FILE prints FILE's SHA-256 from SHASUMS256.txt in Node
-# VERSION's release directory.
+# VERSION's release directory, once its detached signature, SHASUMS256.txt.sig,
+# checks out against a key in NODE_KEYRING. Needs gpg and gpgv.
 node_sha256() {
-	local url sums sha
+	local url sums sha dir signer
 	url="https://nodejs.org/dist/v$1/SHASUMS256.txt"
-	sums="$(curl -fsSL --retry 3 "$url")" || verify_error "Node v$1: could not read $url" || return
+	command -v gpgv >/dev/null && command -v gpg >/dev/null ||
+		verify_error "Node v$1: checking SHASUMS256.txt's signature needs gpg and gpgv (gnupg); install them, or pin the archive's SHA-256" || return
+	[[ -r "$NODE_KEYRING" ]] || verify_error "Node v$1: no release keys at $NODE_KEYRING" || return
+	dir="$(mktemp -d)"
+	# gpgv reads only a binary keyring; the armored one is what the repo reviews.
+	if ! curl -fsSL --retry 3 -o "$dir/SHASUMS256.txt" "$url" ||
+		! curl -fsSL --retry 3 -o "$dir/SHASUMS256.txt.sig" "$url.sig"; then
+		rm -rf "$dir"
+		verify_error "Node v$1: could not read $url and its .sig" || return
+	fi
+	if ! GNUPGHOME="$dir" gpg --batch --quiet --dearmor <"$NODE_KEYRING" >"$dir/keyring.gpg" 2>"$dir/err" ||
+		! GNUPGHOME="$dir" gpgv --status-fd 3 --keyring "$dir/keyring.gpg" \
+			"$dir/SHASUMS256.txt.sig" "$dir/SHASUMS256.txt" 3>"$dir/status" 2>>"$dir/err"; then
+		sed 's/^/   /' "$dir/err" >&2
+		rm -rf "$dir"
+		verify_error "Node v$1: $url is not signed by a Node.js release key; if a new releaser signed it, run images/keys/update-nodejs-keys.sh" || return
+	fi
+	signer="$(awk '$2 == "VALIDSIG" { print $NF; exit }' "$dir/status")"
+	echo ">> Node v$1 SHASUMS256.txt signed by release key $signer" >&2
+	sums="$(cat "$dir/SHASUMS256.txt")"
+	rm -rf "$dir"
 	sha="$(printf '%s\n' "$sums" | awk -v f="$2" '$2 == f { print $1; exit }')"
 	[[ -n "$sha" ]] || verify_error "Node v$1: $url lists no $2" || return
 	echo "$sha"

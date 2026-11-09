@@ -25,7 +25,7 @@
 #
 # Every download is checked on the host before the image build uses it (see
 # lib/verify.sh): the runner against the SHA-256 in its release notes, Node
-# against the release's SHASUMS256.txt, Microsoft's repository package against
+# against the release's signed SHASUMS256.txt, Microsoft's repository package against
 # a pinned SHA-256, and actions/runner-images is fetched at a commit SHA. The
 # --*-sha256 and --runner-images-commit flags pin them. The checksums used are
 # printed and kept in /etc/firerunner/downloads.sha256.

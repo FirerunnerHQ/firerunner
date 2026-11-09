@@ -7,7 +7,21 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Node's SHASUMS256.txt is signed: a test release key and a stranger's sign the
+# fixtures. GNUPGHOME stays short, since gpg-agent's socket lives in it.
+for t in gpg gpgv gpgconf; do
+	command -v "$t" >/dev/null || {
+		echo "test-verify-downloads: needs $t (gnupg)" >&2
+		exit 1
+	}
+done
+GPG_RELEASE="$(mktemp -d /tmp/frgpg.XXXXXX)"
+GPG_STRANGER="$(mktemp -d /tmp/frgpg.XXXXXX)"
+cleanup() {
+	for h in "$GPG_RELEASE" "$GPG_STRANGER"; do gpgconf --homedir "$h" --kill gpg-agent 2>/dev/null || true; done
+	rm -rf "$TMP" "$GPG_RELEASE" "$GPG_STRANGER"
+}
+trap cleanup EXIT
 BIN="$TMP/bin"
 REMOTE="$TMP/remote"
 mkdir -p "$BIN" "$REMOTE"
@@ -138,6 +152,22 @@ release release.json "$RUNNER_SHA"
 release release-nosha.json ""
 printf '%s  %s\n%s  node-v%s-darwin-arm64.tar.gz\n' "$NODE_SHA" "$NODE_TGZ" "$(printf '%064d' 1)" "$NV" >"$REMOTE/SHASUMS256.txt"
 printf '%s  node-v%s-darwin-arm64.tar.gz\n' "$(printf '%064d' 1)" "$NV" >"$REMOTE/SHASUMS256-other.txt"
+# A release key the builders trust (NODE_KEYRING), and a stranger's.
+for h in "$GPG_RELEASE" "$GPG_STRANGER"; do
+	chmod 700 "$h"
+	gpg --homedir "$h" --batch --quiet --passphrase '' --quick-gen-key "test <$(basename "$h")@example.com>" ed25519 sign never 2>/dev/null
+done
+gpg --homedir "$GPG_RELEASE" --batch --armor --export >"$TMP/node-keys.asc"
+RELEASE_FPR="$(gpg --homedir "$GPG_RELEASE" --batch --with-colons --list-keys 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')"
+export NODE_KEYRING="$TMP/node-keys.asc"
+sign() { # HOME FILE OUT: OUT is FILE's detached signature by HOME's key.
+	gpg --homedir "$1" --batch --quiet --yes --detach-sign -o "$3" "$2"
+}
+sign "$GPG_RELEASE" "$REMOTE/SHASUMS256.txt" "$REMOTE/SHASUMS256.txt.sig"
+sign "$GPG_RELEASE" "$REMOTE/SHASUMS256-other.txt" "$REMOTE/SHASUMS256-other.txt.sig"
+sign "$GPG_STRANGER" "$REMOTE/SHASUMS256.txt" "$REMOTE/SHASUMS256-stranger.txt.sig"
+# A SHASUMS256.txt that lists a tampered archive, under the real signature.
+printf '%s  %s\n' "$(sha "$REMOTE/evil-node.tar.gz")" "$NODE_TGZ" >"$REMOTE/SHASUMS256-forged.txt"
 
 printf 'not the real package\n' >"$REMOTE/pmc.deb"
 PMC_SHA="$(sha "$REMOTE/pmc.deb")"
@@ -209,6 +239,7 @@ routes() {
 	serve "https://api.github.com/repos/actions/runner/releases/tags/v$RV" "$REMOTE/release.json"
 	serve "$RUNNER_URL" "$REMOTE/$RUNNER_TGZ"
 	serve "https://nodejs.org/dist/v$NV/SHASUMS256.txt" "$REMOTE/SHASUMS256.txt"
+	serve "https://nodejs.org/dist/v$NV/SHASUMS256.txt.sig" "$REMOTE/SHASUMS256.txt.sig"
 	serve "$NODE_URL" "$REMOTE/$NODE_TGZ"
 	serve "$PMC_URL" "$REMOTE/pmc.deb"
 	serve https://api.github.com/repos/actions/runner-images/commits/ubuntu24/test "$REMOTE/ri-tag"
@@ -319,6 +350,10 @@ routes
 run rootfs-node "$ROOTFS" --out "$OUT" --tier firerunner-node
 expect "node: builds" passed
 expect "node: checks against SHASUMS256.txt" has urls "https://nodejs.org/dist/v$NV/SHASUMS256.txt"
+expect "node: checks its signature" has urls "https://nodejs.org/dist/v$NV/SHASUMS256.txt.sig"
+expect "node: uses the SHASUMS256.txt it checked, read once" \
+	test "$(grep -cxF "https://nodejs.org/dist/v$NV/SHASUMS256.txt" "$STATE/urls")" = 1
+expect "node: names the release key that signed it" has err "SHASUMS256.txt signed by release key $RELEASE_FPR"
 expect "node: installs node" exists node-installed
 expect "node: the image records both checksums" has downloads.sha256 "$NODE_SHA  $NODE_TGZ"
 
@@ -331,11 +366,35 @@ expect "tampered node: never unpacked" absent node-installed
 
 routes
 reroute "https://nodejs.org/dist/v$NV/SHASUMS256.txt" "$REMOTE/SHASUMS256-other.txt"
+reroute "https://nodejs.org/dist/v$NV/SHASUMS256.txt.sig" "$REMOTE/SHASUMS256-other.txt.sig"
 run rootfs-node-unlisted "$ROOTFS" --out "$OUT" --tier firerunner-node
 expect "node missing from SHASUMS256.txt: fails before building" failed
 expect "node missing from SHASUMS256.txt: says so" has err "lists no $NODE_TGZ"
 expect "node missing from SHASUMS256.txt: no image" lacks calls mkfs.ext4
 
+# SHASUMS256.txt is believed only under a release key's signature.
+routes
+reroute "https://nodejs.org/dist/v$NV/SHASUMS256.txt" "$REMOTE/SHASUMS256-forged.txt"
+reroute "$NODE_URL" "$REMOTE/evil-node.tar.gz"
+run rootfs-node-forged "$ROOTFS" --out "$OUT" --tier firerunner-node
+expect "forged SHASUMS256.txt: fails before building" failed
+expect "forged SHASUMS256.txt: says why" has err "is not signed by a Node.js release key"
+expect "forged SHASUMS256.txt: no image" lacks calls mkfs.ext4
+expect "forged SHASUMS256.txt: the archive is never fetched" lacks urls "$NODE_URL"
+
+routes
+reroute "https://nodejs.org/dist/v$NV/SHASUMS256.txt.sig" "$REMOTE/SHASUMS256-stranger.txt.sig"
+run rootfs-node-stranger "$ROOTFS" --out "$OUT" --tier firerunner-node
+expect "signed by a stranger: fails" has err "is not signed by a Node.js release key"
+expect "signed by a stranger: no image" lacks calls mkfs.ext4
+
+routes
+reroute "https://nodejs.org/dist/v$NV/SHASUMS256.txt.sig" "$REMOTE/missing"
+run rootfs-node-unsigned "$ROOTFS" --out "$OUT" --tier firerunner-node
+expect "no signature: fails" has err "could not read https://nodejs.org/dist/v$NV/SHASUMS256.txt and its .sig"
+expect "no signature: no image" lacks calls mkfs.ext4
+
+routes
 run rootfs-node-pinned "$ROOTFS" --out "$OUT" --tier firerunner-node --node-sha256 "$NODE_SHA"
 expect "node pinned: builds without SHASUMS256.txt" passed
 expect "node pinned: installs node" exists node-installed
