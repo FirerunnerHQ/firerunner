@@ -1395,8 +1395,11 @@ others; the host holds at most `--max-entries` (default 20000). A job may hold
 at most 64 unfinished uploads. Requests keep to the toolkit's own limits, at
 most ten keys of at most 512 characters each.
 A request body that sends nothing for `--body-idle-timeout` (default 60s;
-`0` for no bound) fails as an incomplete upload and ends its connection;
-an upload that keeps sending is never cut, however long it takes.
+`0` for no bound) fails as an incomplete upload and ends its connection, and
+a response the client stops reading for as long, a download above all, ends
+its connection too; a transfer that keeps moving is never cut, however long
+it takes. One address may hold at most 64 connections to the cache server,
+and all of them together 4096.
 
 The cache is a pure accelerator — every job still passes with caching disabled,
 so when in doubt, leave it off.

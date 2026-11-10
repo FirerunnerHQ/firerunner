@@ -302,22 +302,57 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(s.bindGeneration(r.Context(), r.RemoteAddr))
 	}
 	// The artifact proxy sets its own deadline for a whole RPC.
-	if idle := s.bodyIdle.Load(); idle > 0 && r.Body != nil && r.Body != http.NoBody && !strings.HasPrefix(r.URL.Path, artifactTwirpBase) {
-		r.Body = &idleBody{ReadCloser: r.Body, rc: http.NewResponseController(w), idle: time.Duration(idle)}
+	if idle := s.bodyIdle.Load(); idle > 0 && !strings.HasPrefix(r.URL.Path, artifactTwirpBase) {
+		rc := http.NewResponseController(w)
+		if r.Body != nil && r.Body != http.NoBody {
+			r.Body = &idleBody{ReadCloser: r.Body, rc: rc, idle: time.Duration(idle)}
+		}
+		// A response, a download above all, that the client stops reading
+		// ends too. net/http clears the write deadline once it has flushed
+		// the response, so the last write's deadline also bounds that flush
+		// and never reaches the connection's next request
+		// (TestDownloadIdleBoundEndsWithTheRequest).
+		w = &idleWriter{ResponseWriter: w, rc: rc, idle: time.Duration(idle)}
 	}
 	s.mux.ServeHTTP(w, r)
 }
 
+// idleWriter pushes the connection's write deadline idle ahead of each write,
+// so a response the client stops reading ends, while one it keeps reading,
+// however long, does not (see SetBodyIdle).
+type idleWriter struct {
+	http.ResponseWriter
+	rc   *http.ResponseController
+	idle time.Duration
+}
+
+func (w *idleWriter) Write(p []byte) (int, error) {
+	_ = w.rc.SetWriteDeadline(time.Now().Add(w.idle))
+	return w.ResponseWriter.Write(p)
+}
+
+// Unwrap lets http.ResponseController reach the connection's own writer.
+func (w *idleWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// Connection caps for the cache server's listener (cmd/firerunner): one job
+// opens a few at a time, a handful of parallel range reads for a download
+// at most; the rest only hold descriptors and goroutines.
+const (
+	MaxConnsPerSource = 64
+	MaxConns          = 4096
+)
+
 // DefaultBodyIdle is SetBodyIdle's default for the cache-server command.
 const DefaultBodyIdle = 60 * time.Second
 
-// SetBodyIdle bounds how long a request body may send nothing. A guest can
-// otherwise trickle a body for as long as it likes, holding a connection, a
-// goroutine and, for an upload, a reservation, since a large archive leaves
-// no overall deadline that would be safe. Each read pushes the connection's
-// read deadline idle into the future, so an upload that keeps sending is
-// never cut, however long it takes. 0 turns the bound off. Call before
-// serving.
+// SetBodyIdle bounds how long a request body may send nothing, and a response
+// body may go unread. A guest can otherwise trickle an upload, or stop
+// reading a download, for as long as it likes, holding a connection, a
+// goroutine and a reservation or an open blob, since a large archive leaves
+// no overall deadline that would be safe. Each read of the request pushes the
+// connection's read deadline idle into the future, and each write of the
+// response its write deadline, so a transfer that keeps moving is never cut,
+// however long it takes. 0 turns the bound off. Call before serving.
 func (s *Server) SetBodyIdle(idle time.Duration) { s.bodyIdle.Store(int64(max(idle, 0))) }
 
 // idleBody extends the connection's read deadline before each read of the
