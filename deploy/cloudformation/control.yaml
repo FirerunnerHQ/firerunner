@@ -47,6 +47,8 @@ Parameters:
   ZoneName:
     Type: String
     Default: firerunner.internal
+    AllowedPattern: "[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*"
+    ConstraintDescription: a DNS name, with no trailing dot
     Description: The private zone's name; with HostedZoneId, that zone's name.
   HostedZoneId:
     Type: String
@@ -55,7 +57,9 @@ Parameters:
   JitName:
     Type: String
     Default: control
-    Description: The JIT name is <JitName>.<zone>.
+    AllowedPattern: "[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*"
+    ConstraintDescription: a DNS name, with no trailing dot
+    Description: The JIT name is <JitName>.<zone>; unique among the stacks sharing a zone.
   JitPort:
     Type: Number
     Default: 8098
@@ -226,11 +230,19 @@ Resources:
                 Action: ssm:GetParameter
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/*"
               # runner-compute:end
+              # Its own JIT name's A record, and nothing else in a zone other
+              # stacks may share.
               - Effect: Allow
                 Action: route53:ChangeResourceRecordSets
                 Resource: !Sub
                   - "arn:${AWS::Partition}:route53:::hostedzone/${Z}"
                   - { Z: !If [CreateZone, !Ref Zone, !Ref HostedZoneId] }
+                Condition:
+                  ForAllValues:StringEquals:
+                    route53:ChangeResourceRecordSetsActions: [UPSERT]
+                    route53:ChangeResourceRecordSetsRecordTypes: [A]
+                  ForAllValues:StringEqualsIgnoreCase:
+                    route53:ChangeResourceRecordSetsNormalizedRecordNames: [!Sub "${JitName}.${ZoneName}"]
               # No S3 here: the bucket is CacheRole's alone (CacheAssume).
               # Signing only: the key cannot be read, and only this key.
               - !If
@@ -254,11 +266,17 @@ Resources:
   # this resource removes that one record, if it is there. The group depends
   # on it, so no VM is left to write the record again when it runs, and it
   # names the zone, so it runs before the zone goes.
+  # CloudFormation also sends Delete when it rolls back an update that added
+  # this resource, with the stack's VM still serving that name: the function
+  # reads the stack's status, and removes the record only while the stack is
+  # being deleted, or while the create of a stack owning its zone rolls back.
   JitNameCleanup:
     Type: Custom::JitNameCleanup
     Properties:
       ServiceToken: !GetAtt JitNameCleanupFunction.Arn
+      ServiceTimeout: 300
       ZoneId: !If [CreateZone, !Ref Zone, !Ref HostedZoneId]
+      OwnZone: !If [CreateZone, "true", "false"]
       Name: !Sub "${JitName}.${ZoneName}"
 
   # Delete that one A record, and list the zone to find it: nothing else.
@@ -289,6 +307,10 @@ Resources:
                     route53:ChangeResourceRecordSetsRecordTypes: [A]
                   ForAllValues:StringEqualsIgnoreCase:
                     route53:ChangeResourceRecordSetsNormalizedRecordNames: [!Sub "${JitName}.${ZoneName}"]
+              # Why Delete came: this stack's status, and only this stack's.
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Ref AWS::StackId
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !GetAtt JitNameCleanupLogGroup.Arn
@@ -312,16 +334,32 @@ Resources:
         ZipFile: |
           import json, urllib.request
           import boto3
+          from botocore.config import Config
+
+          # Short calls and few retries, so a slow API fails the request well
+          # within the function's timeout, and CloudFormation hears why.
+          CONFIG = Config(connect_timeout=5, read_timeout=15, retries={"max_attempts": 3})
 
 
-          def handler(event, context, route53=None, send=None):
+          def handler(event, context, route53=None, cloudformation=None, send=None):
               """A CloudFormation custom resource: on Delete, remove the A record
-              named Name from the zone ZoneId. Create and Update do nothing."""
+              named Name from the zone ZoneId, if the stack is being deleted.
+              Create and Update do nothing."""
               status, reason, data = "SUCCESS", "", {}
               try:
                   if event["RequestType"] == "Delete":
                       p = event["ResourceProperties"]
-                      data["Deleted"] = "%d" % remove(route53 or boto3.client("route53"), p["ZoneId"], p["Name"])
+                      cf = cloudformation or boto3.client("cloudformation", config=CONFIG)
+                      stack = cf.describe_stacks(StackName=event["StackId"])["Stacks"][0]["StackStatus"]
+                      data["StackStatus"] = stack
+                      # A rolled-back update, or a create rolled back in a shared
+                      # zone, leaves a VM (this stack's, or one whose name it
+                      # took) serving the record: keep it.
+                      if stack == "DELETE_IN_PROGRESS" or stack == "ROLLBACK_IN_PROGRESS" and p.get("OwnZone") == "true":
+                          r53 = route53 or boto3.client("route53", config=CONFIG)
+                          data["Deleted"] = "%d" % remove(r53, p["ZoneId"], p["Name"])
+                      else:
+                          data["Deleted"] = "0"
               except Exception as e:
                   status = "FAILED"
                   reason = "%s: %s (log stream %s)" % (type(e).__name__, e, getattr(context, "log_stream_name", "?"))

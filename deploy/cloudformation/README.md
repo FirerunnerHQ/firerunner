@@ -251,6 +251,15 @@ aws cloudformation wait stack-delete-complete --stack-name firerunner
   (`HostedZoneNotEmpty`) while the record is there. Update the stack to the
   current template first, or delete the `A` record by hand and delete the
   stack again.
+- **Only a stack being deleted loses its record.** CloudFormation also asks
+  the cleanup to delete when it rolls back an update that added it, with the
+  stack's VM still serving the name; the function reads the stack's status
+  and keeps the record then. It also keeps it when a create rolls back in a
+  zone you passed, where the name may be another stack's.
+- **Give every stack in a shared zone its own `JitName`.** Two stacks with
+  one name overwrite each other's record, and deleting either removes it.
+  Changing `JitName` or the zone on an update leaves the old name's record
+  behind; delete it by hand.
 - **If the cleanup fails**, the stack stops in `DELETE_FAILED` and the
   event's reason names the function's log stream. Fix the cause and delete
   again.
