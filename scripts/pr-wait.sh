@@ -21,7 +21,10 @@
 # every workflow run on the head has finished, and has for FR_PR_WAIT_STALL
 # seconds: a run that failed without starting the job, from a workflow file
 # problem or a GitHub Actions incident, never reports it, and waiting longer
-# changes nothing. Then it prints JSON lines on stdout, one object each, keyed by
+# changes nothing. And it stops at once, with the verdict conflict, when the
+# head has no check run and the PR conflicts with its base: GitHub runs no
+# pull_request workflow until that is resolved. Then it prints JSON lines on
+# stdout, one object each, keyed by
 # "type":
 #   check            name, workflow, conclusion, duration_s, url
 #   failed_log       the failed job's log, trimmed to the lines that matter
@@ -35,8 +38,9 @@
 #   summary          the verdict, the head commit and any required check that
 #                    never reported on it (missing_required), last
 # Exit status: 0 all checks passed and no thread is unresolved, 1 a check
-# failed, a thread is unresolved or a required check will never report
-# (verdict missing_required), 2 usage or PR not found, 124 the deadline
+# failed, a thread is unresolved, a required check will never report
+# (verdict missing_required) or the PR conflicts with its base (verdict
+# conflict), 2 usage or PR not found, 124 the deadline
 # passed. Progress goes to stderr. Needs gh (authenticated) and jq.
 # Tuning: FR_PR_WAIT_POLL (10 s between polls), FR_PR_WAIT_LOG_LINES (60),
 # FR_PR_WAIT_STALL (180 s; a late workflow can still start within it).
@@ -201,6 +205,14 @@ while :; do
 	fi
 	if [ "$total" -gt 0 ] && [ "$pending" = 0 ] && [ -z "$missing" ]; then
 		if [ -n "$failed" ]; then verdict=check_failed; else verdict=success; fi
+		break
+	fi
+	# Nothing ran on the head: a PR that conflicts with its base gets no
+	# pull_request run at all, however long one waits.
+	if [ "$total" = 0 ] && { [ -z "$want" ] || [ "${head#"$want"}" != "$head" ]; } &&
+		[ "$(ghr pr view "$number" --json mergeable --jq .mergeable 2>/dev/null)" = CONFLICTING ]; then
+		log "PR #$number conflicts with $base, so GitHub runs no pull_request workflow on it: rebase on $base (or merge it in) and push"
+		verdict=conflict
 		break
 	fi
 	# Required checks missing, nothing pending: if every workflow run on the

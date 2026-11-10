@@ -67,6 +67,8 @@ firerunner config check --catalog FILE    # validate a tier catalog offline
   pushed. A required check that can no longer report, because every
   workflow run on the head has finished without it, ends the wait with the
   verdict `missing_required`; a GitHub Actions incident is the usual cause.
+  A PR that conflicts with its base gets no checks at all; the wait ends at
+  once with the verdict `conflict`: rebase and push.
 - Merge with a merge commit: `gh pr merge --auto --merge`. The repository
   deletes head branches on merge (`delete_branch_on_merge`), so
   `--delete-branch` is unnecessary. `--auto` waits for the six checks the
