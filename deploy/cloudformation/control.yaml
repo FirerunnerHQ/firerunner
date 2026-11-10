@@ -248,6 +248,123 @@ Resources:
     Type: AWS::IAM::InstanceProfile
     Properties: { Roles: [!Ref ControlRole] }
 
+  # The control VM writes its JIT name's A record at boot, so CloudFormation
+  # does not own it: left behind, it keeps a zone this stack made from being
+  # deleted (HostedZoneNotEmpty), and litters a zone it was given. On Delete,
+  # this resource removes that one record, if it is there. The group depends
+  # on it, so no VM is left to write the record again when it runs, and it
+  # names the zone, so it runs before the zone goes.
+  JitNameCleanup:
+    Type: Custom::JitNameCleanup
+    Properties:
+      ServiceToken: !GetAtt JitNameCleanupFunction.Arn
+      ZoneId: !If [CreateZone, !Ref Zone, !Ref HostedZoneId]
+      Name: !Sub "${JitName}.${ZoneName}"
+
+  # Delete that one A record, and list the zone to find it: nothing else.
+  JitNameCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: firerunner-jit-name-cleanup
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: route53:ListResourceRecordSets
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:route53:::hostedzone/${Z}"
+                  - { Z: !If [CreateZone, !Ref Zone, !Ref HostedZoneId] }
+              - Effect: Allow
+                Action: route53:ChangeResourceRecordSets
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:route53:::hostedzone/${Z}"
+                  - { Z: !If [CreateZone, !Ref Zone, !Ref HostedZoneId] }
+                Condition:
+                  ForAllValues:StringEquals:
+                    route53:ChangeResourceRecordSetsActions: [DELETE]
+                    route53:ChangeResourceRecordSetsRecordTypes: [A]
+                  ForAllValues:StringEqualsIgnoreCase:
+                    route53:ChangeResourceRecordSetsNormalizedRecordNames: [!Sub "${JitName}.${ZoneName}"]
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt JitNameCleanupLogGroup.Arn
+
+  # Created here, not by Lambda on first run, so deleting the stack deletes
+  # the logs too.
+  JitNameCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
+  JitNameCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt JitNameCleanupRole.Arn
+      LoggingConfig: { LogGroup: !Ref JitNameCleanupLogGroup }
+      Code:
+        ZipFile: |
+          import json, urllib.request
+          import boto3
+
+
+          def handler(event, context, route53=None, send=None):
+              """A CloudFormation custom resource: on Delete, remove the A record
+              named Name from the zone ZoneId. Create and Update do nothing."""
+              status, reason, data = "SUCCESS", "", {}
+              try:
+                  if event["RequestType"] == "Delete":
+                      p = event["ResourceProperties"]
+                      data["Deleted"] = "%d" % remove(route53 or boto3.client("route53"), p["ZoneId"], p["Name"])
+              except Exception as e:
+                  status = "FAILED"
+                  reason = "%s: %s (log stream %s)" % (type(e).__name__, e, getattr(context, "log_stream_name", "?"))
+              print(json.dumps({"request": event["RequestType"], "status": status, "reason": reason, "data": data}))
+              (send or respond)(event, {
+                  "Status": status, "Reason": reason or "ok",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or event["LogicalResourceId"],
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"], "Data": data,
+              })
+
+
+          def remove(route53, zone, name):
+              """Delete the A record(s) named name; the number deleted. A record or
+              a zone that is already gone is no error."""
+              name = name.rstrip(".").lower() + "."
+              for attempt in range(3):
+                  try:
+                      sets = route53.list_resource_record_sets(
+                          HostedZoneId=zone, StartRecordName=name, StartRecordType="A",
+                          MaxItems="100")["ResourceRecordSets"]
+                  except route53.exceptions.NoSuchHostedZone:
+                      return 0
+                  # Route 53 lists from that name on; several sets share it only
+                  # with a routing policy.
+                  gone = [s for s in sets if s["Name"].lower() == name and s["Type"] == "A"]
+                  if not gone:
+                      return 0
+                  try:
+                      route53.change_resource_record_sets(HostedZoneId=zone, ChangeBatch={
+                          "Changes": [{"Action": "DELETE", "ResourceRecordSet": s} for s in gone]})
+                      return len(gone)
+                  except route53.exceptions.InvalidChangeBatch:
+                      # Changed or deleted since the listing: look again.
+                      if attempt == 2:
+                          raise
+
+
+          def respond(event, body):
+              req = urllib.request.Request(event["ResponseURL"], data=json.dumps(body).encode(),
+                                           method="PUT", headers={"Content-Type": ""})
+              urllib.request.urlopen(req, timeout=30).read()
+
   # cache-server parses requests from job code, so it never holds the control
   # role. The daemon assumes this role, which holds only cache-server's least
   # S3 policy (README, "Keeping the cache in S3"): objects under the prefix,
@@ -364,6 +481,8 @@ Resources:
 
   ControlGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
+    # Deleted before JitNameCleanup runs: see there.
+    DependsOn: JitNameCleanup
     # After CacheAssume, so a new stack's first VM may assume the cache role
     # when it boots. DependsOn cannot name a resource that may not exist;
     # a reference in Metadata orders the two all the same.

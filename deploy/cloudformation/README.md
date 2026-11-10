@@ -233,6 +233,32 @@ Turn on immutable releases for the release repository. The pinned checksums
 already refuse a replaced asset, but immutability also protects the first
 deploy of a version.
 
+## Deleting the stack
+
+```sh
+aws cloudformation delete-stack --stack-name firerunner
+aws cloudformation wait stack-delete-complete --stack-name firerunner
+```
+
+- **The JIT name goes with it.** The VM writes `control.<zone>` itself, so
+  CloudFormation does not own that record. A small custom resource
+  (`JitNameCleanup`, an inline Lambda) deletes it once the group and its VM
+  are gone, and before the zone. Its role may only list the zone and delete
+  that one A record. A record that is already gone, or was never written,
+  is fine. In a zone you passed as `HostedZoneId`, no other record is
+  touched.
+- **Stacks made before `JitNameCleanup`** fail to delete their own zone
+  (`HostedZoneNotEmpty`) while the record is there. Update the stack to the
+  current template first, or delete the `A` record by hand and delete the
+  stack again.
+- **If the cleanup fails**, the stack stops in `DELETE_FAILED` and the
+  event's reason names the function's log stream. Fix the cause and delete
+  again.
+- **What stays:** the cache bucket (`Cache=s3`; see above) and the SSM
+  parameters under the prefix. The stack does not own the runner instances
+  the VM launched: check for the owner's leftovers (`firerunner:owner` tag)
+  before you delete a reaper stack.
+
 ## Reaper safety net (optional)
 
 firerunner's own reaper runs on the control VM and checks with GitHub before

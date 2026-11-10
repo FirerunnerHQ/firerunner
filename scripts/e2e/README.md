@@ -135,8 +135,9 @@ VM's architecture). It goes up to `FR_E2E_BUCKET` and the VM fetches it
 through a presigned URL. A VM that the group replaces boots the release again.
 
 `control-vm.sh down` deletes the stack first, so that nothing relaunches
-runners, then runs `inventory.sh --cleanup --yes`. Then it deletes the JIT
-name and the session's parameters. The runner scale sets stay registered on
+runners, then runs `inventory.sh --cleanup --yes`. The stack deletes its
+JIT name itself; `down` deletes one that a stack made before that left, and
+the session's parameters. The runner scale sets stay registered on
 GitHub; the next `up` with the same owner reuses them.
 
 The shared stack itself, made and deployed as
