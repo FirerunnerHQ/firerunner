@@ -874,3 +874,19 @@ func TestIdentityWaitersAreCapped(t *testing.T) {
 	go func() { _, _, _ = l.s.awaitIdentity(ctx2, a, deadline) }()
 	waitersAre(t, l.s, a, 1, 1) // the slots came back
 }
+
+// Only a request that will wait needs a slot: with none to give, a resolved
+// identity still passes, and a pending one past its deadline is still pending.
+func TestIdentityNeedsNoWaiterSlotUnlessItWaits(t *testing.T) {
+	const ip = "172.16.1.2"
+	l := newScopeLab(t)
+	l.s.maxSourceWaiters, l.s.maxWaiters = 0, 0
+	l.set(ip, testIdentity("owner/repo", mainRef, "g"))
+	if i, reason, _ := l.s.awaitIdentity(context.Background(), ip, time.Now().Add(time.Minute)); reason != "" || i.Generation != "g" {
+		t.Fatalf("a resolved identity with no waiter slots: %q", reason)
+	}
+	l.set(ip, pendingIdentity("owner/repo", "g"))
+	if _, reason, _ := l.s.awaitIdentity(context.Background(), ip, time.Now()); reason != denyPending {
+		t.Fatalf("a pending identity past its deadline with no waiter slots: %q, want %q", reason, denyPending)
+	}
+}
