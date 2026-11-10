@@ -318,6 +318,20 @@ view internal/config/config.go internal/ec2x/a.go
 run_it 5
 check "gate: other paths need no review" test "$(summary .review_required)" = false
 
+# --- a conflicting PR runs nothing ------------------------------------------
+
+setup conflict
+jq '.mergeable = "CONFLICTING"' "$STATE/view.json" >"$STATE/v" && mv "$STATE/v" "$STATE/view.json"
+run_it 5 --deadline 20
+check "conflict: stops at once instead of waiting out the deadline" test "$rc:$(summary .verdict)" = 1:conflict
+check "conflict: says what to do" grep -q 'conflicts with main.*rebase on main' <<<"$errout"
+
+setup conflict-with-checks
+jq '.mergeable = "CONFLICTING"' "$STATE/view.json" >"$STATE/v" && mv "$STATE/v" "$STATE/view.json"
+snap 1 "$(c test pass)"
+run_it 5
+check "conflict-with-checks: checks that ran on the head still decide" test "$rc:$(summary .verdict)" = 0:success
+
 # --- only the current head counts --------------------------------------------
 
 # Just after a push: the old head is green, the new one has no run yet.
