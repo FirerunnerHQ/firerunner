@@ -312,6 +312,38 @@ func TestStartRefusesADifferentJobForTheSameRunner(t *testing.T) {
 	}
 }
 
+// TestConflictOutlastsAnInFlightResolve: a resolve still running when two
+// sources disagree must not, on finishing, restore the identity the conflict
+// denied. The resolver ignores its context, as a REST call that has already
+// answered would.
+func TestConflictOutlastsAnInFlightResolve(t *testing.T) {
+	r, reader := discoverRegistry(t)
+	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	slow := resolveFunc(func(context.Context, Job) (Identity, error) {
+		close(entered)
+		<-release
+		defer close(done)
+		return identity(), nil
+	})
+	r.Start(context.Background(), Job{Runner: "runner-1", Repository: "owner/repo", RunID: 42, JobID: "j"}, slow)
+	<-entered
+	ok := resolveFunc(func(context.Context, Job) (Identity, error) { return identity(), nil })
+	r.Start(context.Background(), Job{Runner: "runner-1", Repository: "owner/other", RunID: 7, JobID: "k"}, ok)
+	i, err := reader.Lookup("172.16.0.2")
+	if err == nil || !i.Unresolved {
+		t.Fatalf("after the conflict: %+v, %v; want unresolved", i, err)
+	}
+	close(release)
+	<-done
+	r.resolving.Wait() // the resolve's goroutine has finished with the lease
+	if i, err := reader.Lookup("172.16.0.2"); err == nil || !i.Unresolved {
+		t.Fatalf("the in-flight resolve restored the identity: %+v, %v", i, err)
+	}
+}
+
 // TestGitHubRunnerJobSharesAListingAndPages: a burst of lookups lists a run
 // once, and a run of more than 100 jobs is read past its first page.
 func TestGitHubRunnerJobSharesAListingAndPages(t *testing.T) {
