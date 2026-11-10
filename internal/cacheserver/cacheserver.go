@@ -349,9 +349,12 @@ func (b *idleBody) Read(p []byte) (int, error) {
 // StartJanitor runs a background loop that reclaims abandoned (reserved but
 // never finalized) entries until the returned stop function is called.
 // It also writes the index when a hit has only moved UsedAt, every
-// usedFlushInterval and once more when stopped; stop waits for that.
+// usedFlushInterval and once more when stopped; stop waits for that, and may
+// be called more than once. Without a janitor, a hit's UsedAt is written only
+// with the next other change to the index.
 func (s *Server) StartJanitor() (stop func()) {
 	done, exited := make(chan struct{}), make(chan struct{})
+	var once sync.Once
 	go func() {
 		defer close(exited)
 		t := time.NewTicker(10 * time.Minute)
@@ -372,7 +375,7 @@ func (s *Server) StartJanitor() (stop func()) {
 		}
 	}()
 	return func() {
-		close(done)
+		once.Do(func() { close(done) })
 		<-exited
 	}
 }

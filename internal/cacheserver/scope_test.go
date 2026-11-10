@@ -963,4 +963,5 @@ func TestJanitorStopFlushesUsed(t *testing.T) {
 	if !usedOnDisk(t, l) {
 		t.Fatal("stopping the janitor left a hit's UsedAt unwritten")
 	}
+	stop() // a second stop is harmless
 }
