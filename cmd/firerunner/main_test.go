@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -516,6 +517,34 @@ func TestPooledTiers(t *testing.T) {
 	})
 	if len(got) != 2 || !got["pooled"] || !got["scheduled"] {
 		t.Fatalf("pooledTiers = %v, want the tiers that keep a pool at some time", got)
+	}
+}
+
+func TestSetPoolKey(t *testing.T) {
+	pooled := []config.Tier{{Name: "pooled", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{Pool: 1}}}
+	cold := []config.Tier{{Name: "cold", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{}}}
+	for _, c := range []struct {
+		name      string
+		key       []byte
+		tiers     []config.Tier
+		ephemeral bool
+		warned    bool
+	}{
+		{"key", bytes.Repeat([]byte("k"), 64), pooled, false, false},
+		{"no key, a pool", nil, pooled, true, true},
+		{"no key, no pool", nil, cold, true, false},
+	} {
+		var logs bytes.Buffer
+		client := ec2.NewClient(nil, nil, 0, nil)
+		if err := setPoolKey(client, c.key, c.tiers, slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if client.PoolKeyEphemeral() != c.ephemeral || strings.Contains(logs.String(), "rebuilt after every restart") != c.warned {
+			t.Errorf("%s: ephemeral %v, log %q", c.name, client.PoolKeyEphemeral(), logs.String())
+		}
+	}
+	if err := setPoolKey(ec2.NewClient(nil, nil, 0, nil), []byte("short"), pooled, slog.New(slog.DiscardHandler)); err == nil {
+		t.Fatal("a short key was accepted")
 	}
 }
 

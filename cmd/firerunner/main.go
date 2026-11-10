@@ -832,8 +832,29 @@ func newEC2Client(ctx context.Context, cfg *config.Config, log *slog.Logger) (*e
 	if err != nil {
 		return nil, err
 	}
+	key, err := cfg.ReadEC2PoolKey()
+	if err != nil {
+		return nil, err
+	}
 	log.Info("EC2 provisioner ready", "region", awsCfg.Region)
-	return ec2.NewClient(awsec2.NewFromConfig(awsCfg), awsssm.NewFromConfig(awsCfg), 0, log.With("component", "ec2")), nil
+	c := ec2.NewClient(awsec2.NewFromConfig(awsCfg), awsssm.NewFromConfig(awsCfg), 0, log.With("component", "ec2"))
+	if err := setPoolKey(c, key, cfg.EffectiveTiers(), log); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// setPoolKey gives the client the deployment's pool key. With none, the
+// client keeps its own random key, and a tier keeping a pool is warned of
+// once: no pool instance survives a restart, as none can be trusted.
+func setPoolKey(c *ec2.Client, key []byte, tiers []config.Tier, log *slog.Logger) error {
+	if key != nil {
+		return c.SetPoolKey(key)
+	}
+	if len(pooledTiers(tiers)) > 0 {
+		log.Warn("no --ec2-pool-key-file: pool instances are signed with a key of this process's own, so the warm pool is rebuilt after every restart")
+	}
+	return nil
 }
 
 // openJobEvents returns where job events go, and how to close it. The store
