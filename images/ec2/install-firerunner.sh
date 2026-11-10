@@ -28,8 +28,15 @@ install_firerunner() {
 # fetch_firerunner NAME DIR leaves a verified binary at DIR/NAME.
 fetch_firerunner() {
 	local name="$1" dir="$2" base
-	if [ -n "${FR_URL:-}" ]; then
-		curl -fsSL --retry 3 -o "$dir/$name" "$FR_URL" || return 1
+	# FR_URL may carry a credential, such as a presigned URL: keep it out of
+	# provision.sh's xtrace, which the build log and syslog keep. Even the
+	# test is written so that the trace shows only "set".
+	if [ -n "${FR_URL:+set}" ]; then
+		local trace=0 rc=0
+		case $- in *x*) trace=1 && set +x ;; esac
+		curl -fsSL --retry 3 -o "$dir/$name" "$FR_URL" || rc=1
+		[ "$trace" = 0 ] || set -x
+		[ "$rc" = 0 ] || return 1
 		echo "$FR_SHA256  $dir/$name" | sha256sum -c - >/dev/null || return 1
 		return 0
 	fi

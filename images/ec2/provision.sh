@@ -227,6 +227,12 @@ if [ "$TOOLSET" != minimal ]; then
 	umount -l $SCRATCH
 fi
 rm -rf /tmp/* /imagegeneration
+# cloud-init keeps this build's user-data (which may hold a presigned
+# --firerunner-url) and logs its run: none of that belongs in the image. This
+# script keeps running from its open file once the copy is unlinked.
+cloud-init clean --logs --seed
+rm -rf /var/lib/cloud/instance /var/lib/cloud/instances /var/lib/cloud/data \
+	/var/log/cloud-init.log /var/log/cloud-init-output.log
 mark finished
 sync
 shutdown -h now

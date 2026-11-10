@@ -108,6 +108,12 @@ expect "the default tag is not resolved" "" bash -c "! grep -q runner-images/com
 expect "user-data installs the boot unit" "" grep -q 'FIRERUNNER_JIT_URL' "$STATE/user-data"
 expect "user-data drops cloud-init's netplan" "" grep -q 'rm -f /etc/netplan/50-cloud-init.yaml' "$STATE/user-data"
 expect "user-data resets the hostname" "" grep -q 'truncate -s 0 /etc/hostname' "$STATE/user-data"
+# The image must keep no copy of the build's user-data or log of its run: a
+# --firerunner-url can be presigned.
+expect "user-data cleans cloud-init's copies and logs" "" grep -qx 'cloud-init clean --logs --seed' "$STATE/user-data"
+expect "user-data removes the instance's user-data" "" grep -q '^rm -rf /var/lib/cloud/instance /var/lib/cloud/instances ' "$STATE/user-data"
+expect "user-data cleans up before it reports finished" "" \
+	bash -c "[ \"\$(grep -n -e '^cloud-init clean' -e '^mark finished\$' '$STATE/user-data' | cut -d: -f2- | tr '\n' '|')\" = 'cloud-init clean --logs --seed|mark finished|' ]"
 expect "user-data fits EC2's limit, compressed" "" [ "$(wc -c <"$STATE/user-data.gz")" -le 16384 ]
 expect "user-data installs the cache proxy, inactive" "" \
 	bash -c "grep -q 'install_cache_proxy\$' '$STATE/user-data' && grep -q 'systemctl disable nginx.service' '$STATE/user-data' && grep -q '^upstream cache_backend\|server __UPSTREAM__;' '$STATE/user-data'"
