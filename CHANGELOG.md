@@ -8,6 +8,52 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-11-10
+
+### Changed
+
+- `images/build-ec2-ami.sh` and `images/layer-ec2-ami.sh` check the build
+  provenance of the firerunner release they put on an image with
+  `gh attestation verify`, as `deploy-control.sh` does, and the image installs
+  only a download with the SHA-256 that was checked. A `latest` build is
+  pinned to the release's tag. They now need `gh`, logged in;
+  `FIRERUNNER_SKIP_ATTESTATION=1` skips the check. A binary from
+  `--firerunner-url` is still taken on its `--firerunner-sha256` alone, and
+  `--firerunner-sha256` without `--firerunner-url` is refused.
+- The control VM's bootstrap reads `<prefix>/control/env` as data: blank
+  lines, `#` comments and `FR_NAME=value` lines, with a value bare or in
+  quotes. Any other line, or a value holding a backslash, `$` or a backtick,
+  fails the bootstrap with the line's number in the log. Values reach
+  firerunner exactly as written.
+
+### Fixed
+
+- The control stack's JIT name cleanup removes the record only while the stack
+  is being deleted (or while the create of a stack owning its zone rolls back),
+  not when CloudFormation rolls back an update that added the cleanup, with the
+  stack's VM still serving that name. A slow Route 53 or CloudFormation call
+  now fails the delete within 5 minutes instead of an hour.
+- Deleting a `control.yaml` stack no longer fails with `HostedZoneNotEmpty`.
+  The control VM's JIT name record, which the VM writes itself, is now
+  deleted with the stack, after the VM and before the zone; in a zone passed
+  as `HostedZoneId`, only that record is removed. A stack made before this
+  needs updating to the new template first, or the record deleted by hand.
+
+### Security
+
+- On EC2, the cache identity finds a runner's job by the runner's GitHub ID,
+  from its JIT registration, as well as its name, which a runner registered in
+  another scope could share. A runner whose ID is unknown is not looked up;
+  JobStarted resolves it instead.
+- The control VM's role may change only its own JIT name's `A` record, by
+  `UPSERT`, rather than any record in the zone. `JitName` and `ZoneName` must
+  be DNS names without a trailing dot.
+- `--url` / `FR_URL` must be an https URL naming a GitHub organization,
+  repository or enterprise; the scale-set client sends the configured
+  credentials to it.
+- The `build-image` workflow and the dispatched `e2e` job, which run on
+  persistent self-hosted hosts, run only from `main`.
+
 ## [0.1.12] - 2026-11-10
 
 ### Changed
@@ -373,7 +419,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.13
 [0.1.12]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.12
 [0.1.11]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.11
 [0.1.10]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.10
