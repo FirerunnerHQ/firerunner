@@ -749,18 +749,19 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 		return
 	}
 	if len(ids) > maxBlocks {
-		// Each id costs an open and a copy, so a list of one id repeated
-		// would otherwise multiply work without adding bytes.
+		// Each id costs a stat, an open and a copy.
 		azureError(w, http.StatusBadRequest, "BlockListTooLong", "a block list names at most 50,000 blocks")
 		return
 	}
 
 	// Check the whole list before writing or claiming a byte. Assembly claims
 	// what it writes, and a claim can evict other entries for good, so a list
-	// that will fail must fail first: a block named twice (one staged block
-	// copied over and over would claim bytes nobody uploaded), or a block never
-	// uploaded. Staged blocks already count against the per-entry cap, so with
-	// each named once the assembly cannot outgrow what was uploaded.
+	// that will fail must fail first: a block never uploaded. A block named
+	// twice is refused too. Azure accepts a repeated id; the @actions/cache
+	// toolkit never sends one, and honouring it let one staged block claim,
+	// and evict other entries for, bytes nobody uploaded. Staged blocks already
+	// count against the per-entry cap, so with each named once the assembly
+	// cannot outgrow what was uploaded.
 	dir := s.tmpDir(e.ID)
 	seen := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
