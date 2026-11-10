@@ -128,9 +128,11 @@ ephemeral runners.
 
 The guest decides what it writes there, so each file keeps at most
 `--log-max-mib` (default 64), with a closing line saying the rest was
-dropped. All of them together take at most `--log-dir-max-mib` (default 2048):
-the oldest are removed before a new runner's log is opened. The files are
-readable only by the daemon's user (mode 0600).
+dropped. All of them together take at most `--log-dir-max-mib` (default 2048),
+counting the logs of runners still writing: the oldest finished logs are
+removed to make room, never one still open, and when the open logs alone have
+spent the budget they stop with a closing line too. The files are readable
+only by the daemon's user (mode 0600).
 
 ## Alignment with GitHub's official recommendations
 

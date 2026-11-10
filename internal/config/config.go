@@ -414,7 +414,7 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.StringVar(&c.Firecracker.ExtIface, "ext-iface", env("FR_EXT_IFACE", ""), "host external interface for microVM egress NAT (required)")
 	fs.StringVar(&c.Firecracker.LogDir, "log-dir", env("FR_LOG_DIR", ""), "directory for per-runner console logs (off-VM log forwarding)")
 	fs.IntVar(&v.logMaxMiB, "log-max-mib", er.int("FR_LOG_MAX_MIB", 64), "with --log-dir, MiB of console kept per runner; the rest is dropped (0 = no cap)")
-	fs.IntVar(&v.logDirMaxMiB, "log-dir-max-mib", er.int("FR_LOG_DIR_MAX_MIB", 2048), "with --log-dir, MiB all runner logs may take; the oldest are removed first (0 = no cap)")
+	fs.IntVar(&v.logDirMaxMiB, "log-dir-max-mib", er.int("FR_LOG_DIR_MAX_MIB", 2048), "with --log-dir, MiB all runner logs may take, open ones included; the oldest finished ones are removed first (0 = no cap)")
 
 	fs.BoolVar(&c.Firecracker.Jailer, "jailer", er.boolean("FR_JAILER", false), "run each microVM under the Firecracker jailer (chroot + PID ns + privilege drop); opt-in, requires a root launcher and --jail-uid/--jail-gid")
 	fs.StringVar(&c.Firecracker.JailerBin, "jailer-bin", env("FR_JAILER_BIN", "jailer"), "path to the jailer binary (must match the firecracker version)")
