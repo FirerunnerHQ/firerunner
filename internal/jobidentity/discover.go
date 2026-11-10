@@ -84,9 +84,11 @@ func (c *Candidates) clock() time.Time {
 }
 
 // RunnerFinder tells which job of a run, if any, is in progress on a runner:
-// GitHub's own record, so a run named by anyone else proves nothing.
+// GitHub's own record, so a run named by anyone else proves nothing. The job
+// must name both the runner and its GitHub ID, runnerID: a name alone could be
+// shared by a runner registered in another scope.
 type RunnerFinder interface {
-	RunnerJob(ctx context.Context, repository string, runID int64, runner string) (jobID int64, found bool, err error)
+	RunnerJob(ctx context.Context, repository string, runID int64, runner string, runnerID int64) (jobID int64, found bool, err error)
 }
 
 // discoverTries and discoverPause bound how long Discover looks: GitHub may
@@ -113,6 +115,14 @@ func (r *Registry) Discover(ctx context.Context, runner string, cands *Candidate
 	if pause == 0 {
 		pause = discoverPause
 	}
+	runnerID := r.runnerID(runner)
+	if runnerID == 0 {
+		// Without the runner's ID only its name could match a job, and a
+		// runner registered elsewhere could share that: JobStarted, from the
+		// scale set's own session, resolves it instead.
+		r.log.Info("cache identity: the runner's GitHub ID is unknown; waiting for JobStarted", "runner", runner)
+		return
+	}
 	for try := 0; try < discoverTries; try++ {
 		if !r.awaitsIdentity(runner) || ctx.Err() != nil {
 			return
@@ -121,7 +131,7 @@ func (r *Registry) Discover(ctx context.Context, runner string, cands *Candidate
 			if !r.awaitsIdentity(runner) {
 				return // released, or JobStarted got there first
 			}
-			id, found, err := finder.RunnerJob(ctx, j.Repository, j.RunID, runner)
+			id, found, err := finder.RunnerJob(ctx, j.Repository, j.RunID, runner, runnerID)
 			if rateLimited(err) {
 				// Resolution shares the credential: spend no more of it here.
 				r.log.Warn("cache identity: GitHub refused the lookup; waiting for JobStarted", "runner", runner, "err", err)

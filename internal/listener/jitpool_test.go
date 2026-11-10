@@ -141,3 +141,46 @@ func TestJitParallelism(t *testing.T) {
 		}
 	}
 }
+
+// idClient answers like GitHub does, naming the registered runner and its ID.
+type idClient struct{ id int }
+
+func (c idClient) GenerateJitRunnerConfig(_ context.Context, s *scaleset.RunnerScaleSetJitRunnerSetting, _ int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
+	return &scaleset.RunnerScaleSetJitRunnerConfig{
+		Runner:           &scaleset.RunnerReference{ID: c.id, Name: s.Name},
+		EncodedJITConfig: "jit-" + s.Name,
+	}, nil
+}
+
+// Generate reports the ID GitHub gave the runner it just registered, under the
+// name it returns, so the job identity can match by ID.
+func TestGenerateReportsTheRunnersID(t *testing.T) {
+	var gotName string
+	var gotID int64
+	src := &JITSource{
+		clients:    newClientPool(1, func() (jitClient, error) { return idClient{id: 900}, nil }),
+		namePrefix: "t",
+		onRunnerID: func(name string, id int64) { gotName, gotID = name, id },
+	}
+	name, _, err := src.Generate(context.Background(), core.RunnerSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotName != name || gotID != 900 {
+		t.Fatalf("reported %q %d, want %q 900", gotName, gotID, name)
+	}
+}
+
+// The JIT source a scale set hands out reports to the scale set's OnRunnerID.
+func TestScaleSetJITReportsToItsConfig(t *testing.T) {
+	var got int64
+	s := &ScaleSet{cfg: Config{OnRunnerID: func(_ string, id int64) { got = id }}}
+	j := s.JIT()
+	if j.onRunnerID == nil {
+		t.Fatal("the JIT source does not report runner IDs")
+	}
+	j.onRunnerID("t-1", 900)
+	if got != 900 {
+		t.Fatalf("the scale set's OnRunnerID got %d, want 900", got)
+	}
+}

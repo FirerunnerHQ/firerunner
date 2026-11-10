@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/ghauth"
 	"github.com/firerunnerhq/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 )
 
 // A tenant's EC2 tier carries its own owner tag and hears of its own runners'
@@ -37,6 +39,77 @@ func TestEC2OptionsAreTheTenants(t *testing.T) {
 	if heard != "runner-1" {
 		t.Fatalf("heard %q", heard)
 	}
+}
+
+// A tier's listener reports the IDs of the runners it registers to the
+// tenant's hook, which the job identity matches runners by.
+func TestListenerReportsRunnerIDs(t *testing.T) {
+	s := &shard{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler)}
+	var gotName string
+	var gotID int64
+	hooks := tenantHooks{onRunnerID: func(name string, id int64) { gotName, gotID = name, id }}
+	c := s.listenerConfig(tenant{Owner: "tenant-1"}, config.Tier{Name: "t"}, hooks, health.NewTracker("t"), assigned.New(nil), slog.New(slog.DiscardHandler))
+	if c.OnRunnerID == nil {
+		t.Fatal("the listener does not report runner IDs")
+	}
+	c.OnRunnerID("runner-1", 900)
+	if gotName != "runner-1" || gotID != 900 {
+		t.Fatalf("reported %q %d", gotName, gotID)
+	}
+}
+
+// With an EC2 cache, the identity hooks note each runner's ID in the job
+// registry, which Discover then matches the runner's job by.
+func TestIdentityHooksNoteRunnerIDs(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := jobidentity.NewRegistry(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(jobs.Close)
+	cfg := &config.Config{Tiers: []config.Tier{{Name: "t", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{Cache: true}}}}
+	if !cfg.UsesEC2Cache() {
+		t.Fatal("the test config uses no EC2 cache")
+	}
+	s := &shard{cfg: cfg, log: slog.New(slog.DiscardHandler), cacheJobs: jobs}
+	hooks, err := s.identityHooks(context.Background(), tenant{URL: "https://github.com/acme", Token: "pat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hooks.onRunnerID == nil {
+		t.Fatal("the hooks do not note runner IDs")
+	}
+	// The noted ID reaches the runner's lookup once it registers.
+	hooks.onRunnerID("runner-1", 900)
+	if err := jobs.Register("runner-1", "172.16.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	cands := &jobidentity.Candidates{}
+	cands.Offer(jobidentity.Job{Repository: "acme/app", RunID: 1})
+	f := &idFinder{}
+	jobs.Discover(context.Background(), "runner-1", cands, f, noResolve{})
+	if f.got != 900 {
+		t.Fatalf("the runner's lookup got ID %d, want 900", f.got)
+	}
+}
+
+// idFinder records the runner ID it is asked about and reports a job, so
+// Discover stops at once.
+type idFinder struct{ got int64 }
+
+func (f *idFinder) RunnerJob(_ context.Context, _ string, _ int64, _ string, runnerID int64) (int64, bool, error) {
+	f.got = runnerID
+	return 1, true, nil
+}
+
+// noResolve leaves the identity unresolved; the test looks only at the lookup.
+type noResolve struct{}
+
+func (noResolve) Resolve(context.Context, jobidentity.Job) (jobidentity.Identity, error) {
+	return jobidentity.Identity{}, errors.New("not resolved in this test")
 }
 
 func TestExtraTenant(t *testing.T) {

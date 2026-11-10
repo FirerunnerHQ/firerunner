@@ -17,15 +17,17 @@ import (
 // finderFunc answers RunnerJob from a map of "repository#run" to the runner
 // GitHub records on an in-progress job of that run, and counts the calls.
 type fakeFinder struct {
-	mu    sync.Mutex
-	on    map[string]string // repository#run -> runner
-	calls int
+	mu     sync.Mutex
+	on     map[string]string // repository#run -> runner
+	calls  int
+	gotIDs []int64 // the runner ID each call was given
 }
 
-func (f *fakeFinder) RunnerJob(_ context.Context, repo string, run int64, runner string) (int64, bool, error) {
+func (f *fakeFinder) RunnerJob(_ context.Context, repo string, run int64, runner string, runnerID int64) (int64, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	f.gotIDs = append(f.gotIDs, runnerID)
 	if f.on[fmt.Sprintf("%s#%d", repo, run)] == runner {
 		return run * 10, true, nil
 	}
@@ -55,6 +57,7 @@ func discoverRegistry(t *testing.T) (*Registry, Reader) {
 // names the job, and the identity resolves from it, before any JobStarted.
 func TestDiscoverFindsTheRunnersJobAmongTheOffered(t *testing.T) {
 	r, reader := discoverRegistry(t)
+	r.NoteRunnerID("runner-1", 901)
 	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +80,7 @@ func TestDiscoverFindsTheRunnersJobAmongTheOffered(t *testing.T) {
 // a job on another runner, proves nothing; JobStarted still resolves it.
 func TestDiscoverWithoutAMatchLeavesItToJobStarted(t *testing.T) {
 	r, reader := discoverRegistry(t)
+	r.NoteRunnerID("runner-1", 901)
 	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +113,7 @@ func TestDiscoverLeavesAResolvingOrUnknownRunnerAlone(t *testing.T) {
 		return Identity{}, nil
 	})
 	r.Discover(context.Background(), "runner-1", cands, finder, never) // no lease
+	r.NoteRunnerID("runner-1", 901)
 	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
 		t.Fatal(err)
 	}
@@ -177,23 +182,118 @@ func TestGitHubRunnerJob(t *testing.T) {
 			return
 		}
 		fmt.Fprint(w, `{"jobs":[
-			{"id":1,"status":"completed","runner_name":"runner-1"},
-			{"id":2,"status":"in_progress","runner_name":"runner-2"},
-			{"id":3,"status":"in_progress","runner_name":"runner-1"}]}`)
+			{"id":1,"status":"completed","runner_id":901,"runner_name":"runner-1"},
+			{"id":2,"status":"in_progress","runner_id":902,"runner_name":"runner-2"},
+			{"id":3,"status":"in_progress","runner_id":901,"runner_name":"runner-1"}]}`)
 	}))
 	defer srv.Close()
 	g := &GitHub{base: srv.URL, pat: "pat", client: srv.Client()}
-	if id, ok, err := g.RunnerJob(context.Background(), "owner/repo", 42, "runner-1"); err != nil || !ok || id != 3 {
+	if id, ok, err := g.RunnerJob(context.Background(), "owner/repo", 42, "runner-1", 901); err != nil || !ok || id != 3 {
 		t.Fatalf("runner-1: %d %v %v, want its in-progress job 3", id, ok, err)
 	}
-	if _, ok, err := g.RunnerJob(context.Background(), "owner/repo", 42, "runner-9"); err != nil || ok {
+	if _, ok, err := g.RunnerJob(context.Background(), "owner/repo", 42, "runner-9", 909); err != nil || ok {
 		t.Fatalf("runner-9: %v %v, want no job", ok, err)
 	}
-	if _, _, err := g.RunnerJob(context.Background(), "owner/repo", 43, "runner-1"); err == nil {
+	if _, _, err := g.RunnerJob(context.Background(), "owner/repo", 43, "runner-1", 901); err == nil {
 		t.Fatal("a missing run is no error")
 	}
-	if _, _, err := g.RunnerJob(context.Background(), "../etc", 42, "runner-1"); err == nil {
+	if _, _, err := g.RunnerJob(context.Background(), "../etc", 42, "runner-1", 901); err == nil {
 		t.Fatal("an invalid repository was asked about")
+	}
+	if _, _, err := g.RunnerJob(context.Background(), "owner/repo", 42, "runner-1", 0); err == nil {
+		t.Fatal("a runner of unknown ID was looked up by name alone")
+	}
+}
+
+// With the runner's ID known, the ID alone decides: a runner registered in
+// another scope under the same name, with a job in progress, is not matched,
+// even listed first.
+func TestGitHubRunnerJobMatchesByID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"jobs":[
+			{"id":4,"status":"in_progress","runner_id":777,"runner_name":"runner-1"},
+			{"id":3,"status":"in_progress","runner_id":900,"runner_name":"runner-1"}]}`)
+	}))
+	defer srv.Close()
+	g := &GitHub{base: srv.URL, pat: "pat", client: srv.Client()}
+	if id, ok, err := g.RunnerJob(context.Background(), "owner/repo", 42, "runner-1", 900); err != nil || !ok || id != 3 {
+		t.Fatalf("runner 900: %d %v %v, want its job 3, not the same-named runner's", id, ok, err)
+	}
+	if _, ok, err := g.RunnerJob(context.Background(), "owner/repo", 42, "runner-1", 555); err != nil || ok {
+		t.Fatalf("runner 555, whose name two other runners share: %v %v, want no job", ok, err)
+	}
+	if _, ok, err := g.RunnerJob(context.Background(), "owner/repo", 42, "runner-2", 900); err != nil || ok {
+		t.Fatalf("runner-2 with runner 900's ID: %v %v, want no job: the name must match too", ok, err)
+	}
+}
+
+// A runner of unknown GitHub ID is not looked up: by name alone, a runner
+// registered in another scope could match. JobStarted resolves it instead.
+func TestDiscoverWithoutTheRunnersIDLooksNothingUp(t *testing.T) {
+	r, _ := discoverRegistry(t)
+	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	cands := &Candidates{}
+	cands.Offer(Job{Repository: "owner/repo", RunID: 1})
+	f := &fakeFinder{on: map[string]string{"owner/repo#1": "runner-1"}}
+	ok := resolveFunc(func(context.Context, Job) (Identity, error) { return identity(), nil })
+	r.Discover(context.Background(), "runner-1", cands, f, ok)
+	if f.count() != 0 {
+		t.Fatalf("%d lookups for a runner of unknown ID, want none", f.count())
+	}
+}
+
+// A runner registered again under the same name keeps its ID, as an EC2 launch
+// does when a pooled start fails and it falls back to a fresh instance.
+func TestRunnerIDOutlastsARelease(t *testing.T) {
+	r, _ := discoverRegistry(t)
+	r.NoteRunnerID("runner-1", 900)
+	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Release("runner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register("runner-1", "172.16.0.3"); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.runnerID("runner-1"); got != 900 {
+		t.Fatalf("runner ID after a release and a new register: %d, want 900", got)
+	}
+}
+
+// NoteRunnerID's ID, given before or after the runner registers, reaches the
+// finder through Discover.
+func TestDiscoverPassesTheRunnersID(t *testing.T) {
+	for _, after := range []bool{false, true} {
+		r, _ := discoverRegistry(t)
+		if !after {
+			r.NoteRunnerID("runner-1", 900)
+		}
+		if err := r.Register("runner-1", "172.16.0.2"); err != nil {
+			t.Fatal(err)
+		}
+		if after {
+			r.NoteRunnerID("runner-1", 900)
+		}
+		cands := &Candidates{}
+		cands.Offer(Job{Repository: "owner/repo", RunID: 1})
+		f := &fakeFinder{on: map[string]string{"owner/repo#1": "runner-1"}}
+		ok := resolveFunc(func(context.Context, Job) (Identity, error) { return identity(), nil })
+		r.Discover(context.Background(), "runner-1", cands, f, ok)
+		f.mu.Lock()
+		got := f.gotIDs
+		f.mu.Unlock()
+		if len(got) == 0 || got[0] != 900 {
+			t.Fatalf("noted after register %v: the finder got IDs %v, want 900", after, got)
+		}
+		r.mu.Lock()
+		left := len(r.noted)
+		r.mu.Unlock()
+		if left != 0 {
+			t.Fatalf("noted after register %v: %d IDs left waiting", after, left)
+		}
 	}
 }
 
@@ -201,6 +301,7 @@ func TestGitHubRunnerJob(t *testing.T) {
 // another runner is passed over for the older run that has this runner's.
 func TestDiscoverSkipsAnotherRunnersJob(t *testing.T) {
 	r, reader := discoverRegistry(t)
+	r.NoteRunnerID("runner-1", 901)
 	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +324,7 @@ func TestDiscoverSkipsAnotherRunnersJob(t *testing.T) {
 
 type limitedFinder struct{ calls int }
 
-func (f *limitedFinder) RunnerJob(context.Context, string, int64, string) (int64, bool, error) {
+func (f *limitedFinder) RunnerJob(context.Context, string, int64, string, int64) (int64, bool, error) {
 	f.calls++
 	return 0, false, statusError{"GET", "/repos/o/r/actions/runs/1/jobs", http.StatusForbidden}
 }
@@ -232,6 +333,7 @@ func (f *limitedFinder) RunnerJob(context.Context, string, int64, string) (int64
 // rate limit ends the search at once instead of spending more of it.
 func TestDiscoverStopsWhenGitHubRefuses(t *testing.T) {
 	r, _ := discoverRegistry(t)
+	r.NoteRunnerID("runner-1", 901)
 	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +350,7 @@ func TestDiscoverStopsWhenGitHubRefuses(t *testing.T) {
 
 type refusingFinder struct{ calls int }
 
-func (f *refusingFinder) RunnerJob(context.Context, string, int64, string) (int64, bool, error) {
+func (f *refusingFinder) RunnerJob(context.Context, string, int64, string, int64) (int64, bool, error) {
 	f.calls++
 	return 0, false, fmt.Errorf("%w (owner/repo): HTTP 422", errTokenRefused)
 }
@@ -265,6 +367,7 @@ func TestDiscoverWarnsOnceWhenGitHubRefusesAToken(t *testing.T) {
 	}
 	t.Cleanup(r.Close)
 	r.discoverPause = time.Millisecond
+	r.NoteRunnerID("runner-1", 901)
 	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
 		t.Fatal(err)
 	}
@@ -277,6 +380,7 @@ func TestDiscoverWarnsOnceWhenGitHubRefusesAToken(t *testing.T) {
 		t.Fatalf("%d lookups, want %d", f.calls, discoverTries)
 	}
 	// Candidates are shared: a second runner sees the same repository.
+	r.NoteRunnerID("runner-2", 902)
 	if err := r.Register("runner-2", "172.16.0.3"); err != nil {
 		t.Fatal(err)
 	}
@@ -296,6 +400,7 @@ func TestDiscoverWarnsOnceWhenGitHubRefusesAToken(t *testing.T) {
 // ever name different jobs for one runner, neither is trusted.
 func TestStartRefusesADifferentJobForTheSameRunner(t *testing.T) {
 	r, reader := discoverRegistry(t)
+	r.NoteRunnerID("runner-1", 901)
 	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
 		t.Fatal(err)
 	}
@@ -318,6 +423,7 @@ func TestStartRefusesADifferentJobForTheSameRunner(t *testing.T) {
 // answered would.
 func TestConflictOutlastsAnInFlightResolve(t *testing.T) {
 	r, reader := discoverRegistry(t)
+	r.NoteRunnerID("runner-1", 901)
 	if err := r.Register("runner-1", "172.16.0.2"); err != nil {
 		t.Fatal(err)
 	}
@@ -376,10 +482,10 @@ func TestGitHubRunnerJobSharesAListingAndPages(t *testing.T) {
 		switch page {
 		case "1":
 			for i := range 100 {
-				jobs = append(jobs, fmt.Sprintf(`{"id":%d,"status":"in_progress","runner_name":"r-%d"}`, i, i))
+				jobs = append(jobs, fmt.Sprintf(`{"id":%d,"status":"in_progress","runner_id":%d,"runner_name":"r-%d"}`, i, 1000+i, i))
 			}
 		case "2":
-			jobs = append(jobs, `{"id":150,"status":"in_progress","runner_name":"late"}`)
+			jobs = append(jobs, `{"id":150,"status":"in_progress","runner_id":7150,"runner_name":"late"}`)
 		}
 		fmt.Fprintf(w, `{"jobs":[%s]}`, strings.Join(jobs, ","))
 	}))
@@ -390,7 +496,7 @@ func TestGitHubRunnerJobSharesAListingAndPages(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if id, ok, err := g.RunnerJob(context.Background(), "owner/repo", 42, "late"); err != nil || !ok || id != 150 {
+			if id, ok, err := g.RunnerJob(context.Background(), "owner/repo", 42, "late", 7150); err != nil || !ok || id != 150 {
 				t.Errorf("late: %d %v %v, want job 150 from page 2", id, ok, err)
 			}
 		}()
