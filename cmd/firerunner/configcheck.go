@@ -142,6 +142,10 @@ func configCmd(args []string, stdout, stderr io.Writer) int {
 			// anything; so does the check. Its error never echoes the key.
 			_, err = cfg.ResolvePrivateKey()
 		}
+		if err == nil {
+			// Startup refuses a pool key file it cannot use; so does the check.
+			_, err = cfg.ReadEC2PoolKey()
+		}
 		if err != nil {
 			r.Error = err.Error()
 		} else {

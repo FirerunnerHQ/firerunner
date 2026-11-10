@@ -44,6 +44,10 @@ const (
 	// TagPool marks a stopped-pool instance: PoolWarming while it boots
 	// once, PoolReady once it has stopped, PoolClaimed when a job took it.
 	TagPool = "firerunner:pool"
+	// TagPoolMAC proves a pool instance was launched by an install holding
+	// the pool key (see poolMAC). Rediscovery trusts no pool instance
+	// without it.
+	TagPoolMAC = "firerunner:pool-mac"
 )
 
 // Stopped-pool states, the values of TagPool.

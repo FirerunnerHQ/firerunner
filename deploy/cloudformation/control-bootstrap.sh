@@ -26,6 +26,9 @@
 #                 instance role, as before)
 #   FR_ROOT_GIB   the root volume's size, which caps the cache's local use
 #   FR_APP_KMS_KEY  a KMS key that signs for the GitHub App; set, no key is read
+#   FR_POOL_KEY_SECRET  the Secrets Manager secret holding the key that signs
+#                 EC2 pool instances (a stack made before it leaves it empty:
+#                 firerunner then rebuilds its warm pool after every restart)
 #
 # and these SSM parameters under $FR_PREFIX/control/:
 #   env              FR_* lines (non-secret): FR_URL, FR_APP_CLIENT_ID, ...;
@@ -202,6 +205,20 @@ tenants=$(param tenants)
 if [ -n "$tenants" ]; then
 	printf '%s\n' "$tenants" > "$etc/tenants.json"
 	setenv FR_TENANTS "$etc/tenants.json"
+fi
+if [ -n "${FR_POOL_KEY_SECRET:-}" ]; then
+	# In a root-only file (umask 077), never the env: firerunner reads it.
+	pool_key=$(aws secretsmanager get-secret-value --secret-id "$FR_POOL_KEY_SECRET" \
+		--query SecretString --output text)
+	if [ "${#pool_key}" -lt 32 ]; then
+		log "$FR_POOL_KEY_SECRET: the pool key holds fewer than 32 characters"
+		false
+	fi
+	printf '%s\n' "$pool_key" > "$etc/pool-key"
+	pool_key=''
+	setenv FR_EC2_POOL_KEY_FILE "$etc/pool-key"
+else
+	log "no FR_POOL_KEY_SECRET: the warm pool is rebuilt after every restart; update the stack to keep it"
 fi
 key='' token=''
 if [ -n "${FR_APP_KMS_KEY:-}" ]; then

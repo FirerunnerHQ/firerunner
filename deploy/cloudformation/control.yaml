@@ -252,9 +252,29 @@ Resources:
                   Resource: !Ref AppKMSKeyArn
                   Condition: { StringEquals: { "kms:SigningAlgorithm": RSASSA_PKCS1_V1_5_SHA_256, "kms:MessageType": DIGEST } }
                 - !Ref AWS::NoValue
+              # The pool key, and no other secret.
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref PoolKey
               - Effect: Allow
                 Action: autoscaling:SetInstanceHealth
                 Resource: !Sub "arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-control"
+
+  # Signs the EC2 pool's instances (the firerunner:pool-mac tag), so a
+  # restarted or replaced control VM reuses the pool instances this install
+  # launched and trusts no others: anyone who may tag an instance in the
+  # account can copy the other tags. Only the control role may read it. It is
+  # generated here and never leaves AWS but for the control VM's disk.
+  # Changing GenerateSecretString makes a new value, and so discards the
+  # pool once.
+  PoolKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub "firerunner (${AWS::StackName}): the key that signs EC2 pool instances"
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+      Tags: [{ Key: firerunner:control, Value: !Ref AWS::StackName }]
 
   ControlProfile:
     Type: AWS::IAM::InstanceProfile
@@ -495,6 +515,7 @@ Resources:
               FR_CACHE_ROLE_ARN=${CacheRoleArn}
               FR_ROOT_GIB=${RootVolumeGiB}
               FR_APP_KMS_KEY=${AppKMSKeyArn}
+              FR_POOL_KEY_SECRET=${PoolKey}
               EOF
               version=$(aws ssm get-parameter --name ${ParameterPrefix}/control/version --query Parameter.Value --output text)
               case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) false ;; esac

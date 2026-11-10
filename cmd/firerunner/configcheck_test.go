@@ -149,6 +149,23 @@ func TestConfigCheckRejectsEmptyAppKey(t *testing.T) {
 	}
 }
 
+func TestConfigCheckRejectsAShortPoolKey(t *testing.T) {
+	t.Setenv("FR_MAX_RUNNERS", "4")
+	t.Setenv("FR_TOKEN", "")
+	keyPath := filepath.Join(t.TempDir(), "pool-key")
+	if err := os.WriteFile(keyPath, []byte("SECRETSHORT\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"check", "--url", "https://github.com/o", "--token", "ghp_x", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0"}
+	code, out, _ := runConfig(t, append(args, "--ec2-pool-key-file", keyPath)...)
+	if code != 1 || !strings.Contains(out, "--ec2-pool-key-file") || strings.Contains(out, "SECRETSHORT") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	if code, out, _ := runConfig(t, args...); code != 0 {
+		t.Fatalf("without the key file: exit %d\n%s", code, out)
+	}
+}
+
 // TestRunRejectsEmptyAppKey drives the daemon's startup path: an empty key
 // file is an error naming the file, never a panic in the scale set client.
 func TestRunRejectsEmptyAppKey(t *testing.T) {

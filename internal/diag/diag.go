@@ -563,6 +563,9 @@ func runDoctor(cfg *config.Config, version string, extra ...Check) DoctorReport 
 		checks = append(checks, *c)
 	}
 
+	if c := ec2PoolKeyCheck(cfg); c != nil {
+		checks = append(checks, *c)
+	}
 	checks = append(checks, extra...)
 	checks = append(checks, listenerChecks(fc, time.Now())...)
 	if c := cacheCredentialsCheck(cfg, time.Now()); c != nil {
@@ -955,6 +958,27 @@ func authCheck(cfg *config.Config) Check {
 		return pass("auth", "GitHub App configured (client %s, installation %d), signing in KMS key %s", cfg.AppClientID, cfg.AppInstallID, cfg.AppKMSKey)
 	}
 	return pass("auth", "GitHub App configured (client %s, installation %d)", cfg.AppClientID, cfg.AppInstallID)
+}
+
+// ec2PoolKeyCheck reports on the key that signs EC2 pool instances, when a
+// tier keeps a pool or a key is configured; nil otherwise.
+func ec2PoolKeyCheck(cfg *config.Config) *Check {
+	pooled := false
+	for _, t := range cfg.EffectiveTiers() {
+		pooled = pooled || t.IsEC2() && t.MaxPool() > 0
+	}
+	if !pooled && cfg.EC2PoolKeyFile == "" {
+		return nil
+	}
+	var c Check
+	if _, err := cfg.ReadEC2PoolKey(); err != nil {
+		c = fail("ec2-pool-key", "%v", err)
+	} else if cfg.EC2PoolKeyFile == "" {
+		c = warn("ec2-pool-key", "no --ec2-pool-key-file: each process signs pool instances with a key of its own, so the warm pool is rebuilt after every restart")
+	} else {
+		c = pass("ec2-pool-key", "pool instances are signed with the key in %s", cfg.EC2PoolKeyFile)
+	}
+	return &c
 }
 
 // fetchCacheStats best-effort reads the cache-server's /stats snapshot for the

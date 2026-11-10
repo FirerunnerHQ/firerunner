@@ -84,6 +84,11 @@ type Config struct {
 	// instead of JITAddr's IP: a stable private DNS name that follows a
 	// replaced control VM. The port stays JITAddr's.
 	JITHost string
+	// EC2PoolKeyFile names the file holding the key that signs EC2 pool
+	// instances, so a restarted firerunner trusts the ones it launched and
+	// no others (ReadEC2PoolKey). Empty: a random key per process, and the
+	// pool is rebuilt after every restart.
+	EC2PoolKeyFile string
 	// EC2Reaper is "on", "dry-run" or "off": whether instances and spot
 	// requests this install left behind are cleaned up.
 	EC2Reaper string
@@ -439,6 +444,7 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.DurationVar(&c.JITTTL, "jit-ttl", er.duration("FR_JIT_TTL", 5*time.Minute), "how long an EC2 instance's JIT config waits to be fetched before it expires")
 	fs.StringVar(&c.Owner, "owner", env("FR_OWNER", ""), "name of this install: tagged as firerunner:owner on every instance it launches, so its pool and reaper find them again. Defaults to the host name; set a stable value when the control VM can be replaced. Setting it also keeps the tiers' scale sets registered across restarts (without it, a scale set this process created is deleted when it stops)")
 	fs.StringVar(&c.RunnerSweep, "runner-sweep", env("FR_RUNNER_SWEEP", "on"), "every 5 minutes, remove offline runners in this install's scale sets that it does not track (left by a launch that died before connecting, or by an earlier process), once two sweeps in a row find them: on, dry-run (log only), or off")
+	fs.StringVar(&c.EC2PoolKeyFile, "ec2-pool-key-file", "", "file holding the key (at least 32 bytes) that signs ec2 pool instances, so a restarted firerunner reuses the pool instances it launched and trusts no others; keep it the same across restarts and control VMs. Unset, each process makes a random key and rebuilds the pool after a restart. Default FR_EC2_POOL_KEY_FILE")
 	fs.StringVar(&c.EC2Reaper, "ec2-reaper", env("FR_EC2_REAPER", "on"), "clean up EC2 instances and spot requests this install left behind (after a crash or restart, including pool instances left mid-claim): on, dry-run (log only), or off (nothing cleans them up)")
 
 	fs.StringVar(&v.egress, "egress", env("FR_EGRESS", "api,actions,git,dns,packages,ntp"), "comma-separated egress allowlist: GitHub /meta categories (api,actions,git,packages) plus dns,ntp; or 'open' for no allowlist")
@@ -474,6 +480,10 @@ func Parse(args []string) (*Config, error) {
 	// A path, not a secret; but it names credentials, so likewise.
 	if c.CacheCredentialsFile == "" {
 		c.CacheCredentialsFile = env("FR_CACHE_CREDENTIALS_FILE", DefaultCacheCredentialsFile)
+	}
+	// A path, not a secret; but it names a key, so likewise.
+	if c.EC2PoolKeyFile == "" {
+		c.EC2PoolKeyFile = env("FR_EC2_POOL_KEY_FILE", "")
 	}
 	c.JobEventsDSN = env("FR_JOB_EVENTS_DSN", "")
 	c.JobEventsDSNFile = env("FR_JOB_EVENTS_DSN_FILE", "")
