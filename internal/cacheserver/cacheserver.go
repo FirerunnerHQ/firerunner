@@ -127,6 +127,7 @@ type Server struct {
 	maxEntries        int              // 0 = unlimited; entries, completed and reserved
 	maxRepoEntries    int              // 0 = unlimited; the same, for one repository
 	staged            map[uint64]int64 // bytes written so far for a not-yet-finalized entry
+	usedDirty         bool             // a hit moved UsedAt since the last save; see flushUsed
 	identityMu        sync.Mutex
 	identityDenied    map[string]uint64 // by reason, under identityMu
 	identityFailures  map[string]bool
@@ -347,22 +348,52 @@ func (b *idleBody) Read(p []byte) (int, error) {
 
 // StartJanitor runs a background loop that reclaims abandoned (reserved but
 // never finalized) entries until the returned stop function is called.
+// It also writes the index when a hit has only moved UsedAt, every
+// usedFlushInterval and once more when stopped; stop waits for that, and may
+// be called more than once. Without a janitor, a hit's UsedAt is written only
+// with the next other change to the index.
 func (s *Server) StartJanitor() (stop func()) {
-	done := make(chan struct{})
+	done, exited := make(chan struct{}), make(chan struct{})
+	var once sync.Once
 	go func() {
+		defer close(exited)
 		t := time.NewTicker(10 * time.Minute)
 		defer t.Stop()
+		flush := time.NewTicker(usedFlushInterval)
+		defer flush.Stop()
 		s.gc()
 		for {
 			select {
 			case <-done:
+				s.flushUsed()
 				return
 			case <-t.C:
 				s.gc()
+			case <-flush.C:
+				s.flushUsed()
 			}
 		}
 	}()
-	return func() { close(done) }
+	return func() {
+		once.Do(func() { close(done) })
+		<-exited
+	}
+}
+
+// usedFlushInterval bounds how long a hit's UsedAt may go unwritten: a crash
+// in that window loses only LRU order, never an entry.
+const usedFlushInterval = 30 * time.Second
+
+// flushUsed writes the index if a hit has changed UsedAt since the last save.
+func (s *Server) flushUsed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.usedDirty {
+		return
+	}
+	if err := s.save(); err != nil {
+		s.log.Warn("cache index save failed", "err", err)
+	}
 }
 
 // --- Twirp message shapes (proto3 JSON, useProtoFieldName: true; int64 as string) ---
@@ -583,9 +614,12 @@ func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	e := s.match(repo, identity.ReadRefs, strings.ToLower(req.Key), req.RestoreKeys, req.Version)
 	if e != nil {
+		// Only LRU order depends on UsedAt, so a hit does not rewrite the
+		// whole index under the lock: flushUsed writes it within
+		// usedFlushInterval, and any other save carries it sooner.
 		e.UsedAt = time.Now().Unix()
+		s.usedDirty = true
 		s.hits++
-		_ = s.save()
 	} else {
 		s.misses++
 	}
@@ -1115,21 +1149,33 @@ func (s *Server) evictOldest(entries []*Entry, n int) int {
 // match exhausts each scope before trying the next. Within a scope an exact
 // key beats its prefix; restore keys are tried in order, exact then prefix.
 func (s *Server) match(repo string, readRefs []string, key string, restoreKeys []string, version string) *Entry {
+	// One pass over every entry, under the lock; the attempts below then see
+	// only this repository's complete entries of this version, at most
+	// --max-repo-entries, rather than every entry once per ref and key.
+	var cands []*Entry
+	for _, e := range s.entries {
+		if e.Complete && e.RepoID == repo && e.Version == version && restorable(e, repo) {
+			cands = append(cands, e)
+		}
+	}
 	for _, ref := range readRefs {
-		if e := s.completeExact(repo, ref, key, version); e != nil {
+		if ref == "" {
+			continue
+		}
+		if e := completeExact(cands, ref, key); e != nil {
 			return e
 		}
 		if key != "" {
-			if e := s.completePrefix(repo, ref, key, version); e != nil {
+			if e := completePrefix(cands, ref, key); e != nil {
 				return e
 			}
 		}
 		for _, rk := range restoreKeys {
 			rk = strings.ToLower(rk)
-			if e := s.completeExact(repo, ref, rk, version); e != nil {
+			if e := completeExact(cands, ref, rk); e != nil {
 				return e
 			}
-			if e := s.completePrefix(repo, ref, rk, version); e != nil {
+			if e := completePrefix(cands, ref, rk); e != nil {
 				return e
 			}
 		}
@@ -1144,25 +1190,23 @@ func restorable(e *Entry, repo string) bool {
 	return e.Version != gitcache.EntryVersion || ownGitEntry(e.Key, repo)
 }
 
-func (s *Server) completeExact(repo, ref, key, version string) *Entry {
+// completeExact and completePrefix pick the newest of cands, match's
+// candidates, saved under ref with key, or a key starting with prefix.
+func completeExact(cands []*Entry, ref, key string) *Entry {
 	var best *Entry
-	for _, e := range s.entries {
-		if e.Complete && ref != "" && e.Ref == ref && e.RepoID == repo && e.Version == version && e.Key == key && restorable(e, repo) {
-			if newer(best, e) {
-				best = e
-			}
+	for _, e := range cands {
+		if e.Ref == ref && e.Key == key && newer(best, e) {
+			best = e
 		}
 	}
 	return best
 }
 
-func (s *Server) completePrefix(repo, ref, prefix, version string) *Entry {
+func completePrefix(cands []*Entry, ref, prefix string) *Entry {
 	var best *Entry
-	for _, e := range s.entries {
-		if e.Complete && ref != "" && e.Ref == ref && e.RepoID == repo && e.Version == version && strings.HasPrefix(e.Key, prefix) && restorable(e, repo) {
-			if newer(best, e) {
-				best = e
-			}
+	for _, e := range cands {
+		if e.Ref == ref && strings.HasPrefix(e.Key, prefix) && newer(best, e) {
+			best = e
 		}
 	}
 	return best
@@ -1450,7 +1494,11 @@ func (s *Server) save() error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.indexPath())
+	if err := os.Rename(tmp, s.indexPath()); err != nil {
+		return err
+	}
+	s.usedDirty = false // every entry's UsedAt is in what was written
+	return nil
 }
 
 // --- small helpers ---

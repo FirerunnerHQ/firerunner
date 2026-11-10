@@ -239,6 +239,8 @@ func cacheServe(args []string) error {
 		log.Warn("artifact forwarding disabled; actions/upload-artifact and download-artifact will fail on cache-redirect goldens — pass --artifact-upstream to forward them to GitHub")
 	}
 	stopJanitor := srv.StartJanitor()
+	// Deferred after stopSync, so it runs first: its last flush of hits'
+	// UsedAt must be in the index the sync then uploads.
 	defer stopJanitor()
 
 	httpSrv := &http.Server{
