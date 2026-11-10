@@ -1064,6 +1064,27 @@ expect "up --cache s3: sets the stack's Cache" "$(cat "$STATE/create-params.json
 run control-vm.sh up --cache memory
 expect "up --cache memory: a usage error" "$(dump)" rc_is 2
 
+# Without --cache, the session's cache follows the shared stack's.
+vm_fresh vm-up-cache-inherit
+answer stack-st 1 "$(base_stack | jq -c '.Stacks[0].Parameters += [{ParameterKey: "Cache", ParameterValue: "s3"}]')"
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack CREATE_COMPLETE)"
+answer asg 1 i-0ctl
+answer invocation 1 "$(inv Success 0 $'active\nfirerunner v1.2.0\n' '')"
+run control-vm.sh up
+expect "up: the cache follows the shared stack's" "$(cat "$STATE/create-params.json" 2>&1)" \
+	jqe 'map({key: .ParameterKey, value: .ParameterValue}) | from_entries | .Cache == "s3"' "$STATE/create-params.json"
+
+# A catalog whose tiers want the cache, with the cache off, is refused before
+# anything is made: the VM's firerunner would refuse it, over and over.
+vm_fresh vm-up-cache-needed
+ssm_seed /fr/e2e/control/tiers '[{"name":"cloud","provisioner":"ec2","ec2":{"ami":"ami-0lit","cache":true}}]'
+answer stack-st-e2e-test 1 "$NOSTACK"
+run control-vm.sh up
+expect "up: refuses ec2.cache tiers with the cache off" "$(dump)" rc_is 2
+expect "up: says which tiers and what to pass" "$(dump)" err_has 'tiers cloud use ec2.cache, but the cache is off: pass --cache disk or --cache s3'
+expect "up: makes no stack for it" "" not_called "create-stack"
+
 vm_fresh vm-down-cache
 # A stack that failed to create has no outputs; its retained bucket is a
 # resource all the same.

@@ -28,8 +28,11 @@
 #            from the JSON's tiers.
 #            The shared catalog loses its idle capacity on the way: no
 #            ec2.pool, no schedule, min 0, so a session bills only for the
-#            jobs it runs. --cache sets the stack's Cache parameter (default
-#            off): cache-server on the VM for tiers with ec2.cache.
+#            jobs it runs. --cache sets the stack's Cache parameter (default:
+#            the shared stack's, else off): cache-server on the VM for tiers
+#            with ec2.cache. A catalog with ec2.cache tiers needs one: with
+#            the cache off, up refuses rather than start a VM whose
+#            firerunner would refuse its own configuration.
 #            To test a pool or hot runners, pass --tiers FILE,
 #            which is taken as written.
 #   status   the stack, its VM, whether firerunner is active there, and the
@@ -240,6 +243,15 @@ seed_and_create() {
 	fi
 	jq -e 'type == "array" and length > 0 and all(.[]; .name | type == "string")' <<<"$tiers" >/dev/null 2>&1 ||
 		e2e_die 2 "the tier catalog is not a JSON array of named tiers"
+	# The cache follows the shared stack's unless given. firerunner refuses a
+	# catalog whose tiers want a cache the stack does not run, and the VM
+	# would be replaced over and over: refuse here, before anything is made.
+	cache="${cache:-$(param "$b" Cache)}"
+	cache="${cache:-off}"
+	if [ "$cache" = off ]; then
+		cached="$(jq -r '[.[] | select(.ec2.cache == true) | .name] | join(" ")' <<<"$tiers")"
+		[ -z "$cached" ] || e2e_die 2 "tiers $cached use ec2.cache, but the cache is off: pass --cache disk or --cache s3"
+	fi
 	suffix="$(e2e_tier_suffix)"
 
 	# AMI parameters under the shared prefix move under the session's, the
@@ -268,7 +280,7 @@ seed_and_create() {
 
 	keys="$(aws cloudformation get-template-summary --template-body "file://$TEMPLATE" \
 		--query 'Parameters[].ParameterKey' --output json)" || e2e_die 1 "get-template-summary failed"
-	jq -c --argjson keys "$keys" --arg o "$owner" --arg p "$prefix" --arg z "$zone_id" --arg zn "$zone" --arg c "${cache:-off}" '
+	jq -c --argjson keys "$keys" --arg o "$owner" --arg p "$prefix" --arg z "$zone_id" --arg zn "$zone" --arg c "$cache" '
 		[.Parameters[] | select(.ParameterKey | IN("Owner", "ParameterPrefix", "HostedZoneId", "ZoneName", "JitName", "Cache") | not)
 			| {ParameterKey, ParameterValue}]
 		+ [{ParameterKey: "Owner", ParameterValue: $o}, {ParameterKey: "ParameterPrefix", ParameterValue: $p},
