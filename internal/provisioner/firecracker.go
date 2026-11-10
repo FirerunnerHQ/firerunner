@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,7 +71,8 @@ type FirecrackerConfig struct {
 	// job, this is how runner logs are forwarded off the ephemeral VM.
 	LogDir string
 	// LogMaxBytes caps each runner's log file, and LogDirMaxBytes all of
-	// them together, the oldest removed first; 0 means no cap.
+	// them together, open ones included, the oldest closed ones removed
+	// first; 0 means no cap.
 	LogMaxBytes    int64
 	LogDirMaxBytes int64
 	// MaxVMs bounds concurrent microVMs and sizes the per-VM network pool.
@@ -191,6 +191,8 @@ type Firecracker struct {
 	// flushConntrack removes the host's conntrack entries for a guest
 	// address; see flushGuestConntrack.
 	flushConntrack func(guestIPs ...string) error
+	// logs holds the console logs to LogDirMaxBytes; nil without that cap.
+	logs *logBudget
 }
 
 // NewFirecracker returns a Firecracker provisioner, filling in defaults.
@@ -222,7 +224,12 @@ func NewFirecracker(cfg FirecrackerConfig, log *slog.Logger) *Firecracker {
 	if cfg.MaxVMs < 1 {
 		cfg.MaxVMs = 64
 	}
+	var logs *logBudget
+	if cfg.LogDir != "" && cfg.LogDirMaxBytes > 0 {
+		logs = newLogBudget(cfg.LogDir, cfg.LogMaxBytes, cfg.LogDirMaxBytes, log)
+	}
 	return &Firecracker{
+		logs:           logs,
 		cfg:            cfg,
 		log:            log,
 		run:            execRun,
@@ -728,14 +735,23 @@ func (f *Firecracker) openConsole(name string, onBusy, onConnected func()) (io.W
 		}
 		// The guest writes what it likes to its console, so each file has a
 		// cap and the directory a budget, or one job could fill the host disk.
-		f.pruneLogs(f.cfg.LogDirMaxBytes - f.cfg.LogMaxBytes)
-		// 0600: the console can carry whatever a job printed to it.
-		file, err := os.OpenFile(filepath.Join(f.cfg.LogDir, name+".log"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-		if err != nil {
-			return nil, nil, err
+		// The budget is shared by every guest writing at once; see logBudget.
+		if f.logs != nil {
+			l, err := f.logs.open(name)
+			if err != nil {
+				return nil, nil, err
+			}
+			writers = append(writers, tolerantWriter{w: l})
+			closeFn = func() { _ = l.Close() }
+		} else {
+			// 0600: the console can carry whatever a job printed to it.
+			file, err := os.OpenFile(filepath.Join(f.cfg.LogDir, name+".log"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+			if err != nil {
+				return nil, nil, err
+			}
+			writers = append(writers, tolerantWriter{w: newCappedWriter(file, f.cfg.LogMaxBytes)})
+			closeFn = func() { _ = file.Close() }
 		}
-		writers = append(writers, tolerantWriter{w: newCappedWriter(file, f.cfg.LogMaxBytes)})
-		closeFn = func() { _ = file.Close() }
 	}
 	if len(writers) == 1 {
 		return writers[0], closeFn, nil
@@ -785,50 +801,6 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 	c.left, c.cut = 0, true
 	_, _ = io.WriteString(c.w, consoleCutNote)
 	return len(p), err
-}
-
-// pruneLogs removes the oldest per-runner logs in LogDir until the rest take
-// at most budget bytes, leaving room for the one about to be created. It does
-// nothing when LogDirMaxBytes is unset. It is best-effort: a failure is
-// logged.
-func (f *Firecracker) pruneLogs(budget int64) {
-	if f.cfg.LogDirMaxBytes <= 0 {
-		return
-	}
-	entries, err := os.ReadDir(f.cfg.LogDir)
-	if err != nil {
-		f.log.Warn("list runner logs", "dir", f.cfg.LogDir, "err", err)
-		return
-	}
-	type logFile struct {
-		path string
-		size int64
-		mod  time.Time
-	}
-	var logs []logFile
-	var total int64
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		logs = append(logs, logFile{filepath.Join(f.cfg.LogDir, e.Name()), info.Size(), info.ModTime()})
-		total += info.Size()
-	}
-	sort.Slice(logs, func(i, j int) bool { return logs[i].mod.Before(logs[j].mod) })
-	for _, l := range logs {
-		if total <= budget {
-			return
-		}
-		if err := os.Remove(l.path); err != nil {
-			f.log.Warn("remove old runner log", "path", l.path, "err", err)
-			continue
-		}
-		total -= l.size
-	}
 }
 
 // busyMarker is printed by the in-guest Actions runner to the serial console
