@@ -131,10 +131,10 @@ func TestFromFlags_MaxVMLifetime(t *testing.T) {
 func TestFromFlags_MissingRequired(t *testing.T) {
 	cases := map[string][]string{
 		"no url":    {"--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0", "--token", "t"},
-		"no kernel": {"--url", "u", "--golden", "/g", "--ext-iface", "eth0", "--token", "t"},
-		"no golden": {"--url", "u", "--kernel", "/k", "--ext-iface", "eth0", "--token", "t"},
-		"no iface":  {"--url", "u", "--kernel", "/k", "--golden", "/g", "--token", "t"},
-		"no auth":   {"--url", "u", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0"},
+		"no kernel": {"--url", "https://github.com/o", "--golden", "/g", "--ext-iface", "eth0", "--token", "t"},
+		"no golden": {"--url", "https://github.com/o", "--kernel", "/k", "--ext-iface", "eth0", "--token", "t"},
+		"no iface":  {"--url", "https://github.com/o", "--kernel", "/k", "--golden", "/g", "--token", "t"},
+		"no auth":   {"--url", "https://github.com/o", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0"},
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -201,11 +201,27 @@ func TestParse_MalformedEnvFailsClosed(t *testing.T) {
 
 func TestFromFlags_AppCredsSatisfyAuth(t *testing.T) {
 	args := []string{
-		"--url", "u", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0",
+		"--url", "https://github.com/o", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0",
 		"--app-client-id", "Iv1.abc", "--app-installation-id", "1",
 	}
 	if _, err := FromFlags(args); err != nil {
 		t.Fatalf("app creds should satisfy auth: %v", err)
+	}
+}
+
+// The scale-set client sends the PAT or App credentials to --url's host, so
+// it must be https, naming an account.
+func TestFromFlags_URLMustBeHTTPS(t *testing.T) {
+	base := []string{"--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0", "--token", "t"}
+	for _, u := range []string{"http://github.com/o", "github.com/o", "https://github.com", "https://github.com/", "ftp://x/o"} {
+		if _, err := FromFlags(append([]string{"--url", u}, base...)); err == nil || !strings.Contains(err.Error(), "https URL") {
+			t.Errorf("--url %q: %v, want refused", u, err)
+		}
+	}
+	for _, u := range []string{"https://github.com/o", "https://github.com/o/repo", "https://github.com/enterprises/e", "https://ghes.example.com/o"} {
+		if _, err := FromFlags(append([]string{"--url", u}, base...)); err != nil {
+			t.Errorf("--url %q: %v, want accepted", u, err)
+		}
 	}
 }
 
@@ -454,7 +470,7 @@ func TestFromFlags_TierToolCacheMissing(t *testing.T) {
 func TestFromFlags_TierCatalogSatisfiesGolden(t *testing.T) {
 	// A tier catalog replaces the top-level --golden requirement.
 	p := writeTiers(t, `[{"name":"firerunner","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":0,"max":4}]`)
-	args := []string{"--url", "u", "--kernel", "/k", "--ext-iface", "eth0", "--token", "t", "--tiers", p}
+	args := []string{"--url", "https://github.com/o", "--kernel", "/k", "--ext-iface", "eth0", "--token", "t", "--tiers", p}
 	if _, err := FromFlags(args); err != nil {
 		t.Fatalf("tier catalog should satisfy the golden requirement: %v", err)
 	}
@@ -660,11 +676,11 @@ func TestFromFlags_EC2OnlyCatalogNeedsNoFirecrackerHost(t *testing.T) {
 	}
 	// The same flags are still required as soon as a Firecracker tier joins.
 	mixed := writeTiers(t, `[{"name":"local","vcpu":2,"mem_mib":4096,"golden":"/g","max":2},`+ec2TierJSON+`]`)
-	if _, err := FromFlags(append([]string{"--url", "u", "--token", "t", "--tiers", mixed}, jitAddr...)); err == nil {
+	if _, err := FromFlags(append([]string{"--url", "https://github.com/o", "--token", "t", "--tiers", mixed}, jitAddr...)); err == nil {
 		t.Fatal("expected --kernel to be required once a firecracker tier is present")
 	}
 	// The single tier derived from scalar flags is a Firecracker tier.
-	if _, err := FromFlags([]string{"--url", "u", "--token", "t", "--golden", "/g"}); err == nil {
+	if _, err := FromFlags([]string{"--url", "https://github.com/o", "--token", "t", "--golden", "/g"}); err == nil {
 		t.Fatal("expected --kernel to be required without a tier catalog")
 	}
 }
@@ -784,7 +800,7 @@ func TestFromFlags_ExplicitFirecrackerProvisioner(t *testing.T) {
 func TestFromFlags_JITAddr(t *testing.T) {
 	ec2Only := writeTiers(t, `[`+ec2TierJSON+`]`)
 	args := func(extra ...string) []string {
-		return append([]string{"--url", "u", "--token", "t", "--tiers", ec2Only}, extra...)
+		return append([]string{"--url", "https://github.com/o", "--token", "t", "--tiers", ec2Only}, extra...)
 	}
 	c, err := FromFlags(args("--jit-addr", "10.0.0.5:8098"))
 	if err != nil {
@@ -828,7 +844,7 @@ func TestFromFlags_EC2CacheAddr(t *testing.T) {
 	cached := writeTiers(t, `[`+strings.Replace(ec2TierJSON, `"ec2":{`, `"ec2":{"cache":true,`, 1)+`]`)
 	plain := writeTiers(t, `[`+ec2TierJSON+`]`)
 	args := func(tiers string, extra ...string) []string {
-		return append([]string{"--url", "u", "--token", "t", "--tiers", tiers, "--jit-addr", "10.0.0.5:8098"}, extra...)
+		return append([]string{"--url", "https://github.com/o", "--token", "t", "--tiers", tiers, "--jit-addr", "10.0.0.5:8098"}, extra...)
 	}
 	c, err := FromFlags(args(cached, "--ec2-cache-addr", "10.0.0.5:8099"))
 	if err != nil || !c.UsesEC2Cache() || c.EC2CacheAddr != "10.0.0.5:8099" {
@@ -862,7 +878,7 @@ func TestFromFlags_EC2CacheAddr(t *testing.T) {
 func TestFromFlags_JITHost(t *testing.T) {
 	ec2Only := writeTiers(t, `[`+ec2TierJSON+`]`)
 	args := func(extra ...string) []string {
-		return append([]string{"--url", "u", "--token", "t", "--tiers", ec2Only, "--jit-addr", "10.0.0.5:8098"}, extra...)
+		return append([]string{"--url", "https://github.com/o", "--token", "t", "--tiers", ec2Only, "--jit-addr", "10.0.0.5:8098"}, extra...)
 	}
 	c, err := FromFlags(args())
 	if err != nil || c.JITEndpoint() != "10.0.0.5:8098" {

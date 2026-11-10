@@ -50,6 +50,10 @@ env:
 
 jobs:
   build:
+    # Only main's code: the job runs the repository's build scripts with sudo on
+    # a persistent self-hosted host, and main can change only through a
+    # reviewed, checked PR. A dispatch from another branch is skipped.
+    if: github.ref == 'refs/heads/main'
     # Requires a Linux KVM host with loop-mount + mkfs.ext4 (self-hosted).
     runs-on: [self-hosted, kvm]
     strategy:
