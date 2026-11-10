@@ -1274,7 +1274,8 @@ There is no global repository/default-ref override or anonymous fallback.
   generation, or `--identity-wait` (default 60s, `0` denies at once) runs out;
   only then is it denied. The toolkit's HTTP client allows 3 minutes per request.
   Waiting grants nothing a resolved record would not: the same validation and
-  connection-generation check apply afterwards.
+  connection-generation check apply afterwards. At most 16 requests from one
+  address, and 1024 in all, wait at a time; one more is denied at once.
 - The first denial per address is logged with its reason (bounded to 4096
   outstanding addresses); a successful lookup resets it. `/stats` exposes
   `identity_denied` (total), `identity_denied_by_reason`, `identity_waits` and
@@ -1283,7 +1284,8 @@ There is no global repository/default-ref override or anonymous fallback.
   `firerunner_cache_identity_waits_total` and
   `firerunner_cache_identity_wait_seconds_total`. Reasons: `missing` (no
   record), `pending` (the wait ran out or the client left), `unresolved`,
-  `expired`, `invalid`, and `generation` (a connection outlived its VM). A
+  `expired`, `invalid`, `generation` (a connection outlived its VM), and
+  `waiters` (too many requests were already waiting). A
   rising `pending` count means `--identity-wait` is shorter than the
   `JobStarted` lag; `unresolved` points at App permissions or the REST API.
 - REST `pull_requests` can be empty: the resolver checks commit-associated PRs

@@ -131,6 +131,10 @@ type Server struct {
 	identityDenied    map[string]uint64 // by reason, under identityMu
 	identityFailures  map[string]bool
 	identityWait      time.Duration
+	waiters           map[string]int // requests waiting on a pending identity, by source, under identityMu
+	waitersTotal      int            // their sum, under identityMu
+	maxWaiters        int            // caps on both; see maxIdentityWaiters
+	maxSourceWaiters  int
 	identityWaits     atomic.Uint64
 	identityWaitNanos atomic.Uint64
 	lookup            func(string) (jobidentity.Identity, error)
@@ -251,14 +255,17 @@ func New(dir string, log *slog.Logger) (*Server, error) {
 		return nil, fmt.Errorf("chmod cache dir %q: %w", dir, err)
 	}
 	s := &Server{
-		dir:             dir,
-		log:             log.With("module", "cacheserver"),
-		entries:         make(map[uint64]*Entry),
-		staged:          make(map[uint64]int64),
-		nextID:          1,
-		artifactTimeout: defaultArtifactRPCTimeout,
-		identityDenied:  make(map[string]uint64),
-		identityWait:    DefaultIdentityWait,
+		dir:              dir,
+		log:              log.With("module", "cacheserver"),
+		entries:          make(map[uint64]*Entry),
+		staged:           make(map[uint64]int64),
+		nextID:           1,
+		artifactTimeout:  defaultArtifactRPCTimeout,
+		identityDenied:   make(map[string]uint64),
+		waiters:          make(map[string]int),
+		maxWaiters:       maxIdentityWaiters,
+		maxSourceWaiters: maxSourceIdentityWaiters,
+		identityWait:     DefaultIdentityWait,
 	}
 	s.bodyIdle.Store(int64(DefaultBodyIdle))
 	if err := s.load(); err != nil {
