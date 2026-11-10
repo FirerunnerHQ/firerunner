@@ -112,6 +112,22 @@ func dirLogBytes(t *testing.T, dir string) int64 {
 	return total
 }
 
+// settledLogBytes measures b's directory while holding the budget's lock, and
+// returns what the .log files take and what the budget counts them as taking.
+// Holding the lock is what makes the scan one snapshot: a scan without it
+// reads each file's size at a different moment, so it can add a closed log
+// that a later write has already removed to live logs that grew after the
+// removal, a sum no instant on disk ever had (#257). Under the lock no log is
+// opened, truncated or removed, and an open log grows only into bytes the
+// budget has already counted for it, so the disk can be no larger than the
+// count however the writers' file writes interleave with the scan.
+func settledLogBytes(t *testing.T, b *logBudget) (onDisk, counted int64) {
+	t.Helper()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return dirLogBytes(t, b.dir), b.inUseLocked()
+}
+
 // Many guests writing at once share the directory budget: together their
 // logs never take more than it, though each alone may write its full cap,
 // and the old logs that make room for them are removed.
@@ -144,8 +160,12 @@ func TestConcurrentConsoleLogsShareDirBudget(t *testing.T) {
 					t.Errorf("console write failed: %v", err)
 					return
 				}
-				if n := dirLogBytes(t, dir); n > budget {
-					t.Errorf("logs take %d bytes while guests write, over the budget of %d", n, budget)
+				onDisk, counted := settledLogBytes(t, f.logs)
+				if onDisk > counted {
+					t.Errorf("logs take %d bytes while guests write, more than the %d the budget counts", onDisk, counted)
+				}
+				if counted > budget {
+					t.Errorf("the budget counts %d bytes while guests write, over its %d", counted, budget)
 				}
 			}
 		}()
