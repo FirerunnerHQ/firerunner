@@ -8,6 +8,35 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-11-10
+
+### Fixed
+
+- cache-server refuses, with 400 and before it claims any space, a block list
+  that names a block more than once or names one never uploaded. Before, a
+  repeated block could claim, and evict other cache entries for, bytes that
+  were never uploaded.
+
+### Security
+
+- A runner denied the cache because two sources named different jobs for it
+  stays denied. A lookup still running for the first job could restore its
+  access when it finished.
+- `deploy-control.sh` checks the build provenance of the release it deploys
+  before it pins its checksums: it downloads the binaries and
+  `firerunner-control-bootstrap.sh` and runs `gh attestation verify` on each,
+  requiring the release workflow, the deployed tag and a GitHub-hosted runner.
+  It now needs `gh`. Releases before v0.1.9 carry no attestations; set
+  `DEPLOY_SKIP_ATTESTATION=1` to deploy one.
+- `build-ec2-ami.sh` keeps a `--firerunner-url` out of the build's shell
+  trace, and the build removes cloud-init's copies of its user-data and its
+  logs before the image is taken, so a presigned URL does not end up in the
+  runner image.
+- `build-toolcache.sh --python` relocates Python in a container with no
+  network. The pip upgrade in python-versions' `setup.sh` now reinstalls the
+  pip wheel bundled in the checked archive instead of fetching one from PyPI,
+  so the drive holds only what was checked.
+
 ## [0.1.10] - 2026-11-10
 
 ### Added
@@ -315,7 +344,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.11
 [0.1.10]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.10
 [0.1.9]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.9
 [0.1.8]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.8
