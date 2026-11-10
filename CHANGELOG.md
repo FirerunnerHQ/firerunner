@@ -8,6 +8,29 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-11-10
+
+### Changed
+
+- cache-server's `--body-idle-timeout` (default 60s) now also ends a response
+  the client stops reading for that long, a download above all (a megabyte
+  must be read within each period); a transfer that keeps moving is never
+  cut. One address may hold at most 64 connections to the cache server, and
+  all of them together 4096.
+
+### Security
+
+- EC2 pool instances are signed: firerunner tags each one it launches
+  `firerunner:pool-mac`, an HMAC of its owner, tier and instance ID, and after
+  a restart it never starts, nor hands a JIT config to, a pool instance whose
+  MAC is missing or wrong; it terminates it instead. The key comes from the
+  new `--ec2-pool-key-file` (`FR_EC2_POOL_KEY_FILE`); `control.yaml` generates
+  one in Secrets Manager and the control VM reads it at boot. Without a key,
+  each process uses a random one and the warm pool is rebuilt after every
+  restart. **Upgrading discards existing pool instances once:** ones launched
+  by an older release carry no MAC, so they are terminated and the pool
+  refills.
+
 ## [0.1.13] - 2026-11-10
 
 ### Changed
@@ -419,7 +442,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.14
 [0.1.13]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.13
 [0.1.12]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.12
 [0.1.11]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.11
