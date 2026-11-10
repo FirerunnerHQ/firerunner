@@ -71,6 +71,10 @@ diverted() { grep -q 'results-receiver.actions.githubusercontent.com' "$R/etc/ho
 # 1. A bundle: the host is diverted to a loopback proxy; containers are not.
 fresh host control.fr.internal:8099
 expect "host: succeeds" "$(cat "$STATE/out" 2>/dev/null)" setup
+# The proxy must outwait cache-server's default --identity-wait (60 s), or a
+# first restore made before the job's identity resolves becomes a miss.
+rpc_timeout="$(awk '/CacheService\//{on=1} on && /proxy_read_timeout/{gsub(/[^0-9]/,"",$2); print $2; exit}' "$HERE/assets/firerunner-cache-nginx.conf")"
+expect "the cache RPC timeout outwaits the identity wait" "proxy_read_timeout ${rpc_timeout:-none}s" [ "${rpc_timeout:-0}" -gt 60 ]
 expect "host: the key is owner-only" "$(mode "$R/etc/firerunner-cache/server.key")" [ "$(mode "$R/etc/firerunner-cache/server.key")" = 600 ]
 expect "host: the key and leaf are the bundle's" "" bash -c "[ \"\$(cat '$R/etc/firerunner-cache/server.key')\" = KEY-PEM ] && [ \"\$(cat '$R/etc/firerunner-cache/server.pem')\" = LEAF-PEM ]"
 expect "host: the CA joins the system store" "$(cat "$STATE/calls")" \
