@@ -249,10 +249,11 @@ func cacheServe(args []string) error {
 		ConnContext: srv.ConnectionContext,
 		// Guests run untrusted code; bound timeouts
 		// keep a slow or stalled client from pinning a connection (and its
-		// goroutine/fd) indefinitely. Body reads are streamed to disk with no
-		// overall deadline because a large cache archive can legitimately take a
-		// while; instead a body that stalls is cut after --body-idle-timeout
-		// (srv.SetBodyIdle), and header and idle phases get hard limits here.
+		// goroutine/fd) indefinitely. Bodies stream with no overall deadline,
+		// because a large cache archive can legitimately take a while; instead an
+		// upload that stalls, or a download its client stops reading, is cut
+		// after --body-idle-timeout (srv.SetBodyIdle), and header and idle phases
+		// get hard limits here.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -266,11 +267,15 @@ func cacheServe(args []string) error {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Info("cache-server listening", "addr", *addr, "dir", *dir, "max_size", *maxSize, "artifact_upstream", *artifactUpstream, "s3_bucket", *s3Bucket, "s3_prefix", *s3Prefix)
-	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	ln, err := cacheListen(*addr)
+	if err != nil {
 		return err
 	}
-	// ListenAndServe returns as Shutdown starts. Wait for the requests in
+	log.Info("cache-server listening", "addr", *addr, "dir", *dir, "max_size", *maxSize, "artifact_upstream", *artifactUpstream, "s3_bucket", *s3Bucket, "s3_prefix", *s3Prefix)
+	if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	// Serve returns as Shutdown starts. Wait for the requests in
 	// flight, so the deferred index sync pushes the entries they finalize.
 	<-drained
 	log.Info("cache-server stopped")
@@ -302,6 +307,17 @@ type cacheFlags struct {
 	identityWait, bodyIdle                                  *time.Duration
 }
 
+// cacheListen listens on addr for cache-server. Every guest reaches it, so the
+// connections one address, and all together, may hold are capped, as the JIT
+// endpoint's are.
+func cacheListen(addr string) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return jitserver.LimitListener(ln, cacheserver.MaxConnsPerSource, cacheserver.MaxConns), nil
+}
+
 // newCacheFlagSet registers the cache-server flags.
 func newCacheFlagSet() (*flag.FlagSet, cacheFlags) {
 	fs := flag.NewFlagSet("cache-server", flag.ContinueOnError)
@@ -315,7 +331,7 @@ func newCacheFlagSet() (*flag.FlagSet, cacheFlags) {
 		jobsDir:          fs.String("jobs-dir", jobidentity.DefaultDir, "private identity directory written by the local daemon"),
 		jobsOwner:        fs.Int("jobs-owner-uid", os.Getuid(), "UID of the daemon that owns job records (default current UID)"),
 		identityWait:     fs.Duration("identity-wait", cacheserver.DefaultIdentityWait, "how long a request from a VM whose job identity is still pending waits for it before being denied (0 denies at once)"),
-		bodyIdle:         fs.Duration("body-idle-timeout", cacheserver.DefaultBodyIdle, "end a request whose body sends nothing for this long; an upload that keeps sending is never cut (0 for no bound)"),
+		bodyIdle:         fs.Duration("body-idle-timeout", cacheserver.DefaultBodyIdle, "end a request whose body sends nothing, or whose response goes unread, for this long; a transfer that keeps moving is never cut (0 for no bound)"),
 		artifactUpstream: fs.String("artifact-upstream", cacheserver.DefaultArtifactUpstream, "Results endpoint to forward ArtifactService RPCs (upload/download-artifact v4+) to, since a cache-redirect golden diverts them here along with the cache; defaults to github.com's, accepts any protocol-compatible upstream, or empty to refuse artifact RPCs"),
 		s3Bucket:         fs.String("s3-bucket", "", "keep completed blobs and the index in this S3 bucket instead of --dir, which then only stages uploads; credentials come from the default AWS chain, or --s3-credentials-file"),
 		s3CredsFile:      fs.String("s3-credentials-file", "", "with --s3-bucket, sign with the credentials in this file (credential_process JSON, kept fresh by the daemon's --cache-role-arn) instead of the default AWS chain, waiting for it at start; pass --s3-region too, as instance metadata may be unreachable"),
@@ -389,8 +405,8 @@ cache-server flags:
   --max-entry-size string  refuse any single entry larger than this (default "10GB"; 0 = unlimited)
   --max-entries int  keep at most this many entries, evicting LRU ones first (default 20000; 0 = unlimited)
   --max-repo-entries int  the same for one repository, evicting its own first (default 2000; 0 = unlimited)
-  --body-idle-timeout duration  end a request whose body sends nothing this long
-                     (default 60s; 0 = no bound)
+  --body-idle-timeout duration  end a request whose body sends nothing, or whose
+                     response goes unread, this long (default 60s; 0 = no bound)
   --jobs-owner-uid int  daemon UID that owns the records (default current UID)
   --jobs-dir string  daemon's private job identity directory (default "/run/firerunner/jobs")
   --artifact-upstream string  forward ArtifactService RPCs (upload/download-

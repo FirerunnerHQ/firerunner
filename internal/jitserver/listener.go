@@ -1,6 +1,7 @@
 package jitserver
 
 import (
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -151,4 +152,13 @@ func (c *limitedConn) CloseWrite() error {
 		return cw.CloseWrite()
 	}
 	return nil
+}
+
+// ReadFrom passes through to the TCP connection as well, so a response
+// streamed from a file still goes out by sendfile.
+func (c *limitedConn) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := c.Conn.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(struct{ io.Writer }{c.Conn}, r)
 }
