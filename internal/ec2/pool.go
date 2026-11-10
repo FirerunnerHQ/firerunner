@@ -36,6 +36,12 @@ import (
 // The pool's state lives in tags (TagPool), so a restarted firerunner finds
 // its ready instances again. Ones a crash left claimed are the reaper's to
 // end, once GitHub confirms no job runs on them.
+//
+// Tags alone prove nothing: anyone who may tag an instance in the account can
+// write them. So each pool instance is signed (TagPoolMAC, poolmac.go) right
+// after its launch, and one whose MAC is missing or wrong never joins the
+// pool: it is never registered for a JIT config nor started, and it is
+// terminated (see reject).
 type Pool struct {
 	p      *Provisioner
 	target int
@@ -174,19 +180,26 @@ func (pl *Pool) filters() []types.Filter {
 }
 
 // discover sorts this tier's pool instances by their tags: ready ones join the
-// pool and warming ones are followed until they stop. Claimed ones, left by a
-// firerunner that died mid-claim or mid-job, are the reaper's: it checks with
-// GitHub whether their runner is still running a job before ending them.
+// pool and warming ones are followed until they stop, if their MAC holds;
+// those whose MAC fails are rejected. Claimed ones, left by a firerunner that
+// died mid-claim or mid-job, are the reaper's: it checks with GitHub whether
+// their runner is still running a job before ending them.
 func (pl *Pool) discover(ctx context.Context) error {
 	out, err := pl.p.c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{Filters: pl.filters()})
 	if err != nil {
 		return err
 	}
+	rejected := 0
 	for _, r := range out.Reservations {
 		for _, i := range r.Instances {
 			id, state := aws.ToString(i.InstanceId), i.State.Name
 			switch tagValue(i.Tags, TagPool) {
 			case PoolReady, PoolWarming:
+				if err := pl.verify(i); err != nil {
+					pl.reject(ctx, i, err)
+					rejected++
+					continue
+				}
 				if state == types.InstanceStateNameStopped {
 					pl.markReady(ctx, i)
 				} else {
@@ -198,8 +211,39 @@ func (pl *Pool) discover(ctx context.Context) error {
 		}
 	}
 	r, w := pl.Ready()
-	pl.log.Info("pool rediscovered", "ready", r, "warming", w)
+	pl.log.Info("pool rediscovered", "ready", r, "warming", w, "rejected", rejected)
 	return nil
+}
+
+// verify checks a pool instance's MAC for this tier's owner and tier.
+func (pl *Pool) verify(i types.Instance) error {
+	return pl.p.c.verifyPoolMAC(i, pl.p.o.Owner, pl.p.o.Tier)
+}
+
+// reject keeps an instance whose MAC failed out of the pool for good: it is
+// never registered for a JIT config nor started. It is terminated only when
+// it carries this install's owner tag and a pool state, as the control role
+// may end only those, and anything else is not the pool's to end. One whose
+// spot request will not cancel is left, still unused, for the reaper.
+func (pl *Pool) reject(ctx context.Context, i types.Instance, why error) {
+	id := aws.ToString(i.InstanceId)
+	pl.mu.Lock()
+	delete(pl.warming, id)
+	pl.mu.Unlock()
+	owner, state := tagValue(i.Tags, TagOwner), tagValue(i.Tags, TagPool)
+	if owner != pl.p.o.Owner || (state != PoolReady && state != PoolWarming) {
+		pl.log.Warn("pool instance failed its MAC check; not using it", "instance", id, "why", why, "owner", owner, "pool", state)
+		return
+	}
+	pl.log.Warn("pool instance failed its MAC check; not using it, terminating it", "instance", id, "why", why)
+	if !pl.discard(ctx, id, aws.ToString(i.SpotInstanceRequestId)) {
+		pl.log.Warn("could not terminate the rejected pool instance; the reaper retries", "instance", id)
+	}
+}
+
+// sign tags a pool instance this process just launched with its MAC.
+func (pl *Pool) sign(ctx context.Context, id string) error {
+	return pl.tag(ctx, id, TagPoolMAC, pl.p.c.poolMAC(pl.p.o.Owner, pl.p.o.Tier, id))
 }
 
 // refresh moves warming instances that have stopped into the pool, and
@@ -248,9 +292,14 @@ func (pl *Pool) refresh(ctx context.Context) {
 	}
 }
 
-// markReady tags a stopped pool instance ready and adds it to the pool.
+// markReady tags a stopped pool instance ready and adds it to the pool, if
+// its MAC holds.
 func (pl *Pool) markReady(ctx context.Context, i types.Instance) {
 	id := aws.ToString(i.InstanceId)
+	if err := pl.verify(i); err != nil {
+		pl.reject(ctx, i, err)
+		return
+	}
 	if err := pl.tag(ctx, id, TagPool, PoolReady); err != nil {
 		pl.log.Warn("tag pool instance ready", "instance", id, "err", err)
 		return
@@ -294,6 +343,14 @@ func (pl *Pool) fill(ctx context.Context) {
 			return
 		}
 		id := aws.ToString(inst.InstanceId)
+		// Signed at once, and even as ctx ends: unsigned, no later process
+		// would trust it.
+		if err := pl.sign(context.WithoutCancel(ctx), id); err != nil {
+			pl.log.Warn("could not sign the new pool instance; discarding it", "instance", id, "err", err)
+			pl.discard(context.WithoutCancel(ctx), id, aws.ToString(inst.SpotInstanceRequestId))
+			pl.failed(err)
+			return
+		}
 		pl.log.Info("warming pool instance", "instance", id, "type", inst.InstanceType)
 		pl.mu.Lock()
 		pl.warming[id] = pl.now()

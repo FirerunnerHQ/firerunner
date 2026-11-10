@@ -38,6 +38,15 @@ func (f *fakeEC2) put(tags map[string]string, state types.InstanceStateName, lau
 	return i.id
 }
 
+// signPool tags an instance with the pool MAC c's pool would have given it,
+// from its own owner and tier tags.
+func (f *fakeEC2) signPool(c *Client, id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i := f.instances[id]
+	i.tags[TagPoolMAC] = c.poolMAC(i.tags[TagOwner], i.tags[TagTier], id)
+}
+
 // githubRunners plays GitHub for the reaper: busy runners refuse removal.
 type githubRunners struct {
 	busy    map[string]bool
@@ -133,6 +142,7 @@ func TestReaper_LeavesWhatItMustNotTouch(t *testing.T) {
 	foreign := f.put(map[string]string{TagOwner: "someone-else", TagTier: "cloud", TagRunner: "x"}, types.InstanceStateNameStopped, old, false)
 	g := &githubRunners{}
 	r, c := reaperFor(f, g, nil)
+	f.signPool(c, pooled)
 	c.track(live)
 	rep, _ := r.Sweep(context.Background())
 	if len(rep.Instances) != 0 || len(g.removed) != 0 {
@@ -152,6 +162,32 @@ func TestReaper_PoolInstanceOfATierWithoutAPool(t *testing.T) {
 	r.Sweep(context.Background())
 	if f.state(id) != types.InstanceStateNameShuttingDown {
 		t.Fatalf("state %q, want the leftover pool instance terminated", f.state(id))
+	}
+}
+
+func TestReaper_PoolInstanceFailingItsMAC(t *testing.T) {
+	// The pool never uses a pool instance without a valid MAC; the reaper
+	// ends one the pool could not (its request would not cancel then), or
+	// that appeared since. One just launched is not signed yet: it waits
+	// out the grace period.
+	f := newFakeEC2(t)
+	forged := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameStopped, old, true)
+	otherKey := f.put(job("", TagPool, PoolWarming, TagTier, "pooled"), types.InstanceStateNameRunning, old, true)
+	young := f.put(job("", TagPool, PoolWarming, TagTier, "pooled"), types.InstanceStateNameRunning, time.Now(), true)
+	signed := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameStopped, old, true)
+	r, c := reaperFor(f, &githubRunners{}, nil)
+	f.signPool(c, signed)
+	f.signPool(NewClient(f, nil, time.Hour, quietLog()), otherKey)
+	rep, err := r.Sweep(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(rep.Instances)
+	if want := []string{forged, otherKey}; !slices.Equal(rep.Instances, want) {
+		t.Fatalf("reaped %v, want %v", rep.Instances, want)
+	}
+	if !slices.Equal(rep.Young, []string{young}) || f.state(young) != types.InstanceStateNameRunning || f.state(signed) != types.InstanceStateNameStopped {
+		t.Fatalf("young %v; states: young %s, signed %s", rep.Young, f.state(young), f.state(signed))
 	}
 }
 
@@ -180,7 +216,8 @@ func TestReaper_CancelsSpotRequestsWithoutAnInstance(t *testing.T) {
 	f := newFakeEC2(t)
 	gone := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameTerminated, old, true)
 	kept := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameStopped, old, true)
-	r, _ := reaperFor(f, &githubRunners{}, nil)
+	r, c := reaperFor(f, &githubRunners{}, nil)
+	f.signPool(c, kept)
 	rep, _ := r.Sweep(context.Background())
 	if !slices.Equal(rep.SpotRequests, []string{"sir-" + gone}) {
 		t.Fatalf("cancelled %v, want only the request whose instance is gone", rep.SpotRequests)

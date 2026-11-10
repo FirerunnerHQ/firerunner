@@ -360,6 +360,9 @@ func TestPool_RediscoversAfterRestart(t *testing.T) {
 	h.f.mu.Unlock()
 
 	c := NewClient(h.f, nil, 5*time.Millisecond, quietLog())
+	if err := c.SetPoolKey(h.p.c.poolKey); err != nil { // the deployment's key, as both processes read it
+		t.Fatal(err)
+	}
 	p2 := c.Tier(h.p.o)
 	p2.pool.tick = 5 * time.Millisecond
 	ctx, cancel2 := context.WithCancel(context.Background())

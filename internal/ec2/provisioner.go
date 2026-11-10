@@ -66,6 +66,11 @@ type Client struct {
 	// for; the reaper leaves them alone.
 	liveMu sync.Mutex
 	live   map[string]bool
+
+	// poolKey signs and verifies pool instances (poolmac.go); set before
+	// any tier runs, read-only after.
+	poolKey          []byte
+	poolKeyEphemeral bool
 }
 
 func (c *Client) track(id string) {
@@ -87,7 +92,8 @@ func (c *Client) isLive(id string) bool {
 }
 
 // NewClient returns a Client. params may be nil when no tier names its AMI by
-// SSM parameter. pollInterval <= 0 means DefaultPollInterval.
+// SSM parameter. pollInterval <= 0 means DefaultPollInterval. It signs pool
+// instances with a random key until SetPoolKey.
 func NewClient(api API, params ParamAPI, pollInterval time.Duration, log *slog.Logger) *Client {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -95,7 +101,10 @@ func NewClient(api API, params ParamAPI, pollInterval time.Duration, log *slog.L
 	if pollInterval <= 0 {
 		pollInterval = DefaultPollInterval
 	}
-	return &Client{api: api, amis: newAMIResolver(api, params), watch: newWatcher(api, pollInterval, log), breakers: newBreakers(), log: log, live: map[string]bool{}}
+	return &Client{
+		api: api, amis: newAMIResolver(api, params), watch: newWatcher(api, pollInterval, log), breakers: newBreakers(), log: log, live: map[string]bool{},
+		poolKey: randomPoolKey(), poolKeyEphemeral: true,
+	}
 }
 
 // Options configures one EC2 tier's provisioner.

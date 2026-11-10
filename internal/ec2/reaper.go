@@ -24,8 +24,9 @@ type ReaperOptions struct {
 	// Owner is this install's firerunner:owner tag; nothing else is touched.
 	Owner string
 	// PooledTiers names the tiers that keep a stopped pool: their ready and
-	// warming instances belong to the pool. Pool instances of any other
-	// tier (its pool was configured away) are reaped.
+	// warming instances belong to the pool, if their pool MAC holds (see
+	// TagPoolMAC). Pool instances of any other tier (its pool was
+	// configured away), and ones whose MAC fails, are reaped.
 	PooledTiers map[string]bool
 	// Remove deregisters a runner before its instance is reaped.
 	Remove RemoveRunner
@@ -207,7 +208,21 @@ func (r *Reaper) judge(ctx context.Context, i types.Instance, now time.Time, rep
 
 	if pool == PoolReady || pool == PoolWarming {
 		if r.o.PooledTiers[tier] {
-			return // the pool's own
+			macErr := r.c.verifyPoolMAC(i, r.o.Owner, tier)
+			if macErr == nil {
+				return // the pool's own
+			}
+			// Not signed with this install's key: the pool never uses it.
+			// One just launched is signed a moment after RunInstances, so
+			// leave it the grace period.
+			if now.Sub(aws.ToTime(i.LaunchTime)) < r.o.Grace {
+				rep.Young = append(rep.Young, id)
+				return
+			}
+			if r.reap(ctx, log, "pool instance failing its MAC check: "+macErr.Error(), id, spotReq) {
+				rep.Instances = append(rep.Instances, id)
+			}
+			return
 		}
 		if r.reap(ctx, log, "pool instance of a tier that keeps no pool", id, spotReq) {
 			rep.Instances = append(rep.Instances, id)
