@@ -352,8 +352,10 @@ checksums it was built from in `/downloads.sha256` in the same format, so
 checksum only for assets uploaded since mid-2025; an older Python or CodeQL
 release needs a `--checksums` line. The toolcache drive picks a Python build
 from the python-versions manifest and accepts only an asset of a
-python-versions release. Its `setup.sh` still upgrades pip from PyPI inside
-the container, which this does not check.
+python-versions release. Its `setup.sh` runs in a container with no
+network (`--network none`); the pip upgrade at its end is pointed at the
+pip wheel the checked archive bundles (`PIP_NO_INDEX=1`,
+`PIP_FIND_LINKS`), so nothing unchecked reaches the drive.
 Node's `SHASUMS256.txt` comes from the same server as the tarball, so the
 builders believe it only under its detached signature, `SHASUMS256.txt.sig`,
 made with a Node.js release key: `gpgv` checks it against

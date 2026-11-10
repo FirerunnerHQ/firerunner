@@ -579,6 +579,11 @@ expect "python: checks the asset's digest" has urls "$PY_API"
 expect "python: picks the newest stable 3.12 by number" lacks urls "$PY_DECOY"
 expect "python: the container gets the checked tarball" has python-dl "$PY_TGZ"
 expect "python: the container downloads nothing" lacks calls "$PY_URL"
+expect "python: the container has no network" has calls "docker run --rm --network none "
+expect "python: pip may use no index" has calls "-e PIP_NO_INDEX=1 "
+# shellcheck disable=SC2016 # a literal ${wheels[0]} in the container's script
+expect "python: pip reinstalls the archive's own wheel" has calls 'PIP_FIND_LINKS="${wheels[0]}" bash ./setup.sh'
+expect "python: the container installs no packages" lacks calls "apt-get"
 expect "python: the drive records it" has downloads.sha256 "$PY_SHA  $PY_TGZ"
 
 routes
