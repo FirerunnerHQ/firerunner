@@ -184,7 +184,7 @@ func TestResolvePrivateKey_Unset(t *testing.T) {
 }
 
 func TestFromFlags_AppNeedsInstallationID(t *testing.T) {
-	_, err := FromFlags([]string{"--url", "u", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0",
+	_, err := FromFlags([]string{"--url", "https://github.com/o", "--kernel", "/k", "--golden", "/g", "--ext-iface", "eth0",
 		"--app-client-id", "Iv1.abc"})
 	if err == nil || !strings.Contains(err.Error(), "--app-installation-id is required") {
 		t.Fatalf("err %v", err)

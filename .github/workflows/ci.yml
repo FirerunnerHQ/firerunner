@@ -183,7 +183,8 @@ jobs:
   # End-to-end boot of a real Firecracker microVM. Requires a KVM-capable
   # self-hosted runner; runs only when manually dispatched so it never blocks PRs.
   e2e:
-    if: github.event_name == 'workflow_dispatch'
+    # main's code only, as build-image: a persistent self-hosted host.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, kvm]
     steps:
       - name: Checkout

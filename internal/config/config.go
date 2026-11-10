@@ -379,7 +379,7 @@ func FlagSet() *flag.FlagSet {
 func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs := flag.NewFlagSet("firerunner", flag.ContinueOnError)
 
-	fs.StringVar(&c.URL, "url", env("FR_URL", ""), "GitHub org or repo URL to register the scale set (required)")
+	fs.StringVar(&c.URL, "url", env("FR_URL", ""), "https URL of the GitHub organization, repository or enterprise to register the scale set to (required)")
 	fs.StringVar(&c.ScaleSetName, "name", env("FR_NAME", "firerunner"), "scale set name; also the runs-on label")
 	fs.StringVar(&c.RunnerGroup, "runner-group", env("FR_RUNNER_GROUP", "default"), "runner group name")
 	fs.StringVar(&v.labels, "labels", env("FR_LABELS", ""), "extra comma-separated runs-on labels")
@@ -601,6 +601,9 @@ func (c *Config) validate() error {
 	switch {
 	case c.URL == "":
 		return fmt.Errorf("--url is required")
+	case accountOf(c.URL) == "":
+		// The scale-set client sends its credentials to this URL's host.
+		return fmt.Errorf("--url %q: want an https URL of a GitHub organization, repository or enterprise", c.URL)
 	case fc && c.Firecracker.KernelImage == "":
 		return fmt.Errorf("--kernel is required")
 	case c.Firecracker.GoldenRootFS == "" && len(c.Tiers) == 0:
