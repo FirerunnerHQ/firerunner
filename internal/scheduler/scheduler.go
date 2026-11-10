@@ -86,9 +86,14 @@ func (p *PendingLaunches) Count() int { return int(p.n.Load()) }
 type Scheduler struct {
 	opts      Options
 	afterFunc func(time.Duration, func())
-	mu        sync.Mutex
-	running   int
-	wg        sync.WaitGroup
+	// removeRetryDelay paces a removal whose outcome GitHub could not
+	// confirm (defaultRemoveRetryDelay). A field set at construction, not a
+	// package variable, so a test can shorten it without racing a removeLoop
+	// another test left running.
+	removeRetryDelay time.Duration
+	mu               sync.Mutex
+	running          int
+	wg               sync.WaitGroup
 	// active tracks in-flight microVMs by runner name so a shutdown drain can
 	// tell an idle warm-pool VM (cancel it immediately) from one running a job
 	// (let it finish). MarkBusy flips a VM to busy when its guest dequeues a job.
@@ -162,7 +167,12 @@ func New(o Options) *Scheduler {
 	if o.CompletedGrace == 0 {
 		o.CompletedGrace = DefaultCompletedGrace
 	}
-	return &Scheduler{opts: o, active: make(map[string]*vmHandle), afterFunc: afterFunc}
+	return &Scheduler{
+		opts:             o,
+		active:           make(map[string]*vmHandle),
+		afterFunc:        afterFunc,
+		removeRetryDelay: defaultRemoveRetryDelay,
+	}
 }
 
 // afterFunc is time.AfterFunc without its *Timer; tests replace it to run
@@ -408,9 +418,9 @@ func (s *Scheduler) reclaimQueued(desired int) int {
 	return reclaimed
 }
 
-// removeRetryDelay paces a removal whose outcome GitHub could not confirm. A
-// var so tests can shorten it.
-var removeRetryDelay = 2 * time.Second
+// defaultRemoveRetryDelay is how long removeLoop waits before retrying a
+// removal whose outcome GitHub could not confirm.
+const defaultRemoveRetryDelay = 2 * time.Second
 
 // removeLoop deregisters queued VMs one at a time, so each removal runs only
 // when it can, a queued one can still be reclaimed, and a VM never has two
@@ -440,7 +450,7 @@ func (s *Scheduler) removeLoop(ctx context.Context) {
 		if s.settleRemoval(name, err) {
 			select {
 			case <-ctx.Done():
-			case <-time.After(removeRetryDelay):
+			case <-time.After(s.removeRetryDelay):
 			}
 		}
 	}

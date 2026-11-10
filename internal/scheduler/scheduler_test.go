@@ -1047,10 +1047,6 @@ func TestDemandRiseReclaimsQueuedRemovals(t *testing.T) {
 // ErrRemovalUnknown answer keeps the VM out of live and retries until GitHub
 // gives a definite one.
 func TestUnconfirmedRemovalStaysRemovingUntilSettled(t *testing.T) {
-	old := removeRetryDelay
-	removeRetryDelay = 10 * time.Millisecond
-	defer func() { removeRetryDelay = old }()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1067,6 +1063,7 @@ func TestUnconfirmedRemovalStaysRemovingUntilSettled(t *testing.T) {
 		}
 	})
 	s := New(Options{Max: 4, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	s.removeRetryDelay = 10 * time.Millisecond
 	startIdle(t, ctx, s, entered, 1)
 
 	s.Reconcile(ctx, 0)
@@ -1087,10 +1084,6 @@ func TestUnconfirmedRemovalStaysRemovingUntilSettled(t *testing.T) {
 // is busy, so the drain's idle cancel leaves it alone — the case that used to
 // spin.
 func TestRemoveLoopStopsOnShutdown(t *testing.T) {
-	old := removeRetryDelay
-	removeRetryDelay = time.Hour // only shutdown can end the wait
-	defer func() { removeRetryDelay = old }()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	release := make(chan struct{})
 	busyCh := make(chan func(), 1)
@@ -1111,6 +1104,7 @@ func TestRemoveLoopStopsOnShutdown(t *testing.T) {
 		return fmt.Errorf("remove: %w", core.ErrRemovalUnknown)
 	})
 	s := New(Options{Max: 2, Provisioner: prov, JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	s.removeRetryDelay = time.Hour // only shutdown can end the wait
 	s.Reconcile(ctx, 1)
 	onBusy = <-busyCh
 	waitRunning(t, s, 1)
@@ -1132,10 +1126,6 @@ func TestRemoveLoopStopsOnShutdown(t *testing.T) {
 // has dequeued a job, an unconfirmed removal is dropped rather than retried:
 // the runner is plainly still registered.
 func TestUnconfirmedRemovalOfABusyVMIsNotRetried(t *testing.T) {
-	old := removeRetryDelay
-	removeRetryDelay = 10 * time.Millisecond
-	defer func() { removeRetryDelay = old }()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	busyCh := make(chan func(), 1)
@@ -1152,6 +1142,7 @@ func TestUnconfirmedRemovalOfABusyVMIsNotRetried(t *testing.T) {
 		return fmt.Errorf("remove: %w", core.ErrRemovalUnknown)
 	})
 	s := New(Options{Max: 2, Provisioner: prov, JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	s.removeRetryDelay = 10 * time.Millisecond
 	s.Reconcile(ctx, 1)
 	onBusy = <-busyCh
 	waitRunning(t, s, 1)
@@ -2053,9 +2044,6 @@ func TestRemovalRefusedThenFailureCounts(t *testing.T) {
 // is not handed back to demand; demand gets a new VM, and the removal keeps
 // going.
 func TestUnconfirmedRemovalIsNotReclaimed(t *testing.T) {
-	old := removeRetryDelay
-	removeRetryDelay = time.Hour // the retry waits; reclaim gets its chance
-	defer func() { removeRetryDelay = old }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	entered := make(chan struct{}, 2)
@@ -2065,6 +2053,7 @@ func TestUnconfirmedRemovalIsNotReclaimed(t *testing.T) {
 		return fmt.Errorf("remove: %w", core.ErrRemovalUnknown)
 	})
 	s := New(Options{Max: 2, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	s.removeRetryDelay = time.Hour // the retry waits; reclaim gets its chance
 	startIdle(t, ctx, s, entered, 1)
 	s.Reconcile(ctx, 0)
 	waitCalls(t, &calls, 1)
@@ -2101,7 +2090,7 @@ func TestUnconfirmedRemovalIsNotReclaimed(t *testing.T) {
 	if removing != 1 || queued != 1 {
 		t.Fatalf("removing=%d queued=%d, want the unconfirmed VM still removing and queued", removing, queued)
 	}
-	cancel() // stop the retrying loop before removeRetryDelay is restored
+	cancel() // stop the retrying loop so it does not outlive the test
 	waitRemoverStopped(t, s)
 }
 
