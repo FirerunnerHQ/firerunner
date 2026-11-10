@@ -538,9 +538,9 @@ const (
 )
 
 // RunnerJob implements RunnerFinder: the job of run that GitHub records as in
-// progress on runner, if any; on the runner with runnerID when that is known.
+// progress on the runner with this name and ID, if any.
 func (g *GitHub) RunnerJob(ctx context.Context, repository string, runID int64, runner string, runnerID int64) (int64, bool, error) {
-	if !ValidRepository(repository) || runID <= 0 || runner == "" {
+	if !ValidRepository(repository) || runID <= 0 || runner == "" || runnerID <= 0 {
 		return 0, false, errors.New("invalid run or runner")
 	}
 	jobs, err := g.listRunJobs(ctx, repository, runID)
@@ -551,7 +551,7 @@ func (g *GitHub) RunnerJob(ctx context.Context, repository string, runID int64, 
 		if j.Status != "in_progress" {
 			continue
 		}
-		if runnerID != 0 && j.RunnerID == runnerID || runnerID == 0 && j.RunnerName == runner {
+		if j.RunnerID == runnerID && j.RunnerName == runner {
 			return j.ID, true, nil
 		}
 	}

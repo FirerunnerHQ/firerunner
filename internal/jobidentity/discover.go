@@ -84,9 +84,9 @@ func (c *Candidates) clock() time.Time {
 }
 
 // RunnerFinder tells which job of a run, if any, is in progress on a runner:
-// GitHub's own record, so a run named by anyone else proves nothing. runnerID,
-// when not 0, is the runner's GitHub ID and decides the match: a name can
-// repeat across registration scopes, an ID cannot.
+// GitHub's own record, so a run named by anyone else proves nothing. The job
+// must name both the runner and its GitHub ID, runnerID: a name alone could be
+// shared by a runner registered in another scope.
 type RunnerFinder interface {
 	RunnerJob(ctx context.Context, repository string, runID int64, runner string, runnerID int64) (jobID int64, found bool, err error)
 }
@@ -116,6 +116,13 @@ func (r *Registry) Discover(ctx context.Context, runner string, cands *Candidate
 		pause = discoverPause
 	}
 	runnerID := r.runnerID(runner)
+	if runnerID == 0 {
+		// Without the runner's ID only its name could match a job, and a
+		// runner registered elsewhere could share that: JobStarted, from the
+		// scale set's own session, resolves it instead.
+		r.log.Info("cache identity: the runner's GitHub ID is unknown; waiting for JobStarted", "runner", runner)
+		return
+	}
 	for try := 0; try < discoverTries; try++ {
 		if !r.awaitsIdentity(runner) || ctx.Err() != nil {
 			return

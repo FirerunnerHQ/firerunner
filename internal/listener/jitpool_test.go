@@ -170,3 +170,17 @@ func TestGenerateReportsTheRunnersID(t *testing.T) {
 		t.Fatalf("reported %q %d, want %q 900", gotName, gotID, name)
 	}
 }
+
+// The JIT source a scale set hands out reports to the scale set's OnRunnerID.
+func TestScaleSetJITReportsToItsConfig(t *testing.T) {
+	var got int64
+	s := &ScaleSet{cfg: Config{OnRunnerID: func(_ string, id int64) { got = id }}}
+	j := s.JIT()
+	if j.onRunnerID == nil {
+		t.Fatal("the JIT source does not report runner IDs")
+	}
+	j.onRunnerID("t-1", 900)
+	if got != 900 {
+		t.Fatalf("the scale set's OnRunnerID got %d, want 900", got)
+	}
+}

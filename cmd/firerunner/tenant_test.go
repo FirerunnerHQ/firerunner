@@ -82,6 +82,34 @@ func TestIdentityHooksNoteRunnerIDs(t *testing.T) {
 	if hooks.onRunnerID == nil {
 		t.Fatal("the hooks do not note runner IDs")
 	}
+	// The noted ID reaches the runner's lookup once it registers.
+	hooks.onRunnerID("runner-1", 900)
+	if err := jobs.Register("runner-1", "172.16.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	cands := &jobidentity.Candidates{}
+	cands.Offer(jobidentity.Job{Repository: "acme/app", RunID: 1})
+	f := &idFinder{}
+	jobs.Discover(context.Background(), "runner-1", cands, f, noResolve{})
+	if f.got != 900 {
+		t.Fatalf("the runner's lookup got ID %d, want 900", f.got)
+	}
+}
+
+// idFinder records the runner ID it is asked about and reports a job, so
+// Discover stops at once.
+type idFinder struct{ got int64 }
+
+func (f *idFinder) RunnerJob(_ context.Context, _ string, _ int64, _ string, runnerID int64) (int64, bool, error) {
+	f.got = runnerID
+	return 1, true, nil
+}
+
+// noResolve leaves the identity unresolved; the test looks only at the lookup.
+type noResolve struct{}
+
+func (noResolve) Resolve(context.Context, jobidentity.Job) (jobidentity.Identity, error) {
+	return jobidentity.Identity{}, errors.New("not resolved in this test")
 }
 
 func TestExtraTenant(t *testing.T) {

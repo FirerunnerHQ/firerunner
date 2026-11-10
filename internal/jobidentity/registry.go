@@ -32,7 +32,7 @@ type lease struct {
 	// started is the job the identity is resolved from: the first Start's.
 	started Job
 	// runnerID is GitHub's ID for the runner, from its JIT config; 0 when
-	// unknown. Unlike the name, it is unique across registration scopes.
+	// unknown, and then Discover does not look the runner's job up at all.
 	runnerID int64
 }
 
@@ -186,22 +186,29 @@ func (r *Registry) Register(runner, ip string) error {
 
 // NoteRunnerID records GitHub's ID for a runner whose JIT config was just
 // generated, for its lease once it registers. Discover matches the runner's
-// job by this ID, which no runner registered elsewhere can share.
+// job by this ID as well as its name: a name alone could be shared by a
+// runner registered in another scope.
 func (r *Registry) NoteRunnerID(runner string, id int64) {
 	if runner == "" || id <= 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if l := r.leases[runner]; l != nil {
+		l.runnerID = id
+		return
+	}
+	r.noteLocked(runner, id)
+}
+
+// noteLocked keeps id for runner's next Register, dropping notes older than
+// notedTTL. The caller holds mu.
+func (r *Registry) noteLocked(runner string, id int64) {
 	now := time.Now()
 	for name, n := range r.noted {
 		if now.Sub(n.at) > notedTTL {
 			delete(r.noted, name)
 		}
-	}
-	if l := r.leases[runner]; l != nil {
-		l.runnerID = id
-		return
 	}
 	if r.noted == nil {
 		r.noted = map[string]noted{}
@@ -230,6 +237,11 @@ func (r *Registry) Release(runner string) error {
 	}
 	if l.cancel != nil {
 		l.cancel()
+	}
+	if l.runnerID != 0 {
+		// The same runner may register again, as an EC2 launch does when a
+		// pooled start fails and it falls back to a fresh instance.
+		r.noteLocked(runner, l.runnerID)
 	}
 	delete(r.leases, runner)
 	err := os.Remove(filepath.Join(r.dir, l.identity.IP+".json"))
