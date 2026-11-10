@@ -241,9 +241,27 @@ func (pl *Pool) reject(ctx context.Context, i types.Instance, why error) {
 	}
 }
 
-// sign tags a pool instance this process just launched with its MAC.
+// signBackoff is the first wait between attempts to sign an instance EC2 does
+// not know yet; it doubles, signAttempts times in all (about 30 s).
+var (
+	signBackoff  = 500 * time.Millisecond
+	signAttempts = 6
+)
+
+// sign tags a pool instance this process just launched with its MAC. EC2 may
+// not know an instance for a few seconds after RunInstances names it
+// (InvalidInstanceID.NotFound), so that error is retried.
 func (pl *Pool) sign(ctx context.Context, id string) error {
-	return pl.tag(ctx, id, TagPoolMAC, pl.p.c.poolMAC(pl.p.o.Owner, pl.p.o.Tier, id))
+	mac := pl.p.c.poolMAC(pl.p.o.Owner, pl.p.o.Tier, id)
+	wait := signBackoff
+	for attempt := 1; ; attempt++ {
+		err := pl.tag(ctx, id, TagPoolMAC, mac)
+		if err == nil || !isCode(err, errNotFound) || attempt == signAttempts {
+			return err
+		}
+		time.Sleep(wait)
+		wait *= 2
+	}
 }
 
 // refresh moves warming instances that have stopped into the pool, and

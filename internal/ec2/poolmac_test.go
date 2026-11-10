@@ -291,14 +291,37 @@ func TestPoolMAC_UnsignableLaunchIsDiscarded(t *testing.T) {
 	// instance, so it goes at once rather than warm for nothing.
 	h := poolHarness(t, 1, config.MarketSpot)
 	h.f.mu.Lock()
-	h.f.tagErr = apiErr("RequestLimitExceeded")
+	h.f.tagErr = apiErr("RequestLimitExceeded") // not retried
 	h.f.mu.Unlock()
 	h.runPool(t)
 	eventually(t, "the launch discarded", func() bool {
 		l := h.f.launched()
 		return len(l) >= 1 && h.f.state(l[0].id) == types.InstanceStateNameShuttingDown
 	})
-	if _, w := h.p.pool.Ready(); w != 0 {
-		t.Fatalf("warming = %d, want the unsigned instance not followed", w)
+	id := h.f.launched()[0].id
+	h.p.pool.mu.Lock()
+	_, followed := h.p.pool.warming[id]
+	h.p.pool.mu.Unlock()
+	if followed {
+		t.Fatal("the unsigned instance is followed as warming")
+	}
+}
+
+func TestPoolMAC_SignRetriesAnInstanceEC2DoesNotKnowYet(t *testing.T) {
+	// Right after RunInstances, CreateTags on the new ID may answer
+	// InvalidInstanceID.NotFound for a few seconds: that is no reason to
+	// discard it.
+	old := signBackoff
+	signBackoff = time.Millisecond
+	t.Cleanup(func() { signBackoff = old })
+	h := poolHarness(t, 1, config.MarketSpot)
+	h.f.mu.Lock()
+	h.f.tagUnknown = signAttempts - 1
+	h.f.mu.Unlock()
+	h.runPool(t)
+	eventually(t, "warming", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
+	in := h.f.launched()[0]
+	if in.tags[TagPoolMAC] != h.p.c.poolMAC("test-owner", "cloud-4c", in.id) || in.state == types.InstanceStateNameShuttingDown {
+		t.Fatalf("tags %v, state %s; want it signed and kept", in.tags, in.state)
 	}
 }

@@ -265,6 +265,8 @@ Resources:
   # launched and trusts no others: anyone who may tag an instance in the
   # account can copy the other tags. Only the control role may read it. It is
   # generated here and never leaves AWS but for the control VM's disk.
+  # Changing GenerateSecretString makes a new value, and so discards the
+  # pool once.
   PoolKey:
     Type: AWS::SecretsManager::Secret
     Properties:

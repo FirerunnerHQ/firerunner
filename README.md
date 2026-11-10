@@ -570,7 +570,11 @@ starting the instance:
   Secrets Manager. Without it, each process signs with a random key of its
   own, so the pool is rebuilt after every restart. Changing the key
   discards the pool once, as does the upgrade from a release before it:
-  older pool instances carry no MAC.
+  older pool instances carry no MAC. The MAC proves which install launched
+  an instance, not that nobody changed it since: whoever may modify or
+  attach volumes or change security groups on your instances is still to
+  be trusted. Run one control plane per owner at a time, as before: one
+  without the key would discard the other's pool, and the other its.
 - **Fallback.** With the pool empty, or if a stopped instance cannot start
   (spot capacity), the job cold-launches instead.
 

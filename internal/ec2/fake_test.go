@@ -164,8 +164,11 @@ type fakeEC2 struct {
 	// stale read right after StartInstances can.
 	startErr          error
 	startStaysStopped bool
-	// tagErr fails CreateTags.
-	tagErr error
+	// tagErr fails CreateTags. tagUnknown fails this many CreateTags calls
+	// first with InvalidInstanceID.NotFound, as for an instance EC2 does not
+	// know yet right after RunInstances.
+	tagErr     error
+	tagUnknown int
 	// clock, when set, is the fake's notion of now (launch times).
 	clock func() time.Time
 	// modifyErr fails ModifyInstanceAttribute.
@@ -477,6 +480,11 @@ func (f *fakeEC2) CreateTags(_ context.Context, in *ec2.CreateTagsInput, _ ...fu
 	defer f.mu.Unlock()
 	if f.tagErr != nil {
 		return nil, f.tagErr
+	}
+	if f.tagUnknown > 0 {
+		// EC2 does not know a just-launched instance yet (R7).
+		f.tagUnknown--
+		return nil, apiErr(errNotFound)
 	}
 	for _, id := range in.Resources {
 		if _, ok := f.instances[id]; !ok {
