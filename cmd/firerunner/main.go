@@ -698,7 +698,10 @@ func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitse
 	if err != nil {
 		return nil, nil, fmt.Errorf("--jit-addr: %w", err)
 	}
-	srv := &http.Server{Handler: jit, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	// Every runner can reach this port: bound what one source, and all of
+	// them, may hold open, so a job cannot crowd out other runners' fetches.
+	ln = jitserver.LimitListener(ln, jitserver.MaxConnsPerSource, jitserver.MaxConns)
+	srv := jit.HTTPServer()
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Error("jit endpoint stopped", "err", err)
