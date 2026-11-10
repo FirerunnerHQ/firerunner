@@ -28,7 +28,8 @@
 #   FR_APP_KMS_KEY  a KMS key that signs for the GitHub App; set, no key is read
 #
 # and these SSM parameters under $FR_PREFIX/control/:
-#   env              FR_* lines (non-secret): FR_URL, FR_APP_CLIENT_ID, ...
+#   env              FR_* lines (non-secret): FR_URL, FR_APP_CLIENT_ID, ...;
+#                    read as data, never by a shell (parse_env)
 #   tiers            the tier catalog (JSON)
 #   app-private-key  SecureString: the GitHub App key, or
 #   token            SecureString: a PAT (one of the two)
@@ -82,6 +83,66 @@ param() {
 	fi
 }
 
+# The daemon's environment, as NAME=value words in order (a later one wins,
+# as in systemd). It is data: no shell ever reads it. config check gets it
+# through env(1), and the unit through an EnvironmentFile written from it.
+envs=()
+
+# Values a shell and systemd both take literally. Plain: letters, digits and
+# _ . / : @ % + = , - only. Quoted: anything printable but quotes, backslash,
+# $ and backtick, which systemd's EnvironmentFile parser (or a shell) acts on.
+plain='^[A-Za-z0-9_./:@%+=,-]*$'
+literal() { [[ "$1" != *[[:cntrl:]\'\"\\\$\`]* ]]; }
+
+# setenv NAME VALUE: add a setting this script makes. The value is never
+# logged: it may be the token.
+setenv() {
+	literal "$2" || {
+		log "$1: its value holds a quote, backslash, \$, backtick or control character"
+		return 1
+	}
+	envs+=("$1=$2")
+}
+
+# parse_env TEXT: add the settings in $FR_PREFIX/control/env. Each line is
+# blank, a # comment, or FR_NAME=value, the value plain or in one pair of
+# single or double quotes. Anything else fails, naming the line's number but
+# not its content, which may hold a secret pasted by mistake.
+parse_env() {
+	local n=0 line key value
+	local name='^(FR_[A-Z0-9_]+)=(.*)$' dq='^"(.*)"$' sq="^'(.*)'\$" skip='^[[:blank:]]*(#.*)?$'
+	while IFS= read -r line || [ -n "$line" ]; do
+		n=$((n + 1))
+		[[ "$line" =~ $skip ]] && continue
+		if [[ ! "$line" =~ $name ]]; then
+			log "$FR_PREFIX/control/env line $n: want FR_NAME=value, the name in A-Z, 0-9 and _"
+			return 1
+		fi
+		key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+		if [[ "$value" =~ $dq || "$value" =~ $sq ]] && literal "${BASH_REMATCH[1]}"; then
+			value=${BASH_REMATCH[1]}
+		elif [[ ! "$value" =~ $plain ]]; then
+			log "$FR_PREFIX/control/env line $n ($key): want a value of letters, digits and _./:@%+=,- or, in quotes, no quote, backslash, \$, backtick or control character"
+			return 1
+		fi
+		envs+=("$key=$value")
+	done <<< "$1"
+}
+
+# write_env FILE: the settings as systemd's EnvironmentFile reads them back
+# unchanged: plain values bare, others in single quotes, inside which systemd
+# acts on nothing (and no value holds a single quote).
+write_env() {
+	local kv
+	for kv in "${envs[@]}"; do
+		if [[ "${kv#*=}" =~ $plain ]]; then
+			printf '%s\n' "$kv"
+		else
+			printf "%s='%s'\n" "${kv%%=*}" "${kv#*=}"
+		fi
+	done > "$1"
+}
+
 install -d -m 0700 "$etc"
 umask 077
 install -m 0755 "$src/firerunner" "$bin/firerunner"
@@ -90,15 +151,14 @@ tiers=$(param tiers)
 [ -n "$tiers" ] || { log "missing $FR_PREFIX/control/tiers"; false; }
 printf '%s\n' "$tiers" > "$etc/tiers.json"
 
-{
-	param env
-	echo "FR_TIERS=$etc/tiers.json"
-	echo "FR_OWNER=$FR_OWNER"
-	echo "FR_AWS_REGION=$AWS_REGION"
-	echo "FR_JIT_ADDR=$ip:$FR_JIT_PORT"
-	echo "FR_JIT_HOST=$FR_JIT_HOST"
-	echo "FR_WORKDIR=/var/lib/firerunner"
-} > "$etc/firerunner.env"
+env_text=$(param env)
+parse_env "$env_text"
+setenv FR_TIERS "$etc/tiers.json"
+setenv FR_OWNER "$FR_OWNER"
+setenv FR_AWS_REGION "$AWS_REGION"
+setenv FR_JIT_ADDR "$ip:$FR_JIT_PORT"
+setenv FR_JIT_HOST "$FR_JIT_HOST"
+setenv FR_WORKDIR /var/lib/firerunner
 
 # The cache: cache-server on this VM, as its own user, reading the job
 # identities the daemon writes (README: separate service users). Instances
@@ -117,35 +177,36 @@ print(any((t.get("ec2") or {}).get("cache") for t in json.load(open(sys.argv[1])
 if [ "$cache" != off ]; then
 	id -u firerunner-cache > /dev/null 2>&1 ||
 		useradd --system --no-create-home --shell /sbin/nologin firerunner-cache
-	echo "FR_CACHE_JOBS_DIR=/run/firerunner/jobs" >> "$etc/firerunner.env"
+	setenv FR_CACHE_JOBS_DIR /run/firerunner/jobs
 	if [ "$cache" = s3 ] && [ -n "${FR_CACHE_ROLE_ARN:-}" ]; then
 		# In the daemon's runtime directory: the cache user's group may read it.
-		printf '%s\n' "FR_CACHE_ROLE_ARN=$FR_CACHE_ROLE_ARN" "FR_CACHE_CREDENTIALS_FILE=$cache_creds" >> "$etc/firerunner.env"
+		setenv FR_CACHE_ROLE_ARN "$FR_CACHE_ROLE_ARN"
+		setenv FR_CACHE_CREDENTIALS_FILE "$cache_creds"
 	elif [ "$cache" = s3 ]; then
 		log "no FR_CACHE_ROLE_ARN: cache-server uses the instance role; update the stack to give it a role of its own"
 	fi
 	if [ "$cache_tier" = True ]; then
-		echo "FR_EC2_CACHE_ADDR=$FR_JIT_HOST:$cache_port" >> "$etc/firerunner.env"
+		setenv FR_EC2_CACHE_ADDR "$FR_JIT_HOST:$cache_port"
 	fi
 elif [ "$cache_tier" = True ]; then
 	log "a tier sets ec2.cache but the stack's Cache parameter is off: set it to disk or s3"
 fi
 dsn=$(param job-events-dsn)
 if [ -n "$dsn" ]; then
-	# In a file of its own: the env file is sourced below, and a password may hold
-	# anything a shell would act on.
+	# In a file of its own: a password may hold anything, and the env file
+	# takes only values systemd reads literally.
 	printf '%s\n' "$dsn" > "$etc/job-events-dsn"
-	echo "FR_JOB_EVENTS_DSN_FILE=$etc/job-events-dsn" >> "$etc/firerunner.env"
+	setenv FR_JOB_EVENTS_DSN_FILE "$etc/job-events-dsn"
 fi
 tenants=$(param tenants)
 if [ -n "$tenants" ]; then
 	printf '%s\n' "$tenants" > "$etc/tenants.json"
-	echo "FR_TENANTS=$etc/tenants.json" >> "$etc/firerunner.env"
+	setenv FR_TENANTS "$etc/tenants.json"
 fi
 key='' token=''
 if [ -n "${FR_APP_KMS_KEY:-}" ]; then
 	# The key stays in KMS: nothing to fetch, and none on this disk.
-	echo "FR_APP_KMS_KEY=$FR_APP_KMS_KEY" >> "$etc/firerunner.env"
+	setenv FR_APP_KMS_KEY "$FR_APP_KMS_KEY"
 else
 	key=$(param app-private-key)
 	token=$(param token)
@@ -154,17 +215,18 @@ if [ -n "${FR_APP_KMS_KEY:-}" ]; then
 	:
 elif [ -n "$key" ]; then
 	printf '%s\n' "$key" > "$etc/app-key.pem"
-	echo "FR_APP_PRIVATE_KEY=$etc/app-key.pem" >> "$etc/firerunner.env"
+	setenv FR_APP_PRIVATE_KEY "$etc/app-key.pem"
 elif [ -n "$token" ]; then
-	echo "FR_TOKEN=$token" >> "$etc/firerunner.env"
+	setenv FR_TOKEN "$token"
 else
 	log "missing $FR_PREFIX/control/app-private-key (or token)"
 	false
 fi
 
+write_env "$etc/firerunner.env"
+
 # Refuse to start a config firerunner would reject; the log says why.
-# shellcheck source=/dev/null
-if ! (set -a && . "$etc/firerunner.env" && "$bin/firerunner" config check); then
+if ! env "${envs[@]}" "$bin/firerunner" config check; then
 	log "firerunner rejected the config"
 	false
 fi

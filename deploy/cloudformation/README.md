@@ -110,6 +110,12 @@ The bootstrap sets `FR_OWNER`, `FR_JIT_ADDR`, `FR_JIT_HOST`,
 `FR_AWS_REGION`, `FR_TIERS` and `FR_WORKDIR` itself; leave them out of
 `env`.
 
+`env` is data, never shell: each line is blank, a `#` comment, or
+`FR_NAME=value`. A bare value holds letters, digits and `_ . / : @ % + = , -`;
+in single or double quotes it may hold anything printable but quotes, a
+backslash, `$` and a backtick, which it takes literally. Any other line fails
+the bootstrap, and the log names its line number.
+
 ```sh
 aws ssm put-parameter --name /firerunner/control/env --type String --value "$(cat env)"
 aws ssm put-parameter --name /firerunner/control/tiers --type String --value "$(cat tiers.json)"

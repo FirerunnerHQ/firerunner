@@ -282,6 +282,66 @@ touch "$STATE/check-fails"
 failed "config rejected"
 expect "config rejected: firerunner's reason is in the log" "$(cat "$STATE/out")" grep -q 'config: bad tier' "$STATE/out"
 
+# 6. The env parameter is data. Comments, blank lines and quoted values are
+# read the way a shell would have read them, and reach both config check and
+# the unit's EnvironmentFile unchanged. systemd takes a single-quoted value
+# literally ($, backslash and " included; systemd 262, checked 2026-11-10).
+setup
+printf '%s\n' '# the org' '' 'FR_URL=https://github.com/acme' '  # indented comment' \
+	'FR_LABELS="linux, big"' "FR_NAME='fr one'" 'FR_JOB_EVENTS_DSN="postgres://u:p@db/fr?ssl=1&x=a;b"' 'FR_MAX_RUNNERS=' > "$STATE/ssm/env"
+printf 'FR_APP_CLIENT_ID=Iv1' >> "$STATE/ssm/env" # no final newline
+expect "env data: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+for want in FR_URL=https://github.com/acme 'FR_LABELS=linux, big' 'FR_NAME=fr one' \
+	'FR_JOB_EVENTS_DSN=postgres://u:p@db/fr?ssl=1&x=a;b' FR_MAX_RUNNERS= FR_APP_CLIENT_ID=Iv1; do
+	expect "env data: config check sees $want" "$(cat "$STATE/check-env" 2>/dev/null)" grep -qxF "$want" "$STATE/check-env"
+done
+for want in "FR_LABELS='linux, big'" "FR_NAME='fr one'" "FR_JOB_EVENTS_DSN='postgres://u:p@db/fr?ssl=1&x=a;b'" FR_MAX_RUNNERS= FR_APP_CLIENT_ID=Iv1; do
+	expect "env data: env file has $want" "$(envfile)" grep -qxF "$want" <(envfile)
+done
+expect "env data: no comment in the env file" "$(envfile)" bash -c "! grep -q '#' '$FR_ROOT/etc/firerunner/firerunner.env'"
+
+# refused <case> <line>: the env parameter's last line is refused: the run
+# fails like any other, names the line's number but not its content, and
+# nothing in it ran.
+refused() {
+	local c="$1" line="$2"
+	setup
+	printf '%s\n' "$line" >> "$STATE/ssm/env"
+	failed "$c"
+	expect "$c: names the line" "$(cat "$STATE/out")" grep -q '/fr/control/env line 4' "$STATE/out"
+	expect "$c: not its content" "$(cat "$STATE/out")" bash -c "! grep -q pwned '$STATE/out'"
+	expect "$c: nothing ran" "" test ! -e "$TMP/pwned"
+	expect "$c: config never checked" "" test ! -f "$STATE/check-env"
+	rm -f "$TMP/pwned"
+}
+# shellcheck disable=SC2016 # the shell text is the data under test
+{
+	refused 'env $()' 'FR_X=$(touch "$TMP/pwned")'
+	refused 'env backticks' 'FR_X=`touch "$TMP/pwned"`'
+	refused 'env ;' 'FR_X=1; touch "$TMP/pwned"'
+	refused 'env ; no space' 'FR_X=1;touch'
+	refused 'env $ in double quotes' 'FR_X="$(touch "$TMP/pwned")"'
+	refused 'env backslash in quotes' "FR_X='a\\b'"
+	refused 'env unquoted space' 'FR_X=a touch-pwned'
+	refused 'env unmatched quote' 'FR_X="pwned'
+	refused 'env non-FR_ key' 'PATH=/pwned'
+	refused 'env lowercase key' 'fr_x=pwned'
+	refused 'env export' 'export FR_X=pwned'
+	refused 'env no =' 'touch "$TMP/pwned"'
+}
+setup
+printf 'FR_X=1\r\n' >> "$STATE/ssm/env"
+failed "env carriage return"
+
+# A value this script writes is held to the same rule, and never logged.
+setup
+rm "$STATE/ssm/app-private-key"
+# shellcheck disable=SC2016 # a literal $
+echo 'ghp_$pwned' > "$STATE/ssm/token"
+failed "token with a \$"
+expect "token with a \$: names the setting" "$(cat "$STATE/out")" grep -q 'FR_TOKEN: its value holds' "$STATE/out"
+expect "token with a \$: not the token" "$(cat "$STATE/out")" bash -c "! grep -q pwned '$STATE/out'"
+
 # The launch template's user-data: rendered from control.yaml with test
 # values, /etc/firerunner moved under the scratch root. A fake release
 # server (curl) serves $STATE/release/<file>; the release's bootstrap is a
