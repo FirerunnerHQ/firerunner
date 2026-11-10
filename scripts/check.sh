@@ -160,6 +160,7 @@ step check-remote scripts/test-check-remote.sh
 step control-bootstrap deploy/cloudformation/test-control-bootstrap.sh
 step deploy-control deploy/cloudformation/test-deploy-control.sh
 step cfn-reaper python3 -I deploy/cloudformation/test-reaper.py
+step cfn-jit-cleanup python3 -I deploy/cloudformation/test-jit-cleanup.py
 step cfn-policies python3 -I deploy/cloudformation/test-policies.py
 # cfn-lint: installed, or run through uvx/pipx at the version CI pins.
 if command -v cfn-lint >/dev/null; then

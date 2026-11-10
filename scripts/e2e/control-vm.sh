@@ -38,10 +38,10 @@
 #            the VM's architecture), through FR_E2E_BUCKET and a presigned
 #            URL, and restarts it. A VM the group replaces boots the release
 #            again: install again.
-#   down     deletes the stack, then cleans up the owner's runners
-#            (inventory.sh --cleanup --yes), its JIT name and its SSM
-#            parameters. It refuses a stack control-vm.sh did not make for
-#            FR_OWNER.
+#   down     deletes the stack, which removes its JIT name, then cleans up
+#            the owner's runners (inventory.sh --cleanup --yes), a JIT name
+#            an older stack left, and its SSM parameters. It refuses a stack
+#            control-vm.sh did not make for FR_OWNER.
 #   list     the live control VMs of every session, with their owners.
 #
 # up and down wait at most FR_E2E_STACK_DEADLINE seconds (1200). The last line
@@ -447,6 +447,8 @@ cmd_down() {
 	cleanup="$(FR_OWNER="$owner" "$HERE/inventory.sh" --cleanup --yes | tail -n 1)" || rc=1
 	jq -e . <<<"$cleanup" >/dev/null 2>&1 || cleanup=null
 
+	# The stack's JitNameCleanup deletes the JIT name. This is for stacks
+	# made before it, and for a session whose stack an earlier down removed.
 	if [ -n "$zone_id" ] && [ -n "$jit" ]; then
 		rrs="$(aws route53 list-resource-record-sets --hosted-zone-id "$zone_id" --output json \
 			--query "ResourceRecordSets[?Name=='$jit.' && Type=='A']" 2>/dev/null)" || rrs='[]'

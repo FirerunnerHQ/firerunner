@@ -123,3 +123,34 @@ for name in ("control.yaml", "byoc-role.yaml", "reaper.yaml"):
         if "Tag/firerunner:owner" in line and '[!Ref Owner, !Sub "${Owner}/*"]' not in line:
             sys.exit(f"FAIL {name}: an owner condition leaves out tenants: {line.strip()}")
 print("ok   every owner condition covers the install's tenants")
+
+# The JIT name cleanup may delete one A record, the JIT name, in the one zone,
+# and nothing else: on a zone it was given, the zone's other records are
+# someone else's. It runs after the group is gone and before the zone goes.
+cleanup_role = resource("JitNameCleanupRole")
+trust, policy = cleanup_role.split("Policies:", 1)
+if trust.count("Effect:") != 1 or "Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole" not in trust:
+    sys.exit("FAIL control.yaml: JitNameCleanupRole must trust only Lambda")
+actions = re.findall(r"Action: (.*)", policy)
+if actions != ["route53:ListResourceRecordSets", "route53:ChangeResourceRecordSets",
+               "[logs:CreateLogStream, logs:PutLogEvents]"] or policy.count("Effect: Allow") != 3 or "Deny" in policy:
+    sys.exit(f"FAIL control.yaml: JitNameCleanupRole's actions are {actions}")
+zone_arn = '''Resource: !Sub
+                  - "arn:${AWS::Partition}:route53:::hostedzone/${Z}"
+                  - { Z: !If [CreateZone, !Ref Zone, !Ref HostedZoneId] }'''
+change = policy.split("route53:ChangeResourceRecordSets", 1)[1].split("- Effect", 1)[0]
+if policy.count(zone_arn) != 2 or zone_arn not in change or \
+        "route53:ChangeResourceRecordSetsActions: [DELETE]" not in change or \
+        "route53:ChangeResourceRecordSetsRecordTypes: [A]" not in change or \
+        'route53:ChangeResourceRecordSetsNormalizedRecordNames: [!Sub "${JitName}.${ZoneName}"]' not in change or \
+        change.count("ForAllValues:") != 2:
+    sys.exit("FAIL control.yaml: JitNameCleanupRole may change only the JIT name's A record, by DELETE, in the stack's zone")
+if "Resource: !GetAtt JitNameCleanupLogGroup.Arn" not in policy:
+    sys.exit("FAIL control.yaml: JitNameCleanupRole may write only its own log group")
+print("ok   control.yaml: the JIT name cleanup may delete only the JIT name's A record")
+cleanup = resource("JitNameCleanup")
+if "ZoneId: !If [CreateZone, !Ref Zone, !Ref HostedZoneId]" not in cleanup or \
+        'Name: !Sub "${JitName}.${ZoneName}"' not in cleanup or \
+        "DependsOn: JitNameCleanup" not in resource("ControlGroup").split("Properties:", 1)[0]:
+    sys.exit("FAIL control.yaml: JitNameCleanup must name the zone, and ControlGroup depend on it")
+print("ok   control.yaml: the JIT name is removed after the group and before the zone")
