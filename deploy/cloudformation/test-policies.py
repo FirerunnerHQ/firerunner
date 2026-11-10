@@ -132,8 +132,8 @@ trust, policy = cleanup_role.split("Policies:", 1)
 if trust.count("Effect:") != 1 or "Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole" not in trust:
     sys.exit("FAIL control.yaml: JitNameCleanupRole must trust only Lambda")
 actions = re.findall(r"Action: (.*)", policy)
-if actions != ["route53:ListResourceRecordSets", "route53:ChangeResourceRecordSets",
-               "[logs:CreateLogStream, logs:PutLogEvents]"] or policy.count("Effect: Allow") != 3 or "Deny" in policy:
+if actions != ["route53:ListResourceRecordSets", "route53:ChangeResourceRecordSets", "cloudformation:DescribeStacks",
+               "[logs:CreateLogStream, logs:PutLogEvents]"] or policy.count("Effect: Allow") != 4 or "Deny" in policy:
     sys.exit(f"FAIL control.yaml: JitNameCleanupRole's actions are {actions}")
 zone_arn = '''Resource: !Sub
                   - "arn:${AWS::Partition}:route53:::hostedzone/${Z}"
@@ -147,10 +147,26 @@ if policy.count(zone_arn) != 2 or zone_arn not in change or \
     sys.exit("FAIL control.yaml: JitNameCleanupRole may change only the JIT name's A record, by DELETE, in the stack's zone")
 if "Resource: !GetAtt JitNameCleanupLogGroup.Arn" not in policy:
     sys.exit("FAIL control.yaml: JitNameCleanupRole may write only its own log group")
+describe = policy.split("cloudformation:DescribeStacks", 1)[1].split("- Effect", 1)[0]
+if "Resource: !Ref AWS::StackId" not in describe:
+    sys.exit("FAIL control.yaml: JitNameCleanupRole may describe only its own stack")
 print("ok   control.yaml: the JIT name cleanup may delete only the JIT name's A record")
 cleanup = resource("JitNameCleanup")
 if "ZoneId: !If [CreateZone, !Ref Zone, !Ref HostedZoneId]" not in cleanup or \
         'Name: !Sub "${JitName}.${ZoneName}"' not in cleanup or \
+        'OwnZone: !If [CreateZone, "true", "false"]' not in cleanup or \
+        "ServiceTimeout: 300" not in cleanup or \
         "DependsOn: JitNameCleanup" not in resource("ControlGroup").split("Properties:", 1)[0]:
     sys.exit("FAIL control.yaml: JitNameCleanup must name the zone, and ControlGroup depend on it")
 print("ok   control.yaml: the JIT name is removed after the group and before the zone")
+
+# The control VM may write its own JIT name's A record, by UPSERT, and nothing
+# else in a zone other stacks may share.
+control_policy = resource("ControlRole").split("Policies:", 1)[1]
+vm_change = control_policy.split("Action: route53:ChangeResourceRecordSets", 1)[1].split("- Effect", 1)[0]
+if "route53:ChangeResourceRecordSetsActions: [UPSERT]" not in vm_change or \
+        "route53:ChangeResourceRecordSetsRecordTypes: [A]" not in vm_change or \
+        'route53:ChangeResourceRecordSetsNormalizedRecordNames: [!Sub "${JitName}.${ZoneName}"]' not in vm_change or \
+        vm_change.count("ForAllValues:") != 2:
+    sys.exit("FAIL control.yaml: the control VM may change only its JIT name's A record, by UPSERT")
+print("ok   control.yaml: the control VM may write only its own JIT name")
