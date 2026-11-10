@@ -178,16 +178,20 @@ if (( ${#PYTHON_VERSIONS[@]} > 0 )); then
     fetch "$name" "$url" github_asset_sha256 actions/python-versions "$tag" "$name"
     mv "$DL/$name" "$DL/python/$name"
   done
-  log "python ${PYTHON_VERSIONS[*]} (via ubuntu:${UBUNTU_TAG} container)"
-  docker run --rm -e AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache \
+  log "python ${PYTHON_VERSIONS[*]} (via ubuntu:${UBUNTU_TAG} container, offline)"
+  # The container has no network, so it runs only what was checked above.
+  # setup.sh ends with `pip install --upgrade --force-reinstall pip`;
+  # PIP_NO_INDEX and PIP_FIND_LINKS make that reinstall the pip wheel the
+  # archive bundles for ensurepip, not whatever an index would serve.
+  docker run --rm --network none \
+    -e AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache -e PIP_NO_INDEX=1 \
     -v "$STAGE:/opt/hostedtoolcache" -v "$DL/python:/dl:ro" ubuntu:"${UBUNTU_TAG}" bash -euo pipefail -c '
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update >/dev/null
-      apt-get install -y --no-install-recommends ca-certificates >/dev/null
       for tgz in /dl/*.tar.gz; do
         tmp="$(mktemp -d)"
         tar -xzf "$tgz" -C "$tmp"
-        ( cd "$tmp" && bash ./setup.sh )
+        wheels=("$tmp"/lib/python*/ensurepip/_bundled)
+        [[ -d "${wheels[0]}" ]] || { echo "${tgz##*/}: no bundled pip wheel" >&2; exit 1; }
+        ( cd "$tmp" && PIP_FIND_LINKS="${wheels[0]}" bash ./setup.sh )
         rm -rf "$tmp"
       done
     ' || die "python relocation failed"
