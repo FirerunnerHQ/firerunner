@@ -519,6 +519,7 @@ func escapeRefPath(ref string) string {
 type runJob struct {
 	ID         int64  `json:"id"`
 	Status     string `json:"status"`
+	RunnerID   int64  `json:"runner_id"`
 	RunnerName string `json:"runner_name"`
 }
 
@@ -537,8 +538,8 @@ const (
 )
 
 // RunnerJob implements RunnerFinder: the job of run that GitHub records as in
-// progress on runner, if any.
-func (g *GitHub) RunnerJob(ctx context.Context, repository string, runID int64, runner string) (int64, bool, error) {
+// progress on runner, if any; on the runner with runnerID when that is known.
+func (g *GitHub) RunnerJob(ctx context.Context, repository string, runID int64, runner string, runnerID int64) (int64, bool, error) {
 	if !ValidRepository(repository) || runID <= 0 || runner == "" {
 		return 0, false, errors.New("invalid run or runner")
 	}
@@ -547,7 +548,10 @@ func (g *GitHub) RunnerJob(ctx context.Context, repository string, runID int64, 
 		return 0, false, err
 	}
 	for _, j := range jobs {
-		if j.RunnerName == runner && j.Status == "in_progress" {
+		if j.Status != "in_progress" {
+			continue
+		}
+		if runnerID != 0 && j.RunnerID == runnerID || runnerID == 0 && j.RunnerName == runner {
 			return j.ID, true, nil
 		}
 	}

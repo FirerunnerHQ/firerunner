@@ -49,6 +49,9 @@ type Config struct {
 	// scale set (JobAvailable, JobAssigned), as it arrives: the cache's
 	// identity discovery takes its candidate runs from them.
 	OnJobOffered func(jobidentity.Job)
+	// OnRunnerID, if set, is told GitHub's ID for each runner the scale set's
+	// JIT source registers, before the runner launches.
+	OnRunnerID func(runner string, id int64)
 	// Events, if set, is told of each job's assignment, start and end.
 	Events jobevent.Sink
 	// Pending, if set, keeps the tier's assigned-but-not-started jobs, read
@@ -250,7 +253,7 @@ func isSessionConflict(err error) bool {
 // JIT returns a JIT source bound to this scale set, satisfying
 // scheduler.JITSource.
 func (s *ScaleSet) JIT() *JITSource {
-	return &JITSource{clients: s.jitClients, remover: s.removeClient, scaleSetID: s.scaleSetID, namePrefix: s.cfg.Name}
+	return &JITSource{clients: s.jitClients, remover: s.removeClient, scaleSetID: s.scaleSetID, namePrefix: s.cfg.Name, onRunnerID: s.cfg.OnRunnerID}
 }
 
 // ErrFatal marks a listener error that reconnecting cannot fix: GitHub
@@ -788,6 +791,7 @@ type JITSource struct {
 	remover    runnerRemover
 	scaleSetID int
 	namePrefix string
+	onRunnerID func(runner string, id int64)
 }
 
 // Generate implements scheduler.JITSource.
@@ -801,6 +805,9 @@ func (j *JITSource) Generate(ctx context.Context, _ core.RunnerSpec) (name, jitC
 	cfg, err := c.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, j.scaleSetID)
 	if err != nil {
 		return "", "", fmt.Errorf("generate JIT config: %w", err)
+	}
+	if j.onRunnerID != nil && cfg.Runner != nil {
+		j.onRunnerID(name, int64(cfg.Runner.ID))
 	}
 	return name, cfg.EncodedJITConfig, nil
 }

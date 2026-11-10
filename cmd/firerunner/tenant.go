@@ -62,6 +62,7 @@ type tenantHooks struct {
 	onJobStarted func(context.Context, jobidentity.Job)
 	onJobOffered func(jobidentity.Job)
 	onRunnerJob  func(runner string)
+	onRunnerID   func(runner string, id int64)
 }
 
 // identityHooks resolves a tenant's job identities with its own credentials.
@@ -81,6 +82,7 @@ func (s *shard) identityHooks(ctx context.Context, t tenant) (tenantHooks, error
 		cands := &jobidentity.Candidates{}
 		hooks.onJobOffered = cands.Offer
 		hooks.onRunnerJob = func(runner string) { jobs.Discover(ctx, runner, cands, resolver, resolver) }
+		hooks.onRunnerID = jobs.NoteRunnerID // Discover matches by it
 	}
 	return hooks, nil
 }
@@ -105,6 +107,7 @@ func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tr
 		URL:          t.URL,
 		OnJobStarted: hooks.onJobStarted,
 		OnJobOffered: hooks.onJobOffered,
+		OnRunnerID:   hooks.onRunnerID,
 		Events:       s.events,
 		Health:       tracker,
 		Pending:      jobs,

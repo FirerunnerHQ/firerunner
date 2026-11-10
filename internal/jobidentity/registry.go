@@ -31,7 +31,20 @@ type lease struct {
 	cancel   context.CancelFunc
 	// started is the job the identity is resolved from: the first Start's.
 	started Job
+	// runnerID is GitHub's ID for the runner, from its JIT config; 0 when
+	// unknown. Unlike the name, it is unique across registration scopes.
+	runnerID int64
 }
+
+// noted is a runner ID NoteRunnerID was given before the runner registered.
+type noted struct {
+	id int64
+	at time.Time
+}
+
+// notedTTL bounds how long an ID waits for its runner to register: a launch
+// that failed before Register leaves one behind.
+const notedTTL = time.Hour
 
 // Registry owns a dedicated directory exclusively. A lock prevents two daemons
 // from clearing each other's records. Keep it alive until all VMs have drained.
@@ -46,6 +59,8 @@ type Registry struct {
 	log     *slog.Logger
 	// discoverPause is discoverPause, shortened by tests.
 	discoverPause time.Duration
+	// noted holds runner IDs by name until Register takes them, under mu.
+	noted map[string]noted
 	// resolving counts the goroutines Start runs; Close waits for them.
 	resolving sync.WaitGroup
 	closed    bool // under mu: Close has begun, so Register refuses
@@ -164,8 +179,44 @@ func (r *Registry) Register(runner, ip string) error {
 	if err := r.write(i); err != nil {
 		return err
 	}
-	r.leases[runner] = &lease{identity: i}
+	r.leases[runner] = &lease{identity: i, runnerID: r.noted[runner].id}
+	delete(r.noted, runner)
 	return nil
+}
+
+// NoteRunnerID records GitHub's ID for a runner whose JIT config was just
+// generated, for its lease once it registers. Discover matches the runner's
+// job by this ID, which no runner registered elsewhere can share.
+func (r *Registry) NoteRunnerID(runner string, id int64) {
+	if runner == "" || id <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for name, n := range r.noted {
+		if now.Sub(n.at) > notedTTL {
+			delete(r.noted, name)
+		}
+	}
+	if l := r.leases[runner]; l != nil {
+		l.runnerID = id
+		return
+	}
+	if r.noted == nil {
+		r.noted = map[string]noted{}
+	}
+	r.noted[runner] = noted{id: id, at: now}
+}
+
+// runnerID is the ID noted for runner's lease, or 0.
+func (r *Registry) runnerID(runner string) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if l := r.leases[runner]; l != nil {
+		return l.runnerID
+	}
+	return 0
 }
 
 // Release cancels outstanding lookups before removing the file. On error the

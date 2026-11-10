@@ -141,3 +141,32 @@ func TestJitParallelism(t *testing.T) {
 		}
 	}
 }
+
+// idClient answers like GitHub does, naming the registered runner and its ID.
+type idClient struct{ id int }
+
+func (c idClient) GenerateJitRunnerConfig(_ context.Context, s *scaleset.RunnerScaleSetJitRunnerSetting, _ int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
+	return &scaleset.RunnerScaleSetJitRunnerConfig{
+		Runner:           &scaleset.RunnerReference{ID: c.id, Name: s.Name},
+		EncodedJITConfig: "jit-" + s.Name,
+	}, nil
+}
+
+// Generate reports the ID GitHub gave the runner it just registered, under the
+// name it returns, so the job identity can match by ID.
+func TestGenerateReportsTheRunnersID(t *testing.T) {
+	var gotName string
+	var gotID int64
+	src := &JITSource{
+		clients:    newClientPool(1, func() (jitClient, error) { return idClient{id: 900}, nil }),
+		namePrefix: "t",
+		onRunnerID: func(name string, id int64) { gotName, gotID = name, id },
+	}
+	name, _, err := src.Generate(context.Background(), core.RunnerSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotName != name || gotID != 900 {
+		t.Fatalf("reported %q %d, want %q 900", gotName, gotID, name)
+	}
+}
