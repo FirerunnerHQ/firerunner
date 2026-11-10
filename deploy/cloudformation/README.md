@@ -49,6 +49,23 @@ credentials are stack parameters and SSM parameters.
 3. Any failure marks the instance unhealthy. The group replaces it, and the
    log says why (see [Debugging](#debugging)).
 
+## The pool key
+
+The stack generates a Secrets Manager secret, `PoolKey`, that signs EC2 pool
+instances (`firerunner:pool-mac`; see the README's *Stopped pool*). Only the
+control role may read it. At boot the VM copies it to the root-only file
+`/etc/firerunner/pool-key` and points firerunner at it
+(`FR_EC2_POOL_KEY_FILE`), so a restarted or replaced VM reuses the pool
+instances this install launched and trusts no others.
+
+- **Upgrading.** Pool instances launched by a release before the key carry no
+  MAC. The first VM with the key terminates them once and refills the pool.
+- **A stack made before `PoolKey`** has no secret: firerunner then signs with a
+  random key per process and rebuilds the pool after every restart. Update
+  the stack to keep it.
+- **Rotating the key** (a new secret value, then a VM refresh) discards the
+  pool once, the same way.
+
 ## Job events (optional)
 
 Store a Postgres URL as the SecureString `<prefix>/control/job-events-dsn`, and
@@ -284,7 +301,8 @@ control VM is not there.
   ends the install's instances (by `Owner`) whose latest start is more than
   `MaxAgeMinutes` ago (default 720). That covers running instances, and used
   instances left stopped.
-- **Stopped pool instances (`ready`, `warming`) are kept.**
+- **Stopped pool instances (`ready`, `warming`) are kept.** It holds no pool
+  key; the control VM ends pool instances whose MAC fails.
 - **Spot requests.** It cancels a persistent spot request first. If that
   fails, it keeps the instance rather than leave the request open. A
   one-time request needs no cancel.

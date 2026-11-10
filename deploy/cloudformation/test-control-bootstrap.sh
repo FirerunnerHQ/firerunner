@@ -36,6 +36,12 @@ ssm)
 	[ -f "$f" ] || { echo "An error occurred (ParameterNotFound) when calling the GetParameter operation" >&2; exit 254; }
 	cat "$f"
 	;;
+secretsmanager)
+	# The secret is $STATE/pool-key; the call is recorded.
+	echo "$*" >> "$STATE/secretsmanager"
+	[ ! -f "$STATE/sm-denied" ] || { echo "An error occurred (AccessDeniedException) when calling the GetSecretValue operation" >&2; exit 254; }
+	cat "$STATE/pool-key"
+	;;
 *) echo "$*" >> "$STATE/$svc" ;;
 esac
 FAKE
@@ -154,6 +160,30 @@ setup
 expect "no job events: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "no job events: nothing in the env" "$(envfile)" bash -c "! grep -q FR_JOB_EVENTS '$FR_ROOT/etc/firerunner/firerunner.env'"
 expect "no tenants: nothing in the env" "$(envfile)" bash -c "! grep -q FR_TENANTS '$FR_ROOT/etc/firerunner/firerunner.env'"
+
+# The pool key: fetched from its secret into a root-only file the env names,
+# never into the env itself, nor the log.
+poolsecret=arn:aws:secretsmanager:us-west-2:123456789012:secret:fr-PoolKey-0aaa
+poolkey=Kq7Zx2Lm9Pw4Rt6Yv8Bn3Cs5Df1Gh0Jk2Lq4Mw6Ne8Pr0St2Uv4Wx6Yz8Ab0Cd2E
+setup
+echo "FR_POOL_KEY_SECRET=$poolsecret" >> "$FR_ROOT/etc/firerunner/bootstrap.env"
+echo "$poolkey" > "$STATE/pool-key"
+expect "pool key: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "pool key: read from its secret" "$(cat "$STATE/secretsmanager" 2>/dev/null)" \
+	grep -q -- "get-secret-value --secret-id $poolsecret --query SecretString --output text" "$STATE/secretsmanager"
+expect "pool key: env names the file" "$(envfile)" grep -qx "FR_EC2_POOL_KEY_FILE=$FR_ROOT/etc/firerunner/pool-key" <(envfile)
+expect "pool key: config checked with it" "$(cat "$STATE/check-env" 2>/dev/null)" \
+	grep -qx "FR_EC2_POOL_KEY_FILE=$FR_ROOT/etc/firerunner/pool-key" "$STATE/check-env"
+expect "pool key: the file holds it" "" grep -qxF "$poolkey" "$FR_ROOT/etc/firerunner/pool-key"
+expect "pool key: file owner-only" "$(ls -l "$FR_ROOT/etc/firerunner")" \
+	bash -c "[ \"\$(stat -c %a '$FR_ROOT/etc/firerunner/pool-key' 2>/dev/null || stat -f %Lp '$FR_ROOT/etc/firerunner/pool-key')\" = 600 ]"
+expect "pool key: not in the env file, the check's env or the log" "" \
+	bash -c "! grep -qF '$poolkey' '$FR_ROOT/etc/firerunner/firerunner.env' '$STATE/check-env' '$STATE/out'"
+setup
+expect "no pool key: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "no pool key: nothing in the env" "$(envfile)" bash -c "! grep -q FR_EC2_POOL_KEY_FILE '$FR_ROOT/etc/firerunner/firerunner.env'"
+expect "no pool key: says to update the stack" "$(cat "$STATE/out")" grep -q 'no FR_POOL_KEY_SECRET' "$STATE/out"
+expect "no pool key: no secret read" "" test ! -f "$STATE/secretsmanager"
 
 # 2. A PAT instead of an app key.
 setup
@@ -276,6 +306,20 @@ failed "ssm denied"
 expect "ssm denied: says why" "$(cat "$STATE/out")" grep -q 'AccessDeniedException' "$STATE/out"
 expect "ssm denied: not reported as missing" "$(cat "$STATE/out")" bash -c "! grep -q missing '$STATE/out'"
 
+# 4c. The pool key cannot be read, or is too short to be one.
+setup
+echo "FR_POOL_KEY_SECRET=$poolsecret" >> "$FR_ROOT/etc/firerunner/bootstrap.env"
+echo "$poolkey" > "$STATE/pool-key"
+touch "$STATE/sm-denied"
+failed "pool key denied"
+expect "pool key denied: says why" "$(cat "$STATE/out")" grep -q 'AccessDeniedException' "$STATE/out"
+setup
+echo "FR_POOL_KEY_SECRET=$poolsecret" >> "$FR_ROOT/etc/firerunner/bootstrap.env"
+echo "short-pwned" > "$STATE/pool-key"
+failed "pool key short"
+expect "pool key short: says why, not the key" "$(cat "$STATE/out")" \
+	bash -c "grep -q 'fewer than 32' '$STATE/out' && ! grep -q pwned '$STATE/out'"
+
 # 5. firerunner rejects the config.
 setup
 touch "$STATE/check-fails"
@@ -356,7 +400,7 @@ vals = {"AWS::Region": "us-west-2", "ParameterPrefix": "/fr", "Owner": "prod-a",
         "ZoneId": "Z123", "JitName": "control", "ZoneName": "fr.internal", "JitPort": "8098", "ReleaseRepo": "acme/fr",
         "Cache": "s3", "CachePort": "8099", "CacheBucketName": "fr-cache-bucket", "RootVolumeGiB": "30",
         "CacheRoleArn": "arn:aws:iam::123456789012:role/fr-CacheRole-0aaa",
-        "AppKMSKeyArn": ""}
+        "AppKMSKeyArn": "", "PoolKey": "arn:aws:secretsmanager:us-west-2:123456789012:secret:fr-PoolKey-0aaa"}
 body = re.sub(r"\$\{([A-Za-z:]+)\}", lambda m: vals[m.group(1)], body)
 print(body.replace("/etc/firerunner", sys.argv[2] + "/etc/firerunner"))
 PY2
@@ -409,6 +453,8 @@ export -f userdata
 	expect "user-data: bootstrap env written" "" grep -qx 'FR_JIT_HOST=control.fr.internal' "$FR_ROOT/etc/firerunner/bootstrap.env"
 	expect "user-data: bootstrap env names the cache mode and bucket" "$(cat "$FR_ROOT/etc/firerunner/bootstrap.env")" \
 		bash -c "grep -qx 'FR_CACHE=s3' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_CACHE_PORT=8099' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_CACHE_BUCKET=fr-cache-bucket' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_ROOT_GIB=30' '$FR_ROOT/etc/firerunner/bootstrap.env' && grep -qx 'FR_CACHE_ROLE_ARN=arn:aws:iam::123456789012:role/fr-CacheRole-0aaa' '$FR_ROOT/etc/firerunner/bootstrap.env'"
+	expect "user-data: bootstrap env names the pool key's secret" "$(cat "$FR_ROOT/etc/firerunner/bootstrap.env")" \
+		grep -qx 'FR_POOL_KEY_SECRET=arn:aws:secretsmanager:us-west-2:123456789012:secret:fr-PoolKey-0aaa' "$FR_ROOT/etc/firerunner/bootstrap.env"
 	expect "user-data: the launch template serves IMDS on IPv4 only" "" \
 		grep -q 'MetadataOptions: {.*HttpProtocolIpv6: disabled' "$HERE/control.yaml"
 	expect "user-data: bootstrap ran with the verified binary" "$(cat "$STATE/bootstrapped" 2>/dev/null)" \

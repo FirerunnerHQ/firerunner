@@ -557,6 +557,20 @@ starting the instance:
 - **Refill and restart.** The pool refills in the background. Its state lives
   in the `firerunner:pool` tag, so a restarted firerunner finds its ready
   instances again and terminates any a crash left mid-claim.
+- **Signed (`--ec2-pool-key-file`).** Anyone who may tag an instance in the
+  account could copy those tags onto an instance of their own. So firerunner
+  tags each pool instance it launches `firerunner:pool-mac`, an HMAC-SHA256
+  of its owner, tier and instance ID under a key the control plane holds.
+  After a restart, an instance whose MAC is missing or wrong is never given
+  a JIT config nor started: firerunner logs a warning naming it and
+  terminates it. Keep the key in a root-only file named by
+  `--ec2-pool-key-file` (`FR_EC2_POOL_KEY_FILE`), at least 32 bytes, the
+  same across restarts and replaced control VMs;
+  [`control.yaml`](deploy/cloudformation/control.yaml) generates one in
+  Secrets Manager. Without it, each process signs with a random key of its
+  own, so the pool is rebuilt after every restart. Changing the key
+  discards the pool once, as does the upgrade from a release before it:
+  older pool instances carry no MAC.
 - **Fallback.** With the pool empty, or if a stopped instance cannot start
   (spot capacity), the job cold-launches instead.
 
@@ -626,6 +640,8 @@ running process tracks, and anything younger than 2 minutes.
   and the next sweep ends it. Past `--max-vm-lifetime`, it is terminated
   regardless.
 - **A pool instance of a tier that no longer keeps a pool:** terminated.
+- **A pool instance whose `firerunner:pool-mac` fails:** terminated (see
+  *Signed* above).
 - **A persistent spot request whose instance is gone:** cancelled.
 
 Everything is found by the `firerunner:owner` tag, which defaults to the host
@@ -685,6 +701,10 @@ daemon's "job started" log line for the runner's name gives the job's
   `--jit-host` name); required when a tier sets `ec2.cache`.
 - `--aws-region` / `FR_AWS_REGION`: defaults to the SDK's sources, then the
   control VM's own region.
+- `--ec2-pool-key-file` / `FR_EC2_POOL_KEY_FILE`: a root-only file holding
+  the key (at least 32 bytes) that signs pool instances, so a restart reuses
+  them; see *Signed* under the stopped pool. Unset, the pool is rebuilt after
+  every restart.
 
 **Running the control VM.** [`deploy/cloudformation/`](deploy/cloudformation/README.md) has a
 CloudFormation template that does this for you:
