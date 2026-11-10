@@ -749,17 +749,39 @@ func (s *Server) commitBlockList(w http.ResponseWriter, r *http.Request, e *Entr
 		return
 	}
 	if len(ids) > maxBlocks {
-		// Each id costs an open and a copy, so a list of one id repeated
-		// would otherwise multiply work without adding bytes.
+		// Each id costs a stat, an open and a copy.
 		azureError(w, http.StatusBadRequest, "BlockListTooLong", "a block list names at most 50,000 blocks")
 		return
+	}
+
+	// Check the whole list before writing or claiming a byte. Assembly claims
+	// what it writes, and a claim can evict other entries for good, so a list
+	// that will fail must fail first: a block never uploaded. A block named
+	// twice is refused too. Azure accepts a repeated id; the @actions/cache
+	// toolkit never sends one, and honouring it let one staged block claim,
+	// and evict other entries for, bytes nobody uploaded. Staged blocks already
+	// count against the per-entry cap, so with each named once the assembly
+	// cannot outgrow what was uploaded.
+	dir := s.tmpDir(e.ID)
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			azureError(w, http.StatusBadRequest, azBadBlockList, "the block list names a block more than once")
+			return
+		}
+		seen[id] = struct{}{}
+		fi, err := os.Stat(filepath.Join(dir, hex.EncodeToString([]byte(id))))
+		if err != nil || !fi.Mode().IsRegular() {
+			azureError(w, http.StatusBadRequest, azBadBlockList, "the block list names a block that was not uploaded")
+			return
+		}
 	}
 
 	// Assemble into a temp file and rename over the blob only once it is fully
 	// built and within the per-entry cap. Streaming straight into the live blob
 	// would truncate a previously finalized entry the instant a commit arrives,
-	// even if a staged block is missing or the total exceeds the cap.
-	dir := s.tmpDir(e.ID)
+	// even if a staged block is missing or the total exceeds the cap. Both are
+	// checked again while copying: a block can change after the check above.
 	tmp := s.blobPath(e.ID) + ".tmp"
 	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {

@@ -242,3 +242,40 @@ func TestRefusedUploadReleasesItsClaim(t *testing.T) {
 		t.Fatalf("retry within the budget -> %d, want 201", code)
 	}
 }
+
+// A block list that cannot commit fails before it claims a byte: claims evict
+// completed entries for good, so a failing list must not cost anyone theirs.
+// One staged block named over and over would otherwise claim, and evict for,
+// bytes nobody uploaded.
+func TestFailingBlockListEvictsNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ids  []string
+	}{
+		{"a block named twice", []string{"b0", "b0"}},
+		{"named again, then missing", []string{"b0", "b0", "b0", "nope"}},
+		{"a missing block after a real one", []string{"b0", "nope"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, ts, _ := budgetServer(t, 1000)
+			saveEntry(t, ts.URL, "1", "old", "v1", 400) // id 1, completed
+			url := reserve(t, ts.URL, "new")
+			putBlockPart(t, url, "b0", bytes.Repeat([]byte("x"), 300))
+			putBlockPart(t, url, "b1", bytes.Repeat([]byte("y"), 300))
+			list := "<BlockList>"
+			for _, id := range tc.ids {
+				list += "<Latest>" + id + "</Latest>"
+			}
+			list += "</BlockList>"
+			if code := putStatus(t, url+"&comp=blocklist", []byte(list)); code != http.StatusBadRequest {
+				t.Fatalf("block list %v -> %d, want 400", tc.ids, code)
+			}
+			s.mu.Lock()
+			_, kept := s.entries[1]
+			s.mu.Unlock()
+			if !kept {
+				t.Fatal("a block list that failed evicted a completed entry")
+			}
+		})
+	}
+}
