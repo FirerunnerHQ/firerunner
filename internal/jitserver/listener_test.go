@@ -35,6 +35,17 @@ func (l *chanListener) Close() error {
 	return nil
 }
 
+// push hands c to whoever accepts from l, failing the test instead of
+// blocking when the accepting side has stopped.
+func (l *chanListener) push(t *testing.T, c net.Conn, stopped <-chan struct{}) {
+	t.Helper()
+	select {
+	case l.conns <- c:
+	case <-stopped:
+		t.Fatal("the accepting side stopped before taking a connection")
+	}
+}
+
 func (l *chanListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 8098} }
 
 // srcConn is the server's end of a pipe, appearing to come from src, and
@@ -64,16 +75,18 @@ func dial(src netip.Addr) (server *srcConn, client net.Conn) {
 
 // acceptor accepts from l in the background, one connection at a time.
 type acceptor struct {
-	in  *chanListener
-	got chan net.Conn
+	in      *chanListener
+	got     chan net.Conn
+	stopped chan struct{}
 }
 
 func startAcceptor(t *testing.T, perSource, total int) *acceptor {
 	t.Helper()
 	in := newChanListener()
 	l := LimitListener(in, perSource, total)
-	a := &acceptor{in: in, got: make(chan net.Conn)}
+	a := &acceptor{in: in, got: make(chan net.Conn), stopped: make(chan struct{})}
 	go func() {
+		defer close(a.stopped)
 		for {
 			c, err := l.Accept()
 			if err != nil {
@@ -92,11 +105,14 @@ func (a *acceptor) offer(t *testing.T, src netip.Addr) net.Conn {
 	t.Helper()
 	sc, cc := dial(src)
 	t.Cleanup(func() { _ = cc.Close() })
-	a.in.conns <- sc
+	a.in.push(t, sc, a.stopped)
 	select {
 	case c := <-a.got:
 		return c
 	case <-sc.closed:
+		return nil
+	case <-a.stopped:
+		t.Fatal("the listener stopped accepting")
 		return nil
 	}
 }
@@ -163,13 +179,13 @@ func TestHeldConnectionsDoNotStarveAnotherSource(t *testing.T) {
 	for range 3 * MaxConnsPerSource {
 		sc, cc := dial(holder)
 		t.Cleanup(func() { _ = cc.Close() })
-		in.conns <- sc
+		in.push(t, sc, served)
 	}
 	// Accept runs one connection at a time, so pushing the guest's
 	// connection waits until every holder connection has been decided.
 	sc, cc := dial(guest)
 	t.Cleanup(func() { _ = cc.Close() })
-	in.conns <- sc
+	in.push(t, sc, served)
 	go func() { _, _ = io.WriteString(cc, "GET /jit HTTP/1.1\r\nHost: jit\r\n\r\n") }()
 	resp, err := http.ReadResponse(bufio.NewReader(cc), nil)
 	if err != nil {
@@ -199,5 +215,52 @@ func TestSourceOf(t *testing.T) {
 		if got := sourceOf(tc.addr); got != tc.want {
 			t.Errorf("sourceOf(%v) = %v, want %v", tc.addr, got, tc.want)
 		}
+	}
+}
+
+// TestRefusedTCPConnectionGetsNoResponse runs the listener over real
+// loopback TCP: a connection over the per-source cap is closed without an
+// answer, and the one holding the slot is still served.
+func TestRefusedTCPConnectionGetsNoResponse(t *testing.T) {
+	s := New(0, nil)
+	if err := s.Register(netip.MustParseAddr("127.0.0.1"), "runner-1", "the-config", nil); err != nil {
+		t.Fatal(err)
+	}
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := s.HTTPServer()
+	served := make(chan struct{})
+	go func() { defer close(served); _ = srv.Serve(LimitListener(tcp, 1, MaxConns)) }()
+	t.Cleanup(func() { _ = srv.Close(); <-served })
+
+	held, err := net.Dial("tcp", tcp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	// Accept runs in order, so the held connection takes the one slot
+	// before the second is decided.
+	refused, err := net.Dial("tcp", tcp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = refused.Close() })
+	_, _ = io.WriteString(refused, "GET /jit HTTP/1.1\r\nHost: jit\r\n\r\n")
+	n, err := refused.Read(make([]byte, 1))
+	if n != 0 || err == nil {
+		t.Fatalf("connection over the cap read %d bytes, err %v; want it closed with no response", n, err)
+	}
+
+	_, _ = io.WriteString(held, "GET /jit HTTP/1.1\r\nHost: jit\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(held), nil)
+	if err != nil {
+		t.Fatalf("the connection holding the slot was not served: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "the-config" {
+		t.Fatalf("held fetch = %d %q, want 200 with its config", resp.StatusCode, body)
 	}
 }

@@ -17,10 +17,13 @@ const (
 	// bundle, phase reports), each on its own connection, so it needs one;
 	// the rest is slack for a retry that overlaps a closing connection.
 	MaxConnsPerSource = 4
-	// MaxConns bounds the connections held open across all addresses. A
-	// legitimate request holds its slot for milliseconds, so this binds only
-	// when many sources each hold their full MaxConnsPerSource.
-	MaxConns = 512
+	// MaxConns bounds the connections held open across all addresses, as a
+	// backstop for the daemon's file descriptors and memory. Every source
+	// shares it, so it sits far above any realistic runner count: filling it
+	// takes a thousand runners each holding its full MaxConnsPerSource. A
+	// held connection costs one descriptor and a few KiB, and Go raises the
+	// descriptor limit to the hard limit at start (systemd's is far higher).
+	MaxConns = 4096
 )
 
 // The server's per-connection limits. Requests carry no body and every
@@ -51,8 +54,9 @@ func (s *Server) HTTPServer() *http.Server {
 // remote address and at most total open overall. A connection over either
 // limit is closed as soon as it is accepted, with a reset where the
 // transport allows one, so a refusal holds no slot and leaves no TIME_WAIT
-// behind; the client sees a failed request and retries. A slot comes back
-// when the server closes the connection.
+// behind; the client sees a failed request (the guest retries its config
+// fetch; the cache bundle and phase reports are best effort). A slot comes
+// back when the server closes the connection.
 func LimitListener(ln net.Listener, perSource, total int) net.Listener {
 	return &limitListener{Listener: ln, perSource: perSource, total: total, open: map[netip.Addr]int{}}
 }
@@ -137,4 +141,14 @@ func (c *limitedConn) Close() error {
 	err := c.Conn.Close()
 	c.once.Do(c.release)
 	return err
+}
+
+// CloseWrite passes through to the TCP connection, which embedding the
+// net.Conn interface would hide: net/http half-closes before its final close
+// on an error reply, so the client reads the reply instead of a reset.
+func (c *limitedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }

@@ -730,9 +730,9 @@ warn that they cannot run.
 **Security groups.** The runners' group needs no inbound rules. The control
 VM's group must allow TCP to the `--jit-addr` port **from the runners' group
 only**. Never expose that port publicly. A job can reach that port too, so
-firerunner holds at most 4 connections open per source address and 512 in
+firerunner holds at most 4 connections open per source address and 4096 in
 all, closes each after one request, and refuses the rest at once; a runner
-retries a refused fetch.
+retries a refused config fetch.
 
 **Verifying a deployment end to end.** These steps create real, billable
 resources. [`scripts/e2e/`](scripts/e2e/README.md) has tested helpers for them:
