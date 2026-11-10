@@ -2,11 +2,13 @@ package jitserver
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -243,14 +245,18 @@ func TestRefusedTCPConnectionGetsNoResponse(t *testing.T) {
 	// Accept runs in order, so the held connection takes the one slot
 	// before the second is decided.
 	refused, err := net.Dial("tcp", tcp.Addr().String())
-	if err != nil {
+	switch {
+	case errors.Is(err, syscall.ECONNRESET):
+		// Refused, and reset, before Dial returned: the behaviour under test.
+	case err != nil:
 		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = refused.Close() })
-	_, _ = io.WriteString(refused, "GET /jit HTTP/1.1\r\nHost: jit\r\n\r\n")
-	n, err := refused.Read(make([]byte, 1))
-	if n != 0 || err == nil {
-		t.Fatalf("connection over the cap read %d bytes, err %v; want it closed with no response", n, err)
+	default:
+		t.Cleanup(func() { _ = refused.Close() })
+		_, _ = io.WriteString(refused, "GET /jit HTTP/1.1\r\nHost: jit\r\n\r\n")
+		n, err := refused.Read(make([]byte, 1))
+		if n != 0 || err == nil {
+			t.Fatalf("connection over the cap read %d bytes, err %v; want it closed with no response", n, err)
+		}
 	}
 
 	_, _ = io.WriteString(held, "GET /jit HTTP/1.1\r\nHost: jit\r\n\r\n")
