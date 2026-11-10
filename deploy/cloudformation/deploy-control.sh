@@ -10,6 +10,13 @@
 # Roll back by deploying the previous version. Needs jq and the AWS CLI with
 # credentials and AWS_REGION (or a profile region) for the stack.
 #
+# Before it pins VERSION's checksums, it downloads the binaries and the
+# bootstrap script they list and checks each one's build provenance with
+# `gh attestation verify` (needs gh, logged in): signed by the release repo's
+# .github/workflows/release.yml, for the tag VERSION, on a GitHub-hosted
+# runner. Releases before v0.1.9 carry no attestations;
+# DEPLOY_SKIP_ATTESTATION=1 deploys one without this check.
+#
 # Exit codes: 0 deployed, 1 failed (the message says where), 2 usage.
 set -euo pipefail
 
@@ -42,9 +49,44 @@ if [ -z "$asg" ] || [ "$asg" = None ]; then die "stack $stack has no AutoScaling
 # Refuse a version the VM could not install, before touching anything, and
 # pin its checksums now: every later boot of this version verifies against
 # these, so a release asset replaced afterwards is refused.
-url="https://github.com/$repo/releases/download/$version/SHA256SUMS"
+base="https://github.com/$repo/releases/download/$version"
+url="$base/SHA256SUMS"
 sums=$(curl -fsSL "$url") || die "no release $version in $repo ($url)"
-grep -qE '  firerunner_linux_(amd64|arm64)$' <<< "$sums" || die "$url lists no firerunner binary"
+assets=()
+for a in firerunner_linux_amd64 firerunner_linux_arm64; do
+	if grep -q "  $a\$" <<< "$sums"; then assets+=("$a"); fi
+done
+[ ${#assets[@]} -gt 0 ] || die "$url lists no firerunner binary"
+grep -q '  firerunner-control-bootstrap\.sh$' <<< "$sums" || die "$url lists no firerunner-control-bootstrap.sh"
+assets+=(firerunner-control-bootstrap.sh)
+
+# SHA256SUMS comes from the same release as the files, so it proves nothing
+# by itself. Each file it lists must also carry an attestation that the
+# release workflow built it from this tag.
+sha256() { if command -v sha256sum > /dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+if [ "${DEPLOY_SKIP_ATTESTATION:-}" = 1 ]; then
+	log "DEPLOY_SKIP_ATTESTATION=1: not checking the build provenance of $version"
+else
+	command -v gh > /dev/null || die "checking $version's build provenance needs gh (gh attestation verify)"
+	dl=$(mktemp -d)
+	trap 'rm -rf "$dl"' EXIT
+	for a in "${assets[@]}"; do
+		curl -fsSL -o "$dl/$a" "$base/$a" || die "could not download $base/$a"
+		want=$(awk -v n="$a" '$2 == n { print $1 }' <<< "$sums")
+		got=$(sha256 "$dl/$a")
+		[ "$want" = "$got" ] || die "$a: SHA-256 is $got, SHA256SUMS says ${want//$'\n'/ }"
+		gh attestation verify "$dl/$a" --repo "$repo" \
+			--signer-workflow "$repo/.github/workflows/release.yml" \
+			--source-ref "refs/tags/$version" --deny-self-hosted-runners \
+			> /dev/null 2> "$dl/verify.err" || {
+			sed '/^$/d; s/^/  /' "$dl/verify.err" >&2
+			die "$a: no attestation that $repo's release workflow built it for $version (DEPLOY_SKIP_ATTESTATION=1 skips this check)"
+		}
+	done
+	log "build provenance checked: ${assets[*]}"
+fi
+# Pin only the lines for the files checked above: the ones the VM reads.
+sums=$(grep -E '  (firerunner_linux_(amd64|arm64)|firerunner-control-bootstrap\.sh)$' <<< "$sums")
 
 get() { aws ssm get-parameter --name "$prefix/control/$1" --query Parameter.Value --output text 2>/dev/null || echo ""; }
 put() { aws ssm put-parameter --name "$prefix/control/$1" --type String --value "$2" --overwrite > /dev/null; }
