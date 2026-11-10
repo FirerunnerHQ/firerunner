@@ -47,6 +47,15 @@ const DefaultIdentityWait = 60 * time.Second
 
 const identityPoll = 250 * time.Millisecond
 
+// Each request waiting on a pending identity holds a connection and a
+// goroutine, and polls. One job makes a handful of cache requests before its
+// identity resolves, so a source over maxSourceIdentityWaiters, or the server
+// over maxIdentityWaiters, is denied at once rather than waiting.
+const (
+	maxSourceIdentityWaiters = 16
+	maxIdentityWaiters       = 1024
+)
+
 // Denial reasons exported by /stats and /metrics, in exposition order.
 const (
 	denyMissing    = "missing"
@@ -55,9 +64,10 @@ const (
 	denyExpired    = "expired"
 	denyInvalid    = "invalid"
 	denyGeneration = "generation"
+	denyWaiters    = "waiters" // too many requests already waiting
 )
 
-var denyReasons = []string{denyMissing, denyPending, denyUnresolved, denyExpired, denyInvalid, denyGeneration}
+var denyReasons = []string{denyMissing, denyPending, denyUnresolved, denyExpired, denyInvalid, denyGeneration, denyWaiters}
 
 // SetIdentityWait sets how long a pending lease may wait for job rights
 // (0 denies at once). Call before serving.
@@ -118,6 +128,12 @@ func (s *Server) awaitIdentity(ctx context.Context, host string, deadline time.T
 		case !now.Before(deadline):
 			return jobidentity.Identity{}, denyPending, waited
 		}
+		if !waited {
+			if !s.startWaiting(host) {
+				return jobidentity.Identity{}, denyWaiters, false
+			}
+			defer s.stopWaiting(host)
+		}
 		waited = true
 		t := time.NewTimer(min(identityPoll, deadline.Sub(now)))
 		select {
@@ -157,4 +173,26 @@ func (s *Server) denyIdentity(host, reason string) {
 func owns(i jobidentity.Identity, e *Entry) bool {
 	return i.WriteRef != "" && e.Ref == i.WriteRef && e.RepoID == i.Repository &&
 		e.Generation == i.Generation && e.JobID == i.JobID && e.RunID == i.RunID
+}
+
+// startWaiting takes a waiter slot for host, or reports that its source or the
+// server already has as many waiting as it may.
+func (s *Server) startWaiting(host string) bool {
+	s.identityMu.Lock()
+	defer s.identityMu.Unlock()
+	if s.waiters[host] >= s.maxSourceWaiters || s.waitersTotal >= s.maxWaiters {
+		return false
+	}
+	s.waiters[host]++
+	s.waitersTotal++
+	return true
+}
+
+func (s *Server) stopWaiting(host string) {
+	s.identityMu.Lock()
+	defer s.identityMu.Unlock()
+	if s.waiters[host]--; s.waiters[host] <= 0 {
+		delete(s.waiters, host)
+	}
+	s.waitersTotal--
 }

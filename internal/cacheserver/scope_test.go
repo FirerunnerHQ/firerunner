@@ -816,3 +816,61 @@ func TestIdentityDenialMetricsByReason(t *testing.T) {
 		t.Fatalf("stats: %+v", st)
 	}
 }
+
+// waitersAre waits until host has n requests waiting, and total in all.
+func waitersAre(t *testing.T, s *Server, host string, n, total int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.identityMu.Lock()
+		got, gotTotal := s.waiters[host], s.waitersTotal
+		s.identityMu.Unlock()
+		if got == n && gotTotal == total {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s has %d waiting (%d in all), want %d (%d)", host, got, gotTotal, n, total)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Requests waiting on a pending identity are capped per source and in all; one
+// over a cap is denied at once, and slots return when the waits end.
+func TestIdentityWaitersAreCapped(t *testing.T) {
+	const a, b, c = "172.16.1.2", "172.16.2.2", "172.16.3.2"
+	l := newScopeLab(t)
+	l.s.maxSourceWaiters, l.s.maxWaiters = 2, 3
+	for _, ip := range []string{a, b, c} {
+		l.set(ip, pendingIdentity("owner/repo", "g"))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	deadline := time.Now().Add(time.Minute)
+	ended := make(chan string, 3)
+	wait := func(ip string) {
+		_, reason, _ := l.s.awaitIdentity(ctx, ip, deadline)
+		ended <- reason
+	}
+	go wait(a)
+	go wait(a)
+	waitersAre(t, l.s, a, 2, 2)
+	if _, reason, waited := l.s.awaitIdentity(ctx, a, deadline); reason != denyWaiters || waited {
+		t.Fatalf("a third request from one source: %q, waited %v; want %q at once", reason, waited, denyWaiters)
+	}
+	go wait(b) // another source still gets a slot
+	waitersAre(t, l.s, b, 1, 3)
+	if _, reason, _ := l.s.awaitIdentity(ctx, c, deadline); reason != denyWaiters {
+		t.Fatalf("a request over the total: %q, want %q", reason, denyWaiters)
+	}
+	cancel()
+	for range 3 {
+		if reason := <-ended; reason != denyPending {
+			t.Fatalf("a cancelled wait ended with %q, want %q", reason, denyPending)
+		}
+	}
+	waitersAre(t, l.s, a, 0, 0)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	go func() { _, _, _ = l.s.awaitIdentity(ctx2, a, deadline) }()
+	waitersAre(t, l.s, a, 1, 1) // the slots came back
+}
