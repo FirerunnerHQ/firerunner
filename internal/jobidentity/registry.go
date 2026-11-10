@@ -46,6 +46,9 @@ type Registry struct {
 	log     *slog.Logger
 	// discoverPause is discoverPause, shortened by tests.
 	discoverPause time.Duration
+	// resolving counts the goroutines Start runs; Close waits for them.
+	resolving sync.WaitGroup
+	closed    bool // under mu: Close has begun, so Register refuses
 }
 
 func NewRegistry(dir string, log *slog.Logger) (*Registry, error) {
@@ -138,6 +141,9 @@ func (r *Registry) write(i Identity) error {
 func (r *Registry) Register(runner, ip string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return errors.New("identity registry closed")
+	}
 	a, err := netip.ParseAddr(ip)
 	if err != nil || !a.Is4() || runner == "" {
 		return errors.New("invalid VM identity")
@@ -196,6 +202,9 @@ func (r *Registry) Start(ctx context.Context, j Job, resolver Resolver) {
 		if err := r.write(l.identity); err != nil {
 			r.log.Warn("publish unresolved cache identity", "runner", j.Runner, "err", err)
 		}
+		// The denial is final: stop the first job's resolve, which would
+		// otherwise publish its identity over this one when it finishes.
+		l.cancel()
 		r.mu.Unlock()
 		return
 	}
@@ -212,8 +221,12 @@ func (r *Registry) Start(ctx context.Context, j Job, resolver Resolver) {
 	if err := r.write(l.identity); err != nil {
 		r.log.Warn("publish pending cache identity", "runner", j.Runner, "err", err)
 	}
+	// Counted before mu is released: Close deletes leases under mu, so it
+	// cannot reach Wait while a Start that found one is still uncounted.
+	r.resolving.Add(1)
 	r.mu.Unlock()
 	go func() {
+		defer r.resolving.Done()
 		defer cancel()
 		var i Identity
 		var err error
@@ -231,7 +244,9 @@ func (r *Registry) Start(ctx context.Context, j Job, resolver Resolver) {
 		}
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		if r.leases[j.Runner] != l {
+		// A released lease, or one a conflict denied while this resolve ran:
+		// either way, nothing here may be published.
+		if r.leases[j.Runner] != l || l.identity.Unresolved {
 			return
 		}
 		if ctx.Err() != nil {
@@ -271,6 +286,7 @@ func (r *Registry) Close() {
 	<-r.done
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.closed = true
 	for name, l := range r.leases {
 		if l.cancel != nil {
 			l.cancel()
@@ -278,5 +294,9 @@ func (r *Registry) Close() {
 		_ = os.Remove(filepath.Join(r.dir, l.identity.IP+".json"))
 		delete(r.leases, name)
 	}
+	r.mu.Unlock()
+	// Cancelled above, so they return promptly; none writes after Close.
+	r.resolving.Wait()
+	r.mu.Lock()
 	_ = r.lock.Close()
 }
