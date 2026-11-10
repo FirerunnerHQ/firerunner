@@ -194,7 +194,10 @@ Because the disk lasts for one job, the image favours speed over durability:
   release, checked against `SHA256SUMS`, with `--firerunner-version` choosing
   which, or from `--firerunner-url` with `--firerunner-sha256`. A binary that
   fails the check, or has no `git-proxy`, stays out, and the image then has no
-  git cache.
+  git cache. The URL may be presigned: the build does not trace it, and
+  removes cloud-init's copies of its user-data and its logs before the
+  snapshot. The disk blocks they used are freed, not wiped, so give such a
+  URL a short expiry.
 - `firerunner-ec2-tune` grows the root filesystem to the volume's size on each
   job boot, so `root_volume_gib` takes effect, adds zram swap as large as
   memory, moves Docker's data to RAM for a tier with

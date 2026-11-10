@@ -81,6 +81,8 @@ SUDO=""
 [ "$(id -u)" = 0 ] || SUDO="sudo -n"
 say "syn_rule: $($SUDO nft list chain ip firerunner_syn post 2>&1 | grep -c masquerade)"
 say "syn_retry_gap: $(cat /proc/sys/net/ipv4/tcp_syn_linear_timeouts)"
+# Files that still hold the build's user-data, or cloud-init's log of its run.
+say "build_userdata: $($SUDO grep -rlsF -e 'install_boot_unit()' -e 'RUNNER_SHA256=' /var/lib/cloud /var/log 2>/dev/null | wc -l) $($SUDO find /var/lib/cloud /var/log -name 'cloud-init*.log' 2>/dev/null | wc -l)"
 nic="$(ip -o route get 1.1.1.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')"
 $SUDO tc qdisc add dev "$nic" clsact
 $SUDO tc filter add dev "$nic" egress protocol ip prio 1 u32 match ip dport 443 0xffff match ip sport 0 1 action drop
@@ -247,6 +249,7 @@ check "apt prefers gzip indexes" 'apt:.*"gz"'
 check "apt skips translations" 'apt_languages: .*"none"'
 check "apt skips indexes and hooks that CI never needs" 'apt_extras: 0'
 check "the kernel skips the PS/2 probe" 'cmdline:.*i8042.nokbd'
+check "no copy or log of the build's user-data" 'build_userdata: 0 0$'
 check "the probe finished" 'probe: done'
 check "more memory than the VM has does not kill the job" 'overcommit_rc: 0'
 check "a job's OOM does not take the boot service with it" 'oom_rc: 137'

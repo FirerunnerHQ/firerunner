@@ -17,7 +17,8 @@ cat >"$TMP/bin/curl" <<'FAKE'
 out="$5"
 for last; do :; done
 echo "$last" >> "$STATE/urls"
-file="$STATE/remote/${last##*/}"
+path="${last%%\?*}"
+file="$STATE/remote/${path##*/}"
 [ -f "$file" ] || exit 22
 cp "$file" "$out"
 FAKE
@@ -51,6 +52,8 @@ run() {
 		PATH="$TMP/bin:$PATH"
 		# shellcheck source=ec2/install-firerunner.sh disable=SC1091
 		. "$HERE/ec2/install-firerunner.sh"
+		# provision.sh runs under set -x; TRACE=1 does too, into $STATE/trace.
+		[ -z "${TRACE:-}" ] || { exec 2>"$STATE/trace" && set -x; }
 		install_firerunner || echo "not installed" >"$STATE/result"
 	)
 }
@@ -63,6 +66,7 @@ pass() { # DESC CMD...
 	fi
 }
 installed() { [ -x "$FIRERUNNER_BIN" ]; }
+not_grep() { ! grep -q "$@"; }
 absent() { [ ! -e "$FIRERUNNER_BIN" ] && [ -f "$STATE/result" ]; }
 
 fresh
@@ -121,6 +125,14 @@ pass "a URL with its hash: installs" installed
 fresh
 FR_URL=https://x.test/firerunner_linux_amd64 FR_SHA256="$(printf '0%.0s' {1..64})" run
 pass "a URL with the wrong hash: not installed" absent
+
+# A presigned URL is a credential: the build's xtrace must not print it.
+fresh
+right="$(sha256sum "$STATE/remote/firerunner_linux_amd64" | cut -d' ' -f1)"
+TRACE=1 FR_URL="https://x.test/firerunner_linux_amd64?X-Amz-Signature=s3cr3t" FR_SHA256="$right" run
+pass "a URL under xtrace: installs" installed
+pass "a URL under xtrace: not traced" not_grep s3cr3t "$STATE/trace"
+pass "a URL under xtrace: the trace resumes after it" grep -q 'install -m 0755' "$STATE/trace"
 
 if [ "$fails" -ne 0 ]; then
 	echo "$fails failure(s)"
