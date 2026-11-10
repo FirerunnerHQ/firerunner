@@ -8,6 +8,35 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-11-10
+
+### Changed
+
+- A cache hit no longer rewrites cache-server's whole index under its lock:
+  the entry's last-used time is written within 30 s (plus the S3 sync
+  interval for an S3 index), by any other change sooner, and on shutdown. A
+  lookup also scans the entries once rather than once per ref and restore key.
+- cache-server lets at most 16 requests from one address, and 1024 in all,
+  wait on a pending job identity at a time; one more is denied at once, with
+  the new reason `waiters` in `/stats` and `/metrics`.
+
+### Fixed
+
+- `--log-dir-max-mib` now holds while many runners write their console logs
+  at once: it counts the bytes of logs still being written, removes only
+  finished logs to make room, and stops a log with a closing line when the
+  budget is spent. A log still open is no longer removed.
+- On EC2 runners the instance's cache proxy waited at most 30 s for a cache
+  RPC, so a first restore waiting on the job's identity (up to 60 s) became a
+  miss after 30 s. It now waits 90 s. Takes effect with a rebuilt runner AMI.
+
+### Security
+
+- The EC2 JIT endpoint now limits how many connections one source address,
+  and all of them together, can hold open, closes each connection after one
+  request, and uses shorter read and write deadlines, so one runner cannot
+  crowd out other runners fetching their configs.
+
 ## [0.1.11] - 2026-11-10
 
 ### Fixed
@@ -344,7 +373,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.12
 [0.1.11]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.11
 [0.1.10]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.10
 [0.1.9]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.9
