@@ -40,7 +40,9 @@ credentials are stack parameters and SSM parameters.
    `firerunner-control-bootstrap.sh`, and checks both against
    `<prefix>/control/sha256sums`. That parameter holds the release's
    `SHA256SUMS`, which `deploy-control.sh` pinned at deploy time, so an
-   asset replaced afterwards is refused.
+   asset replaced afterwards is refused. Before it pins them,
+   `deploy-control.sh` checks each file's build provenance (see
+   [Deploy, roll back](#deploy-roll-back)).
 2. [`control-bootstrap.sh`](control-bootstrap.sh) installs the binary and
    writes `/etc/firerunner/` from SSM. Then `firerunner config check` must
    pass, and only then does the name move and the unit start.
@@ -198,6 +200,17 @@ wait and are picked up by the new listener.
 
 Changing `env` or `tiers` takes a refresh too. Run `deploy-control.sh` with
 the current version.
+
+`SHA256SUMS` comes from the same release as the files it lists, so
+`deploy-control.sh` does not take it on its own word. On your machine, before
+it changes anything, it downloads both binaries and
+`firerunner-control-bootstrap.sh`, checks each against `SHA256SUMS`, and runs
+`gh attestation verify` on each: the attestation must come from the release
+repo's `.github/workflows/release.yml`, for the tag being deployed, on a
+GitHub-hosted runner. Any failure stops the deploy. This needs
+[`gh`](https://cli.github.com/), logged in. Releases before v0.1.9 carry no
+attestations: to deploy or roll back to one, set `DEPLOY_SKIP_ATTESTATION=1`,
+which pins `SHA256SUMS` unchecked, as before.
 
 ## Debugging
 
