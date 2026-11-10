@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for layer-ec2-ami.sh with fake aws, curl and system commands: no AWS
+# Tests for layer-ec2-ami.sh with fake aws, curl, gh and system commands: no AWS
 # account, no root, and no real disk.
 set -euo pipefail
 
@@ -33,19 +33,29 @@ case "$last" in
 *instance-id) echo i-0self ;;
 *availability-zone) echo us-east-1a ;;
 *SHA256SUMS)
+	echo "$last" >>"$STATE/downloads"
 	for a; do [ "$prev" = -o ] && out="$a"; prev="$a"; done
 	sum="$(sha256sum "$FAKE_BIN" 2>/dev/null || shasum -a 256 "$FAKE_BIN")"
 	echo "${sum%% *}  firerunner_linux_amd64" >"$out"
 	;;
 *firerunner_linux_amd64)
+	echo "$last" >>"$STATE/downloads"
 	for a; do [ "$prev" = -o ] && out="$a"; prev="$a"; done
 	cp "$FAKE_BIN" "$out"
+	# A release replaced after its check: the next download is another binary,
+	# with a SHA256SUMS of its own to match.
+	[ ! -f "$STATE/replaced" ] || printf '#!/bin/sh\nexit 0 # replaced\n' >"$FAKE_BIN"
 	;;
 *) exit 22 ;;
 esac
 FAKE
-printf '#!/bin/sh\nexit 0\n' >"$TMP/fake-firerunner"
-chmod +x "$TMP/fake-firerunner"
+# Fake gh: every binary carries its attestation unless $STATE/unattested.
+cat >"$TMP/bin/gh" <<'FAKE'
+#!/usr/bin/env bash
+echo "gh $*" >>"$STATE/gh"
+[ "$1 $2" = "attestation verify" ] || exit 1
+[ ! -f "$STATE/unattested" ] || { echo "Error: no matching attestations found" >&2; exit 1; }
+FAKE
 export FAKE_BIN="$TMP/fake-firerunner"
 cat >"$TMP/bin/lsblk" <<'FAKE'
 #!/bin/sh
@@ -83,6 +93,7 @@ expect() { # DESC CMD...
 }
 called() { grep -qF -- "$1" "$STATE/calls"; }
 not_called() { ! called "$1"; }
+not_grep() { ! grep -q "$@"; }
 ordered() {
 	local a b
 	a="$(grep -nF -- "$1" "$STATE/calls" | head -1 | cut -d: -f1)"
@@ -90,9 +101,11 @@ ordered() {
 	[ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]
 }
 fresh() {
-	rm -rf "$STATE"
+	rm -rf "$STATE" "$TMP/root"
 	mkdir -p "$STATE" "$TMP/root/tmp" "$TMP/root/usr/local/bin"
 	: >"$STATE/calls"
+	printf '#!/bin/sh\nexit 0\n' >"$FAKE_BIN"
+	chmod +x "$FAKE_BIN"
 }
 run() {
 	rc=0
@@ -117,6 +130,34 @@ expect "keeps ENA" called "--ena-support"
 expect "publishes after the image is ready" ordered "ec2 register-image" "ssm put-parameter --name /p/new"
 expect "deletes the volume" called "ec2 delete-volume --volume-id vol-0new"
 expect "prints the image" grep -q '"ami":"ami-0new"' "$STATE/out"
+
+expect "checks the release's attestation" grep -q 'gh attestation verify .*/firerunner_linux_amd64 --repo FirerunnerHQ/firerunner --signer-workflow FirerunnerHQ/firerunner/.github/workflows/release.yml --source-ref refs/tags/v1.2.3 --deny-self-hosted-runners$' "$STATE/gh"
+expect "installs only what it checked, not by the release's SHA256SUMS" not_grep SHA256SUMS "$STATE/downloads"
+
+# A binary without the attestation: refused before anything is made.
+fresh
+: >"$STATE/unattested"
+run --base ami-0x --ssm-param /p/new --firerunner-version v1.2.3
+expect "unattested: fails" [ "$rc" != 0 ]
+expect "unattested: says why, and how to skip" grep -q 'FIRERUNNER_SKIP_ATTESTATION=1 skips' "$STATE/err"
+expect "unattested: no volume" not_called "ec2 create-volume"
+expect "unattested: nothing installed" test ! -e "$TMP/root/usr/local/bin/firerunner"
+
+# The release replaced after its check, SHA256SUMS and all: the download is
+# held to the SHA-256 that was checked.
+fresh
+: >"$STATE/replaced"
+run --base ami-0x --ssm-param /p/new --firerunner-version v1.2.3
+expect "replaced after the check: fails" [ "$rc" != 0 ]
+expect "replaced after the check: nothing installed" test ! -e "$TMP/root/usr/local/bin/firerunner"
+expect "replaced after the check: nothing published" not_called "ssm put-parameter"
+
+fresh
+FIRERUNNER_SKIP_ATTESTATION=1 run --base ami-0x --ssm-param /p/new --firerunner-version v1.2.3
+expect "skip: exits 0" [ "$rc" = 0 ]
+expect "skip: says so" grep -q 'FIRERUNNER_SKIP_ATTESTATION=1: not checking' "$STATE/err"
+expect "skip: no gh" test ! -f "$STATE/gh"
+expect "skip: the release's SHA256SUMS instead" grep -q SHA256SUMS "$STATE/downloads"
 
 fresh
 run --base ami-0x --ssm-param /p/new --firerunner-version latest

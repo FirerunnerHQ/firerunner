@@ -191,10 +191,17 @@ Because the disk lasts for one job, the image favours speed over durability:
 - For a tier with `git_cache`, `firerunner-git-proxy.service` answers fresh
   fetches from cache-server. git is pointed at it only while it runs, because
   git treats a dead proxy as a failed fetch. The image takes the binary from a
-  release, checked against `SHA256SUMS`, with `--firerunner-version` choosing
-  which, or from `--firerunner-url` with `--firerunner-sha256`. A binary that
-  fails the check, or has no `git-proxy`, stays out, and the image then has no
-  git cache. The URL may be presigned: the build does not trace it, and
+  release, with `--firerunner-version` choosing which (default: the latest).
+  Before the build starts, `build-ec2-ami.sh` and `layer-ec2-ami.sh` download
+  it and check with `gh attestation verify` that firerunner's release workflow
+  built it from that tag on a GitHub-hosted runner; the release's own
+  `SHA256SUMS` proves nothing by itself. The build then installs only a
+  download with the SHA-256 that was checked. This needs `gh`, logged in (in
+  Actions, `GH_TOKEN`); `FIRERUNNER_SKIP_ATTESTATION=1` skips the check and
+  falls back to `SHA256SUMS`. Or the binary comes from `--firerunner-url` with
+  `--firerunner-sha256`, a binary you vouch for: nothing checks where it was
+  built. A binary that fails its check, or has no `git-proxy`, stays out of a
+  full build, which then has no git cache; a layer build fails. The URL may be presigned: the build does not trace it, and
   removes cloud-init's copies of its user-data and its logs before the
   snapshot. The disk blocks they used are freed, not wiped, so give such a
   URL a short expiry.

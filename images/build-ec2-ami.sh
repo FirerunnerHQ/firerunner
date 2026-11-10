@@ -30,9 +30,14 @@
 #                         pinned for the default tag; another tag is resolved
 #                         to its commit now)
 #   --firerunner-version V firerunner release for the git cache's proxy, such as
-#                         v0.1.1 (default: the latest release)
+#                         v0.1.1 (default: the latest release). This machine
+#                         checks its attestation with gh (logged in), and the
+#                         build instance checks its download against the
+#                         SHA-256 it verified; FIRERUNNER_SKIP_ATTESTATION=1
+#                         skips that, leaving the release's own SHA256SUMS
 #   --firerunner-url URL  take the binary from here instead; needs
-#                         --firerunner-sha256
+#                         --firerunner-sha256. You vouch for this binary:
+#                         nothing checks where it was built
 #   --firerunner-sha256 H the binary's SHA-256
 #   --volume-gib N        root volume size (default 40; full: 80; minimal: 20)
 #   --tag K=V             extra tag on the instance, AMI and snapshot (repeatable)
@@ -63,7 +68,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 region="" subnet="" sg="" param="" itype="" arch="x64" runner_version="" runner_sha256="" volume=""
 ri_ref_pinned="ubuntu24/20261101.360" ri_commit_pinned="add4380b0d6685806e9192c33c37359ee0aa4023"
 toolset="" ri_ref="$ri_ref_pinned" ri_commit=""
-fr_version="" fr_url="" fr_sha256=""
+fr_version="" fr_url="" fr_sha256="" fr_repo=FirerunnerHQ/firerunner
 ri_skip="configure-apt-mock.sh configure-system.sh cleanup.sh list-dpkg.sh post-build-validation.sh install-android-sdk.sh install-homebrew.sh configure-snap.sh"
 timeout_s="" render=0
 tags=()
@@ -96,7 +101,7 @@ while [ $# -gt 0 ]; do
 	--render) render=1 ;;
 	--render-assets) render=2 ;;
 	-h | --help)
-		sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*) die "unknown argument: $1 (see --help)" ;;
@@ -153,7 +158,22 @@ if [ "$render" != 2 ]; then
 	[ -z "$ri_commit" ] || [[ "$ri_commit" =~ ^[0-9a-f]{40}$ ]] || die "bad --runner-images-commit '$ri_commit'"
 fi
 [ -z "$fr_url" ] || [[ "$fr_sha256" =~ ^[0-9a-f]{64}$ ]] || die "--firerunner-url needs --firerunner-sha256"
+[ -z "$fr_sha256" ] || [ -n "$fr_url" ] || die "--firerunner-sha256 needs --firerunner-url"
 [ -z "$fr_version" ] || [[ "$fr_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "bad firerunner version '$fr_version'"
+# A release's binary runs as root on the build instance and ships in the
+# image. Its SHA256SUMS comes from the same release, so it proves nothing by
+# itself: check here that the release workflow built it from the tag, and
+# hand the build instance that tag and the SHA-256 checked.
+if [ "$render" != 2 ] && [ -z "$fr_url" ]; then
+	if [ "${FIRERUNNER_SKIP_ATTESTATION:-}" = 1 ]; then
+		log "FIRERUNNER_SKIP_ATTESTATION=1: not checking the build provenance of firerunner ${fr_version:-latest}"
+	else
+		release="$(firerunner_release "$fr_repo" "$fr_version" "firerunner_linux_$ubuntu_arch")" ||
+			die "cannot check firerunner ${fr_version:-latest}'s build provenance (FIRERUNNER_SKIP_ATTESTATION=1 skips this check)"
+		fr_version="${release% *}" fr_sha256="${release#* }"
+		log "firerunner $fr_version firerunner_linux_$ubuntu_arch sha256 $fr_sha256, built by $fr_repo's release workflow"
+	fi
+fi
 
 # strip prints an asset without its comment lines, keeping the first line: the
 # comments are for this repository, and EC2 caps compressed user-data at 16 KiB.

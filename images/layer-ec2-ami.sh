@@ -13,6 +13,11 @@
 # Usage:
 #   images/layer-ec2-ami.sh --base AMI_OR_PARAM --ssm-param NAME --firerunner-version vX.Y.Z
 #
+# Before it touches AWS, it checks with gh (logged in, e.g. GH_TOKEN) that the
+# release's binary carries an attestation from firerunner's release workflow
+# for that tag, and installs only a download with the SHA-256 it checked.
+# FIRERUNNER_SKIP_ATTESTATION=1 skips that, leaving the release's own SHA256SUMS.
+#
 # It prints the new image's details as one line of JSON, and publishes the image to
 # NAME only once it is available. On any failure nothing is published, and its
 # volume is deleted.
@@ -43,6 +48,20 @@ done
 [ -n "$base" ] || die "--base is required"
 [ -n "$param" ] || die "--ssm-param is required"
 [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "--firerunner-version must be a release tag"
+
+# The binary runs here as root and ships in the image; its release's
+# SHA256SUMS proves nothing by itself (build-ec2-ami.sh checks the same way).
+# shellcheck source=lib/verify.sh disable=SC1091
+. "$HERE/lib/verify.sh"
+sha256=""
+if [ "${FIRERUNNER_SKIP_ATTESTATION:-}" = 1 ]; then
+	log "FIRERUNNER_SKIP_ATTESTATION=1: not checking the build provenance of firerunner $version"
+else
+	release="$(firerunner_release FirerunnerHQ/firerunner "$version" firerunner_linux_amd64)" ||
+		die "cannot check firerunner $version's build provenance (FIRERUNNER_SKIP_ATTESTATION=1 skips this check)"
+	sha256="${release#* }"
+	log "firerunner $version firerunner_linux_amd64 sha256 $sha256, built by its release workflow"
+fi
 
 imds() {
 	local token
@@ -106,7 +125,7 @@ mounted=1
 
 # shellcheck source=ec2/install-firerunner.sh disable=SC1091
 . "$HERE/ec2/install-firerunner.sh"
-RUNNER_ARCH=x64 FR_VERSION="$version" FIRERUNNER_BIN="$ROOT/usr/local/bin/firerunner" install_firerunner || die "could not install firerunner $version"
+RUNNER_ARCH=x64 FR_VERSION="$version" FR_SHA256="$sha256" FR_URL="" FIRERUNNER_BIN="$ROOT/usr/local/bin/firerunner" install_firerunner || die "could not install firerunner $version"
 assets="$(mktemp -p "$ROOT/tmp")"
 "$HERE/build-ec2-ami.sh" --render-assets >"$assets"
 chroot "$ROOT" /bin/bash "${assets#"$ROOT"}"

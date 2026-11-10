@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for build-ec2-ami.sh with a fake `aws` and `curl`: no AWS account or
+# Tests for build-ec2-ami.sh with a fake `aws`, `curl` and `gh`: no AWS account or
 # network needed. The fake records every aws call and plays the build
 # instance through pending -> running -> stopped (or a scripted failure).
 set -euo pipefail
@@ -43,6 +43,13 @@ cat >"$TMP/bin/curl" <<'FAKE'
 for last; do :; done
 echo "$last" >>"$STATE/curl"
 case "$last" in
+https://github.com/FirerunnerHQ/firerunner/releases/download/*)
+	# A release's binary: its content names its tag and asset.
+	out=""
+	for a; do [ "${prev:-}" != -o ] || out="$a"; prev="$a"; done
+	echo "firerunner ${last#*/download/}" >"$out"
+	exit 0
+	;;
 */repos/actions/runner/releases/latest) v=9.9.9 ;;
 */repos/actions/runner/releases/tags/v*) v="${last##*/v}" ;;
 */repos/actions/runner-images/commits/*) printf '%040d' 7; exit 0 ;;
@@ -52,6 +59,21 @@ a="$(printf '%064d' 0 | tr 0 a)" b="$(printf '%064d' 0 | tr 0 b)"
 [ "$v" != 0.0.1 ] || a="" b=""
 printf '{\n  "tag_name": "v%s",\n  "body": "- <!-- BEGIN SHA linux-x64 -->%s<!-- END SHA linux-x64 -->\\r\\n- <!-- BEGIN SHA linux-arm64 -->%s<!-- END SHA linux-arm64 -->"\n}\n' "$v" "$a" "$b"
 FAKE
+# Fake gh: the latest firerunner release is v7.7.7 (or $STATE/latest), and
+# every binary carries an attestation unless $STATE/unattested exists.
+cat >"$TMP/bin/gh" <<'FAKE'
+#!/usr/bin/env bash
+echo "gh $*" >>"$STATE/gh"
+case "$1 $2" in
+"api repos/FirerunnerHQ/firerunner/releases/latest") cat "$STATE/latest" 2>/dev/null || echo v7.7.7 ;;
+"attestation verify")
+	[ ! -f "$STATE/unattested" ] || { echo "Error: no matching attestations found" >&2; exit 1; }
+	;;
+*) exit 1 ;;
+esac
+FAKE
+# fr_sum TAG ASSET: the SHA-256 of the fake curl's binary.
+fr_sum() { printf 'firerunner %s/%s\n' "$1" "$2" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1; }
 A64="$(printf '%064d' 0 | tr 0 a)"
 B64="$(printf '%064d' 0 | tr 0 b)"
 cat >"$TMP/bin/sleep" <<'FAKE'
@@ -119,6 +141,58 @@ expect "user-data installs the cache proxy, inactive" "" \
 	bash -c "grep -q 'install_cache_proxy\$' '$STATE/user-data' && grep -q 'systemctl disable nginx.service' '$STATE/user-data' && grep -q '^upstream cache_backend\|server __UPSTREAM__;' '$STATE/user-data'"
 # shellcheck disable=SC2016 # a literal $node in the user-data
 expect "user-data wraps every bundled node" "" grep -q 'install -m 0755 /usr/local/libexec/nodewrap "\$node"' "$STATE/user-data"
+
+# 1b. The latest firerunner release, checked here: the build instance gets its
+# tag and the SHA-256 whose attestation checked out, not the release's own
+# SHA256SUMS.
+fresh fr-attested
+build
+expect "attested: exit 0" "$(cat "$STATE/err")" [ "$(cat "$STATE/rc")" = 0 ]
+expect "attested: latest resolved to its tag" "" grep -q '^FR_VERSION=v7.7.7$' "$STATE/user-data"
+expect "attested: the checked SHA-256 reaches the build" "$(grep ^FR_ "$STATE/user-data")" \
+	grep -q "^FR_SHA256=$(fr_sum v7.7.7 firerunner_linux_amd64)\$" "$STATE/user-data"
+expect "attested: by the release workflow, for the tag, on GitHub's runners" "$(cat "$STATE/gh" 2>/dev/null)" \
+	grep -q 'gh attestation verify .*/firerunner_linux_amd64 --repo FirerunnerHQ/firerunner --signer-workflow FirerunnerHQ/firerunner/.github/workflows/release.yml --source-ref refs/tags/v7.7.7 --deny-self-hosted-runners$' "$STATE/gh"
+expect "attested: logged" "" grep -q 'firerunner v7.7.7 firerunner_linux_amd64 sha256 ' "$STATE/err"
+fresh fr-attested-version
+PATH="$TMP/bin:$PATH" "$BUILD" --render --runner-version 1.2.3 --arch arm64 --firerunner-version v0.1.1 >"$STATE/out"
+expect "a named version: not resolved" "" bash -c "! grep -q 'gh api' '$STATE/gh'"
+expect "a named version: its arm64 binary checked" "$(cat "$STATE/gh")" grep -q 'firerunner_linux_arm64 .*--source-ref refs/tags/v0.1.1 ' "$STATE/gh"
+expect "a named version: its SHA-256 reaches the build" "" grep -q "^FR_SHA256=$(fr_sum v0.1.1 firerunner_linux_arm64)\$" "$STATE/out"
+
+# A binary without the attestation stops the build before any AWS call.
+fresh fr-unattested
+: >"$STATE/unattested"
+build
+expect "unattested: refused" "$(cat "$STATE/err")" [ "$(cat "$STATE/rc")" = 2 ]
+expect "unattested: no AWS" "$(cat "$STATE/calls" 2>/dev/null)" not_called "ec2"
+expect "unattested: says why, and how to skip" "$(cat "$STATE/err")" \
+	bash -c "grep -q 'no attestation that FirerunnerHQ/firerunner.s release workflow built it for v7.7.7' '$STATE/err' && grep -q 'FIRERUNNER_SKIP_ATTESTATION=1 skips' '$STATE/err'"
+fresh fr-bad-latest
+echo 'v1.0.0; rm -rf /' >"$STATE/latest"
+build
+expect "a latest release that is no tag: refused" "$(cat "$STATE/err")" [ "$(cat "$STATE/rc")" = 2 ]
+expect "a latest release that is no tag: no AWS" "" not_called "ec2"
+
+# Skipping the check leaves the release's SHA256SUMS to the build instance.
+fresh fr-skip
+FIRERUNNER_SKIP_ATTESTATION=1 build
+expect "skip: exit 0" "$(cat "$STATE/err")" [ "$(cat "$STATE/rc")" = 0 ]
+expect "skip: says so" "" grep -q 'FIRERUNNER_SKIP_ATTESTATION=1: not checking the build provenance of firerunner latest' "$STATE/err"
+expect "skip: no gh" "" test ! -f "$STATE/gh"
+expect "skip: no SHA-256 for the release" "" grep -q "^FR_SHA256=''\$" "$STATE/user-data"
+
+# An operator's binary from a URL comes with its hash, and is the operator's
+# to vouch for: nothing is checked here.
+fresh fr-url-vouched
+build --firerunner-url https://x.test/fr --firerunner-sha256 "$A64"
+expect "url: exit 0" "$(cat "$STATE/err")" [ "$(cat "$STATE/rc")" = 0 ]
+expect "url: no gh" "" test ! -f "$STATE/gh"
+expect "url: the given hash reaches the build" "" grep -q "^FR_SHA256=$A64\$" "$STATE/user-data"
+fresh fr-sha-alone
+build --firerunner-version v0.1.1 --firerunner-sha256 "$A64"
+expect "a hash without a URL: refused" "$(cat "$STATE/err")" grep -q -- '--firerunner-sha256 needs --firerunner-url' "$STATE/err"
+expect "a hash without a URL: no AWS" "" not_called "ec2"
 
 # 2. The build instance dies instead of stopping: no image, no publish, and
 # the instance is still terminated.
