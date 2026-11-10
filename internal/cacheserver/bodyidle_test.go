@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -143,6 +145,72 @@ func TestBodyIdleDefault(t *testing.T) {
 	}
 }
 
+// smallBufferServer serves h with a 4 KiB send buffer on each connection, so
+// whether a response blocks does not depend on the host's TCP buffer sizes.
+func smallBufferServer(h http.Handler) *httptest.Server {
+	ts := httptest.NewUnstartedServer(h)
+	ts.Listener = smallSendListener{ts.Listener}
+	ts.Start()
+	return ts
+}
+
+type smallSendListener struct{ net.Listener }
+
+func (l smallSendListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetWriteBuffer(4096)
+	}
+	return c, err
+}
+
+// chunkRecorder is a ResponseWriter that can ReadFrom, recording each chunk it
+// is handed: its size, and whether it reads straight from an *os.File, which
+// is what keeps net/http on sendfile.
+type chunkRecorder struct {
+	httptest.ResponseRecorder
+	sizes  []int64
+	onFile []bool
+}
+
+func (c *chunkRecorder) ReadFrom(r io.Reader) (int64, error) {
+	lr, ok := r.(*io.LimitedReader)
+	_, file := lr.R.(*os.File)
+	c.sizes, c.onFile = append(c.sizes, lr.N), append(c.onFile, ok && file)
+	return io.Copy(&c.ResponseRecorder, r)
+}
+
+// ReadFrom hands a file over in idle-bound chunks, each straight from the file,
+// as http.ServeContent's io.CopyN does, and leaves the outer limit settled.
+func TestIdleWriterReadFromKeepsSendfile(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "blob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const size = 2*idleChunk + 100
+	if _, err := f.Write(make([]byte, size+50)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	rec := &chunkRecorder{ResponseRecorder: *httptest.NewRecorder()}
+	w := &idleWriter{ResponseWriter: rec, rc: http.NewResponseController(rec), idle: time.Minute}
+	src := &io.LimitedReader{R: f, N: size}
+	n, err := w.ReadFrom(src)
+	if err != nil || n != size || src.N != 0 || rec.Body.Len() != size {
+		t.Fatalf("copied %d (body %d), err %v, limit left %d; want %d, nil, 0", n, rec.Body.Len(), err, src.N, size)
+	}
+	if want := []int64{idleChunk, idleChunk, 100}; !slices.Equal(rec.sizes, want) {
+		t.Fatalf("chunks %v, want %v", rec.sizes, want)
+	}
+	for i, ok := range rec.onFile {
+		if !ok {
+			t.Fatalf("chunk %d does not read from the file itself; sendfile would be lost", i)
+		}
+	}
+}
+
 // smallBufferClient reads through a 4 KiB receive buffer, so a server writing
 // a large body blocks on the socket soon after the client stops reading.
 func smallBufferClient() *http.Client {
@@ -201,7 +269,7 @@ func TestDownloadIdleBound(t *testing.T) {
 				t.Fatal(err)
 			}
 			s.SetBodyIdle(200 * time.Millisecond)
-			ts := httptest.NewServer(s)
+			ts := smallBufferServer(s)
 			defer ts.Close()
 			url := bigEntryURL(t, ts.URL, size)
 			resp, err := smallBufferClient().Get(url)
@@ -228,7 +296,9 @@ func TestDownloadIdleBoundEndsWithTheRequest(t *testing.T) {
 	s.SetBodyIdle(100 * time.Millisecond)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
-	url := bigEntryURL(t, ts.URL, 1024)
+	// Two chunks' worth, so the GET certainly leaves a write deadline behind.
+	const size = 2 * idleChunk
+	url := bigEntryURL(t, ts.URL, size)
 	client := &http.Client{}
 	reused := false
 	// The second is a HEAD: its response writes no body, so nothing would push
@@ -242,7 +312,7 @@ func TestDownloadIdleBoundEndsWithTheRequest(t *testing.T) {
 		}
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		want := 1024
+		want := size
 		if method == http.MethodHead {
 			want = 0
 		}

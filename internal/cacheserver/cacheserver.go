@@ -334,6 +334,45 @@ func (w *idleWriter) Write(p []byte) (int, error) {
 // Unwrap lets http.ResponseController reach the connection's own writer.
 func (w *idleWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
+// idleChunk is how much ReadFrom hands to the connection under one deadline.
+// A client must take this much within the idle bound to count as reading:
+// 1 MiB a minute, by default.
+const idleChunk = 1 << 20
+
+// ReadFrom keeps a file's download on sendfile, which a plain wrapper would
+// lose, a chunk at a time with a fresh deadline before each: one deadline over
+// the whole copy would cut a download that legitimately takes longer.
+// http.ServeContent hands it its file inside an io.LimitedReader; net's
+// sendfile sees through only one, so the chunks wrap the file itself.
+func (w *idleWriter) ReadFrom(src io.Reader) (int64, error) {
+	rf, ok := w.ResponseWriter.(io.ReaderFrom)
+	if !ok {
+		return io.Copy(struct{ io.Writer }{w}, src)
+	}
+	inner, limit := src, int64(-1)
+	if lr, ok := src.(*io.LimitedReader); ok {
+		inner, limit = lr.R, lr.N
+		defer func() { lr.N = limit }()
+	}
+	var total int64
+	for limit != 0 {
+		want := int64(idleChunk)
+		if limit > 0 {
+			want = min(want, limit)
+		}
+		_ = w.rc.SetWriteDeadline(time.Now().Add(w.idle))
+		n, err := rf.ReadFrom(&io.LimitedReader{R: inner, N: want})
+		total += n
+		if limit > 0 {
+			limit -= n
+		}
+		if err != nil || n < want {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
 // Connection caps for the cache server's listener (cmd/firerunner): one job
 // opens a few at a time, a handful of parallel range reads for a download
 // at most; the rest only hold descriptors and goroutines.

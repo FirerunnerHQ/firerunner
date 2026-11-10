@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -268,5 +269,37 @@ func TestRefusedTCPConnectionGetsNoResponse(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || string(body) != "the-config" {
 		t.Fatalf("held fetch = %d %q, want 200 with its config", resp.StatusCode, body)
+	}
+}
+
+// An accepted connection still exposes the TCP connection's ReadFrom, which
+// net/http needs to stream a file's response by sendfile.
+func TestLimitedConnKeepsReadFrom(t *testing.T) {
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := LimitListener(tcp, 1, 1)
+	defer ln.Close()
+	client, err := net.Dial("tcp", tcp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	c, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	rf, ok := c.(io.ReaderFrom)
+	if !ok {
+		t.Fatal("the accepted connection hides ReadFrom")
+	}
+	if n, err := rf.ReadFrom(strings.NewReader("hello")); n != 5 || err != nil {
+		t.Fatalf("ReadFrom = %d, %v", n, err)
+	}
+	got := make([]byte, 5)
+	if _, err := io.ReadFull(client, got); err != nil || string(got) != "hello" {
+		t.Fatalf("client read %q, %v", got, err)
 	}
 }

@@ -1398,7 +1398,8 @@ A request body that sends nothing for `--body-idle-timeout` (default 60s;
 `0` for no bound) fails as an incomplete upload and ends its connection, and
 a response the client stops reading for as long, a download above all, ends
 its connection too; a transfer that keeps moving is never cut, however long
-it takes. One address may hold at most 64 connections to the cache server,
+it takes. A download goes out a megabyte at a time under the bound, so a
+client must read one within it (1 MiB a minute by default). One address may hold at most 64 connections to the cache server,
 and all of them together 4096.
 
 The cache is a pure accelerator — every job still passes with caching disabled,
