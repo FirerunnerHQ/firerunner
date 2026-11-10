@@ -8,6 +8,66 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-10
+
+### Added
+
+- `cache-server --body-idle-timeout` (default 60s) ends a request whose body
+  sends nothing for that long. A steady upload is never cut.
+
+### Changed
+
+- `build-image` runs on manual dispatch only. Its monthly schedule waited a day
+  for a `[self-hosted, kvm]` runner and was cancelled; run it, or add a
+  schedule, where such a runner serves your copy.
+
+### Fixed
+
+- The `build-image` workflow's tool-cache job now builds a drive (Node, Go,
+  Python and CodeQL by default, set with the `toolcache_tools` input); it
+  passed no tools and always failed.
+- The image builders write a new image beside `--out` and rename it into place
+  only when it is complete, so a failed rebuild keeps the previous image instead
+  of leaving a half-built one where firerunner boots from. `build-rootfs.sh`
+  checks its downloads before bootstrapping, so a bad download fails in seconds.
+- `build-toolcache.sh --python 3.12` picks the newest stable 3.12 release.
+  It compared versions as text, so 3.12.9 beat 3.12.16, and an old release
+  without a GitHub checksum then failed the build.
+
+### Security
+
+- The image builders believe a Node.js release's `SHASUMS256.txt` only when its
+  signature checks out against a Node.js release key kept in
+  `images/keys/`, and print which key signed it. Before, a checksum file
+  from the same server as the tarball could not catch a compromised server.
+  Building Node unpinned now needs `gpg` and `gpgv` on the build host;
+  `images/keys/update-nodejs-keys.sh` refreshes the keys when a new releaser
+  joins.
+- `images/build-rootfs.sh` checks the `actions/runner` tarball against the
+  SHA-256 in its GitHub release notes, and Node.js against the release's
+  `SHASUMS256.txt`, before using them; a mismatch fails the build. It prints
+  the version and checksums it used and keeps them in the image at
+  `/etc/firerunner/downloads.sha256`. `--runner-sha256` and `--node-sha256`
+  pin the checksums.
+- `images/build-ubuntu-rootfs.sh` checks the same downloads, and Microsoft's
+  `packages-microsoft-prod.deb` against a pinned SHA-256 (`--pmc-sha256`),
+  on the host before the image build copies them in. `--toolset full` fetches
+  actions/runner-images at a commit instead of a tag that can move: the
+  default tag comes with its pinned commit, another `--runner-images-ref` is
+  resolved to one and printed, and `--runner-images-commit` pins it.
+- `images/build-toolcache.sh` checks Node.js against `SHASUMS256.txt`, Go
+  against the go.dev download index, and Python and CodeQL against the
+  SHA-256 the GitHub API reports for the release asset. `--checksums FILE`
+  pins them, and each drive records its checksums in `/downloads.sha256`.
+  `--go` and `--python` now need `jq`.
+- `images/build-ec2-ami.sh` reads the runner's SHA-256 from its release
+  notes (or `--runner-sha256`) before launching the build instance, which
+  checks the download against it. runner-images is fetched at a commit:
+  pinned for the default `--runner-images-ref`, resolved and printed for
+  another, or given with `--runner-images-commit`. PowerShell modules are
+  checked against the SHA-512 the PowerShell Gallery lists. A failed check
+  fails the build, and the JSON output adds `runner_sha256`.
+
 ## [0.1.9] - 2026-11-09
 
 ### Added
@@ -255,7 +315,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.10
 [0.1.9]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.9
 [0.1.8]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.8
 [0.1.7]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.7
