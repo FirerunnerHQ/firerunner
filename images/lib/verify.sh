@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # verify.sh — checks what the image builders download before they use it.
-# build-rootfs.sh, build-ubuntu-rootfs.sh and build-toolcache.sh source it.
+# build-rootfs.sh, build-ubuntu-rootfs.sh, build-toolcache.sh, build-ec2-ami.sh
+# and layer-ec2-ami.sh source it.
 #
 # Every archive a builder executes or bakes into an image is checked against a
 # SHA-256 that is pinned, or read from a source other than the download itself:
@@ -11,6 +12,7 @@
 #   Go               the go.dev download index (?mode=json)
 #   GitHub releases  the asset's digest in the GitHub API (python-versions,
 #                    the CodeQL bundle)
+#   firerunner       its release workflow's attestation (gh attestation verify)
 # and a git repository is fetched at a commit SHA, with git, which hashes each
 # object it receives. Each function prints an error saying what failed and returns non-zero; the
 # callers stop on that.
@@ -82,6 +84,39 @@ runner_release() {
 		sed -n "s/.*<!-- BEGIN SHA $2 -->\([0-9a-f]\{64\}\)<!-- END SHA $2 -->.*/\1/p" | head -n 1)"
 	[[ -n "$sha" ]] ||
 		verify_error "actions/runner v$version: its release notes carry no SHA-256 for $2; pass --runner-sha256" || return
+	echo "$version $sha"
+}
+
+# firerunner_release REPO VERSION NAME prints "VERSION SHA256" for the release
+# asset NAME (firerunner_linux_amd64) of REPO's VERSION, or of its latest
+# release when VERSION is empty, once gh attestation verify shows that REPO's
+# release workflow built it from that tag on a GitHub-hosted runner. The
+# SHA256SUMS beside it comes from the same release, so it proves nothing by
+# itself; deploy-control.sh checks the same way. Needs gh, logged in.
+firerunner_release() {
+	local repo="$1" version="$2" name="$3" dir sha
+	command -v gh >/dev/null ||
+		verify_error "checking firerunner's build provenance needs gh (gh attestation verify)" || return
+	if [[ -z "$version" ]]; then
+		version="$(gh api "repos/$repo/releases/latest" --jq .tag_name)" ||
+			verify_error "could not resolve $repo's latest release" || return
+	fi
+	[[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
+		verify_error "$repo's release '$version' is not a version tag" || return
+	dir="$(mktemp -d)" || verify_error "could not make a temporary directory" || return
+	if ! curl -fsSL --retry 3 -o "$dir/$name" "$GITHUB_GIT/$repo/releases/download/$version/$name"; then
+		rm -rf "$dir"
+		verify_error "could not download $name of $repo $version" || return
+	fi
+	if ! gh attestation verify "$dir/$name" --repo "$repo" \
+		--signer-workflow "$repo/.github/workflows/release.yml" \
+		--source-ref "refs/tags/$version" --deny-self-hosted-runners >/dev/null 2>"$dir/err"; then
+		sed '/^$/d; s/^/  /' "$dir/err" >&2
+		rm -rf "$dir"
+		verify_error "$name: no attestation that $repo's release workflow built it for $version" || return
+	fi
+	sha="$(sha256_of "$dir/$name")"
+	rm -rf "$dir"
 	echo "$version $sha"
 }
 

@@ -117,6 +117,20 @@ sums
 run
 pass "a release without git-proxy: not installed" absent
 
+# A release with the SHA-256 the builder checked against its attestation:
+# held to that, never to the release's own SHA256SUMS.
+fresh
+right="$(sha256sum "$STATE/remote/firerunner_linux_amd64" | cut -d' ' -f1)"
+FR_VERSION=v0.1.1 FR_SHA256="$right" run
+pass "a release with its checked hash: installs" installed
+pass "a release with its checked hash: reads no SHA256SUMS" not_grep SHA256SUMS "$STATE/urls"
+
+fresh
+printf '%s\n# replaced\n' "$good" >"$STATE/remote/firerunner_linux_amd64"
+sums
+FR_VERSION=v0.1.1 FR_SHA256="$right" run
+pass "a release replaced after its check, SHA256SUMS and all: not installed" absent
+
 fresh
 right="$(sha256sum "$STATE/remote/firerunner_linux_amd64" | cut -d' ' -f1)"
 FR_URL=https://x.test/firerunner_linux_amd64 FR_SHA256="$right" run

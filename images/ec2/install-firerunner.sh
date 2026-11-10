@@ -43,6 +43,12 @@ fetch_firerunner() {
 	base="$FIRERUNNER_RELEASES/latest/download"
 	[ -z "${FR_VERSION:-}" ] || base="$FIRERUNNER_RELEASES/download/$FR_VERSION"
 	curl -fsSL --retry 3 -o "$dir/$name" "$base/$name" || return 1
+	# The SHA-256 the builder checked against the release's attestation; the
+	# release's own SHA256SUMS only when it was told to skip that check.
+	if [ -n "${FR_SHA256:-}" ]; then
+		echo "$FR_SHA256  $dir/$name" | sha256sum -c - >/dev/null || return 1
+		return 0
+	fi
 	curl -fsSL --retry 3 -o "$dir/SHA256SUMS" "$base/SHA256SUMS" || return 1
 	(cd "$dir" && grep " $name\$" SHA256SUMS | sha256sum -c - >/dev/null) || return 1
 }

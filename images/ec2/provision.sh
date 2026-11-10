@@ -28,6 +28,8 @@
 #                   use), full (nearly all of them) or minimal (Docker, git)
 #   FR_VERSION      firerunner release for the git cache's proxy; empty means
 #                   the latest
+#   FR_SHA256       the binary's SHA-256, which the builder checked against
+#                   the release's attestation; empty: the release's SHA256SUMS
 #   FR_URL          take the binary from here instead, checked against FR_SHA256
 set -euxo pipefail
 
