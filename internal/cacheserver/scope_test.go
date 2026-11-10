@@ -890,3 +890,77 @@ func TestIdentityNeedsNoWaiterSlotUnlessItWaits(t *testing.T) {
 		t.Fatalf("a pending identity past its deadline with no waiter slots: %q, want %q", reason, denyPending)
 	}
 }
+
+// hitAged saves an entry, ages its UsedAt on disk, restores it once, and
+// returns the index as it was written before the hit.
+func hitAged(t *testing.T, l *scopeLab) []byte {
+	t.Helper()
+	b := l.guest(t, "172.16.0.2", mainRef, "seed")
+	l.save(t, b, "deps", "DEFAULT")
+	l.s.mu.Lock()
+	for _, e := range l.s.entries {
+		e.UsedAt = 1
+	}
+	if err := l.s.save(); err != nil {
+		t.Fatal(err)
+	}
+	l.s.mu.Unlock()
+	before, err := os.ReadFile(l.s.indexPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := restore(t, b, "deps"); got != "DEFAULT" {
+		t.Fatalf("restore: %q", got)
+	}
+	return before
+}
+
+// usedOnDisk reports whether the index on disk records a UsedAt past 1.
+func usedOnDisk(t *testing.T, l *scopeLab) bool {
+	t.Helper()
+	data, err := os.ReadFile(l.s.indexPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []Entry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatal(err)
+	}
+	return len(entries) == 1 && entries[0].UsedAt > 1
+}
+
+// A hit moves UsedAt in memory without rewriting the whole index under the
+// lock; flushUsed writes it.
+func TestHitDefersIndexWrite(t *testing.T) {
+	l := newScopeLab(t)
+	before := hitAged(t, l)
+	after, err := os.ReadFile(l.s.indexPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("a hit rewrote the index")
+	}
+	l.s.flushUsed()
+	if !usedOnDisk(t, l) {
+		t.Fatal("flushUsed did not write the hit's UsedAt")
+	}
+	l.s.mu.Lock()
+	dirty := l.s.usedDirty
+	l.s.mu.Unlock()
+	if dirty {
+		t.Fatal("still dirty after a save")
+	}
+}
+
+// Stopping the janitor, as the daemon does on shutdown, writes a pending
+// UsedAt before it returns.
+func TestJanitorStopFlushesUsed(t *testing.T) {
+	l := newScopeLab(t)
+	stop := l.s.StartJanitor()
+	hitAged(t, l)
+	stop()
+	if !usedOnDisk(t, l) {
+		t.Fatal("stopping the janitor left a hit's UsedAt unwritten")
+	}
+}
