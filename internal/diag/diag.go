@@ -353,6 +353,13 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			if st.ArtifactRPCs > 0 || st.ArtifactErrors > 0 {
 				fmt.Fprintf(tw, "\t%d artifact rpcs forwarded upstream, %d errors\n", st.ArtifactRPCs, st.ArtifactErrors)
 			}
+			if st.ConnRefused > 0 {
+				fmt.Fprintf(tw, "\t%s, the latest %s\n", refusalCounts(st.ConnRefused, st.ConnRefusedByCap), sinceText(st.ConnRefusedLast))
+			}
+			if st.IdleCuts > 0 {
+				fmt.Fprintf(tw, "\t%d transfer(s) cut by --body-idle-timeout (%d request bodies stalled, %d responses unread), the latest %s\n",
+					st.IdleCuts, st.IdleCutsByDirection["request"], st.IdleCutsByDirection["response"], sinceText(st.IdleCutLast))
+			}
 		}
 	} else {
 		fmt.Fprintf(tw, "dep cache\t(none; jobs use GitHub's hosted cache)\n")
@@ -466,6 +473,9 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				fmt.Fprintf(w, "  last refresh failed %s ago: %s\n", humanDuration(time.Since(cc.LastErrorAt).Truncate(time.Second)), truncate(cc.LastError, 200))
 			}
 		}
+		if jr := l.JITRefused; jr != nil && jr.Total() > 0 {
+			fmt.Fprintf(w, "\nJIT endpoint: %s, the latest %s\n", refusalCounts(jr.Total(), jr.ByCap), sinceText(jr.Last))
+		}
 		var backingOff []health.Breaker
 		for _, b := range l.EC2Breakers {
 			if time.Until(b.Until) > 0 { // the file is up to healthInterval old
@@ -561,6 +571,9 @@ func runDoctor(cfg *config.Config, version string, extra ...Check) DoctorReport 
 	// Self-hosted dependency cache (only when configured).
 	if c := cacheCheck(fc); c != nil {
 		checks = append(checks, *c)
+		if st := fetchCacheStats(fc); st != nil {
+			checks = append(checks, refusalCheck("dep-cache-conns", "cache-server", st.ConnRefused, st.ConnRefusedByCap, st.ConnRefusedLast, time.Now()))
+		}
 	}
 
 	if c := ec2PoolKeyCheck(cfg); c != nil {
@@ -569,6 +582,9 @@ func runDoctor(cfg *config.Config, version string, extra ...Check) DoctorReport 
 	checks = append(checks, extra...)
 	checks = append(checks, listenerChecks(fc, time.Now())...)
 	if c := cacheCredentialsCheck(cfg, time.Now()); c != nil {
+		checks = append(checks, *c)
+	}
+	if c := jitRefusalCheck(fc, time.Now()); c != nil {
 		checks = append(checks, *c)
 	}
 
@@ -745,6 +761,49 @@ func cacheCredentialsCheck(cfg *config.Config, now time.Time) *Check {
 	}
 	c := pass(name, "%s valid until %s (%s left)", path, creds.Expires.Format(time.RFC3339), humanDuration(left))
 	return &c
+}
+
+// recentRefusal is how long after a connection refused at a listener's caps
+// doctor still warns about it. The counts run from the server's start, so
+// only the latest refusal's time tells a current problem from an old one.
+const recentRefusal = time.Hour
+
+// refusalCheck judges a listener's refusals at its connection caps: WARN
+// when the latest was within recentRefusal, since each is a failed request
+// for a guest, and PASS otherwise.
+func refusalCheck(name, server string, total uint64, byCap map[string]uint64, last, now time.Time) Check {
+	// A zero last, before any refusal, is long ago.
+	if now.Sub(last) < recentRefusal {
+		return warn(name, "%s %s, the latest %s ago: a guest holds too many connections, or too many guests share it; each refusal fails a request",
+			server, refusalCounts(total, byCap), humanDuration(now.Sub(last).Truncate(time.Second)))
+	}
+	return pass(name, "%s refused no connection at its caps in the last %s (%d since it started)", server, humanDuration(recentRefusal), total)
+}
+
+// jitRefusalCheck judges the JIT endpoint's refusals from the daemon's state
+// file; nil when it serves none, or the file is missing or stale.
+func jitRefusalCheck(fc provisioner.FirecrackerConfig, now time.Time) *Check {
+	li, err := readListeners(fc, now)
+	if err != nil || li.Stale || li.JITRefused == nil {
+		return nil
+	}
+	jr := li.JITRefused
+	c := refusalCheck("jit-conns", "the JIT endpoint", jr.Total(), jr.ByCap, jr.Last, now)
+	return &c
+}
+
+// refusalCounts renders refusals by cap.
+func refusalCounts(total uint64, byCap map[string]uint64) string {
+	return fmt.Sprintf("refused %d connection(s) at its caps (%d per-source, %d total)", total, byCap["per_source"], byCap["total"])
+}
+
+// sinceText renders how long ago t was, or "at an unknown time" when it is
+// zero.
+func sinceText(t time.Time) string {
+	if t.IsZero() {
+		return "at an unknown time"
+	}
+	return humanDuration(time.Since(t).Truncate(time.Second)) + " ago"
 }
 
 // truncate shortens s to at most n runes, marking the cut.
