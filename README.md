@@ -216,8 +216,9 @@ operator raises them per installation, and 0 lifts one:
 ```
 
 - **Runners** count across the installation's tiers. A job past the limit
-  waits in GitHub's queue, and `firerunner status` shows the tier as `HELD`
-  with the reason; the log and the job events record it as `held`.
+  is still assigned to its tier and waits there for a runner, and `firerunner
+  status` shows the tier as `HELD` with the reason; the log and the job events
+  record it as `held`. Tiers with jobs held take the places that free in turn.
 - **vCPUs:** a tier above the limit is not served to that installation, and
   the log and `firerunner config check` warn of it. A tier's vCPUs are its
   largest instance type's, read from the type's size (`large` 2, `xlarge` 4,
@@ -252,7 +253,8 @@ resume. A suspension holds across restarts until it is lifted. While the states
 cannot be read, the last ones read stay in force, and `firerunner doctor`
 warns; until a first read succeeds, the installations in the tenants file are
 held. `_install` names the install's own tiers, which are never held for an
-unread state.
+unread state; suspending it leaves a stopped EC2 pool stopped, but does not
+shrink it (a tenant keeps no pool).
 
 What it does not separate: the daemon itself, which holds every installation's
 App access and signs for them all, and the account's API limits and quotas.
