@@ -75,7 +75,7 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open func(spec string) (
 	default:
 		return usageErr("firerunner tenant: unknown action %q", action)
 	}
-	spec, reason, asJSON := os.Getenv("FR_TENANT_STATE"), "", false
+	spec, reason, asJSON, reasonSet := os.Getenv("FR_TENANT_STATE"), "", false, false
 	var ids []string
 	rest := args[1:]
 	for i := 0; i < len(rest); i++ {
@@ -86,6 +86,9 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open func(spec string) (
 			fmt.Fprint(stdout, tenantUsage)
 			return 0
 		case "--json", "-json":
+			if hasVal && val != "true" {
+				return usageErr("--json takes no value")
+			}
 			asJSON = true
 			continue
 		case "--state", "-state", "--reason", "-reason":
@@ -99,7 +102,7 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open func(spec string) (
 			if strings.HasSuffix(name, "state") {
 				spec = val
 			} else {
-				reason = val
+				reason, reasonSet = val, true
 			}
 			continue
 		}
@@ -117,7 +120,7 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open func(spec string) (
 		return usageErr("%q is not a tenant id: lowercase letters, digits and hyphens, or %s for the install's own tiers", ids[0], tenantstate.Install)
 	case action == "suspend" && strings.TrimSpace(reason) == "":
 		return usageErr("firerunner tenant suspend: --reason is required; it is recorded, and shown in firerunner status")
-	case action != "suspend" && reason != "":
+	case action != "suspend" && reasonSet:
 		return usageErr("--reason is for suspend")
 	case spec == "":
 		return usageErr("no tenant state store: pass --state, or set FR_TENANT_STATE as the daemon's")

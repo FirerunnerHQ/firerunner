@@ -652,7 +652,11 @@ func tierPending(t config.Tier, shared *scheduler.PendingLaunches) *scheduler.Pe
 // tenantstate.DefaultInterval until ctx ends, applying each change to the
 // tenants served. A first read that fails is logged; the catalog's tenants
 // are held until one succeeds.
-func (s *shard) watchStates(ctx context.Context, cfg *config.Config, live *liveTenants, log *slog.Logger) (*tenantstate.Watcher, error) {
+//
+// It sets s.states before the first read, and has live apply the states to
+// each tenant as it is served too: a suspension written while a tenant starts
+// is no change by the time it is served.
+func (s *shard) watchStates(ctx context.Context, cfg *config.Config, live *liveTenants, log *slog.Logger) error {
 	store, err := tenantstate.Open(cfg.TenantState, func() (tenantstate.SSMAPI, error) {
 		awsCfg, err := loadAWSConfig(ctx, cfg)
 		if err != nil {
@@ -661,7 +665,7 @@ func (s *shard) watchStates(ctx context.Context, cfg *config.Config, live *liveT
 		return awsssm.NewFromConfig(awsCfg), nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("--tenant-state: %w", err)
+		return fmt.Errorf("--tenant-state: %w", err)
 	}
 	wlog := log.With("component", "tenant-state")
 	w := &tenantstate.Watcher{Store: store, Interval: tenantstate.DefaultInterval, Log: wlog}
@@ -670,11 +674,15 @@ func (s *shard) watchStates(ctx context.Context, cfg *config.Config, live *liveT
 			s.applyState(id, bound, wlog)
 		}
 	}
+	s.states = w
+	live.mu.Lock()
+	live.onAdd = func(st *servedTenant) { s.applyState(st.t.ID, st.bound, wlog) }
+	live.mu.Unlock()
 	if err := w.Read(ctx); err != nil {
 		wlog.Error("tenant states not read; the catalog's tenants are held until they are", "store", store.String(), "err", err)
 	}
 	go w.Run(ctx)
-	return w, nil
+	return nil
 }
 
 // healthTenantStates is the tenant states' reading for the health file.
@@ -1114,7 +1122,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// every tenantstate.DefaultInterval.
 	live := &liveTenants{}
 	if cfg.TenantState != "" {
-		if s.states, err = s.watchStates(ctx, cfg, live, log); err != nil {
+		if err := s.watchStates(ctx, cfg, live, log); err != nil {
 			return err
 		}
 	}

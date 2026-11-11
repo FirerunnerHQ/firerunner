@@ -77,6 +77,8 @@ func TestTenantCommandUsage(t *testing.T) {
 		{[]string{"list", "acme", "--state", path}, "takes no id"},
 		{[]string{"list", "--state"}, "--state needs a value"},
 		{[]string{"list", "--force", "--state", path}, "unknown flag"},
+		{[]string{"list", "--json=false", "--state", path}, "--json takes no value"},
+		{[]string{"resume", "acme", "--reason=", "--state", path}, "--reason is for suspend"},
 	} {
 		code, out, errOut := runTenant(t, c.args...)
 		if code != 2 || !strings.Contains(errOut, c.want) || out != "" {
@@ -174,11 +176,10 @@ func TestWatchStatesAppliesASuspensionAtTheNextRead(t *testing.T) {
 	live := &liveTenants{}
 	acme := &servedTenant{t: tenant{ID: "acme"}, bound: scheduler.NewTenant("acme", 0)}
 	live.add(acme)
-	w, err := s.watchStates(ctx, &config.Config{TenantState: path}, live, s.log)
-	if err != nil {
+	if err := s.watchStates(ctx, &config.Config{TenantState: path}, live, s.log); err != nil {
 		t.Fatal(err)
 	}
-	s.states = w
+	w := s.states
 	if susp, _ := acme.bound.State(); susp {
 		t.Fatal("suspended before any suspension")
 	}
@@ -219,6 +220,35 @@ func TestTenantStartsInItsState(t *testing.T) {
 	ro := s.tenantReaperOptions(acme, nil, s.log)
 	if ro.Suspended == nil || ro.Suspended() != "abuse" || ro.MaxLifetime != 45*time.Minute || ro.Owner != "o/acme" {
 		t.Fatalf("reaper options = %+v", ro)
+	}
+}
+
+// A suspension written while a tenant starts, after its bound read the
+// states and before it is served, reaches it once it is served: the read in
+// between saw a change, but applied it only to the tenants served then.
+func TestSuspensionWhileATenantStarts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "tenant-state.json")
+	s := &shard{log: slog.New(slog.DiscardHandler), cfg: &config.Config{}}
+	live := &liveTenants{}
+	if err := s.watchStates(ctx, &config.Config{TenantState: path}, live, s.log); err != nil {
+		t.Fatal(err)
+	}
+	acme := tenant{ID: "acme"}
+	st := &servedTenant{t: acme, bound: s.newBound(acme, s.log)} // starting
+	if code, _, _ := runTenant(t, "suspend", "acme", "--reason", "abuse", "--state", path); code != 0 {
+		t.Fatal("suspend failed")
+	}
+	if err := s.states.Read(ctx); err != nil { // the change, while acme is not served yet
+		t.Fatal(err)
+	}
+	if susp, _ := st.bound.State(); susp {
+		t.Fatal("the test needs the read to miss the starting tenant")
+	}
+	live.add(st)
+	if susp, why := st.bound.State(); !susp || !strings.Contains(why, "abuse") {
+		t.Fatalf("served without its suspension: %v %q", susp, why)
 	}
 }
 

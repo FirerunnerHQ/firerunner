@@ -506,6 +506,10 @@ type liveTenants struct {
 	waiting map[string]*health.Tracker
 	// skipped are tenants never started: no tier is within their limits.
 	skipped []health.Tenant
+	// onAdd, when set, is called with each tenant once it is served: the
+	// state read while it was starting reaches it here, as a change applies
+	// only to the tenants served.
+	onAdd func(*servedTenant)
 }
 
 // skip records a tenant that is not served, and why.
@@ -548,9 +552,13 @@ func (l *liveTenants) bounds() map[string]*scheduler.Tenant {
 
 func (l *liveTenants) add(st *servedTenant) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.served = append(l.served, st)
 	delete(l.waiting, st.t.ID)
+	onAdd := l.onAdd
+	l.mu.Unlock()
+	if onAdd != nil {
+		onAdd(st)
+	}
 }
 
 func (l *liveTenants) remove(st *servedTenant) {

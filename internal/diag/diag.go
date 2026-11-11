@@ -561,8 +561,11 @@ func renderTenants(w io.Writer, tenants []health.Tenant) {
 		name := or(t.ID, "(install)")
 		switch t.State {
 		case "suspended":
-			fmt.Fprintf(w, "  %s SUSPENDED since %s (%s ago): %s\n", name, t.Since.UTC().Format(time.RFC3339),
-				humanDuration(time.Since(t.Since).Truncate(time.Second)), t.Reason)
+			since := ""
+			if !t.Since.IsZero() {
+				since = fmt.Sprintf(" since %s (%s ago)", t.Since.UTC().Format(time.RFC3339), humanDuration(time.Since(t.Since).Truncate(time.Second)))
+			}
+			fmt.Fprintf(w, "  %s SUSPENDED%s: %s\n", name, since, t.Reason)
 		case "held":
 			fmt.Fprintf(w, "  %s HELD: %s\n", name, t.Reason)
 		}
