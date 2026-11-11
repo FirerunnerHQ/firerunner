@@ -17,6 +17,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/ec2"
 	"github.com/firerunnerhq/firerunner/internal/ghauth"
 	"github.com/firerunnerhq/firerunner/internal/ghrunners"
+	"github.com/firerunnerhq/firerunner/internal/guardduty"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jitserver"
 	"github.com/firerunnerhq/firerunner/internal/jobevent"
@@ -65,6 +66,9 @@ type shard struct {
 	// states reads which tenants are suspended (--tenant-state); nil when
 	// none are kept.
 	states *tenantstate.Watcher
+	// findings flags tenants for review from GuardDuty (--guardduty); nil
+	// when off. It never suspends one.
+	findings *guardduty.Poller
 }
 
 // tenantHooks are the callbacks that give a tenant's jobs a cache identity.
@@ -521,10 +525,10 @@ func (l *liveTenants) skip(t tenant, why string) {
 	l.skipped = append(l.skipped, h)
 }
 
-// tenants reports the tenants, their limits and states, the install's own
-// first; nil when the install serves only itself, with no limits, and is
-// not suspended.
-func (l *liveTenants) tenants(states tenantstate.States) []health.Tenant {
+// tenants reports the tenants, their limits, states and flags, the install's
+// own first; nil when the install serves only itself, with no limits, and is
+// neither suspended nor flagged.
+func (l *liveTenants) tenants(states tenantstate.States, flags tenantstate.Flags) []health.Tenant {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var out []health.Tenant
@@ -532,8 +536,14 @@ func (l *liveTenants) tenants(states tenantstate.States) []health.Tenant {
 		out = append(out, st.health(states))
 	}
 	out = append(out, l.skipped...)
+	for i := range out {
+		if fl, ok := flags[stateKey(out[i].ID)]; ok {
+			out[i].Flag = &health.Flag{Type: fl.Type, Severity: fl.Severity, Tier: fl.Tier, Instance: fl.Instance,
+				Finding: fl.Finding, Count: fl.Count, First: fl.First, Last: fl.Last}
+		}
+	}
 	slices.SortStableFunc(out, func(a, b health.Tenant) int { return strings.Compare(a.ID, b.ID) })
-	if len(out) == 1 && out[0].ID == "" && out[0].Limits == (health.Limits{JobDuration: "0s"}) && len(out[0].Refused) == 0 && out[0].State == "" {
+	if len(out) == 1 && out[0].ID == "" && out[0].Limits == (health.Limits{JobDuration: "0s"}) && len(out[0].Refused) == 0 && out[0].State == "" && out[0].Flag == nil {
 		return nil
 	}
 	return out

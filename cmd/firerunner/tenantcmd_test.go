@@ -11,15 +11,30 @@ import (
 	"time"
 
 	"github.com/firerunnerhq/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/guardduty"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
 	"github.com/firerunnerhq/firerunner/internal/tenantstate"
 )
 
 func runTenant(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
+	return runTenantOn(t, nil, args...)
+}
+
+// runTenantOn runs the tenant subcommand with file stores and gd as
+// GuardDuty.
+func runTenantOn(t *testing.T, gd guardduty.API, args ...string) (int, string, string) {
+	t.Helper()
 	var out, errOut bytes.Buffer
-	code := tenantCmd(args, &out, &errOut, func(spec string) (tenantstate.Store, error) {
-		return tenantstate.Open(spec, nil)
+	code := tenantCmd(args, &out, &errOut, tenantOpeners{
+		states: func(spec string) (tenantstate.Store, error) { return tenantstate.Open(spec, nil) },
+		flags:  func(spec string) (tenantstate.FlagStore, error) { return tenantstate.OpenFlags(spec, nil) },
+		guardDuty: func() (guardduty.API, error) {
+			if gd == nil {
+				t.Fatal("GuardDuty opened")
+			}
+			return gd, nil
+		},
 	})
 	return code, out.String(), errOut.String()
 }
@@ -59,6 +74,8 @@ func TestTenantCommand(t *testing.T) {
 // Usage errors exit 2 and say what is wrong; nothing is written.
 func TestTenantCommandUsage(t *testing.T) {
 	t.Setenv("FR_TENANT_STATE", "")
+	t.Setenv("FR_OWNER", "")
+	t.Setenv("FR_GUARDDUTY_MIN_SEVERITY", "")
 	path := filepath.Join(t.TempDir(), "tenant-state.json")
 	for _, c := range []struct {
 		args []string
@@ -79,6 +96,17 @@ func TestTenantCommandUsage(t *testing.T) {
 		{[]string{"list", "--force", "--state", path}, "unknown flag"},
 		{[]string{"list", "--json=false", "--state", path}, "--json takes no value"},
 		{[]string{"resume", "acme", "--reason=", "--state", path}, "--reason is for suspend"},
+		{[]string{"clear-flag", "--state", path}, "takes one tenant id"},
+		{[]string{"clear-flag", "Acme", "--state", path}, "is not a tenant id"},
+		{[]string{"clear-flag", "acme"}, "no tenant state store"},
+		{[]string{"list", "--owner", "fr", "--state", path}, "--owner is for findings"},
+		{[]string{"findings", "--owner", "fr", "--state", path}, "--state is for suspend, resume, clear-flag, list"},
+		{[]string{"findings", "acme", "--owner", "fr"}, "takes no id"},
+		{[]string{"findings"}, "no owner"},
+		{[]string{"findings", "--owner", "fr", "--since", "a day"}, "give a duration"},
+		{[]string{"findings", "--owner", "fr", "--since", "-1h"}, "give a duration"},
+		{[]string{"findings", "--owner", "fr", "--min-severity", "0"}, "from 1 to 10"},
+		{[]string{"findings", "--owner", "fr", "--min-severity", "high"}, "not a number"},
 	} {
 		code, out, errOut := runTenant(t, c.args...)
 		if code != 2 || !strings.Contains(errOut, c.want) || out != "" {
@@ -192,7 +220,7 @@ func TestWatchStatesAppliesASuspensionAtTheNextRead(t *testing.T) {
 	if susp, why := acme.bound.State(); !susp || !strings.Contains(why, "abuse") {
 		t.Fatalf("after the read: %v %q", susp, why)
 	}
-	h := live.tenants(func() tenantstate.States { st, _ := w.States(); return st }())
+	h := live.tenants(func() tenantstate.States { st, _ := w.States(); return st }(), nil)
 	if len(h) != 1 || h[0].State != "suspended" || h[0].Reason != "abuse" || h[0].Since.IsZero() {
 		t.Fatalf("health = %+v", h)
 	}

@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
+	awsgd "github.com/aws/aws-sdk-go-v2/service/guardduty"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	awssq "github.com/aws/aws-sdk-go-v2/service/servicequotas"
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -43,6 +44,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/ec2"
 	"github.com/firerunnerhq/firerunner/internal/ghauth"
 	"github.com/firerunnerhq/firerunner/internal/ghrunners"
+	"github.com/firerunnerhq/firerunner/internal/guardduty"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jitserver"
 	"github.com/firerunnerhq/firerunner/internal/jobevent"
@@ -88,7 +90,7 @@ func main() {
 		case "migrate":
 			os.Exit(migrateCmd(args[1:], os.Stdout, os.Stderr))
 		case "tenant":
-			os.Exit(tenantCmd(args[1:], os.Stdout, os.Stderr, openTenantState))
+			os.Exit(tenantCmd(args[1:], os.Stdout, os.Stderr, openTenant()))
 		case "cache-server":
 			if err := cacheServe(args[1:]); err != nil {
 				slog.Error("cache-server failed", "err", err)
@@ -685,6 +687,55 @@ func (s *shard) watchStates(ctx context.Context, cfg *config.Config, live *liveT
 	return nil
 }
 
+// watchFindings reads GuardDuty's findings at once and every
+// guardduty.DefaultInterval until ctx ends, flagging for review the tenants
+// of this shard whose machines they name: the install, by its owner tag, and
+// each tenant of the catalog, by owner/<id>. It records each flag as an event
+// too. It never suspends a tenant: it is given no tenant state to write.
+func (s *shard) watchFindings(ctx context.Context, cfg *config.Config, owner string, api guardduty.API, store tenantstate.FlagStore, log *slog.Logger) {
+	ids := make([]string, 0, len(cfg.Tenants))
+	for _, t := range cfg.Tenants {
+		ids = append(ids, t.ID)
+	}
+	glog := log.With("component", "guardduty")
+	s.findings = &guardduty.Poller{
+		API: api, Store: store, Tenant: guardduty.Owners(owner, ids),
+		MinSeverity: cfg.GuardDutyMinSeverity, Interval: guardduty.DefaultInterval, Log: glog,
+		OnFlag: func(f guardduty.Flagged) {
+			jobevent.Record(s.events, jobevent.Event{Kind: jobevent.Flagged, Tier: f.Tier, Instance: f.Instance,
+				Reason: fmt.Sprintf("tenant %s flagged for review: GuardDuty %s, severity %g", f.Tenant, f.Type, f.Severity)})
+		},
+	}
+	glog.Info("reading GuardDuty findings; a finding flags its tenant for review, and never suspends it",
+		"flags", store.String(), "minSeverity", cfg.GuardDutyMinSeverity, "every", guardduty.DefaultInterval)
+	go s.findings.Run(ctx)
+}
+
+// readsFindings reports whether the daemon reads GuardDuty's findings: with
+// --guardduty, and an EC2 tier for them to name. A Firecracker-only install
+// never calls GuardDuty.
+func readsFindings(cfg *config.Config) bool { return cfg.GuardDuty && cfg.UsesEC2() }
+
+// openFindings returns the GuardDuty client and the flag store beside
+// --tenant-state, with the daemon's AWS configuration.
+func openFindings(ctx context.Context, cfg *config.Config) (guardduty.API, tenantstate.FlagStore, error) {
+	awsCfg, err := loadAWSConfig(ctx, cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("--guardduty: %w", err)
+	}
+	store, err := tenantstate.OpenFlags(cfg.TenantState, func() (tenantstate.SSMAPI, error) { return awsssm.NewFromConfig(awsCfg), nil })
+	if err != nil {
+		return nil, nil, fmt.Errorf("--guardduty: %w", err)
+	}
+	return awsgd.NewFromConfig(awsCfg), store, nil
+}
+
+// healthGuardDuty is the findings' reading for the health file.
+func healthGuardDuty(st guardduty.Status) *health.GuardDuty {
+	return &health.GuardDuty{Flags: st.Store, MinSeverity: st.MinSeverity, Detectors: st.Detectors,
+		LastPoll: st.LastPoll, LastError: st.LastError, LastErrorAt: st.LastErrorAt}
+}
+
 // healthTenantStates is the tenant states' reading for the health file.
 func healthTenantStates(st tenantstate.Status) *health.TenantStates {
 	return &health.TenantStates{Store: st.Store, LastRead: st.LastRead, LastError: st.LastError, LastErrorAt: st.LastErrorAt}
@@ -1126,6 +1177,16 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			return err
 		}
 	}
+	if cfg.GuardDuty && !readsFindings(cfg) {
+		log.Warn("--guardduty: no EC2 tier, whose machines GuardDuty's findings would name; findings are not read")
+	}
+	if readsFindings(cfg) {
+		api, store, err := openFindings(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		s.watchFindings(ctx, cfg, owner, api, store, log)
+	}
 
 	served, err := s.start(ctx, t, hooks)
 	if err != nil {
@@ -1163,12 +1224,18 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		f.CacheCredentials = healthCacheCredentials(cacheCreds)
 		f.JITRefused = healthRefusals(jitListener)
-		f.Tenants, f.TenantStates = live.tenants(nil), nil
+		var states tenantstate.States
+		var flags tenantstate.Flags
+		f.TenantStates, f.GuardDuty = nil, nil
 		if s.states != nil {
-			states, _ := s.states.States()
-			f.Tenants = live.tenants(states)
+			states, _ = s.states.States()
 			f.TenantStates = healthTenantStates(s.states.Status())
 		}
+		if s.findings != nil {
+			flags = s.findings.Flags()
+			f.GuardDuty = healthGuardDuty(s.findings.Status())
+		}
+		f.Tenants = live.tenants(states, flags)
 	}, log)
 
 	// Drive every tier's listener concurrently. A listener reconnects its own

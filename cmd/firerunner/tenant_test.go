@@ -19,6 +19,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 	"github.com/firerunnerhq/firerunner/internal/provisioner"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
+	"github.com/firerunnerhq/firerunner/internal/tenantstate"
 )
 
 // A tenant's EC2 tier carries its own owner tag and hears of its own runners'
@@ -126,14 +127,18 @@ func TestLiveTenantsReportLimits(t *testing.T) {
 	install := &servedTenant{t: tenant{}, bound: scheduler.NewTenant("", 0)}
 	l := &liveTenants{}
 	l.add(install)
-	if got := l.tenants(nil); got != nil {
+	if got := l.tenants(nil, nil); got != nil {
 		t.Fatalf("an unlimited install alone: %+v", got)
+	}
+	flagged := tenantstate.Flags{tenantstate.Install: {Type: "CryptoCurrency:EC2/BitcoinTool.B!DNS", Severity: 8, Count: 1}}
+	if got := l.tenants(nil, flagged); len(got) != 1 || got[0].Flag == nil || got[0].Flag.Severity != 8 {
+		t.Fatalf("an unlimited install alone, flagged: %+v", got)
 	}
 	acme := &servedTenant{t: tenant{ID: "acme", Limits: config.Limits{Runners: 2, VCPU: 2, JobDuration: 30 * time.Minute}, Refused: []string{"big"}},
 		bound: scheduler.NewTenant("acme", 2)}
 	l.add(acme)
 	l.skip(tenant{ID: "aaa", Limits: config.Limits{VCPU: 1}}, "none of its tiers is within its limits")
-	got := l.tenants(nil)
+	got := l.tenants(nil, nil)
 	if len(got) != 3 || got[0].ID != "" || got[1].ID != "aaa" || got[2].ID != "acme" {
 		t.Fatalf("tenants = %+v", got)
 	}
