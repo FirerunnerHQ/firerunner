@@ -230,6 +230,12 @@ Resources:
                 Action: ssm:GetParameter
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/*"
               # runner-compute:end
+              # Which tenants are suspended (firerunner tenant suspend): one
+              # parameter per tenant under this path, read every 15 s. The VM
+              # only reads them; an operator writes them.
+              - Effect: Allow
+                Action: ssm:GetParametersByPath
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/control/tenant-state"
               # Its own JIT name's A record, and nothing else in a zone other
               # stacks may share.
               - Effect: Allow

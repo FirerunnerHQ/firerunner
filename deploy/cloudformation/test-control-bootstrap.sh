@@ -29,6 +29,12 @@ cat > "$TMP/bin/aws" <<'FAKE'
 svc="$1"; shift
 case "$svc" in
 ssm)
+	if [ "$1" = get-parameters-by-path ]; then
+		echo "$*" >> "$STATE/ssm-paths"
+		[ ! -f "$STATE/ssm-path-denied" ] || { echo "An error occurred (AccessDeniedException) when calling the GetParametersByPath operation" >&2; exit 254; }
+		echo '{"Parameters": []}'
+		exit 0
+	fi
 	name=""
 	while [ $# -gt 0 ]; do [ "$1" = --name ] && name="$2"; shift; done
 	f="$STATE/ssm/${name#/fr/control/}"
@@ -156,6 +162,17 @@ echo '[{"id":"t1"}]' > "$STATE/ssm/tenants"
 expect "tenants: boots" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "tenants: env names the file" "$(envfile)" grep -qx "FR_TENANTS=$FR_ROOT/etc/firerunner/tenants.json" <(envfile)
 expect "tenants: the file holds them" "" grep -qxF '[{"id":"t1"}]' "$FR_ROOT/etc/firerunner/tenants.json"
+# Tenant suspensions: the daemon reads them from SSM when the role can, and
+# a stack whose role cannot leaves them off, with a hint, and still boots.
+setup
+expect "tenant state: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "tenant state: env names the path" "$(envfile)" grep -qx "FR_TENANT_STATE=ssm:/fr/control/tenant-state" <(envfile)
+expect "tenant state: the path probed" "" grep -q -- "--path /fr/control/tenant-state" "$STATE/ssm-paths"
+setup
+touch "$STATE/ssm-path-denied"
+expect "tenant state denied: still boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "tenant state denied: off" "$(envfile)" bash -c "! grep -q FR_TENANT_STATE '$FR_ROOT/etc/firerunner/firerunner.env'"
+expect "tenant state denied: says to update the stack" "$(cat "$STATE/out")" grep -q "update the stack to let the VM read it" "$STATE/out"
 setup
 expect "no job events: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "no job events: nothing in the env" "$(envfile)" bash -c "! grep -q FR_JOB_EVENTS '$FR_ROOT/etc/firerunner/firerunner.env'"

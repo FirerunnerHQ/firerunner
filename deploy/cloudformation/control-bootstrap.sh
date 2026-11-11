@@ -38,6 +38,9 @@
 #   token            SecureString: a PAT (one of the two)
 #   job-events-dsn   SecureString: Postgres URL that keeps job events (optional)
 #   tenants          tenants served beside this install, JSON (optional)
+#   tenant-state/<id>  a suspended tenant's record, written by
+#                    "firerunner tenant suspend" (optional; the daemon reads
+#                    the path itself, every 15 s)
 #
 # On any failure it marks the instance unhealthy, so the group replaces it.
 set -euo pipefail
@@ -205,6 +208,15 @@ tenants=$(param tenants)
 if [ -n "$tenants" ]; then
 	printf '%s\n' "$tenants" > "$etc/tenants.json"
 	setenv FR_TENANTS "$etc/tenants.json"
+fi
+# Suspensions live under this path; the daemon reads it every 15 s. A stack
+# made before the VM's role could read it leaves suspension off, rather than
+# a daemon that cannot read whether its tenants are suspended.
+state_path="$FR_PREFIX/control/tenant-state"
+if aws ssm get-parameters-by-path --path "$state_path" --max-items 1 > /dev/null 2>&1; then
+	setenv FR_TENANT_STATE "ssm:$state_path"
+else
+	log "cannot read $state_path: tenant suspension is off; update the stack to let the VM read it"
 fi
 if [ -n "${FR_POOL_KEY_SECRET:-}" ]; then
 	# In a root-only file (umask 077), never the env: firerunner reads it.

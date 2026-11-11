@@ -101,6 +101,18 @@ and 30 minutes per job. Raise them in its entry, where 0 lifts one:
 "limits": {"max_runners": 10, "max_vcpu": 8, "max_job_duration": "2h"}
 ```
 
+To suspend a tenant, from a shell with rights to write the stack's parameters:
+
+```sh
+firerunner tenant suspend acme --reason "abuse report" --state ssm:<prefix>/control/tenant-state
+firerunner tenant resume acme --state ssm:<prefix>/control/tenant-state
+```
+
+The VM reads `<prefix>/control/tenant-state` every 15 seconds; within that,
+the tenant's launches are held and its runners ended, busy or not. The VM's
+role may only read the path. A stack made before that grant leaves suspension
+off, and the VM's log says to update the stack.
+
 A tier above its vCPU limit is not served to it, with a warning in the log and in
 `firerunner config check`. A job past the runner limit waits, and `firerunner
 status` says why; a job past its duration has its runner ended, and fails. A
