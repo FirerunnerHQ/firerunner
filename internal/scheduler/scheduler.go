@@ -1160,12 +1160,10 @@ func (s *Scheduler) Running() int {
 func (s *Scheduler) Capacity() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A tenant's bound does not cut it: GitHub would keep the jobs past the
+	// bound in its own queue, where nothing records why they wait. Assigned
+	// here, they are held with the reason (see Options.OnHold).
 	room := max(0, s.opts.Max-s.running)
-	if s.opts.Tenant != nil {
-		if free := s.opts.Tenant.free(); free >= 0 {
-			room = min(room, free)
-		}
-	}
 	committed := max(0, s.live()-s.pending)
 	sr, ok := s.opts.Provisioner.(provisioner.SlotReporter)
 	if !ok {

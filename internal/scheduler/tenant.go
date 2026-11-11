@@ -129,19 +129,6 @@ func (t *Tenant) release() {
 	}
 }
 
-// free is how many more launches the tenant would grant now; -1 is no bound.
-func (t *Tenant) free() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.heldWhy != "" {
-		return 0
-	}
-	if t.max == 0 {
-		return -1
-	}
-	return max(0, t.max-t.running)
-}
-
 // Suspend refuses every launch of the tenant's tiers and stops every runner
 // they have, busy or not, so its machines end now: a job running fails. A
 // launch already on its way is stopped as it starts. The reason is the

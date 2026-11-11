@@ -62,9 +62,6 @@ func TestSuspendStopsEveryRunnerAndHolds(t *testing.T) {
 	if n, why := s[0].Held(); n != 2 || !strings.Contains(why, "is suspended: abuse report") {
 		t.Fatalf("held %d %q", n, why)
 	}
-	if got := s[0].Capacity(); got != 0 {
-		t.Fatalf("capacity %d while suspended", got)
-	}
 	select {
 	case r := <-prov.entered:
 		t.Fatalf("launched %s while suspended", r)
