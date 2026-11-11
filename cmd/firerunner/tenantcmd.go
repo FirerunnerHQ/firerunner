@@ -17,19 +17,21 @@ import (
 )
 
 const tenantUsage = `usage:
-  firerunner tenant suspend ID --reason TEXT [--state SPEC] [--json]
+  firerunner tenant suspend ID --reason TEXT [--state SPEC] [--env-file FILE|none] [--json]
       hold every launch of the tenant and end every runner it has, busy or
       not: its running jobs fail
-  firerunner tenant resume ID [--state SPEC] [--json]
+  firerunner tenant resume ID [--state SPEC] [--env-file FILE|none] [--json]
       lift a suspension
-  firerunner tenant list [--state SPEC] [--json]
+  firerunner tenant list [--state SPEC] [--env-file FILE|none] [--json]
       list the suspended tenants
 
 ID is a tenant's id in the --tenants catalog, or _install for the install's
 own tiers. SPEC is where the daemon reads tenant states, as its
 --tenant-state: ssm:<path> (one SSM parameter per suspended tenant; uses this
 shell's AWS credentials and region, FR_AWS_REGION or AWS_REGION) or an
-absolute file path. Default FR_TENANT_STATE.
+absolute file path. Default FR_TENANT_STATE; with no FR_* variable set, the
+daemon's settings file is read for it, as status and doctor do (--env-file
+FILE reads another, --env-file none none).
 
 A running daemon reads the states every 15 seconds: within that, a suspended
 tenant's launches are held and its machines asked to terminate. The
@@ -75,9 +77,14 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open func(spec string) (
 	default:
 		return usageErr("firerunner tenant: unknown action %q", action)
 	}
+	// On the daemon's host, its settings, the state store included, are in
+	// its EnvironmentFile, as for status and doctor.
+	rest, err := diagEnv("tenant", args[1:], stderr)
+	if err != nil {
+		return usageErr("firerunner tenant: %v", err)
+	}
 	spec, reason, asJSON, reasonSet := os.Getenv("FR_TENANT_STATE"), "", false, false
 	var ids []string
-	rest := args[1:]
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
 		name, val, hasVal := strings.Cut(a, "=")
