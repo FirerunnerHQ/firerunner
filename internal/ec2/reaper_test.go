@@ -19,12 +19,15 @@ func (f *fakeEC2) put(tags map[string]string, state types.InstanceStateName, lau
 	f.next++
 	i := &fakeInstance{
 		id: fmt.Sprintf("i-%04d", f.next), ip: fmt.Sprintf("10.0.2.%d", f.next),
-		itype: "c7a.large", subnet: "subnet-a", state: state, tags: map[string]string{},
+		itype: "c7a.xlarge", subnet: "subnet-a", state: state, tags: map[string]string{},
 		volumeTags: map[string]string{}, spotTags: map[string]string{}, launched: launched,
 		// As the harness's tier launches them.
 		image: "ami-0abc", rootDevice: "/dev/sda1", groups: []string{"sg-1"},
 	}
 	i.volumes = map[string]string{i.rootDevice: "vol-" + i.id}
+	i.attachedAt = map[string]time.Time{i.rootDevice: launched}
+	i.kept = map[string]bool{}
+	i.tokens, i.hops = types.HttpTokensStateRequired, 1
 	for k, v := range tags {
 		i.tags[k] = v
 		i.volumeTags[k] = v // firerunner tags volumes like their instances

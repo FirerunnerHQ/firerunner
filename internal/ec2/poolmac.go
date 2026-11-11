@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -115,17 +116,20 @@ func (c *Client) verifyPoolMAC(i types.Instance, owner, tier string) error {
 
 // diskOf is what TagPoolDiskMAC signs of an instance as EC2 describes it: its
 // image, its root device name and every block device mapping, as
-// "device=volume" sorted. ok is false while EC2 lists no EBS volume on the
-// root device yet, as it may not right after RunInstances.
+// "device=volume@attach-time/delete-on-termination" sorted. The attach time
+// tells a volume detached and attached again (to be altered elsewhere) from
+// the one attached at launch: same ID, later time. ok is false while EC2
+// lists no EBS volume on the root device yet, as it may not right after
+// RunInstances.
 func diskOf(i types.Instance) (image, root string, volumes []string, ok bool) {
 	image, root = aws.ToString(i.ImageId), aws.ToString(i.RootDeviceName)
 	for _, m := range i.BlockDeviceMappings {
 		dev, vol := aws.ToString(m.DeviceName), ""
-		if m.Ebs != nil {
-			vol = aws.ToString(m.Ebs.VolumeId)
+		if e := m.Ebs; e != nil {
+			vol = fmt.Sprintf("%s@%s/%t", aws.ToString(e.VolumeId), aws.ToTime(e.AttachTime).UTC().Format(time.RFC3339Nano), aws.ToBool(e.DeleteOnTermination))
 		}
 		volumes = append(volumes, dev+"="+vol)
-		ok = ok || (dev == root && vol != "")
+		ok = ok || (dev == root && m.Ebs != nil && aws.ToString(m.Ebs.VolumeId) != "")
 	}
 	slices.Sort(volumes)
 	return image, root, volumes, ok

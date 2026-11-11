@@ -103,6 +103,8 @@ import (
 // instance profile and network interfaces, as RunInstances set them or a test
 // changed them since. Whether it lists a pending instance's volumes is
 // unchecked: volumesLate leaves them out, and firerunner must handle both.
+// A volume's AttachTime is when it was attached, and stays across a stop and
+// start (EC2 API Reference, EbsInstanceBlockDevice; not yet observed).
 //
 // Not modelled, so no test may rely on it: the rebalance recommendation and
 // two-minute warning before a spot interruption; the
@@ -136,12 +138,21 @@ type fakeInstance struct {
 	// launched from, its root device and EBS volumes (device -> volume ID),
 	// security groups, instance profile ARN ("" for none) and network
 	// interfaces (0 counts as 1). A test changes them as someone with
-	// ec2:ModifyInstanceAttribute or ec2:AttachVolume could.
+	// ec2:ModifyInstanceAttribute or ec2:AttachVolume could. attachedAt is
+	// each device's attach time (the launch's for its root volume, kept
+	// across stops and starts), kept the devices whose volume survives
+	// termination, tokens and hops its metadata options, publicIP an
+	// address associated with it.
 	image, rootDevice string
 	volumes           map[string]string
+	attachedAt        map[string]time.Time
+	kept              map[string]bool
 	groups            []string
 	profile           string
 	enis              int
+	tokens            types.HttpTokensState
+	hops              int32
+	publicIP          string
 }
 
 // fakeEC2 is an in-memory EC2. RunInstances fails per type/subnet/market as
@@ -296,6 +307,11 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, opt
 		inst.rootDevice = "/dev/xvda"
 	}
 	inst.volumes = map[string]string{inst.rootDevice: fmt.Sprintf("vol-%04d", f.next)}
+	inst.attachedAt = map[string]time.Time{inst.rootDevice: f.now()}
+	inst.kept = map[string]bool{}
+	if mo := in.MetadataOptions; mo != nil {
+		inst.tokens, inst.hops = mo.HttpTokens, aws.ToInt32(mo.HttpPutResponseHopLimit)
+	}
 	if p := in.IamInstanceProfile; p != nil {
 		inst.profile = aws.ToString(p.Arn) + aws.ToString(p.Name)
 	}
@@ -367,9 +383,18 @@ func (f *fakeEC2) view(i *fakeInstance) types.Instance {
 		for dev, vol := range i.volumes {
 			v.BlockDeviceMappings = append(v.BlockDeviceMappings, types.InstanceBlockDeviceMapping{
 				DeviceName: aws.String(dev),
-				Ebs:        &types.EbsInstanceBlockDevice{VolumeId: aws.String(vol), Status: types.AttachmentStatusAttached},
+				Ebs: &types.EbsInstanceBlockDevice{
+					VolumeId: aws.String(vol), Status: types.AttachmentStatusAttached,
+					AttachTime: aws.Time(i.attachedAt[dev]), DeleteOnTermination: aws.Bool(!i.kept[dev]),
+				},
 			})
 		}
+	}
+	if i.tokens != "" {
+		v.MetadataOptions = &types.InstanceMetadataOptionsResponse{HttpTokens: i.tokens, HttpPutResponseHopLimit: aws.Int32(i.hops)}
+	}
+	if i.publicIP != "" {
+		v.PublicIpAddress = aws.String(i.publicIP)
 	}
 	var groups []types.GroupIdentifier
 	for _, g := range i.groups {
@@ -599,6 +624,8 @@ func (i *fakeInstance) clone() fakeInstance {
 	c := *i
 	c.tags = maps.Clone(i.tags)
 	c.volumes = maps.Clone(i.volumes)
+	c.attachedAt = maps.Clone(i.attachedAt)
+	c.kept = maps.Clone(i.kept)
 	c.groups = slices.Clone(i.groups)
 	return c
 }

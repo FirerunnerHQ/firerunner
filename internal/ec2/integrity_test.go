@@ -70,19 +70,28 @@ var changes = map[string]func(i *fakeInstance){
 	"a volume attached":    func(i *fakeInstance) { i.volumes["/dev/sdf"] = "vol-extra" },
 	"another image":        func(i *fakeInstance) { i.image = "ami-other" },
 	"root device renamed": func(i *fakeInstance) {
-		v := i.volumes[i.rootDevice]
+		v, at := i.volumes[i.rootDevice], i.attachedAt[i.rootDevice]
 		delete(i.volumes, i.rootDevice)
 		i.rootDevice = "/dev/xvda"
-		i.volumes[i.rootDevice] = v
+		i.volumes[i.rootDevice], i.attachedAt[i.rootDevice] = v, at
 	},
-	"a security group added":    func(i *fakeInstance) { i.groups = append(i.groups, "sg-open") },
-	"security group replaced":   func(i *fakeInstance) { i.groups = []string{"sg-open"} },
-	"security groups removed":   func(i *fakeInstance) { i.groups = nil },
-	"subnet not the tier's":     func(i *fakeInstance) { i.subnet = "subnet-z" },
-	"instance profile attached": func(i *fakeInstance) { i.profile = "arn:aws:iam::000000000000:instance-profile/x" },
-	"a network interface added": func(i *fakeInstance) { i.enis = 2 },
-	"disk MAC removed":          func(i *fakeInstance) { delete(i.tags, TagPoolDiskMAC) },
-	"pool MAC removed":          func(i *fakeInstance) { delete(i.tags, TagPoolMAC) },
+	// Detached, altered while attached elsewhere, and attached again: the
+	// same volume on the same device, but a later attach time.
+	"root volume reattached":      func(i *fakeInstance) { i.attachedAt[i.rootDevice] = i.attachedAt[i.rootDevice].Add(time.Minute) },
+	"root volume kept after end":  func(i *fakeInstance) { i.kept[i.rootDevice] = true },
+	"instance type changed":       func(i *fakeInstance) { i.itype = "c7a.48xlarge" },
+	"another of the tier.s types": func(i *fakeInstance) { i.itype = "c7a.xlarge" },
+	"public address associated":   func(i *fakeInstance) { i.publicIP = "203.0.113.7" },
+	"IMDSv1 allowed":              func(i *fakeInstance) { i.tokens = types.HttpTokensStateOptional },
+	"metadata hop limit raised":   func(i *fakeInstance) { i.hops = 2 },
+	"a security group added":      func(i *fakeInstance) { i.groups = append(i.groups, "sg-open") },
+	"security group replaced":     func(i *fakeInstance) { i.groups = []string{"sg-open"} },
+	"security groups removed":     func(i *fakeInstance) { i.groups = nil },
+	"subnet not the tier's":       func(i *fakeInstance) { i.subnet = "subnet-z" },
+	"instance profile attached":   func(i *fakeInstance) { i.profile = "arn:aws:iam::000000000000:instance-profile/x" },
+	"a network interface added":   func(i *fakeInstance) { i.enis = 2 },
+	"disk MAC removed":            func(i *fakeInstance) { delete(i.tags, TagPoolDiskMAC) },
+	"pool MAC removed":            func(i *fakeInstance) { delete(i.tags, TagPoolMAC) },
 }
 
 func TestPoolClaim_RefusesAChangedInstance(t *testing.T) {
@@ -113,6 +122,20 @@ func TestPoolClaim_RefusesAChangedInstance(t *testing.T) {
 				t.Fatalf("started %d, tracked %v", started, h.p.c.isLive(id))
 			}
 		})
+	}
+}
+
+func TestPoolClaim_RefusesATypeTheTierNoLongerLists(t *testing.T) {
+	// The catalog changed since the pool warmed: an instance of a type the
+	// tier dropped is not started, as a new launch would not use it.
+	h := readyPool(t, 1)
+	id := h.f.launched()[0].id
+	h.p.o.EC2.InstanceTypes = []string{"c7a.xlarge"}
+	if _, err := h.p.pool.claim(context.Background(), "runner-x"); !errors.Is(err, errPoolEmpty) {
+		t.Fatalf("claim = %v, want the instance of a dropped type refused", err)
+	}
+	if s := h.f.state(id); s != types.InstanceStateNameShuttingDown {
+		t.Fatalf("state %s, want it terminated", s)
 	}
 }
 
@@ -200,7 +223,8 @@ func TestPool_DisksSignedOnceListed(t *testing.T) {
 	h.f.setState(id, types.InstanceStateNameRunning)
 	eventually(t, "the disks signed", func() bool { return h.f.instance(id).tags[TagPoolDiskMAC] != "" })
 	in := h.f.instance(id)
-	if want := h.p.c.diskMAC("test-owner", "cloud-4c", id, "ami-0abc", "/dev/sda1", []string{"/dev/sda1=" + in.volumes["/dev/sda1"]}); in.tags[TagPoolDiskMAC] != want {
+	root := in.volumes["/dev/sda1"] + "@" + in.attachedAt["/dev/sda1"].UTC().Format(time.RFC3339Nano) + "/true"
+	if want := h.p.c.diskMAC("test-owner", "cloud-4c", id, "ami-0abc", "/dev/sda1", []string{"/dev/sda1=" + root}); in.tags[TagPoolDiskMAC] != want {
 		t.Fatalf("%s = %s, want the MAC of its image and root volume", TagPoolDiskMAC, in.tags[TagPoolDiskMAC])
 	}
 	h.stopWarming()

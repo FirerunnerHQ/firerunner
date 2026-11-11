@@ -476,11 +476,13 @@ func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 		// From here this process owns the instance: the reaper must leave
 		// it alone even once it is tagged claimed.
 		pl.p.c.track(in.id)
-		if err := pl.inspect(ctx, in.id); err != nil {
+		if err := pl.inspect(ctx, in.id, in.itype); err != nil {
 			switch {
 			case errors.Is(err, errChanged):
 				pl.log.Warn("pool instance changed since its launch; not using it, terminating it", "instance", in.id, "why", err)
-				pl.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
+				if !pl.discard(context.WithoutCancel(ctx), in.id, in.spotReq) {
+					pl.log.Warn("could not terminate the changed pool instance; it stays out of the pool", "instance", in.id)
+				}
 				pl.p.c.untrack(in.id)
 				continue
 			case instanceGone(err):
@@ -526,11 +528,12 @@ var errChanged = errors.New("changed since its launch")
 // inspect describes a ready instance just before a claim prepares it, and
 // returns errChanged unless it is still as its launch made it: signed by this
 // install, with the image and volumes it was launched with, exactly the
-// tier's security groups, in one of the tier's subnets, with no instance
-// profile and a single network interface. The MACs alone prove only who
+// tier's security groups, in one of the tier's subnets, of the type it was
+// launched as, with no instance profile, a single network interface, no
+// public address and IMDSv2-only metadata. The MACs alone prove only who
 // launched it; whoever may modify an instance could have swapped its root
 // volume or opened its security groups while it was stopped.
-func (pl *Pool) inspect(ctx context.Context, id string) error {
+func (pl *Pool) inspect(ctx context.Context, id, itype string) error {
 	out, err := pl.p.c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{id}})
 	if err != nil {
 		return err
@@ -570,6 +573,18 @@ func (pl *Pool) inspect(ctx context.Context, id string) error {
 	}
 	if n := len(inst.NetworkInterfaces); n > 1 {
 		why = append(why, fmt.Sprintf("%d network interfaces, want 1", n))
+	}
+	// Stopped, it has a public address only if one was associated with it.
+	if ip := aws.ToString(inst.PublicIpAddress); ip != "" {
+		why = append(why, fmt.Sprintf("public address %s, want none while stopped", ip))
+	}
+	// A bigger type costs more; the claim also reports the type it was given.
+	if it := string(inst.InstanceType); it != itype || !slices.Contains(e.InstanceTypes, it) {
+		why = append(why, fmt.Sprintf("instance type %s, want %s", it, itype))
+	}
+	want := launchMetadataOptions()
+	if mo := inst.MetadataOptions; mo == nil || mo.HttpTokens != want.HttpTokens || aws.ToInt32(mo.HttpPutResponseHopLimit) != aws.ToInt32(want.HttpPutResponseHopLimit) {
+		why = append(why, "metadata options are not IMDSv2-only with one hop")
 	}
 	if len(why) > 0 {
 		return fmt.Errorf("%w: %s", errChanged, strings.Join(why, "; "))

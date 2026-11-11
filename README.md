@@ -576,15 +576,20 @@ starting the instance:
 - **Checked at claim.** The MAC proves which install launched an instance,
   not that nobody changed it since. So while an instance first boots,
   firerunner also tags it `firerunner:pool-disk-mac`, an HMAC of the image
-  it was launched from and its EBS volumes; it signs only instances it
-  launched itself, and only while they run. Before a claim starts an
-  instance, firerunner describes it and checks that its image and volumes
-  still match that MAC, that its security groups are exactly the tier's,
-  its subnet one of the tier's, and that it has no instance profile and one
-  network interface. An instance that fails any of these is never started:
-  firerunner logs what differs, terminates it, and the job takes the next
-  one or cold-launches. The check is made just before the start, so whoever
-  may change your instances in the moment between still has to be trusted.
+  it was launched from and its EBS volumes (each one's ID, attach time and
+  delete-on-termination flag, so a volume detached and attached again
+  fails); it signs only instances it launched itself, and only while they
+  run. Before a claim hands an instance its JIT config, firerunner
+  describes it and checks that its image and volumes still match that MAC,
+  that its security groups are exactly the tier's, its subnet one of the
+  tier's, its type the one it was launched as, and that it has no instance
+  profile, one network interface, no public address and IMDSv2-only
+  metadata. An instance that fails any of these is never started:
+  firerunner logs what differs and terminates it, and the job takes the
+  next one or cold-launches. This checks the instance as it is at claim:
+  whoever may change your instances could still do so in the moment before
+  the start, or while the job runs (security groups, say), and has to be
+  trusted for that.
   Pool instances from a release before this check carry no disk MAC, so the
   upgrade discards the pool once.
 - **Fallback.** With the pool empty, or if a stopped instance cannot start
@@ -660,7 +665,8 @@ running process tracks, and anything younger than 2 minutes.
   runner and instance ID under the `--ec2-pool-key-file` key, and
   deregisters a runner only when that MAC holds. An instance without one
   (launched by a release before it, or without the key file) is left to
-  `--max-vm-lifetime`, and the reaper logs a warning naming it.
+  `--max-vm-lifetime`, and the reaper logs a warning naming it; with
+  `--max-vm-lifetime 0`, nothing ends it, so keep a lifetime on EC2.
 - **A pool instance of a tier that no longer keeps a pool:** terminated.
 - **A pool instance whose `firerunner:pool-mac` fails:** terminated (see
   *Signed* above).
