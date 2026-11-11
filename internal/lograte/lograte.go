@@ -13,7 +13,9 @@ import (
 const Every = time.Minute
 
 // Limiter lets one warning of each kind through per interval and counts the
-// ones it holds back. The zero value spaces warnings Every apart. It is safe
+// ones it holds back. Those are reported with the next warning let through,
+// so the last few are never logged when none follows: keep a counter beside
+// it for the totals. The zero value spaces warnings Every apart. It is safe
 // for concurrent use.
 type Limiter struct {
 	// Interval overrides Every when positive.

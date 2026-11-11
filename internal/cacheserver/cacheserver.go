@@ -77,6 +77,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/firerunnerhq/firerunner/internal/gitcache"
+	"github.com/firerunnerhq/firerunner/internal/jitserver"
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 	"github.com/firerunnerhq/firerunner/internal/lograte"
 )
@@ -185,7 +186,7 @@ const (
 )
 
 // connCaps are the listener's caps, as jitserver.Limited names them.
-var connCaps = []string{"per_source", "total"}
+var connCaps = []string{jitserver.CapPerSource, jitserver.CapTotal}
 
 // Stats is a point-in-time snapshot of the cache store, served by /stats and
 // /metrics and consumed by `firerunner status`.
@@ -371,7 +372,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // idleWriter pushes the connection's write deadline idle ahead of each write,
 // so a response the client stops reading ends, while one it keeps reading,
-// however long, does not (see SetBodyIdle).
+// however long, does not (see SetBodyIdle). A cut is reported only when a
+// handler's own write fails: net/http's flush of a response's buffered tail,
+// after the handler returns, can time out unseen, so a small response left
+// unread is not counted.
 type idleWriter struct {
 	http.ResponseWriter
 	rc   *http.ResponseController
