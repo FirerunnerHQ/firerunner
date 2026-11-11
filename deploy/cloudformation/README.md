@@ -113,6 +113,25 @@ the tenant's launches are held and its runners ended, busy or not. The VM's
 role may only read the path. A stack made before that grant leaves suspension
 off, and the VM's log says to update the stack.
 
+While GuardDuty has a detector in the stack's region, the VM reads its findings
+every 2 minutes and flags for review the tenant whose machine a finding of
+Medium severity or above names (`FR_GUARDDUTY`; see the main README). It never
+suspends one. The flags, and how far the VM has read, are under
+`<prefix>/control/tenant-state-flags`, which the VM's role may write; it may
+not delete them or write the states. Review a flag, then:
+
+```sh
+firerunner tenant list --state ssm:<prefix>/control/tenant-state
+firerunner tenant findings --owner <owner>
+firerunner tenant clear-flag acme --state ssm:<prefix>/control/tenant-state
+```
+
+The role reads GuardDuty only: `ListDetectors`, which names no resource, and
+`ListFindings` and `GetFindings` on the account's detectors in the region. A
+stack made before that grant, or a region without a detector, leaves the
+reading off, and the VM's log says which. Set `FR_GUARDDUTY_MIN_SEVERITY` in the
+`env` parameter to flag from another severity.
+
 A tier above its vCPU limit is not served to it, with a warning in the log and in
 `firerunner config check`. A job past the runner limit waits, and `firerunner
 status` says why; a job past its duration has its runner ended, and fails. A

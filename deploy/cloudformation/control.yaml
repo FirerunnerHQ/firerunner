@@ -236,6 +236,25 @@ Resources:
               - Effect: Allow
                 Action: ssm:GetParametersByPath
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/control/tenant-state"
+              # Tenants flagged for review by GuardDuty findings (--guardduty),
+              # one parameter per tenant and the read's cursor, beside the
+              # states. The VM writes them; it never deletes one (an operator
+              # clears a flag), and a flag never suspends.
+              - Effect: Allow
+                Action: ssm:GetParametersByPath
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/control/tenant-state-flags"
+              - Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/control/tenant-state-flags/*"
+              # GuardDuty's findings, read only. Listing detectors names no
+              # resource; the findings are read only from this account's
+              # detectors in this region.
+              - Effect: Allow
+                Action: guardduty:ListDetectors
+                Resource: "*"
+              - Effect: Allow
+                Action: [guardduty:ListFindings, guardduty:GetFindings]
+                Resource: !Sub "arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*"
               # Its own JIT name's A record, and nothing else in a zone other
               # stacks may share.
               - Effect: Allow
