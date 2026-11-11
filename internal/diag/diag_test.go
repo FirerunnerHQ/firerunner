@@ -930,3 +930,83 @@ func TestStatusShowsScheduledSizes(t *testing.T) {
 		t.Errorf("an unscheduled tier shows a schedule\n%s", out)
 	}
 }
+
+// status shows a flagged tenant's finding, and how reading findings goes;
+// doctor warns while any tenant is flagged, while reads fail, and while the
+// region has no detector, and passes otherwise.
+func TestStatusAndDoctorShowFlags(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	first := now.Add(-2 * time.Hour).UTC().Truncate(time.Second)
+	last := now.Add(-time.Hour).UTC().Truncate(time.Second)
+	flag := &health.Flag{Type: "CryptoCurrency:EC2/BitcoinTool.B!DNS", Severity: 8, Tier: "small", Instance: "i-0aaa", Finding: "f-1", Count: 2, First: first, Last: last}
+	f := health.File{PID: 1, WrittenAt: now,
+		Tiers:   []health.Tier{{Name: "acme/small", State: health.Connected, Since: now}},
+		Tenants: []health.Tenant{{ID: "acme", Limits: health.Limits{JobDuration: "0s"}, Flag: flag}},
+		GuardDuty: &health.GuardDuty{Flags: "ssm:/fr/control/tenant-state-flags", MinSeverity: 4, Detectors: 1,
+			LastPoll: now.Add(-30 * time.Second)}}
+	write := func() {
+		if err := health.Write(filepath.Join(dir, health.FileName), f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: dir, TapPrefix: "fr", NetBase: 16}}
+	var text bytes.Buffer
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"acme FLAGGED for review, not suspended: CryptoCurrency:EC2/BitcoinTool.B!DNS, severity 8, on tier small instance i-0aaa; 2 finding(s) from " +
+			first.Format(time.RFC3339) + " to " + last.Format(time.RFC3339) + " (finding f-1)",
+		"GuardDuty findings of severity 4 and above read 30s ago from 1 detector(s); flags in ssm:/fr/control/tenant-state-flags",
+	} {
+		if !strings.Contains(text.String(), want) {
+			t.Errorf("status missing %q\n%s", want, text.String())
+		}
+	}
+	var js bytes.Buffer
+	if err := Status(cfg, "test", &js, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"flag": {`, `"severity": 8`, `"guardduty": {`, `"detectors": 1`} {
+		if !strings.Contains(js.String(), want) {
+			t.Errorf("status --json missing %q\n%s", want, js.String())
+		}
+	}
+	check := func() Check {
+		for _, c := range listenerChecks(cfg.Firecracker, now) {
+			if c.Name == "guardduty" {
+				return c
+			}
+		}
+		t.Fatal("no guardduty check")
+		return Check{}
+	}
+	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "acme (CryptoCurrency:EC2/BitcoinTool.B!DNS, severity 8, 2 finding(s), last 1h0m ago)") ||
+		!strings.Contains(c.Detail, "clear-flag") {
+		t.Fatalf("doctor with a flag = %+v", c)
+	}
+	f.Tenants[0].Flag = nil
+	write()
+	if c := check(); c.Level != levelPass || !strings.Contains(c.Detail, "no tenant flagged") {
+		t.Fatalf("doctor with no flag = %+v", c)
+	}
+	f.GuardDuty.Detectors = 0
+	write()
+	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "no detector") {
+		t.Fatalf("doctor with no detector = %+v", c)
+	}
+	f.GuardDuty.Detectors, f.GuardDuty.LastError, f.GuardDuty.LastErrorAt = 1, "AccessDeniedException", now
+	write()
+	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "AccessDeniedException") {
+		t.Fatalf("doctor while reads fail = %+v", c)
+	}
+	f.GuardDuty = nil
+	write()
+	for _, c := range listenerChecks(cfg.Firecracker, now) {
+		if c.Name == "guardduty" {
+			t.Fatalf("a check with GuardDuty off: %+v", c)
+		}
+	}
+}

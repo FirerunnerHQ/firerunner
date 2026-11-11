@@ -29,6 +29,11 @@ const (
 	Held Kind = "held"
 	// Stopped: firerunner ended the runner for its tenant's limits (Reason).
 	Stopped Kind = "stopped"
+	// Flagged: a GuardDuty finding named the machine (Instance), and its
+	// tenant is flagged for review (Reason); nothing was stopped. It names
+	// no Runner, as the runner's own record is not changed: join on
+	// Instance.
+	Flagged Kind = "flagged"
 )
 
 // Event is one thing that happened. Fields a source does not know stay empty.
