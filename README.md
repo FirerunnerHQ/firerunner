@@ -231,6 +231,29 @@ operator raises them per installation, and 0 lifts one:
 The install's own tiers are not limited unless `--limit-runners`,
 `--limit-vcpu` and `--limit-job-duration` (`FR_LIMIT_*`) say so.
 
+**Suspending an installation.** An operator suspends one, for example on an
+abuse report, and resumes it later:
+
+```bash
+firerunner tenant suspend acme --reason "abuse report 2026-11-10" --state /etc/firerunner/tenant-state.json
+firerunner tenant list --state /etc/firerunner/tenant-state.json
+firerunner tenant resume acme --state /etc/firerunner/tenant-state.json
+```
+
+The daemon reads the states named by `--tenant-state` (`FR_TENANT_STATE`): a
+JSON file, or `ssm:` and an SSM path with one parameter per suspended
+installation. It reads them at start and every 15 seconds. Within that, a
+suspended installation's launches are held, and every runner it has, busy or
+not, is ended: its running jobs fail, and its instances are asked to terminate
+at once. An instance a restarted daemon no longer tracks is ended by the
+reaper's next sweep (5 minutes). The reason and the time show in `firerunner
+status`; jobs queued meanwhile wait, recorded as `held`, and run after a
+resume. A suspension holds across restarts until it is lifted. While the states
+cannot be read, the last ones read stay in force, and `firerunner doctor`
+warns; until a first read succeeds, the installations in the tenants file are
+held. `_install` names the install's own tiers, which are never held for an
+unread state.
+
 What it does not separate: the daemon itself, which holds every installation's
 App access and signs for them all, and the account's API limits and quotas.
 For a boundary between those too, run each installation's runners in its own
