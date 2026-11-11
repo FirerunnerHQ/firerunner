@@ -2,15 +2,23 @@ package jitserver
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/firerunnerhq/firerunner/internal/lograte"
 )
 
 // chanListener accepts the connections pushed into conns, in order.
@@ -56,12 +64,20 @@ func (l *chanListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(10, 0,
 type srcConn struct {
 	net.Conn
 	src    netip.Addr
+	local  netip.Addr // the address it reached; the pipe's own when unset
 	closed chan struct{}
 	once   sync.Once
 }
 
 func (c *srcConn) RemoteAddr() net.Addr {
 	return net.TCPAddrFromAddrPort(netip.AddrPortFrom(c.src, 40000))
+}
+
+func (c *srcConn) LocalAddr() net.Addr {
+	if c.local.IsValid() {
+		return net.TCPAddrFromAddrPort(netip.AddrPortFrom(c.local, 8099))
+	}
+	return c.Conn.LocalAddr()
 }
 
 func (c *srcConn) Close() error {
@@ -79,15 +95,21 @@ func dial(src netip.Addr) (server *srcConn, client net.Conn) {
 // acceptor accepts from l in the background, one connection at a time.
 type acceptor struct {
 	in      *chanListener
+	l       *Limited
 	got     chan net.Conn
 	stopped chan struct{}
 }
 
-func startAcceptor(t *testing.T, perSource, total int) *acceptor {
+// startAcceptor starts accepting from a listener capped at perSource and
+// total, after setup, when given, has configured it.
+func startAcceptor(t *testing.T, perSource, total int, setup ...func(*Limited)) *acceptor {
 	t.Helper()
 	in := newChanListener()
 	l := LimitListener(in, perSource, total)
-	a := &acceptor{in: in, got: make(chan net.Conn), stopped: make(chan struct{})}
+	for _, f := range setup {
+		f(l)
+	}
+	a := &acceptor{in: in, l: l, got: make(chan net.Conn), stopped: make(chan struct{})}
 	go func() {
 		defer close(a.stopped)
 		for {
@@ -106,7 +128,14 @@ func startAcceptor(t *testing.T, perSource, total int) *acceptor {
 // connection, or nil when the listener refused it by closing it.
 func (a *acceptor) offer(t *testing.T, src netip.Addr) net.Conn {
 	t.Helper()
+	return a.offerTo(t, src, netip.Addr{})
+}
+
+// offerTo is offer for a connection that reached the address local.
+func (a *acceptor) offerTo(t *testing.T, src, local netip.Addr) net.Conn {
+	t.Helper()
 	sc, cc := dial(src)
+	sc.local = local
 	t.Cleanup(func() { _ = cc.Close() })
 	a.in.push(t, sc, a.stopped)
 	select {
@@ -302,4 +331,152 @@ func TestLimitedConnKeepsReadFrom(t *testing.T) {
 	if _, err := io.ReadFull(client, got); err != nil || string(got) != "hello" {
 		t.Fatalf("client read %q, %v", got, err)
 	}
+}
+
+// Each refusal is counted against the cap that refused it, and the latest's
+// time kept; an accepted connection counts nothing.
+func TestLimitListenerCountsRefusalsByCap(t *testing.T) {
+	a := startAcceptor(t, 1, 2)
+	if byCap, last := a.l.Refused(); byCap[CapPerSource] != 0 || byCap[CapTotal] != 0 || !last.IsZero() {
+		t.Fatalf("before any refusal: %v, last %v", byCap, last)
+	}
+	before := time.Now()
+	if a.offer(t, guest) == nil {
+		t.Fatal("refused the first connection")
+	}
+	if a.offer(t, guest) != nil {
+		t.Fatal("accepted a second connection over the per-source cap of 1")
+	}
+	if a.offer(t, foreign) == nil {
+		t.Fatal("refused another source's first connection")
+	}
+	other := netip.MustParseAddr("10.0.1.50")
+	for range 2 {
+		if a.offer(t, other) != nil {
+			t.Fatal("accepted a connection over the total cap of 2")
+		}
+	}
+	byCap, last := a.l.Refused()
+	if byCap[CapPerSource] != 1 || byCap[CapTotal] != 2 {
+		t.Fatalf("refused %v, want 1 at %s and 2 at %s", byCap, CapPerSource, CapTotal)
+	}
+	if last.Before(before) {
+		t.Fatalf("latest refusal at %v, before the refusals began at %v", last, before)
+	}
+}
+
+// Refusals are logged at most once per interval for each cap, with the
+// number left unlogged in between.
+func TestRefusalWarningsAreSpaced(t *testing.T) {
+	var buf syncBuffer
+	now := time.Unix(1000, 0)
+	a := startAcceptor(t, 1, 2, func(l *Limited) {
+		l.WarnTo(slog.New(slog.NewJSONHandler(&buf, nil)))
+		l.warns.Now = func() time.Time { return now }
+	})
+	if a.offer(t, guest) == nil || a.offer(t, foreign) == nil {
+		t.Fatal("refused a first connection")
+	}
+	for range 3 {
+		if a.offer(t, guest) != nil {
+			t.Fatal("accepted a connection over the caps")
+		}
+	}
+	// The total cap is full, so these were refused at it; let a minute pass.
+	now = now.Add(lograte.Every)
+	if a.offer(t, guest) != nil {
+		t.Fatal("accepted a connection over the caps")
+	}
+	var got []string
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var rec struct {
+			Level, Cap string
+			Held       uint64 `json:"unlogged_since_last"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		got = append(got, fmt.Sprintf("%s %s %d", rec.Level, rec.Cap, rec.Held))
+	}
+	if want := []string{"WARN total 0", "WARN total 2"}; !slices.Equal(got, want) {
+		t.Fatalf("warnings %q, want %q", got, want)
+	}
+}
+
+// With ExemptLocal, a connection from this host, by loopback or from the
+// address it reached, is neither counted nor refused, and takes no slot:
+// local tools still get through when guests fill the caps. Without it,
+// loopback is capped like anyone.
+func TestExemptLocalBypassesTheCaps(t *testing.T) {
+	loop4, loop6 := netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1")
+	self := netip.MustParseAddr("10.0.0.5")
+	a := startAcceptor(t, 1, 1, (*Limited).ExemptLocal)
+	if a.offer(t, guest) == nil {
+		t.Fatal("refused the first guest connection")
+	}
+	var local []net.Conn
+	for range 3 {
+		for _, c := range []net.Conn{a.offer(t, loop4), a.offer(t, loop6), a.offerTo(t, self, self)} {
+			if c == nil {
+				t.Fatal("refused a connection from this host with the caps full")
+			}
+			local = append(local, c)
+		}
+	}
+	// Closing them gives back no slot they never took.
+	for _, c := range local {
+		_ = c.Close()
+	}
+	if a.offer(t, foreign) != nil {
+		t.Fatal("accepted a guest over the total cap once local connections closed")
+	}
+	// A guest that reached a different address is a guest, whatever its source.
+	if a.offerTo(t, foreign, self) != nil {
+		t.Fatal("accepted a guest connection over the cap")
+	}
+	// Nor is one whose addresses cannot be read, though both read as the
+	// same zero address.
+	sc, cc := net.Pipe()
+	t.Cleanup(func() { _ = cc.Close() })
+	closed := make(chan struct{})
+	go func() { _, _ = cc.Read(make([]byte, 1)); close(closed) }()
+	a.in.push(t, sc, a.stopped)
+	select {
+	case c := <-a.got:
+		_ = c.Close()
+		t.Fatal("accepted a connection of unknown origin over the cap")
+	case <-a.stopped:
+		t.Fatal("the listener stopped accepting")
+	case <-closed: // refused
+	}
+	if byCap, _ := a.l.Refused(); byCap[CapTotal] != 3 || byCap[CapPerSource] != 0 {
+		t.Fatalf("refused %v, want only the three guest connections, at the total cap", byCap)
+	}
+
+	plain := startAcceptor(t, 1, 1)
+	if plain.offer(t, loop4) == nil {
+		t.Fatal("refused the first loopback connection")
+	}
+	if plain.offer(t, loop4) != nil {
+		t.Fatal("accepted a loopback connection over the cap without ExemptLocal")
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe to write from the accepting goroutine
+// while the test reads it.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
