@@ -5,6 +5,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"sync"
@@ -61,6 +62,20 @@ type Options struct {
 	// can stop that, holding the slot (or the instance) until its lifetime
 	// ends. 0 means DefaultCompletedGrace; negative never stops it.
 	CompletedGrace time.Duration
+	// Tenant, when set, bounds this tier's runners together with the other
+	// tiers of its tenant (see Tenant).
+	Tenant *Tenant
+	// MaxJob, when positive, ends a runner whose job has run this long: the
+	// job fails, and the runner's machine goes. The job's start is the first
+	// MarkBusy: the guest's own report, or GitHub's JobStarted.
+	MaxJob time.Duration
+	// OnStop, when set, is told of each runner the scheduler ends for a
+	// tenant's limit. It is called with the scheduler's lock held.
+	OnStop func(Stop)
+	// OnHold, when set, is told how many launches the tenant holds back and
+	// why, each time that changes; 0 and "" when none are. It is called with
+	// the scheduler's lock held, so it must not call back into it.
+	OnHold func(jobs int, reason string)
 }
 
 // DefaultCompletedGrace is Options.CompletedGrace's default: far longer than
@@ -129,11 +144,15 @@ type Scheduler struct {
 	// draining is set by Drain: from then on nothing launches, so the wait
 	// cannot be extended by a launch it has to wait for in turn. Guarded by mu.
 	draining bool
+	// held is how many launches the latest plan wanted that the tenant held
+	// back, and heldWhy why. Guarded by mu.
+	held    int
+	heldWhy string
 }
 
 // vmHandle is the shutdown-relevant state of one in-flight microVM.
 type vmHandle struct {
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 	busy   bool
 	// since is when the runner was handed to the provisioner.
 	since time.Time
@@ -157,7 +176,27 @@ type vmHandle struct {
 	// job. Only then may the VM's exit re-plan (see replan).
 	completed   bool
 	completedAt uint64
+	// jobStarted is when the runner was first marked busy: its job began.
+	jobStarted time.Time
 }
+
+// Stop is a runner the scheduler ended because of its tenant's limits.
+type Stop struct {
+	Runner string
+	// Kind is StopJobDuration.
+	Kind   string
+	Reason string
+}
+
+// StopJobDuration is a Stop of a runner whose job ran past Options.MaxJob.
+const StopJobDuration = "job_duration"
+
+// StopCause is the cause a runner's context is cancelled with when the
+// scheduler stops it for its tenant's limits: a provisioner may give its
+// reason when it ends the machine.
+type StopCause struct{ Stop }
+
+func (c StopCause) Error() string { return c.Reason }
 
 // New returns a Scheduler.
 func New(o Options) *Scheduler {
@@ -167,12 +206,16 @@ func New(o Options) *Scheduler {
 	if o.CompletedGrace == 0 {
 		o.CompletedGrace = DefaultCompletedGrace
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		opts:             o,
 		active:           make(map[string]*vmHandle),
 		afterFunc:        afterFunc,
 		removeRetryDelay: defaultRemoveRetryDelay,
 	}
+	if o.Tenant != nil {
+		o.Tenant.join(s)
+	}
+	return s
 }
 
 // afterFunc is time.AfterFunc without its *Timer; tests replace it to run
@@ -249,9 +292,12 @@ func (s *Scheduler) reconcileLocked(ctx context.Context) func() {
 	reclaimed := s.reclaimQueued(desired)
 	n := 0
 	if !s.draining {
-		n = plan(desired, s.live(), s.running, s.opts.Max)
+		n = s.grant(plan(desired, s.live(), s.running, s.opts.Max))
 	}
 	s.commit(n)
+	// Counted under the lock, so a Drain that begins once it is released
+	// waits for these launches rather than racing their Add.
+	s.wg.Add(n)
 	running := s.running
 	floor := s.opts.Min
 	stopped := 0
@@ -266,7 +312,6 @@ func (s *Scheduler) reconcileLocked(ctx context.Context) func() {
 		if n > 0 {
 			s.opts.Logger.Info("scaling up", "desired", desired, "launching", n, "running", running, "max", s.opts.Max)
 			for i := 0; i < n; i++ {
-				s.wg.Add(1)
 				go s.launchOne(ctx, time.Now())
 			}
 			return
@@ -278,6 +323,58 @@ func (s *Scheduler) reconcileLocked(ctx context.Context) func() {
 			go s.removeLoop(ctx)
 		}
 	}
+}
+
+// grant asks the tenant for the launches a plan wants, records any it holds
+// back, and returns how many may go. Callers must hold s.mu.
+func (s *Scheduler) grant(want int) int {
+	if s.opts.Tenant == nil {
+		return want
+	}
+	n, why := s.opts.Tenant.take(want)
+	s.setHeld(want-n, why)
+	return n
+}
+
+// setHeld records that the tenant holds n wanted launches back, and why, and
+// reports a change. Callers must hold s.mu.
+func (s *Scheduler) setHeld(n int, why string) {
+	if n <= 0 || why == "" {
+		n, why = 0, ""
+	}
+	if n == s.held && why == s.heldWhy {
+		return
+	}
+	s.held, s.heldWhy = n, why
+	if n > 0 {
+		s.opts.Logger.Info("launches held", "jobs", n, "reason", why)
+	} else {
+		s.opts.Logger.Info("launches no longer held")
+	}
+	if s.opts.OnHold != nil {
+		s.opts.OnHold(n, why)
+	}
+}
+
+// Held returns how many launches the tenant holds back, and why.
+func (s *Scheduler) Held() (int, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.held, s.heldWhy
+}
+
+// retry plans again with the last desired count when the tenant held
+// launches back: a place among its runners has freed. It does what a
+// Reconcile with the same count would.
+func (s *Scheduler) retry() {
+	s.mu.Lock()
+	if s.held == 0 || !s.hasDesired || s.draining || s.lastCtx.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
+	act := s.reconcileLocked(s.lastCtx)
+	s.mu.Unlock()
+	act()
 }
 
 // desired is the last job count plus Min. Callers must hold s.mu.
@@ -335,7 +432,15 @@ func (s *Scheduler) replan(ctx context.Context) (int, context.Context) {
 		s.opts.Logger.Info("runner exited: kept a runner queued for removal", "desired", s.desired())
 		return 0, nil
 	}
-	n := min(1, plan(s.desired(), s.live(), s.running, s.opts.Max))
+	want := plan(s.desired(), s.live(), s.running, s.opts.Max)
+	n := min(1, want)
+	if s.opts.Tenant != nil {
+		granted, why := s.opts.Tenant.take(n)
+		if why != "" || granted == want {
+			s.setHeld(want-granted, why)
+		}
+		n = granted
+	}
 	s.commit(n)
 	if n > 0 {
 		s.opts.Logger.Info("runner exited: scaling up", "desired", s.desired(), "launching", n, "running", s.running, "max", s.opts.Max)
@@ -375,7 +480,7 @@ func (s *Scheduler) scaleDown(desired int) (int, bool) {
 			s.removeQ = append(s.removeQ, name)
 		} else {
 			h.cancelled = true
-			h.cancel()
+			h.cancel(nil)
 		}
 		picked++
 		excess--
@@ -508,7 +613,7 @@ func (s *Scheduler) settleRemoval(name string, err error) bool {
 		// The guest dequeued a job meanwhile.
 	default:
 		h.cancelled = true
-		h.cancel()
+		h.cancel(nil)
 	}
 	return false
 }
@@ -530,6 +635,9 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 		if !finished {
 			finished = true
 			s.running--
+			if s.opts.Tenant != nil {
+				s.opts.Tenant.release()
+			}
 			if jobDone {
 				replanned, replanCtx = s.replan(ctx)
 			}
@@ -602,8 +710,8 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 	// self-destructs.
 	// systemd's TimeoutStopSec (with KillMode=mixed) is the final backstop for a
 	// job that overruns the stop timeout.
-	vmCtx, vmCancel := context.WithCancel(context.WithoutCancel(ctx))
-	defer vmCancel()
+	vmCtx, vmCancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	defer vmCancel(nil)
 	// Settle the reservation before the handle becomes visible to scaleDown:
 	// a handle that is both pending and cancelled would be discounted twice.
 	enter()
@@ -725,7 +833,7 @@ func backoffDelay(failures int) time.Duration {
 
 // track registers an in-flight microVM so a shutdown drain can find and, if it
 // is still idle, cancel it. It starts life idle (busy=false).
-func (s *Scheduler) track(name string, cancel context.CancelFunc) {
+func (s *Scheduler) track(name string, cancel context.CancelCauseFunc) {
 	s.mu.Lock()
 	s.active[name] = &vmHandle{cancel: cancel, since: time.Now()}
 	s.mu.Unlock()
@@ -742,12 +850,42 @@ func (s *Scheduler) untrack(name string) {
 // drain lets it finish instead of cancelling it as an idle warm-pool VM. It is
 // driven by the guest console "Running job:" marker (see the provisioner) and
 // no-ops for a runner that has already exited.
+//
+// The first mark is the job's start: with Options.MaxJob set, the runner is
+// stopped once its job has run that long (see stopOverlong).
 func (s *Scheduler) MarkBusy(name string) {
 	s.mu.Lock()
-	if h := s.active[name]; h != nil {
-		h.busy = true
+	defer s.mu.Unlock()
+	h := s.active[name]
+	if h == nil {
+		return
 	}
-	s.mu.Unlock()
+	h.busy = true
+	if h.jobStarted.IsZero() && !h.completed {
+		h.jobStarted = time.Now()
+		if s.opts.MaxJob > 0 {
+			s.afterFunc(s.opts.MaxJob, func() { s.stopOverlong(name, h) })
+		}
+	}
+}
+
+// stopOverlong ends a runner whose job has run Options.MaxJob and is still
+// running. Its job fails at GitHub: the limit is the tenant's, and the
+// machine must not outlive it. A job that completed meanwhile is left to
+// stopCompleted.
+func (s *Scheduler) stopOverlong(name string, h *vmHandle) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active[name] != h || h.cancelled || h.completed {
+		return
+	}
+	stop := Stop{Runner: name, Kind: StopJobDuration, Reason: fmt.Sprintf("its job ran past the limit of %s", s.opts.MaxJob)}
+	h.cancelled = true
+	h.cancel(StopCause{stop})
+	s.opts.Logger.Warn("stopping a runner: its job ran past the limit", "runner", name, "limit", s.opts.MaxJob)
+	if s.opts.OnStop != nil {
+		s.opts.OnStop(stop)
+	}
 }
 
 // MarkCompleted records that GitHub reported the named runner's job completed.
@@ -789,7 +927,7 @@ func (s *Scheduler) stopCompleted(name string, h *vmHandle) {
 		return
 	}
 	h.cancelled = true
-	h.cancel()
+	h.cancel(nil)
 	s.opts.Logger.Warn("stopping a runner still running after its job completed", "runner", name, "grace", s.opts.CompletedGrace)
 }
 
@@ -829,7 +967,7 @@ func (s *Scheduler) CancelLost(name string) bool {
 		return false
 	}
 	h.cancelled = true
-	h.cancel()
+	h.cancel(nil)
 	s.opts.Logger.Warn("cancelling a runner GitHub no longer lists", "runner", name)
 	return true
 }
@@ -848,7 +986,7 @@ func (s *Scheduler) cancelIfIdle(name string) {
 		return
 	}
 	h.cancelled = true
-	h.cancel()
+	h.cancel(nil)
 }
 
 // SetMin changes the warm-pool floor (Min) while the scheduler runs, as a
@@ -911,6 +1049,13 @@ func (s *Scheduler) maintainMinimum(ctx context.Context) {
 	if !s.draining {
 		n = plan(s.opts.Min, s.running, s.running, s.opts.Max)
 	}
+	if s.opts.Tenant != nil && n > 0 {
+		granted, why := s.opts.Tenant.take(n)
+		if why != "" {
+			s.setHeld(n-granted, why)
+		}
+		n = granted
+	}
 	s.commit(n)
 	running, floor := s.running, s.opts.Min
 	s.mu.Unlock()
@@ -964,6 +1109,11 @@ func (s *Scheduler) Capacity() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	room := max(0, s.opts.Max-s.running)
+	if s.opts.Tenant != nil {
+		if free := s.opts.Tenant.free(); free >= 0 {
+			room = min(room, free)
+		}
+	}
 	committed := max(0, s.live()-s.pending)
 	sr, ok := s.opts.Provisioner.(provisioner.SlotReporter)
 	if !ok {
