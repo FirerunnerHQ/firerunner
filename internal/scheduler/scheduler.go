@@ -183,13 +183,18 @@ type vmHandle struct {
 // Stop is a runner the scheduler ended because of its tenant's limits.
 type Stop struct {
 	Runner string
-	// Kind is StopJobDuration.
+	// Kind is StopJobDuration or StopSuspended.
 	Kind   string
 	Reason string
 }
 
-// StopJobDuration is a Stop of a runner whose job ran past Options.MaxJob.
-const StopJobDuration = "job_duration"
+// Kinds of Stop.
+const (
+	// StopJobDuration is a runner whose job ran past Options.MaxJob.
+	StopJobDuration = "job_duration"
+	// StopSuspended is a runner of a tenant suspended (Tenant.Suspend).
+	StopSuspended = "suspended"
+)
 
 // StopCause is the cause a runner's context is cancelled with when the
 // scheduler stops it for its tenant's limits: a provisioner may give its
@@ -849,10 +854,48 @@ func backoffDelay(failures int) time.Duration {
 
 // track registers an in-flight microVM so a shutdown drain can find and, if it
 // is still idle, cancel it. It starts life idle (busy=false).
+//
+// A runner of a suspended tenant is stopped as it is tracked: its launch was
+// decided before the suspension.
 func (s *Scheduler) track(name string, cancel context.CancelCauseFunc) {
 	s.mu.Lock()
-	s.active[name] = &vmHandle{cancel: cancel, since: time.Now()}
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	h := &vmHandle{cancel: cancel, since: time.Now()}
+	s.active[name] = h
+	if s.opts.Tenant == nil {
+		return
+	}
+	if why := s.opts.Tenant.suspension(); why != "" {
+		s.stopLocked(name, h, Stop{Kind: StopSuspended, Reason: why})
+	}
+}
+
+// stopAll stops every runner the scheduler has, busy or not, for stop: its
+// tenant is suspended.
+func (s *Scheduler) stopAll(stop Stop) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for name, h := range s.active {
+		if !h.cancelled {
+			s.stopLocked(name, h, stop)
+			n++
+		}
+	}
+	if n > 0 {
+		s.opts.Logger.Warn("stopped every runner: the tenant is suspended", "runners", n, "reason", stop.Reason)
+	}
+}
+
+// stopLocked cancels one runner for stop, with the stop as its cause, and
+// reports it. Callers must hold s.mu.
+func (s *Scheduler) stopLocked(name string, h *vmHandle, stop Stop) {
+	stop.Runner = name
+	h.cancelled = true
+	h.cancel(StopCause{stop})
+	if s.opts.OnStop != nil {
+		s.opts.OnStop(stop)
+	}
 }
 
 // untrack removes a microVM from the registry once it has exited.
@@ -895,13 +938,8 @@ func (s *Scheduler) stopOverlong(name string, h *vmHandle) {
 	if s.active[name] != h || h.cancelled || h.completed {
 		return
 	}
-	stop := Stop{Runner: name, Kind: StopJobDuration, Reason: fmt.Sprintf("its job ran past the limit of %s", s.opts.MaxJob)}
-	h.cancelled = true
-	h.cancel(StopCause{stop})
 	s.opts.Logger.Warn("stopping a runner: its job ran past the limit", "runner", name, "limit", s.opts.MaxJob)
-	if s.opts.OnStop != nil {
-		s.opts.OnStop(stop)
-	}
+	s.stopLocked(name, h, Stop{Kind: StopJobDuration, Reason: fmt.Sprintf("its job ran past the limit of %s", s.opts.MaxJob)})
 }
 
 // MarkCompleted records that GitHub reported the named runner's job completed.

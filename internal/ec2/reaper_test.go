@@ -221,6 +221,31 @@ func TestReaper_MaxLifetimeEndsEvenABusyOrphan(t *testing.T) {
 	}
 }
 
+// A suspended tenant's orphan, which a restarted firerunner no longer
+// tracks, is ended even while its runner is busy; once resumed, a busy one is
+// left to finish again.
+func TestReaper_SuspendedTenantsBusyOrphanIsEnded(t *testing.T) {
+	f := newFakeEC2(t)
+	busy := f.put(job("busy-runner"), types.InstanceStateNameRunning, old, true)
+	g := &githubRunners{busy: map[string]bool{"busy-runner": true}}
+	why := "abuse report"
+	r, c := reaperFor(f, g, func(o *ReaperOptions) { o.Suspended = func() string { return why } })
+	f.signRunner(c, busy)
+	rep, _ := r.Sweep(context.Background())
+	if f.state(busy) != types.InstanceStateNameShuttingDown || !slices.Equal(rep.Instances, []string{busy}) || len(f.openSpotRequests()) != 0 {
+		t.Fatalf("suspended: state %q, report %+v, open requests %v", f.state(busy), rep, f.openSpotRequests())
+	}
+
+	why = ""
+	other := f.put(job("busy-2"), types.InstanceStateNameRunning, old, false)
+	g.busy["busy-2"] = true
+	f.signRunner(c, other)
+	r.Sweep(context.Background())
+	if f.state(other) != types.InstanceStateNameRunning {
+		t.Fatalf("resumed: a busy orphan was ended: %q", f.state(other))
+	}
+}
+
 func TestReaper_LookupFailureLeavesTheOrphan(t *testing.T) {
 	f := newFakeEC2(t)
 	id := f.put(job("r"), types.InstanceStateNameRunning, old, false)

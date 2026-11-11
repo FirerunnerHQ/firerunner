@@ -33,6 +33,10 @@ type ReaperOptions struct {
 	// MaxLifetime reaps a running instance this old even if its runner is
 	// busy; 0 disables.
 	MaxLifetime time.Duration
+	// Suspended, when set, says why the owner's tenant is suspended, or "".
+	// While it is, a running orphan is reaped busy or not: a suspended
+	// tenant's machines end, after a restart too.
+	Suspended func() string
 	// Grace leaves alone instances younger than this, so a launch between
 	// RunInstances and its registration is never mistaken for an orphan
 	// (default 2m).
@@ -49,7 +53,8 @@ type ReaperOptions struct {
 // requests left without an instance. It runs at startup and every Interval.
 //
 // It never ends a job: a running orphan is ended only once GitHub agrees to
-// deregister its runner (it has no job), or past MaxLifetime. A busy one is
+// deregister its runner (it has no job), past MaxLifetime, or while its
+// tenant is suspended. A busy one is
 // left to finish; it powers off, and the next sweep ends it. It deregisters a
 // runner only by a runner tag whose TagRunnerMAC holds for the instance.
 type Reaper struct {
@@ -252,6 +257,14 @@ func (r *Reaper) judge(ctx context.Context, i types.Instance, now time.Time, rep
 				rep.Instances = append(rep.Instances, id)
 			}
 			return
+		}
+		if r.o.Suspended != nil {
+			if why := r.o.Suspended(); why != "" {
+				if r.reap(ctx, log, "orphan of a suspended tenant: "+why, id, spotReq) {
+					rep.Instances = append(rep.Instances, id)
+				}
+				return
+			}
 		}
 		if runner == "" {
 			return // nothing to ask GitHub; MaxLifetime ends it
