@@ -1,8 +1,12 @@
 package cacheserver
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +14,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -41,17 +46,19 @@ func putPaced(t *testing.T, url string, steps int, gap time.Duration) int {
 }
 
 // A body that stops sending is cut after the idle bound and answered as an
-// incomplete upload, not a server error; the same pause passes when the
-// bound is off.
+// incomplete upload, not a server error, and counted and logged as a cut
+// request; the same pause passes when the bound is off.
 func TestStalledBodyIsCut(t *testing.T) {
 	for _, tc := range []struct {
 		idle time.Duration
 		want int
+		cuts uint64
 	}{
-		{100 * time.Millisecond, http.StatusBadRequest},
-		{0, http.StatusCreated},
+		{100 * time.Millisecond, http.StatusBadRequest, 1},
+		{0, http.StatusCreated, 0},
 	} {
-		s, err := newAuthorizedStore(t.TempDir(), nil)
+		var logs lockedBuffer
+		s, err := newAuthorizedStore(t.TempDir(), slog.New(slog.NewJSONHandler(&logs, nil)))
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -63,7 +70,80 @@ func TestStalledBodyIsCut(t *testing.T) {
 		if code != tc.want {
 			t.Errorf("idle %v, body pausing 600ms -> status %d, want %d", tc.idle, code, tc.want)
 		}
+		// The handler counted the cut before it answered.
+		st := s.snapshot()
+		if st.IdleCutsByDirection[cutRequest] != tc.cuts || st.IdleCutsByDirection[cutResponse] != 0 || st.IdleCuts != tc.cuts {
+			t.Errorf("idle %v: cuts %v (total %d), want %d request", tc.idle, st.IdleCutsByDirection, st.IdleCuts, tc.cuts)
+		}
+		if got := strings.Count(logs.String(), "cut a transfer idle"); uint64(got) != tc.cuts {
+			t.Errorf("idle %v: %d cut warnings, want %d:\n%s", tc.idle, got, tc.cuts, logs.String())
+		}
+		if strings.Contains(logs.String(), "sig=") {
+			t.Errorf("a cut warning logs the blob signature:\n%s", logs.String())
+		}
+		if (tc.cuts > 0) == st.IdleCutLast.IsZero() {
+			t.Errorf("idle %v: latest cut at %v", tc.idle, st.IdleCutLast)
+		}
 	}
+}
+
+// A cut is counted every time, but warned about once a minute per
+// direction.
+func TestIdleCutWarningsAreSpaced(t *testing.T) {
+	var logs lockedBuffer
+	s, err := New(t.TempDir(), slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1000, 0)
+	s.idleCutWarns.Now = func() time.Time { return now }
+	r := httptest.NewRequest(http.MethodPut, "/upload/1?sig=secret", nil)
+	for range 3 {
+		s.idleCut(cutRequest, r, time.Minute)
+	}
+	s.idleCut(cutResponse, r, time.Minute)
+	now = now.Add(time.Minute)
+	s.idleCut(cutRequest, r, time.Minute)
+	st := s.snapshot()
+	if st.IdleCutsByDirection[cutRequest] != 4 || st.IdleCutsByDirection[cutResponse] != 1 {
+		t.Fatalf("cuts %v, want 4 request and 1 response", st.IdleCutsByDirection)
+	}
+	var got []string
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var rec struct {
+			Direction string
+			Held      uint64 `json:"unlogged_since_last"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		got = append(got, fmt.Sprintf("%s %d", rec.Direction, rec.Held))
+	}
+	if want := []string{"request 0", "response 0", "request 2"}; !slices.Equal(got, want) {
+		t.Fatalf("warnings %q, want %q", got, want)
+	}
+	if strings.Contains(logs.String(), "secret") {
+		t.Fatalf("a cut warning logs the blob signature:\n%s", logs.String())
+	}
+}
+
+// lockedBuffer is a bytes.Buffer a server's goroutines may log to while a
+// test reads it.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
 
 // A stalled block list is an incomplete upload too, not a server error.
@@ -94,6 +174,37 @@ func TestSteadyBodyOutlastsIdleBound(t *testing.T) {
 	url := reserve(t, ts.URL, "a")
 	if code := putPaced(t, url+"&comp=block&blockid=YjA=", 20, 100*time.Millisecond); code != http.StatusCreated {
 		t.Fatalf("steady 2s upload with a 1s idle bound -> %d, want 201", code)
+	}
+	// Its end, io.EOF, is no cut either.
+	if st := s.snapshot(); st.IdleCuts != 0 {
+		t.Fatalf("a completed upload counted as cut: %v", st.IdleCutsByDirection)
+	}
+}
+
+// deadlineWriter is a ResponseWriter whose every write fails on its deadline.
+type deadlineWriter struct{ httptest.ResponseRecorder }
+
+func (*deadlineWriter) Write([]byte) (int, error) { return 0, os.ErrDeadlineExceeded }
+
+// A response is reported cut once, however many of its writes fail, and an
+// ordinary write error is no cut.
+func TestIdleWriterReportsACutOnce(t *testing.T) {
+	cuts := 0
+	dw := &deadlineWriter{ResponseRecorder: *httptest.NewRecorder()}
+	w := &idleWriter{ResponseWriter: dw, rc: http.NewResponseController(dw), idle: time.Minute, cut: func() { cuts++ }}
+	for range 3 {
+		if _, err := w.Write([]byte("x")); err == nil {
+			t.Fatal("write succeeded")
+		}
+	}
+	if cuts != 1 {
+		t.Fatalf("reported %d cuts, want 1", cuts)
+	}
+	w = &idleWriter{ResponseWriter: dw, rc: http.NewResponseController(dw), idle: time.Minute, cut: func() { cuts++ }}
+	w.check(io.ErrClosedPipe)
+	w.check(nil)
+	if cuts != 1 {
+		t.Fatalf("an ordinary error or none reported as a cut")
 	}
 }
 
@@ -281,6 +392,15 @@ func TestDownloadIdleBound(t *testing.T) {
 			got, err := readPaced(resp.Body, 64<<10, tc.gap)
 			if done := got == size && err == nil; done != tc.complete {
 				t.Fatalf("read %d of %d bytes, err %v; want complete %v", got, size, err, tc.complete)
+			}
+			// The server counts a cut before it closes the connection the
+			// client just saw end.
+			want := uint64(0)
+			if !tc.complete {
+				want = 1
+			}
+			if st := s.snapshot(); st.IdleCutsByDirection[cutResponse] != want || st.IdleCutsByDirection[cutRequest] != 0 {
+				t.Fatalf("cuts %v, want %d response", st.IdleCutsByDirection, want)
 			}
 		})
 	}

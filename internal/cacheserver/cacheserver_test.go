@@ -482,6 +482,64 @@ func TestStatsAndMetrics(t *testing.T) {
 	}
 }
 
+// getStats reads /stats and /metrics from base.
+func getStats(t *testing.T, base string) (Stats, string) {
+	t.Helper()
+	var st Stats
+	resp, err := http.Get(base + "/stats")
+	if err != nil {
+		t.Fatalf("GET /stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	mresp, err := http.Get(base + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer mresp.Body.Close()
+	body, _ := io.ReadAll(mresp.Body)
+	return st, string(body)
+}
+
+// The listener's refusals reach /stats and /metrics by cap, every cap
+// present even at zero; without a listener to ask, they read zero.
+func TestStatsReportConnRefusals(t *testing.T) {
+	s, err := newAuthorizedStore(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	st, metrics := getStats(t, ts.URL)
+	if st.ConnRefused != 0 || len(st.ConnRefusedByCap) != 2 || !st.ConnRefusedLast.IsZero() {
+		t.Fatalf("without a listener: %d refused, %v, last %v", st.ConnRefused, st.ConnRefusedByCap, st.ConnRefusedLast)
+	}
+	if !strings.Contains(metrics, `firerunner_cache_conn_refused_total{cap="total"} 0`) {
+		t.Fatalf("metrics lack a zero total cap:\n%s", metrics)
+	}
+
+	last := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	s.SetConnRefusals(func() (map[string]uint64, time.Time) {
+		return map[string]uint64{"per_source": 3, "total": 4}, last
+	})
+	st, metrics = getStats(t, ts.URL)
+	if st.ConnRefused != 7 || st.ConnRefusedByCap["per_source"] != 3 || st.ConnRefusedByCap["total"] != 4 || !st.ConnRefusedLast.Equal(last) {
+		t.Fatalf("refused %d %v, last %v; want 7 (3 per source, 4 total), last %v", st.ConnRefused, st.ConnRefusedByCap, st.ConnRefusedLast, last)
+	}
+	for _, want := range []string{
+		`firerunner_cache_conn_refused_total{cap="per_source"} 3`,
+		`firerunner_cache_conn_refused_total{cap="total"} 4`,
+		`firerunner_cache_idle_cuts_total{direction="request"} 0`,
+		`firerunner_cache_idle_cuts_total{direction="response"} 0`,
+	} {
+		if !strings.Contains(metrics, want) {
+			t.Fatalf("metrics missing %q in:\n%s", want, metrics)
+		}
+	}
+}
+
 // sanity: hex helper matches how blocks are stored (guards the reassembly path).
 func TestBlockIDEncoding(t *testing.T) {
 	if hex.EncodeToString([]byte("blk-0001")) == "" {

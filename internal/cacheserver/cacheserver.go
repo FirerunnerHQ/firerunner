@@ -78,6 +78,7 @@ import (
 
 	"github.com/firerunnerhq/firerunner/internal/gitcache"
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
+	"github.com/firerunnerhq/firerunner/internal/lograte"
 )
 
 const (
@@ -165,7 +166,26 @@ type Server struct {
 	bodyIdle        atomic.Int64 // a time.Duration; see SetBodyIdle
 	artifactRPCs    atomic.Uint64
 	artifactErrors  atomic.Uint64
+
+	// Transfers the idle bound cut, by direction, the latest's time (unix
+	// nanoseconds, 0 before the first) and the spacing of their warnings.
+	idleCutRequests, idleCutResponses atomic.Uint64
+	idleCutLast                       atomic.Int64
+	idleCutWarns                      lograte.Limiter
+	// connRefused reports the listener's refusals; see SetConnRefusals.
+	connRefused atomic.Pointer[func() (map[string]uint64, time.Time)]
 }
+
+// Directions of a transfer the idle bound cuts, as Stats and /metrics count
+// them: a request body that stopped arriving (an upload, above all), or a
+// response the client stopped reading (a download).
+const (
+	cutRequest  = "request"
+	cutResponse = "response"
+)
+
+// connCaps are the listener's caps, as jitserver.Limited names them.
+var connCaps = []string{"per_source", "total"}
 
 // Stats is a point-in-time snapshot of the cache store, served by /stats and
 // /metrics and consumed by `firerunner status`.
@@ -183,6 +203,17 @@ type Stats struct {
 	Evictions              uint64            `json:"evictions"`             // entries removed by the size or entry caps
 	ArtifactRPCs           uint64            `json:"artifact_rpcs"`         // ArtifactService RPCs forwarded upstream
 	ArtifactErrors         uint64            `json:"artifact_errors"`       // artifact RPCs refused, failed, or answered 5xx
+	// Connections the listener refused at its caps (MaxConnsPerSource,
+	// MaxConns), by cap ("per_source", "total"), and the latest's time.
+	ConnRefused      uint64            `json:"conn_refused"`
+	ConnRefusedByCap map[string]uint64 `json:"conn_refused_by_cap"`
+	ConnRefusedLast  time.Time         `json:"conn_refused_last,omitzero"`
+	// Transfers the idle bound (SetBodyIdle) cut, by direction ("request":
+	// a body that stopped arriving; "response": one left unread), and the
+	// latest's time.
+	IdleCuts            uint64            `json:"idle_cuts"`
+	IdleCutsByDirection map[string]uint64 `json:"idle_cuts_by_direction"`
+	IdleCutLast         time.Time         `json:"idle_cut_last,omitzero"`
 }
 
 // snapshot collects current stats. The caller must NOT hold s.mu.
@@ -192,6 +223,25 @@ func (s *Server) snapshot() Stats {
 		IdentityWaits:          s.identityWaits.Load(),
 		IdentityWaitSeconds:    time.Duration(s.identityWaitNanos.Load()).Seconds(),
 		ArtifactRPCs:           s.artifactRPCs.Load(), ArtifactErrors: s.artifactErrors.Load(),
+		ConnRefusedByCap: make(map[string]uint64, len(connCaps)),
+		IdleCutsByDirection: map[string]uint64{
+			cutRequest: s.idleCutRequests.Load(), cutResponse: s.idleCutResponses.Load(),
+		},
+	}
+	st.IdleCuts = st.IdleCutsByDirection[cutRequest] + st.IdleCutsByDirection[cutResponse]
+	if ns := s.idleCutLast.Load(); ns != 0 {
+		st.IdleCutLast = time.Unix(0, ns).UTC()
+	}
+	var byCap map[string]uint64
+	if f := s.connRefused.Load(); f != nil {
+		byCap, st.ConnRefusedLast = (*f)()
+		if !st.ConnRefusedLast.IsZero() {
+			st.ConnRefusedLast = st.ConnRefusedLast.UTC()
+		}
+	}
+	for _, c := range connCaps {
+		st.ConnRefusedByCap[c] = byCap[c]
+		st.ConnRefused += byCap[c]
 	}
 	s.identityMu.Lock()
 	for _, reason := range denyReasons {
@@ -305,14 +355,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if idle := s.bodyIdle.Load(); idle > 0 && !strings.HasPrefix(r.URL.Path, artifactTwirpBase) {
 		rc := http.NewResponseController(w)
 		if r.Body != nil && r.Body != http.NoBody {
-			r.Body = &idleBody{ReadCloser: r.Body, rc: rc, idle: time.Duration(idle)}
+			r.Body = &idleBody{ReadCloser: r.Body, rc: rc, idle: time.Duration(idle),
+				cut: func() { s.idleCut(cutRequest, r, time.Duration(idle)) }}
 		}
 		// A response, a download above all, that the client stops reading
 		// ends too. net/http clears the write deadline once it has flushed
 		// the response, so the last write's deadline also bounds that flush
 		// and never reaches the connection's next request
 		// (TestDownloadIdleBoundEndsWithTheRequest).
-		w = &idleWriter{ResponseWriter: w, rc: rc, idle: time.Duration(idle)}
+		w = &idleWriter{ResponseWriter: w, rc: rc, idle: time.Duration(idle),
+			cut: func() { s.idleCut(cutResponse, r, time.Duration(idle)) }}
 	}
 	s.mux.ServeHTTP(w, r)
 }
@@ -324,11 +376,24 @@ type idleWriter struct {
 	http.ResponseWriter
 	rc   *http.ResponseController
 	idle time.Duration
+	cut  func() // called once, when a write runs past the deadline; may be nil
+	was  bool   // cut has been called
 }
 
 func (w *idleWriter) Write(p []byte) (int, error) {
 	_ = w.rc.SetWriteDeadline(time.Now().Add(w.idle))
-	return w.ResponseWriter.Write(p)
+	n, err := w.ResponseWriter.Write(p)
+	w.check(err)
+	return n, err
+}
+
+// check reports a cut the first time a write fails on the deadline. Writes
+// come from the handler's goroutine alone.
+func (w *idleWriter) check(err error) {
+	if !w.was && w.cut != nil && errors.Is(err, os.ErrDeadlineExceeded) {
+		w.was = true
+		w.cut()
+	}
 }
 
 // Unwrap lets http.ResponseController reach the connection's own writer.
@@ -367,6 +432,7 @@ func (w *idleWriter) ReadFrom(src io.Reader) (int64, error) {
 			limit -= n
 		}
 		if err != nil || n < want {
+			w.check(err)
 			return total, err
 		}
 	}
@@ -375,7 +441,16 @@ func (w *idleWriter) ReadFrom(src io.Reader) (int64, error) {
 
 // Connection caps for the cache server's listener (cmd/firerunner): one job
 // opens a few at a time, a handful of parallel range reads for a download
-// at most; the rest only hold descriptors and goroutines.
+// at most; the rest only hold descriptors and goroutines. Connections from
+// the host itself, such as `firerunner status` reading /stats, are exempt
+// (jitserver.Limited.ExemptLocal), so a full cap never hides the server's
+// health.
+//
+// The total is shared by every guest. It needs no per-tenant share, as
+// tenants never share a cache-server: only the install's own tiers cache,
+// and every extra tenant's are cache-disabled (config.TenantTiers, #168). A
+// cache that served several tenants would need one, or one tenant's
+// instances could fill it.
 const (
 	MaxConnsPerSource = 64
 	MaxConns          = 4096
@@ -401,7 +476,8 @@ type idleBody struct {
 	io.ReadCloser
 	rc   *http.ResponseController
 	idle time.Duration
-	done bool // the body has returned an error, such as io.EOF
+	cut  func() // called when a read runs past the deadline; may be nil
+	done bool   // the body has returned an error, such as io.EOF
 }
 
 func (b *idleBody) Read(p []byte) (int, error) {
@@ -417,7 +493,36 @@ func (b *idleBody) Read(p []byte) (int, error) {
 	_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
 	n, err := b.ReadCloser.Read(p)
 	b.done = err != nil
+	// Only the first error gets here, so a cut is reported once.
+	if b.cut != nil && errors.Is(err, os.ErrDeadlineExceeded) {
+		b.cut()
+	}
 	return n, err
+}
+
+// idleCut counts a transfer the idle bound cut and warns about it, at most
+// once a minute per direction. Without the count a cut looks like a flaky
+// cache: the handler sees an ordinary read or write error.
+func (s *Server) idleCut(direction string, r *http.Request, idle time.Duration) {
+	if direction == cutRequest {
+		s.idleCutRequests.Add(1)
+	} else {
+		s.idleCutResponses.Add(1)
+	}
+	s.idleCutLast.Store(time.Now().UnixNano())
+	if held, ok := s.idleCutWarns.Allow(direction); ok {
+		// The path only: the query holds the blob's signature.
+		s.log.Warn("cut a transfer idle past --body-idle-timeout", "direction", direction,
+			"method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr, "idle", idle, "unlogged_since_last", held)
+	}
+}
+
+// SetConnRefusals has /stats and /metrics report the connections the
+// listener refused at its caps, as refused returns them by cap name with the
+// latest refusal's time (jitserver.Limited.Refused). Without it they report
+// none.
+func (s *Server) SetConnRefusals(refused func() (map[string]uint64, time.Time)) {
+	s.connRefused.Store(&refused)
 }
 
 // StartJanitor runs a background loop that reclaims abandoned (reserved but
@@ -1039,6 +1144,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE firerunner_artifact_rpcs_total counter\nfirerunner_artifact_rpcs_total %d\n", st.ArtifactRPCs)
 	fmt.Fprintf(w, "# HELP firerunner_artifact_errors_total Artifact RPCs refused, failed, or answered 5xx.\n")
 	fmt.Fprintf(w, "# TYPE firerunner_artifact_errors_total counter\nfirerunner_artifact_errors_total %d\n", st.ArtifactErrors)
+	fmt.Fprintf(w, "# HELP firerunner_cache_conn_refused_total Connections refused at the listener's per-source or total cap, by cap.\n# TYPE firerunner_cache_conn_refused_total counter\n")
+	for _, c := range connCaps {
+		fmt.Fprintf(w, "firerunner_cache_conn_refused_total{cap=%q} %d\n", c, st.ConnRefusedByCap[c])
+	}
+	fmt.Fprintf(w, "# HELP firerunner_cache_idle_cuts_total Transfers cut by the body idle bound, by direction: request (a body that stopped arriving) or response (one left unread).\n# TYPE firerunner_cache_idle_cuts_total counter\n")
+	for _, d := range []string{cutRequest, cutResponse} {
+		fmt.Fprintf(w, "firerunner_cache_idle_cuts_total{direction=%q} %d\n", d, st.IdleCutsByDirection[d])
+	}
 }
 
 // authEntry resolves and authorizes the {id} + ?sig= on a blob request.
