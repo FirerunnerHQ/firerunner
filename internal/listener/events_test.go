@@ -72,31 +72,44 @@ func TestJobEvents(t *testing.T) {
 	}
 }
 
-// A job assigned while its tenant is at a limit is recorded as held, with the
-// reason, beside its assignment; one assigned with room is not.
+// The jobs a message assigns that its plan could not start, by its tenant's
+// limit, are recorded as held with the reason: the newest ones, as many as
+// the tier holds back. With nothing held, none is.
 func TestJobHeldWithReason(t *testing.T) {
-	base := scaleset.JobMessageBase{JobID: "job-1", OwnerName: "owner", RepositoryName: "repo"}
+	job := func(id string) *scaleset.JobAssigned {
+		return &scaleset.JobAssigned{JobMessageBase: scaleset.JobMessageBase{JobID: id, OwnerName: "owner", RepositoryName: "repo"}}
+	}
 	events := &eventLog{}
-	why := `tenant "acme" is at its limit of 2 runner(s) at once`
-	f := newFakeSession(0, false)
-	ts := trackedSession{session: f, events: events, tier: "tier-a", held: func() string { return why }}
-	f.msgs <- &scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: base}}}
-	if _, err := ts.GetMessage(context.Background(), 0, 1); err != nil {
+	held, why := 0, `tenant "acme" is at its limit of 2 runner(s) at once`
+	var planned []int
+	a := &scaler{events: events, tier: "tier-a", log: slog.New(slog.DiscardHandler), stats: &statsRecorder{},
+		held: func() (int, string) { return held, why },
+		onDesired: func(_ context.Context, n int) int {
+			planned = append(planned, n)
+			held = 1 // the plan launches one and holds one back
+			return 1
+		}}
+	msg := &scaleset.RunnerScaleSetMessage{Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 2},
+		JobAssignedMessages: []*scaleset.JobAssigned{job("job-1"), nil, job("job-2")}}
+	if err := a.Scale(context.Background(), msg); err != nil {
 		t.Fatal(err)
 	}
-	if len(events.got) != 2 || events.got[0].Kind != jobevent.Assigned || events.got[1].Kind != jobevent.Held {
+	if len(planned) != 1 || planned[0] != 2 {
+		t.Fatalf("planned %v: the hold must be read after the plan", planned)
+	}
+	if len(events.got) != 1 {
 		t.Fatalf("events = %+v", events.got)
 	}
-	if h := events.got[1]; h.Reason != why || h.JobID != "job-1" || h.Tier != "tier-a" || h.Repository != "owner/repo" {
+	if h := events.got[0]; h.Kind != jobevent.Held || h.Reason != why || h.JobID != "job-2" || h.Tier != "tier-a" || h.Repository != "owner/repo" {
 		t.Fatalf("held event = %+v", h)
 	}
 
-	why = ""
-	f.msgs <- &scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: base}}}
-	if _, err := ts.GetMessage(context.Background(), 0, 1); err != nil {
+	held, events.got = 0, nil
+	a.onDesired = func(context.Context, int) int { return 1 }
+	if err := a.Scale(context.Background(), msg); err != nil {
 		t.Fatal(err)
 	}
-	if len(events.got) != 3 || events.got[2].Kind != jobevent.Assigned {
-		t.Fatalf("a job assigned with room was recorded as held: %+v", events.got)
+	if len(events.got) != 0 {
+		t.Fatalf("recorded held with nothing held: %+v", events.got)
 	}
 }

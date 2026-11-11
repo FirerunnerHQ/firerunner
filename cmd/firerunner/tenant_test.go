@@ -272,9 +272,17 @@ func TestTierGetsItsTenantsLimits(t *testing.T) {
 		t.Fatalf("a stop is not in the tier's health: %d", n)
 	}
 
-	lc := s.listenerConfig(ten, tier, tenantHooks{}, tracker, assigned.New(nil), s.log, bound)
-	if lc.Held == nil || lc.Held() != "" {
-		t.Fatal("the listener does not ask the tenant's bound")
+	held := heldBy(func() *scheduler.Scheduler { return nil })
+	if n, why := held(); n != 0 || why != "" {
+		t.Fatalf("before the scheduler: %d %q", n, why)
+	}
+	sched := scheduler.New(o)
+	lc := s.listenerConfig(ten, tier, tenantHooks{}, tracker, assigned.New(nil), s.log, heldBy(func() *scheduler.Scheduler { return sched }))
+	if lc.Held == nil {
+		t.Fatal("the listener does not ask the tier's scheduler what it holds")
+	}
+	if n, _ := lc.Held(); n != 0 {
+		t.Fatalf("held %d", n)
 	}
 }
 

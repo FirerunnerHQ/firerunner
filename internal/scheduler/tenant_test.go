@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -61,9 +62,6 @@ func TestTenantBoundsRunnersAcrossTiers(t *testing.T) {
 	if jobs != 1 || !strings.Contains(why, `tenant "acme" is at its limit of 2 runner(s)`) {
 		t.Fatalf("tier a holds %d (%q), want 1 with the reason", jobs, why)
 	}
-	if got := ten.Holding(); !strings.Contains(got, "at its limit") {
-		t.Fatalf("Holding() = %q while at the limit", got)
-	}
 
 	s[1].Reconcile(ctx, 1)
 	if got := s[1].Running(); got != 0 {
@@ -97,9 +95,6 @@ func TestTenantBoundsRunnersAcrossTiers(t *testing.T) {
 	if s[0].Running() != 1 || s[1].Running() != 1 {
 		t.Fatalf("running %d + %d, want 1 + 1: both tiers' jobs got runners", s[0].Running(), s[1].Running())
 	}
-	if ten.Holding() != "" && ten.Running() < 2 {
-		t.Fatalf("Holding() = %q below the limit", ten.Holding())
-	}
 	prov.finish(third)
 	prov.finish(fourth)
 	s[0].Drain()
@@ -107,6 +102,91 @@ func TestTenantBoundsRunnersAcrossTiers(t *testing.T) {
 	if ten.Running() != 0 {
 		t.Fatalf("tenant counts %d runners after both tiers drained", ten.Running())
 	}
+}
+
+// Places go to the tiers waiting in turn: a tier with a queue does not keep
+// every place its own runners free while another tier's job waits. Tier a
+// waits first and gets the first place; then tier b, though a's queue has a
+// job left and it was a's runner that ended.
+func TestTiersWaitingTakeTurns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ten := NewTenant("acme", 1)
+	jit := &jitSeq{}
+	provA, provB := newJobProv(), newJobProv()
+	a := New(Options{Max: 4, Provisioner: provA, JIT: jit, Logger: testLogger(), Tenant: ten})
+	b := New(Options{Max: 4, Provisioner: provB, JIT: jit, Logger: testLogger(), Tenant: ten})
+	a.Reconcile(ctx, 3) // one runs, two wait
+	a1 := provA.next(t)
+	b.Reconcile(ctx, 1) // one waits, behind a
+	if n, _ := b.Held(); n != 1 {
+		t.Fatalf("tier b holds %d", n)
+	}
+
+	message(ctx, a, 2, a1)
+	provA.finish(a1)
+	a2 := provA.next(t) // a waited first
+	waitUntil(t, "the place taken", func() bool { return ten.Running() == 1 })
+	provB.noMore(t)
+
+	message(ctx, a, 1, a2)
+	provA.finish(a2)
+	b1 := provB.next(t) // now b's turn, though a still has a job queued
+	waitUntil(t, "the place taken", func() bool { return ten.Running() == 1 })
+	provA.noMore(t)
+	if n, _ := a.Held(); n != 1 {
+		t.Fatalf("tier a holds %d, want its last job", n)
+	}
+
+	message(ctx, b, 0, b1)
+	provB.finish(b1)
+	a3 := provA.next(t) // and a's again
+	provA.finish(a3)
+	a.Drain()
+	b.Drain()
+}
+
+// A tier that stops leaves its tenant's line, so it is never ahead of a tier
+// still serving.
+func TestDrainedTierLeavesTheLine(t *testing.T) {
+	ctx, ten, prov, s, _ := tenantLab(t, 1)
+	s[0].Reconcile(ctx, 1)
+	a := prov.next(t)
+	s[1].Reconcile(ctx, 1)
+	ten.mu.Lock()
+	inLine := slices.Contains(ten.line, s[1])
+	ten.mu.Unlock()
+	if !inLine {
+		t.Fatal("a tier with a launch held back is not in line")
+	}
+	s[1].Drain()
+	ten.mu.Lock()
+	inLine = slices.Contains(ten.line, s[1])
+	ten.mu.Unlock()
+	if inLine {
+		t.Fatal("a drained tier is still in line")
+	}
+	prov.finish(a)
+	s[0].Drain()
+}
+
+// The warm floor's top-up is bounded by the tenant too, and comes after a job
+// waiting on another tier.
+func TestWarmTopUpIsBoundedByTheTenant(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ten := NewTenant("", 1)
+	prov := newJobProv()
+	s := New(Options{Max: 4, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger(), Tenant: ten})
+	s.SetMin(ctx, 2) // before any message: the top-up fills the floor
+	a := prov.next(t)
+	if got := s.Running(); got != 1 {
+		t.Fatalf("running %d, want 1: the install's limit", got)
+	}
+	prov.noMore(t)
+	cancel() // no top-up after the exit
+	prov.finish(a)
+	s.Drain()
 }
 
 // A hold clears when the jobs it held are no longer wanted.
@@ -147,13 +227,13 @@ func TestTenantBoundsCapacity(t *testing.T) {
 
 // Without a bound the tenant holds nothing.
 func TestTenantWithoutLimitHoldsNothing(t *testing.T) {
-	ctx, ten, prov, s, hs := tenantLab(t, 0)
+	ctx, _, prov, s, hs := tenantLab(t, 0)
 	s[0].Reconcile(ctx, 4)
 	var names []string
 	for range 4 {
 		names = append(names, prov.next(t))
 	}
-	if _, _, n := hs[0].get(); n != 0 || ten.Holding() != "" {
+	if _, _, n := hs[0].get(); n != 0 {
 		t.Fatalf("a tenant with no limit reported a hold")
 	}
 	if got := s[0].Capacity(); got != 4 {

@@ -331,7 +331,7 @@ func (s *Scheduler) grant(want int) int {
 	if s.opts.Tenant == nil {
 		return want
 	}
-	n, why := s.opts.Tenant.take(want)
+	n, why := s.opts.Tenant.take(s, want)
 	s.setHeld(want-n, why)
 	return n
 }
@@ -346,6 +346,9 @@ func (s *Scheduler) setHeld(n int, why string) {
 		return
 	}
 	s.held, s.heldWhy = n, why
+	if s.opts.Tenant != nil {
+		s.opts.Tenant.wait(s, n > 0)
+	}
 	if n > 0 {
 		s.opts.Logger.Info("launches held", "jobs", n, "reason", why)
 	} else {
@@ -363,11 +366,17 @@ func (s *Scheduler) Held() (int, string) {
 	return s.held, s.heldWhy
 }
 
-// retry plans again with the last desired count when the tenant held
-// launches back: a place among its runners has freed. It does what a
-// Reconcile with the same count would.
+// retry plans again with the last desired count, when a place among its
+// tenant's runners has freed or a hold was lifted, if the tier has launches
+// waiting: ones the tenant held back, or the re-plan an exit whose job
+// completed asked for (see replan). It does what a Reconcile with the same
+// count would.
 func (s *Scheduler) retry() {
 	s.mu.Lock()
+	if s.held > 0 && (s.draining || (s.hasDesired && s.lastCtx.Err() != nil)) {
+		// The tier stopped: it no longer waits in its tenant's line.
+		s.setHeld(0, "")
+	}
 	if s.held == 0 || !s.hasDesired || s.draining || s.lastCtx.Err() != nil {
 		s.mu.Unlock()
 		return
@@ -435,10 +444,17 @@ func (s *Scheduler) replan(ctx context.Context) (int, context.Context) {
 	want := plan(s.desired(), s.live(), s.running, s.opts.Max)
 	n := min(1, want)
 	if s.opts.Tenant != nil {
-		granted, why := s.opts.Tenant.take(n)
-		if why != "" || granted == want {
+		// The place this exit freed is the tenant's: a tier ahead in its
+		// line gets it first (see Tenant).
+		granted, why := s.opts.Tenant.take(s, n)
+		switch {
+		case why != "":
 			s.setHeld(want-granted, why)
+		case granted == want:
+			s.setHeld(0, "")
 		}
+		// Granted one of several: the rest wait for the next message, as
+		// without a tenant, and the hold stays as the last plan left it.
 		n = granted
 	}
 	s.commit(n)
@@ -1050,11 +1066,9 @@ func (s *Scheduler) maintainMinimum(ctx context.Context) {
 		n = plan(s.opts.Min, s.running, s.running, s.opts.Max)
 	}
 	if s.opts.Tenant != nil && n > 0 {
-		granted, why := s.opts.Tenant.take(n)
-		if why != "" {
-			s.setHeld(n-granted, why)
-		}
-		n = granted
+		// Behind every tier in its tenant's line, and not in line itself:
+		// the floor is refilled by the next plan once a place is free.
+		n, _ = s.opts.Tenant.take(s, n)
 	}
 	s.commit(n)
 	running, floor := s.running, s.opts.Min
@@ -1131,6 +1145,7 @@ func (s *Scheduler) Capacity() int {
 func (s *Scheduler) Drain() {
 	s.mu.Lock()
 	s.draining = true
+	s.setHeld(0, "") // out of its tenant's line
 	s.mu.Unlock()
 	s.wg.Wait()
 }

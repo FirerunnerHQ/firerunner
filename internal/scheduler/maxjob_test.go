@@ -119,6 +119,39 @@ func TestCompletedJobIsNotStoppedByTheLimit(t *testing.T) {
 	}
 }
 
+// A job limit's timer that fires after its runner is gone stops nothing,
+// even a later runner under the same name.
+func TestJobLimitTimerAfterTheRunnerIsGone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prov := newJobProv()
+	prov.bootIdle = true
+	var stops []Stop
+	s := New(Options{Max: 1, Provisioner: prov, JIT: jitStub{}, Logger: testLogger(),
+		MaxJob: 30 * time.Minute, OnStop: func(st Stop) { stops = append(stops, st) }})
+	st := &stopTimer{}
+	st.install(s)
+	s.Reconcile(ctx, 1)
+	a := prov.next(t)
+	s.MarkBusy(a)
+	prov.finish(a) // it ends before GitHub reports its job's end
+	waitUntil(t, "the runner gone", func() bool { return s.Running() == 0 })
+	s.Reconcile(ctx, 1) // a job still wanted: the next runner takes the name
+	b := prov.next(t)
+	if a != b {
+		t.Fatalf("names %s and %s: the test needs the name reused", a, b)
+	}
+	st.fns[0]() // the first runner's limit
+	select {
+	case got := <-prov.cancelled:
+		t.Fatalf("the old job's limit stopped %s", got)
+	default:
+	}
+	if len(stops) != 0 {
+		t.Fatalf("stops = %+v", stops)
+	}
+}
+
 // Without a limit, a job starting arms nothing.
 func TestNoJobLimitArmsNothing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

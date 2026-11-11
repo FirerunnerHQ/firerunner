@@ -131,11 +131,23 @@ func (s *shard) schedulerOptions(t tenant, tier config.Tier, bound *scheduler.Te
 	return o
 }
 
+// heldBy asks the tier's scheduler, once there is one, how many launches
+// its tenant holds back, and why.
+func heldBy(sched func() *scheduler.Scheduler) func() (int, string) {
+	return func() (int, string) {
+		if s := sched(); s != nil {
+			return s.Held()
+		}
+		return 0, ""
+	}
+}
+
 // listenerConfig is what a tier's scale set listener gets from its tenant.
-// A job assigned while bound holds launches is recorded as held.
-func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tracker *health.Tracker, jobs *assigned.Jobs, log *slog.Logger, bound *scheduler.Tenant) listener.Config {
+// held says what the tier's tenant holds back, for the jobs a message
+// assigns.
+func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tracker *health.Tracker, jobs *assigned.Jobs, log *slog.Logger, held func() (int, string)) listener.Config {
 	return listener.Config{
-		Held:         bound.Holding,
+		Held:         held,
 		URL:          t.URL,
 		OnJobStarted: hooks.onJobStarted,
 		OnJobOffered: hooks.onJobOffered,
@@ -342,7 +354,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	// before we start booting microVMs.
 	for i, tier := range t.Tiers {
 		tlog := log.With("tier", tier.Name)
-		lis, err := listener.New(ctx, s.listenerConfig(t, tier, hooks, st.trackers[i], tierJobs[tier.Name], tlog, st.bound), t.Owner)
+		lis, err := listener.New(ctx, s.listenerConfig(t, tier, hooks, st.trackers[i], tierJobs[tier.Name], tlog, heldBy(tierScheds[tier.Name].Load)), t.Owner)
 		if err != nil {
 			st.close(context.WithoutCancel(ctx))
 			return nil, fmt.Errorf("tier %q: %w", tier.Name, err)
