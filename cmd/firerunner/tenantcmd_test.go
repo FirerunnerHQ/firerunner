@@ -260,3 +260,26 @@ func (brokenStore) Load(context.Context) (tenantstate.States, error) {
 func (brokenStore) Put(context.Context, string, tenantstate.Record) error { return nil }
 func (brokenStore) Delete(context.Context, string) error                  { return nil }
 func (brokenStore) String() string                                        { return "broken" }
+
+// On the daemon's host, with no FR_* variable set, the tenant command reads the
+// state store from the daemon's settings file, as status and doctor do: an
+// operator on the control VM need not look the store up.
+func TestTenantCommandReadsTheDaemonsEnvFile(t *testing.T) {
+	clearFREnv(t)
+	path := filepath.Join(t.TempDir(), "tenant-state.json")
+	if code, out, errOut := runTenant(t, "suspend", "acme", "--reason", "abuse report", "--state", path, "--env-file", "none"); code != 0 {
+		t.Fatalf("suspend: exit %d\n%s%s", code, out, errOut)
+	}
+	clearFREnv(t)
+	old := daemonEnvFile
+	t.Cleanup(func() { daemonEnvFile = old })
+	daemonEnvFile = writeEnv(t, "FR_TENANT_STATE="+path+"\n")
+	code, out, errOut := runTenant(t, "list", "--json")
+	var r tenantReport
+	if err := json.Unmarshal([]byte(out), &r); err != nil || code != 0 || len(r.Suspended) != 1 || r.Suspended[0].ID != "acme" {
+		t.Fatalf("list with only the daemon's settings file: exit %d, %+v, %v\n%s%s", code, r, err, out, errOut)
+	}
+	if !strings.Contains(errOut, "read 1 settings from "+daemonEnvFile) {
+		t.Fatalf("stderr = %q, want it to say what it read", errOut)
+	}
+}
