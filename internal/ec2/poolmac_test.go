@@ -311,10 +311,8 @@ func TestPoolMAC_SignRetriesAnInstanceEC2DoesNotKnowYet(t *testing.T) {
 	// Right after RunInstances, CreateTags on the new ID may answer
 	// InvalidInstanceID.NotFound for a few seconds: that is no reason to
 	// discard it.
-	old := signBackoff
-	signBackoff = time.Millisecond
-	t.Cleanup(func() { signBackoff = old })
 	h := poolHarness(t, 1, config.MarketSpot)
+	h.p.c.signBackoff = time.Millisecond
 	h.f.mu.Lock()
 	h.f.tagUnknown = signAttempts - 1
 	h.f.mu.Unlock()

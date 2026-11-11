@@ -71,6 +71,34 @@ type Client struct {
 	// any tier runs, read-only after.
 	poolKey          []byte
 	poolKeyEphemeral bool
+	// signBackoff is the first wait in tagNew; tests shorten it.
+	signBackoff time.Duration
+}
+
+// signAttempts bounds tagNew: with signBackoff doubling from 500 ms, about
+// 30 s in all.
+const signAttempts = 6
+
+// tagNew tags an instance this process just launched. EC2 may not know an
+// instance for a few seconds after RunInstances names it
+// (InvalidInstanceID.NotFound), so that error is retried.
+func (c *Client) tagNew(ctx context.Context, id, key, value string) error {
+	wait := c.signBackoff
+	for attempt := 1; ; attempt++ {
+		_, err := c.api.CreateTags(ctx, &ec2.CreateTagsInput{
+			Resources: []string{id},
+			Tags:      []types.Tag{{Key: aws.String(key), Value: aws.String(value)}},
+		})
+		if err == nil || !isCode(err, errNotFound) || attempt == signAttempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+		wait *= 2
+	}
 }
 
 func (c *Client) track(id string) {
@@ -103,7 +131,7 @@ func NewClient(api API, params ParamAPI, pollInterval time.Duration, log *slog.L
 	}
 	return &Client{
 		api: api, amis: newAMIResolver(api, params), watch: newWatcher(api, pollInterval, log), breakers: newBreakers(), log: log, live: map[string]bool{},
-		poolKey: randomPoolKey(), poolKeyEphemeral: true,
+		poolKey: randomPoolKey(), poolKeyEphemeral: true, signBackoff: 500 * time.Millisecond,
 	}
 }
 
@@ -344,6 +372,9 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 	id := aws.ToString(inst.InstanceId)
 	p.c.track(id)
 	defer p.c.untrack(id)
+	// Only a later process's reaper reads it, and this one tracks the
+	// instance meanwhile, so the launch need not wait for it.
+	go p.signRunner(context.WithoutCancel(ctx), id, name)
 	log := p.log.With("runner", name, "instance", id, "type", inst.InstanceType, "subnet", aws.ToString(inst.SubnetId))
 	log.Info("instance launched",
 		"ami", resolved.Sub(entered).Round(time.Millisecond),
@@ -366,6 +397,16 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 	}
 	defer release()
 	return w.run(ctx, ip)
+}
+
+// signRunner tags a job instance this process launched with the MAC of its
+// runner tag (TagRunnerMAC), which RunInstances could not: it binds the
+// instance ID. Without it, a later process's reaper never deregisters the
+// runner by the tag, and leaves a running orphan to MaxLifetime.
+func (p *Provisioner) signRunner(ctx context.Context, id, runner string) {
+	if err := p.c.tagNew(ctx, id, TagRunnerMAC, p.c.runnerMAC(p.o.Owner, p.o.Tier, runner, id)); err != nil {
+		p.log.Warn("could not sign the instance's runner tag; after a restart the reaper leaves it to the max lifetime", "runner", runner, "instance", id, "err", err)
+	}
 }
 
 func (p *Provisioner) launched(path string) {

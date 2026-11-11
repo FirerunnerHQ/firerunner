@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -96,6 +98,12 @@ import (
 // A reason stays until the next setStateFor, also across a start: whether
 // AWS clears it then is unchecked, so firerunner must not rely on either.
 //
+// DescribeInstances reports each instance's image, root device, EBS volumes
+// (one root volume per launch, on the image's root device), security groups,
+// instance profile and network interfaces, as RunInstances set them or a test
+// changed them since. Whether it lists a pending instance's volumes is
+// unchecked: volumesLate leaves them out, and firerunner must handle both.
+//
 // Not modelled, so no test may rely on it: the rebalance recommendation and
 // two-minute warning before a spot interruption; the
 // replacement a persistent request launches (R10 fails the test instead); a
@@ -124,6 +132,16 @@ type fakeInstance struct {
 	tags                  map[string]string
 	spotTags              map[string]string // tags on its spot request
 	launched              time.Time
+	// What DescribeInstances reports of its attachments: the image it was
+	// launched from, its root device and EBS volumes (device -> volume ID),
+	// security groups, instance profile ARN ("" for none) and network
+	// interfaces (0 counts as 1). A test changes them as someone with
+	// ec2:ModifyInstanceAttribute or ec2:AttachVolume could.
+	image, rootDevice string
+	volumes           map[string]string
+	groups            []string
+	profile           string
+	enis              int
 }
 
 // fakeEC2 is an in-memory EC2. RunInstances fails per type/subnet/market as
@@ -145,7 +163,10 @@ type fakeEC2 struct {
 	nextIP string
 	// noIPInRun leaves PrivateIpAddress out of the RunInstances response, as
 	// AWS may, so the launcher has to describe the instance for it.
-	noIPInRun   bool
+	noIPInRun bool
+	// volumesLate leaves a pending instance's block devices out of
+	// DescribeInstances, as AWS may list them only later.
+	volumesLate bool
 	describeErr error
 	// invisible IDs make DescribeInstances fail with InvalidInstanceID.NotFound
 	// whenever they are asked for, as for a just-launched instance.
@@ -266,6 +287,17 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, opt
 		state:      types.InstanceStateNamePending,
 		tags:       map[string]string{},
 		volumeTags: map[string]string{},
+		image:      aws.ToString(in.ImageId),
+		groups:     append([]string(nil), in.SecurityGroupIds...),
+	}
+	// The root volume is created from the image, on its root device.
+	inst.rootDevice = f.images[inst.image]
+	if inst.rootDevice == "" {
+		inst.rootDevice = "/dev/xvda"
+	}
+	inst.volumes = map[string]string{inst.rootDevice: fmt.Sprintf("vol-%04d", f.next)}
+	if p := in.IamInstanceProfile; p != nil {
+		inst.profile = aws.ToString(p.Arn) + aws.ToString(p.Name)
 	}
 	if mo := in.InstanceMarketOptions; mo != nil && mo.SpotOptions != nil && mo.SpotOptions.SpotInstanceType == types.SpotInstanceTypePersistent {
 		inst.spotReq = fmt.Sprintf("sir-%04d", f.next)
@@ -323,6 +355,32 @@ func (f *fakeEC2) view(i *fakeInstance) types.Instance {
 	}
 	for k, val := range i.tags {
 		v.Tags = append(v.Tags, types.Tag{Key: aws.String(k), Value: aws.String(val)})
+	}
+	if i.image != "" {
+		v.ImageId = aws.String(i.image)
+	}
+	if i.rootDevice != "" {
+		v.RootDeviceName = aws.String(i.rootDevice)
+		v.RootDeviceType = types.DeviceTypeEbs
+	}
+	if !(f.volumesLate && i.state == types.InstanceStateNamePending) {
+		for dev, vol := range i.volumes {
+			v.BlockDeviceMappings = append(v.BlockDeviceMappings, types.InstanceBlockDeviceMapping{
+				DeviceName: aws.String(dev),
+				Ebs:        &types.EbsInstanceBlockDevice{VolumeId: aws.String(vol), Status: types.AttachmentStatusAttached},
+			})
+		}
+	}
+	var groups []types.GroupIdentifier
+	for _, g := range i.groups {
+		groups = append(groups, types.GroupIdentifier{GroupId: aws.String(g)})
+	}
+	v.SecurityGroups = groups
+	if i.profile != "" {
+		v.IamInstanceProfile = &types.IamInstanceProfile{Arn: aws.String(i.profile)}
+	}
+	for range max(i.enis, 1) {
+		v.NetworkInterfaces = append(v.NetworkInterfaces, types.InstanceNetworkInterface{SubnetId: aws.String(i.subnet), Groups: groups})
 	}
 	return v
 }
@@ -539,10 +597,9 @@ func (f *fakeEC2) instance(id string) fakeInstance {
 // clone copies an instance, tags included, for reading outside the lock.
 func (i *fakeInstance) clone() fakeInstance {
 	c := *i
-	c.tags = make(map[string]string, len(i.tags))
-	for k, v := range i.tags {
-		c.tags[k] = v
-	}
+	c.tags = maps.Clone(i.tags)
+	c.volumes = maps.Clone(i.volumes)
+	c.groups = slices.Clone(i.groups)
 	return c
 }
 

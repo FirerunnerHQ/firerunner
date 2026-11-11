@@ -45,9 +45,15 @@ const (
 	// once, PoolReady once it has stopped, PoolClaimed when a job took it.
 	TagPool = "firerunner:pool"
 	// TagPoolMAC proves a pool instance was launched by an install holding
-	// the pool key (see poolMAC). Rediscovery trusts no pool instance
+	// the pool key (see poolmac.go). Rediscovery trusts no pool instance
 	// without it.
 	TagPoolMAC = "firerunner:pool-mac"
+	// TagPoolDiskMAC binds a pool instance to the image and volumes it was
+	// launched with (see diskMAC); a claim checks it before the start.
+	TagPoolDiskMAC = "firerunner:pool-disk-mac"
+	// TagRunnerMAC binds TagRunner to its instance (see runnerMAC); the
+	// reaper deregisters no runner without it.
+	TagRunnerMAC = "firerunner:runner-mac"
 )
 
 // Stopped-pool states, the values of TagPool.

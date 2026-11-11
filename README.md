@@ -570,11 +570,23 @@ starting the instance:
   Secrets Manager. Without it, each process signs with a random key of its
   own, so the pool is rebuilt after every restart. Changing the key
   discards the pool once, as does the upgrade from a release before it:
-  older pool instances carry no MAC. The MAC proves which install launched
-  an instance, not that nobody changed it since: whoever may modify or
-  attach volumes or change security groups on your instances is still to
-  be trusted. Run one control plane per owner at a time, as before: one
-  without the key would discard the other's pool, and the other its.
+  older pool instances carry no MAC. Run one control plane per owner at a
+  time, as before: one without the key would discard the other's pool, and
+  the other its.
+- **Checked at claim.** The MAC proves which install launched an instance,
+  not that nobody changed it since. So while an instance first boots,
+  firerunner also tags it `firerunner:pool-disk-mac`, an HMAC of the image
+  it was launched from and its EBS volumes; it signs only instances it
+  launched itself, and only while they run. Before a claim starts an
+  instance, firerunner describes it and checks that its image and volumes
+  still match that MAC, that its security groups are exactly the tier's,
+  its subnet one of the tier's, and that it has no instance profile and one
+  network interface. An instance that fails any of these is never started:
+  firerunner logs what differs, terminates it, and the job takes the next
+  one or cold-launches. The check is made just before the start, so whoever
+  may change your instances in the moment between still has to be trusted.
+  Pool instances from a release before this check carry no disk MAC, so the
+  upgrade discards the pool once.
 - **Fallback.** With the pool empty, or if a stopped instance cannot start
   (spot capacity), the job cold-launches instead.
 
@@ -642,7 +654,13 @@ running process tracks, and anything younger than 2 minutes.
   runner. If GitHub agrees, the runner had no job and the instance is
   terminated. If the runner is busy, its job is left to finish; it powers off,
   and the next sweep ends it. Past `--max-vm-lifetime`, it is terminated
-  regardless.
+  regardless. The runner's name comes from the instance's `firerunner:runner`
+  tag, which anyone who may tag instances could write; so firerunner also
+  tags each job instance `firerunner:runner-mac`, an HMAC of its owner, tier,
+  runner and instance ID under the `--ec2-pool-key-file` key, and
+  deregisters a runner only when that MAC holds. An instance without one
+  (launched by a release before it, or without the key file) is left to
+  `--max-vm-lifetime`, and the reaper logs a warning naming it.
 - **A pool instance of a tier that no longer keeps a pool:** terminated.
 - **A pool instance whose `firerunner:pool-mac` fails:** terminated (see
   *Signed* above).
@@ -706,9 +724,11 @@ daemon's "job started" log line for the runner's name gives the job's
 - `--aws-region` / `FR_AWS_REGION`: defaults to the SDK's sources, then the
   control VM's own region.
 - `--ec2-pool-key-file` / `FR_EC2_POOL_KEY_FILE`: a root-only file holding
-  the key (at least 32 bytes) that signs pool instances, so a restart reuses
-  them; see *Signed* under the stopped pool. Unset, the pool is rebuilt after
-  every restart.
+  the key (at least 32 bytes) that signs pool instances and runner tags, so a
+  restart reuses the pool and its reaper can deregister the runners an
+  earlier process launched; see *Signed* under the stopped pool, and the
+  reaper. Unset, the pool is rebuilt after every restart, and those runners'
+  instances are left to `--max-vm-lifetime`.
 
 **Running the control VM.** [`deploy/cloudformation/`](deploy/cloudformation/README.md) has a
 CloudFormation template that does this for you:
