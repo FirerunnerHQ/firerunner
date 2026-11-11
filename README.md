@@ -1164,13 +1164,15 @@ firerunner cache-server --dir /var/lib/firerunner/cache \
 
 The server also exposes `GET /stats` (JSON: entry count, bytes, hits, misses,
 saves, evictions) and `GET /metrics` (Prometheus text, no client library
-needed) for scraping. `firerunner status` reads `/stats` and shows the live
+needed) for scraping. `firerunner status` reads `/stats` (at `--ec2-cache-addr`
+when only EC2 tiers cache) and shows the live
 entry count, size vs. cap, and hit rate under the `dep cache` row, with the
 connections refused at the caps and the transfers cut by `--body-idle-timeout`
 when there are any. `/stats` has them as `conn_refused`,
 `conn_refused_by_cap` (`per_source`, `total`), `conn_refused_last`,
 `idle_cuts`, `idle_cuts_by_direction` (`request`: a body that stopped
-arriving; `response`: one left unread) and `idle_cut_last`; `/metrics` as
+arriving; `response`: one left unread, counted when a handler's write fails,
+so a small response's final flush is not) and `idle_cut_last`; `/metrics` as
 `firerunner_cache_conn_refused_total{cap}` and
 `firerunner_cache_idle_cuts_total{direction}`. Each is also logged as a
 warning, at most once a minute per cap or direction, and `firerunner doctor`

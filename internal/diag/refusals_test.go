@@ -142,3 +142,49 @@ func TestJITRefusalsInStatusAndDoctor(t *testing.T) {
 		t.Fatalf("jit-conns without a JIT endpoint = %+v, want none", c)
 	}
 }
+
+// On a host whose only cache is the EC2 tiers', status and doctor read that
+// cache-server's /stats at --ec2-cache-addr.
+func TestEC2CacheStatsInStatusAndDoctor(t *testing.T) {
+	st := cacheserver.Stats{Entries: 2, ConnRefused: 1, ConnRefusedByCap: map[string]uint64{"total": 1}, ConnRefusedLast: time.Now()}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/stats" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(st)
+	}))
+	t.Cleanup(ts.Close)
+	addr := strings.TrimPrefix(ts.URL, "http://")
+	cfg := &config.Config{
+		ScaleSetName: "firerunner", EC2CacheAddr: addr,
+		Firecracker: provisioner.FirecrackerConfig{WorkDir: t.TempDir(), TapPrefix: "fr", NetBase: 16},
+		Tiers: []config.Tier{{Name: "cloud", Provisioner: config.ProvisionerEC2, Max: 2, EC2: &config.EC2Tier{
+			InstanceTypes: []string{"c8a.xlarge"}, Market: config.MarketSpot, Cache: true,
+		}}},
+	}
+	text := statusText(t, cfg)
+	for _, want := range []string{"self-hosted for EC2 tiers at " + addr, "2 entries", "refused 1 connection(s) at its caps (0 per-source, 1 total)"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("status missing %q\n%s", want, text)
+		}
+	}
+	found := false
+	for _, c := range runDoctor(cfg, "test").Checks {
+		if c.Name == "dep-cache-conns" {
+			found = true
+			if c.Level != levelWarn {
+				t.Errorf("dep-cache-conns %s %q, want a warning", c.Level, c.Detail)
+			}
+		}
+	}
+	if !found {
+		t.Error("doctor has no dep-cache-conns check for the EC2 cache")
+	}
+
+	// A tier that does not cache reads nothing, whatever the address.
+	cfg.Tiers[0].EC2.Cache = false
+	if text := statusText(t, cfg); strings.Contains(text, "self-hosted") {
+		t.Errorf("status shows a cache no tier uses\n%s", text)
+	}
+}

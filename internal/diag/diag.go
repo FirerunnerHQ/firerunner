@@ -27,6 +27,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/cacheserver"
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/jitserver"
 	"github.com/firerunnerhq/firerunner/internal/provisioner"
 )
 
@@ -117,12 +118,14 @@ func (f FileStat) describe() string {
 // microVMs at, when configured. It is nil when caching is off (the default),
 // in which case jobs use GitHub's hosted cache.
 type CacheInfo struct {
-	// Mode is "gateway" (guest builds the URL from its host gateway and Port) or
-	// "url" (an explicit CacheURL is used verbatim).
+	// Mode is "gateway" (guest builds the URL from its host gateway and Port),
+	// "url" (an explicit CacheURL is used verbatim), or "ec2" (only EC2 tiers
+	// cache, at --ec2-cache-addr).
 	Mode string `json:"mode"`
 	// Port is the local cache-server port published to guests (gateway mode).
 	Port int `json:"port,omitempty"`
-	// URL is the explicit cache-server base URL (url mode).
+	// URL is the explicit cache-server base URL (url mode), or the EC2
+	// tiers' host:port (ec2 mode).
 	URL string `json:"url,omitempty"`
 	// Stats is a live snapshot from the cache-server's /stats endpoint, when it
 	// is reachable; nil otherwise (the cache is off, or the server is down).
@@ -256,9 +259,11 @@ func collectStatus(cfg *config.Config, version string) StatusReport {
 		r.Cache = &CacheInfo{Mode: "url", URL: fc.CacheURL}
 	case fc.CachePort != 0:
 		r.Cache = &CacheInfo{Mode: "gateway", Port: fc.CachePort}
+	case ec2CacheAddr(cfg) != "":
+		r.Cache = &CacheInfo{Mode: "ec2", URL: cfg.EC2CacheAddr}
 	}
 	if r.Cache != nil {
-		r.Cache.Stats = fetchCacheStats(fc)
+		r.Cache.Stats = fetchCacheStats(cacheStatsBase(cfg))
 	}
 
 	// Tier catalog, when one is configured. Each tier is its own scale set with
@@ -338,9 +343,12 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			r.Network.Drops["spoof"], r.Network.Drops["nonpublic"], r.Network.Drops["conn_limit"], r.Network.Drops["conn_rate"])
 	}
 	if r.Cache != nil {
-		if r.Cache.Mode == "url" {
+		switch r.Cache.Mode {
+		case "url":
 			fmt.Fprintf(tw, "dep cache\tself-hosted %s\n", r.Cache.URL)
-		} else {
+		case "ec2":
+			fmt.Fprintf(tw, "dep cache\tself-hosted for EC2 tiers at %s\n", r.Cache.URL)
+		default:
 			fmt.Fprintf(tw, "dep cache\tself-hosted (guest gateway:%d)\n", r.Cache.Port)
 		}
 		if st := r.Cache.Stats; st != nil {
@@ -569,9 +577,14 @@ func runDoctor(cfg *config.Config, version string, extra ...Check) DoctorReport 
 	checks = append(checks, apiReach(apiBase))
 
 	// Self-hosted dependency cache (only when configured).
-	if c := cacheCheck(fc); c != nil {
+	c := cacheCheck(fc)
+	if c != nil {
 		checks = append(checks, *c)
-		if st := fetchCacheStats(fc); st != nil {
+	}
+	// Its refusals, from /stats: when the probe above reached it, or for the
+	// EC2 tiers' cache, which it does not probe.
+	if base := cacheStatsBase(cfg); base != "" && (c == nil || c.Level == levelPass) {
+		if st := fetchCacheStats(base); st != nil {
 			checks = append(checks, refusalCheck("dep-cache-conns", "cache-server", st.ConnRefused, st.ConnRefusedByCap, st.ConnRefusedLast, time.Now()))
 		}
 	}
@@ -794,7 +807,7 @@ func jitRefusalCheck(fc provisioner.FirecrackerConfig, now time.Time) *Check {
 
 // refusalCounts renders refusals by cap.
 func refusalCounts(total uint64, byCap map[string]uint64) string {
-	return fmt.Sprintf("refused %d connection(s) at its caps (%d per-source, %d total)", total, byCap["per_source"], byCap["total"])
+	return fmt.Sprintf("refused %d connection(s) at its caps (%d per-source, %d total)", total, byCap[jitserver.CapPerSource], byCap[jitserver.CapTotal])
 }
 
 // sinceText renders how long ago t was, or "at an unknown time" when it is
@@ -1041,16 +1054,11 @@ func ec2PoolKeyCheck(cfg *config.Config) *Check {
 }
 
 // fetchCacheStats best-effort reads the cache-server's /stats snapshot for the
-// status report. It returns nil on any error (server down, wrong endpoint) so
-// status still renders without live numbers.
-func fetchCacheStats(fc provisioner.FirecrackerConfig) *cacheserver.Stats {
-	var base string
-	switch {
-	case fc.CacheURL != "":
-		base = strings.TrimRight(fc.CacheURL, "/")
-	case fc.CachePort != 0:
-		base = fmt.Sprintf("http://127.0.0.1:%d", fc.CachePort)
-	default:
+// status report from base (cacheStatsBase). It returns nil on any error (server
+// down, wrong endpoint) or an empty base, so status still renders without
+// live numbers.
+func fetchCacheStats(base string) *cacheserver.Stats {
+	if base == "" {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1069,6 +1077,32 @@ func fetchCacheStats(fc provisioner.FirecrackerConfig) *cacheserver.Stats {
 		return nil
 	}
 	return &st
+}
+
+// cacheStatsBase is the base URL status and doctor read cache-server's /stats
+// at: the microVMs' cache, or else the EC2 tiers'. On an EC2 control VM that
+// address is the VM's own, so the connection counts as this host's and gets
+// past the cache's connection caps. Empty when nothing caches.
+func cacheStatsBase(cfg *config.Config) string {
+	fc := cfg.Firecracker
+	switch {
+	case fc.CacheURL != "":
+		return strings.TrimRight(fc.CacheURL, "/")
+	case fc.CachePort != 0:
+		return fmt.Sprintf("http://127.0.0.1:%d", fc.CachePort)
+	case ec2CacheAddr(cfg) != "":
+		return "http://" + cfg.EC2CacheAddr
+	}
+	return ""
+}
+
+// ec2CacheAddr is the EC2 tiers' cache-server host:port, empty when none of
+// them caches.
+func ec2CacheAddr(cfg *config.Config) string {
+	if !cfg.UsesEC2Cache() {
+		return ""
+	}
+	return cfg.EC2CacheAddr
 }
 
 // hitRate renders hits/(hits+misses) as a percentage, or "n/a" before any
