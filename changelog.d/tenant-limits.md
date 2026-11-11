@@ -10,3 +10,11 @@
   record `held` jobs and `stopped` runners with the reason. The install's own
   tiers take limits from `--limit-runners`, `--limit-vcpu` and
   `--limit-job-duration`, and have none by default.
+
+### Changed
+
+- Upgrading with a `--tenants` catalog: a tenant entry without `limits` now
+  runs under the defaults above, so a tenant on tiers of more than 2 vCPU stops
+  being served them, and its jobs past 30 minutes end. Add `limits` to each
+  entry that needs more before upgrading; `firerunner config check` notes every
+  tenant that sets none.

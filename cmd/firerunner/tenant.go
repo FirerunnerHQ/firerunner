@@ -170,7 +170,7 @@ func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracke
 		Pooled:      tier.MaxPool() > 0,
 		JIT:         s.jit,
 		JITURL:      jitserver.URL(s.cfg.JITEndpoint()),
-		MaxLifetime: maxLifetime(s.cfg.Firecracker.MaxVMLifetime, t.Limits.JobDuration),
+		MaxLifetime: tierLifetime(s.cfg.Firecracker.MaxVMLifetime, t.Limits.JobDuration, tier),
 		UsePool:     jobs.ClaimPool,
 		Cache:       s.ec2Cache,
 		Events:      s.events,
@@ -197,6 +197,16 @@ func maxLifetime(install, job time.Duration) time.Duration {
 		return limit
 	}
 	return install
+}
+
+// tierLifetime is maxLifetime for a tier that keeps no warm runners, whose
+// machines launch for a job: a warm runner may wait longer than the slack
+// for one, and keeps the install's backstop. A tenant's tiers keep none.
+func tierLifetime(install, job time.Duration, tier config.Tier) time.Duration {
+	if tier.MaxMin() > 0 {
+		return install
+	}
+	return maxLifetime(install, job)
 }
 
 // stopRecorder reports a runner a tier's scheduler ended for its tenant's

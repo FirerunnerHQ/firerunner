@@ -66,6 +66,13 @@ func TestMaxLifetimeFollowsTheJobLimit(t *testing.T) {
 	if o.MaxLifetime != 45*time.Minute {
 		t.Fatalf("a limited tenant's tier lives %s", o.MaxLifetime)
 	}
+	// A tier that keeps warm runners keeps the install's backstop: a warm
+	// runner may wait longer than the slack for its job.
+	tier.Min = 1
+	o = s.ec2Options(tenant{Owner: "o", Limits: config.Limits{JobDuration: 30 * time.Minute}}, tier, tenantHooks{}, health.NewTracker("t"), assigned.New(nil))
+	if o.MaxLifetime != 6*time.Hour {
+		t.Fatalf("a tier with warm runners lives %s", o.MaxLifetime)
+	}
 }
 
 // An EC2 instance's job report marks its runner busy, which starts the job

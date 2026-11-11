@@ -667,8 +667,20 @@ func (c *Config) validate() error {
 	if err := c.Limits.validate("", flagLimitNames); err != nil {
 		return err
 	}
-	if tiers, refused := c.InstallTiers(); len(tiers) == 0 {
+	tiers, refused := c.InstallTiers()
+	if len(tiers) == 0 {
 		return fmt.Errorf("--limit-vcpu %d leaves the install no tier to serve: %s", c.Limits.VCPU, strings.Join(refused, "; "))
+	}
+	if c.Limits.Runners > 0 {
+		warm := 0
+		for _, t := range tiers {
+			warm += t.MaxMin()
+		}
+		// Idle warm runners never end by themselves, so filling the limit
+		// with them would hold a job on a tier without one for good.
+		if warm >= c.Limits.Runners {
+			return fmt.Errorf("--limit-runners %d must be above the %d warm runner(s) the install's tiers keep at most (min, schedule): they would take every place", c.Limits.Runners, warm)
+		}
 	}
 	if err := c.validateJIT(); err != nil {
 		return err

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -272,6 +273,9 @@ func TestConfigCheckTenantLimits(t *testing.T) {
 			t.Errorf("warnings lack %q:\n%s", w, warnings)
 		}
 	}
+	if notes := strings.Join(r.Notes, "\n"); !strings.Contains(notes, `tenant "new" sets no limits, so it runs under the defaults: 2 runner(s)`) || strings.Contains(notes, `"raised"`) {
+		t.Errorf("notes:\n%s", notes)
+	}
 	if strings.Contains(warnings, `"raised"`) {
 		t.Errorf("a tenant with no vCPU limit is warned of:\n%s", warnings)
 	}
@@ -328,5 +332,27 @@ func TestConfigCheckInstallLimits(t *testing.T) {
 	code, out, _ = runConfig(t, append([]string{"check", "--limit-job-duration", "10s"}, flags...)...)
 	if code != 1 || !strings.Contains(out, "--limit-job-duration 10s is too short") {
 		t.Fatalf("exit %d:\n%s", code, out)
+	}
+}
+
+// Warm runners never end by themselves: a runner limit they would fill would
+// hold a job on a tier without one for good.
+func TestConfigCheckLimitAboveWarmRunners(t *testing.T) {
+	dir := t.TempDir()
+	tiers := filepath.Join(dir, "tiers.json")
+	tier := func(name string, min int) string {
+		return fmt.Sprintf(`{"name":"%s","provisioner":"ec2","min":%d,"max":4,"ec2":{"instance_types":["c8a.large"],"ami":"ami-0aaaaaaaaaaaaaaaa","subnets":["subnet-0aaaaaaaaaaaaaaaa"],"security_groups":["sg-0aaaaaaaaaaaaaaaa"],"market":"on-demand"}}`, name, min)
+	}
+	if err := os.WriteFile(tiers, []byte("["+tier("warm", 2)+","+tier("cold", 0)+"]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	flags := []string{"--url", "https://github.com/home", "--app-client-id", "Iv1", "--app-installation-id", "1",
+		"--app-kms-key", "alias/github-app", "--tiers", tiers, "--jit-addr", "10.0.0.5:8098"}
+	code, out, _ := runConfig(t, append([]string{"check", "--limit-runners", "2"}, flags...)...)
+	if code != 1 || !strings.Contains(out, "--limit-runners 2 must be above the 2 warm runner(s)") {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	if code, out, _ := runConfig(t, append([]string{"check", "--limit-runners", "3"}, flags...)...); code != 0 {
+		t.Fatalf("a limit above the warm runners: exit %d:\n%s", code, out)
 	}
 }

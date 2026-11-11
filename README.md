@@ -224,8 +224,9 @@ operator raises them per installation, and 0 lifts one:
   `Nxlarge` 4N); a size it cannot read, such as `metal`, counts as above any
   limit.
 - **Job duration** counts from the job's start. A job past it has its runner
-  ended, and fails; the job events record the runner as `stopped`. Its
-  machines also live at most the limit plus 15 minutes from launch.
+  ended, and fails; the job events record the runner as `stopped`. On a tier
+  that keeps no warm runners, as a tenant's never do, its machines also live
+  at most the limit plus 15 minutes from launch.
 
 The install's own tiers are not limited unless `--limit-runners`,
 `--limit-vcpu` and `--limit-job-duration` (`FR_LIMIT_*`) say so.
@@ -561,8 +562,8 @@ firerunner also terminates an instance in these cases:
 
 - it is idle when the scale set shrinks;
 - it never fetched its config (this backs off, as a failed microVM boot does);
-- it is older than `--max-vm-lifetime`, or, for a tenant with a job limit,
-  than that limit plus 15 minutes;
+- it is older than `--max-vm-lifetime`, or, on a tier with a job limit and no
+  warm runners, than that limit plus 15 minutes;
 - its job ran past its tenant's job limit (see *Sharing an AWS account*).
 
 Instances and volumes are tagged `firerunner:tier`, `firerunner:runner` and

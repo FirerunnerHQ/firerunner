@@ -211,6 +211,9 @@ func checkLimits(r *checkReport, cfg *config.Config) {
 		if len(tiers) == 0 {
 			r.Warnings = append(r.Warnings, fmt.Sprintf("tenant %q: no tier is within its limits, so it is not served", t.ID))
 		}
+		if t.Limits == nil {
+			r.Notes = append(r.Notes, fmt.Sprintf("tenant %q sets no limits, so it runs under the defaults: %s", t.ID, ct.Limits))
+		}
 		r.Tenants = append(r.Tenants, ct)
 	}
 }
