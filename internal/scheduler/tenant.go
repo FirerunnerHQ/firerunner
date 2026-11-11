@@ -20,6 +20,9 @@ import (
 // schedulers, so a job held on another tier starts when that runner ends
 // rather than at its own tier's next message.
 //
+// A tenant can also be held, which refuses every launch, or suspended, which
+// also stops every runner it has (see Suspend).
+//
 // It is safe for concurrent use.
 type Tenant struct {
 	name string
@@ -31,6 +34,10 @@ type Tenant struct {
 	// line is the schedulers whose launches the tenant holds back, in the
 	// order places go to them.
 	line []*Scheduler
+	// heldWhy, when set, refuses every launch, for that reason; suspended
+	// says whether a suspension set it.
+	heldWhy   string
+	suspended bool
 }
 
 // NewTenant returns the bound for one tenant's tiers: at most max runners at
@@ -65,6 +72,9 @@ func (t *Tenant) take(s *Scheduler, n int) (int, string) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.heldWhy != "" {
+		return 0, t.heldWhy
+	}
 	granted := n
 	if t.max > 0 {
 		ahead := slices.Index(t.line, s)
@@ -110,7 +120,7 @@ func (t *Tenant) release() {
 	t.mu.Lock()
 	t.running--
 	var wake []*Scheduler
-	if t.max > 0 {
+	if t.max > 0 && t.heldWhy == "" {
 		wake = slices.Clone(t.scheds)
 	}
 	t.mu.Unlock()
@@ -119,14 +129,78 @@ func (t *Tenant) release() {
 	}
 }
 
-// free is how many more launches the tenant would grant now; -1 is no bound.
-func (t *Tenant) free() int {
+// Suspend refuses every launch of the tenant's tiers and stops every runner
+// they have, busy or not, so its machines end now: a job running fails. A
+// launch already on its way is stopped as it starts. The reason is the
+// operator's; Resume lifts it.
+//
+// It reports whether it changed anything: suspending again for the same
+// reason does not.
+func (t *Tenant) Suspend(reason string) bool {
+	why := fmt.Sprintf("%s is suspended: %s", t.who(), reason)
+	t.mu.Lock()
+	if t.suspended && t.heldWhy == why {
+		t.mu.Unlock()
+		return false
+	}
+	t.heldWhy, t.suspended = why, true
+	scheds := slices.Clone(t.scheds)
+	t.mu.Unlock()
+	for _, s := range scheds {
+		s.stopAll(Stop{Kind: StopSuspended, Reason: why})
+	}
+	return true
+}
+
+// Hold refuses every launch of the tenant's tiers, for why, and stops
+// nothing; Resume lifts it.
+func (t *Tenant) Hold(why string) bool {
+	held := fmt.Sprintf("%s is held: %s", t.who(), why)
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.max == 0 {
-		return -1
+	if t.heldWhy == held {
+		return false
 	}
-	return max(0, t.max-t.running)
+	t.heldWhy, t.suspended = held, false
+	return true
+}
+
+// Resume lifts a suspension or a hold, and wakes the tenant's schedulers to
+// launch for the jobs that waited.
+// It reports whether there was anything to lift.
+func (t *Tenant) Resume() bool {
+	t.mu.Lock()
+	was := t.heldWhy != ""
+	t.heldWhy, t.suspended = "", false
+	wake := slices.Clone(t.scheds)
+	t.mu.Unlock()
+	if !was {
+		return false
+	}
+	for _, s := range wake {
+		go s.retry()
+	}
+	return true
+}
+
+// State says whether the tenant is suspended, or held, and why.
+func (t *Tenant) State() (suspended bool, why string) {
+	if t == nil {
+		return false, ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.suspended, t.heldWhy
+}
+
+// suspension is why the tenant is suspended, or "".
+func (t *Tenant) suspension() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.suspended {
+		return ""
+	}
+	return t.heldWhy
 }
 
 // Running is how many launches the tenant has granted that have not ended;

@@ -100,6 +100,27 @@ type Tenant struct {
 	Refused []string `json:"refused,omitempty"`
 	// NotServed says why it is not served at all, when it is not.
 	NotServed string `json:"not_served,omitempty"`
+	// State is "suspended" (by an operator) or "held" (its state not read
+	// yet) while its launches are refused; empty while it is active.
+	State  string `json:"state,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	// Since is when it was suspended.
+	Since time.Time `json:"since,omitzero"`
+}
+
+// TenantStates is how the daemon's reading of the tenants' states goes
+// (--tenant-state).
+type TenantStates struct {
+	Store string `json:"store"`
+	// LastRead is the last successful read; zero before the first.
+	LastRead    time.Time `json:"last_read,omitzero"`
+	LastError   string    `json:"last_error,omitempty"`
+	LastErrorAt time.Time `json:"last_error_at,omitzero"`
+}
+
+// Failing reports whether the latest read failed.
+func (s TenantStates) Failing() bool {
+	return s.LastError != "" && !s.LastErrorAt.Before(s.LastRead)
 }
 
 // Limits are a tenant's; 0 is no limit.
@@ -368,8 +389,11 @@ type File struct {
 	// when the daemon serves one.
 	JITRefused *ConnRefusals `json:"jit_refused,omitempty"`
 	// Tenants are the tenants the daemon serves, the install's own first,
-	// when any of them runs under limits.
+	// when any of them runs under limits, or is suspended.
 	Tenants []Tenant `json:"tenants,omitempty"`
+	// TenantStates is how reading the tenants' states goes, when the daemon
+	// reads them.
+	TenantStates *TenantStates `json:"tenant_states,omitempty"`
 }
 
 // ConnRefusals is a listener's connections refused at its connection caps.

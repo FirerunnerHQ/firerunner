@@ -206,23 +206,22 @@ func TestTenantHoldClearsWhenDemandFalls(t *testing.T) {
 	prov.noMore(t)
 }
 
-// A tier advertises no more room than its tenant has left, so GitHub keeps
-// the jobs a limit would hold queued at GitHub.
-func TestTenantBoundsCapacity(t *testing.T) {
-	ctx, _, prov, s, _ := tenantLab(t, 2)
-	if got := s[0].Capacity(); got != 2 {
-		t.Fatalf("capacity %d, want 2: the tenant's limit, below the tier's max of 4", got)
-	}
+// A tier advertises its own room, whatever its tenant has left: a job past
+// the tenant's limit is then assigned here and held with the reason, rather
+// than kept in GitHub's queue where nothing says why it waits.
+func TestTenantDoesNotCutCapacity(t *testing.T) {
+	ctx, _, prov, s, hs := tenantLab(t, 1)
 	s[1].Reconcile(ctx, 1)
 	b := prov.next(t)
-	if got := s[0].Capacity(); got != 1 {
-		t.Fatalf("capacity %d with the other tier using one place, want 1", got)
+	if got := s[0].Capacity(); got != 4 {
+		t.Fatalf("capacity %d with the tenant at its limit, want the tier's 4", got)
 	}
-	if got := s[1].Capacity(); got != 2 {
-		t.Fatalf("capacity %d for the tier holding the runner, want 2 (its runner and one more)", got)
+	s[0].Reconcile(ctx, 1) // GitHub assigned the job: it is held, with the reason
+	if jobs, why, _ := hs[0].get(); jobs != 1 || why == "" {
+		t.Fatalf("held %d %q", jobs, why)
 	}
 	prov.finish(b)
-	s[1].Drain()
+	recv(t, prov.entered, "the held job's runner")
 }
 
 // Without a bound the tenant holds nothing.

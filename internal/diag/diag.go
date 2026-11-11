@@ -467,6 +467,17 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			}
 		}
 		renderTenants(w, l.Tenants)
+		if ts := l.TenantStates; ts != nil {
+			last := "never"
+			if !ts.LastRead.IsZero() {
+				last = humanDuration(time.Since(ts.LastRead).Truncate(time.Second)) + " ago"
+			}
+			fmt.Fprintf(w, "  tenant states from %s, read %s\n", ts.Store, last)
+			if ts.Failing() {
+				fmt.Fprintf(w, "  last read failed %s ago, keeping the last states: %s\n",
+					humanDuration(time.Since(ts.LastErrorAt).Truncate(time.Second)), truncate(ts.LastError, 200))
+			}
+		}
 		if rp := l.Reaper; rp != nil {
 			mode := ""
 			if rp.DryRun {
@@ -548,6 +559,16 @@ func renderTenants(w io.Writer, tenants []health.Tenant) {
 	tw.Flush()
 	for _, t := range tenants {
 		name := or(t.ID, "(install)")
+		switch t.State {
+		case "suspended":
+			since := ""
+			if !t.Since.IsZero() {
+				since = fmt.Sprintf(" since %s (%s ago)", t.Since.UTC().Format(time.RFC3339), humanDuration(time.Since(t.Since).Truncate(time.Second)))
+			}
+			fmt.Fprintf(w, "  %s SUSPENDED%s: %s\n", name, since, t.Reason)
+		case "held":
+			fmt.Fprintf(w, "  %s HELD: %s\n", name, t.Reason)
+		}
 		if t.NotServed != "" {
 			fmt.Fprintf(w, "  %s NOT SERVED: %s\n", name, t.NotServed)
 		}
@@ -763,6 +784,9 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 		return []Check{warn("listeners", "listener state last updated %s ago; is the daemon running?", humanDuration(now.Sub(li.WrittenAt).Truncate(time.Second)))}
 	}
 	var checks []Check
+	if c := tenantStatesCheck(li.File, now); c != nil {
+		checks = append(checks, *c)
+	}
 	for _, t := range li.Tiers {
 		name := "listener[" + t.Name + "]"
 		switch t.State {
@@ -780,6 +804,34 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 		}
 	}
 	return checks
+}
+
+// tenantStatesCheck judges the daemon's reading of tenant states, nil when it
+// reads none: WARN while reads fail (the last states stay in force, and a
+// suspension written meanwhile does not arrive), else PASS with the tenants
+// suspended.
+func tenantStatesCheck(f health.File, now time.Time) *Check {
+	ts := f.TenantStates
+	if ts == nil {
+		return nil
+	}
+	if ts.Failing() {
+		c := warn("tenant-state", "reading %s fails (%s ago): %s; the last states read stay in force", ts.Store,
+			humanDuration(now.Sub(ts.LastErrorAt).Truncate(time.Second)), truncate(ts.LastError, 200))
+		return &c
+	}
+	var suspended []string
+	for _, t := range f.Tenants {
+		if t.State == "suspended" {
+			suspended = append(suspended, or(t.ID, "(install)"))
+		}
+	}
+	detail := "no tenant suspended"
+	if len(suspended) > 0 {
+		detail = "suspended: " + strings.Join(suspended, ", ")
+	}
+	c := pass("tenant-state", "read from %s; %s", ts.Store, detail)
+	return &c
 }
 
 // cacheCredentialsLow is how little life the cache role's credentials may

@@ -52,6 +52,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/reconcile"
 	"github.com/firerunnerhq/firerunner/internal/schedule"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
+	"github.com/firerunnerhq/firerunner/internal/tenantstate"
 	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
@@ -86,6 +87,8 @@ func main() {
 			os.Exit(configCmd(args[1:], os.Stdout, os.Stderr))
 		case "migrate":
 			os.Exit(migrateCmd(args[1:], os.Stdout, os.Stderr))
+		case "tenant":
+			os.Exit(tenantCmd(args[1:], os.Stdout, os.Stderr, openTenantState))
 		case "cache-server":
 			if err := cacheServe(args[1:]); err != nil {
 				slog.Error("cache-server failed", "err", err)
@@ -645,6 +648,48 @@ func tierPending(t config.Tier, shared *scheduler.PendingLaunches) *scheduler.Pe
 	return shared
 }
 
+// watchStates reads the tenant states now and then every
+// tenantstate.DefaultInterval until ctx ends, applying each change to the
+// tenants served. A first read that fails is logged; the catalog's tenants
+// are held until one succeeds.
+//
+// It sets s.states before the first read, and has live apply the states to
+// each tenant as it is served too: a suspension written while a tenant starts
+// is no change by the time it is served.
+func (s *shard) watchStates(ctx context.Context, cfg *config.Config, live *liveTenants, log *slog.Logger) error {
+	store, err := tenantstate.Open(cfg.TenantState, func() (tenantstate.SSMAPI, error) {
+		awsCfg, err := loadAWSConfig(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return awsssm.NewFromConfig(awsCfg), nil
+	})
+	if err != nil {
+		return fmt.Errorf("--tenant-state: %w", err)
+	}
+	wlog := log.With("component", "tenant-state")
+	w := &tenantstate.Watcher{Store: store, Interval: tenantstate.DefaultInterval, Log: wlog}
+	w.OnChange = func(tenantstate.States) {
+		for id, bound := range live.bounds() {
+			s.applyState(id, bound, wlog)
+		}
+	}
+	s.states = w
+	live.mu.Lock()
+	live.onAdd = func(st *servedTenant) { s.applyState(st.t.ID, st.bound, wlog) }
+	live.mu.Unlock()
+	if err := w.Read(ctx); err != nil {
+		wlog.Error("tenant states not read; the catalog's tenants are held until they are", "store", store.String(), "err", err)
+	}
+	go w.Run(ctx)
+	return nil
+}
+
+// healthTenantStates is the tenant states' reading for the health file.
+func healthTenantStates(st tenantstate.Status) *health.TenantStates {
+	return &health.TenantStates{Store: st.Store, LastRead: st.LastRead, LastError: st.LastError, LastErrorAt: st.LastErrorAt}
+}
+
 // healthBreakers converts the EC2 launch options backing off for the health
 // file.
 func healthBreakers(bs []ec2.Breaker) []health.Breaker {
@@ -1073,12 +1118,20 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 	}
 
+	// Which tenants are suspended is read before any tenant serves, and again
+	// every tenantstate.DefaultInterval.
+	live := &liveTenants{}
+	if cfg.TenantState != "" {
+		if err := s.watchStates(ctx, cfg, live, log); err != nil {
+			return err
+		}
+	}
+
 	served, err := s.start(ctx, t, hooks)
 	if err != nil {
 		return err
 	}
 	defer served.close(context.WithoutCancel(ctx))
-	live := &liveTenants{}
 	live.add(served)
 
 	log.Info("firerunner starting",
@@ -1110,7 +1163,12 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		f.CacheCredentials = healthCacheCredentials(cacheCreds)
 		f.JITRefused = healthRefusals(jitListener)
-		f.Tenants = live.tenants()
+		f.Tenants, f.TenantStates = live.tenants(nil), nil
+		if s.states != nil {
+			states, _ := s.states.States()
+			f.Tenants = live.tenants(states)
+			f.TenantStates = healthTenantStates(s.states.Status())
+		}
 	}, log)
 
 	// Drive every tier's listener concurrently. A listener reconnects its own
