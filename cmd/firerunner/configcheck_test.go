@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -214,4 +215,144 @@ func captureStderrMain(t *testing.T, f func()) string {
 	w.Close()
 	b, _ := io.ReadAll(r)
 	return string(b)
+}
+
+// writeTenantConfig writes an EC2 catalog with a 2-vCPU and a 4-vCPU tier, and
+// the tenants given, and returns the daemon flags that serve them.
+func writeTenantConfig(t *testing.T, tenants string) []string {
+	t.Helper()
+	dir := t.TempDir()
+	tier := func(name, itype string) string {
+		return `{"name":"` + name + `","provisioner":"ec2","max":4,"ec2":{"instance_types":["` + itype + `"],"ami":"ami-0aaaaaaaaaaaaaaaa","subnets":["subnet-0aaaaaaaaaaaaaaaa"],"security_groups":["sg-0aaaaaaaaaaaaaaaa"],"market":"on-demand"}}`
+	}
+	tiers := filepath.Join(dir, "tiers.json")
+	if err := os.WriteFile(tiers, []byte("["+tier("small", "c8a.large")+","+tier("big", "c8a.xlarge")+"]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tenantsPath := filepath.Join(dir, "tenants.json")
+	if err := os.WriteFile(tenantsPath, []byte(tenants), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return []string{"--url", "https://github.com/home", "--app-client-id", "Iv1", "--app-installation-id", "1",
+		"--app-kms-key", "alias/github-app", "--tiers", tiers, "--tenants", tenantsPath, "--jit-addr", "10.0.0.5:8098"}
+}
+
+// A tenant runs under the defaults unless its entry sets limits, and config
+// check shows them, with a warning for each tier a vCPU limit leaves out.
+func TestConfigCheckTenantLimits(t *testing.T) {
+	flags := writeTenantConfig(t, `[
+		{"id":"new","url":"https://github.com/new","installation_id":2,"tiers":["small","big"]},
+		{"id":"raised","url":"https://github.com/raised","installation_id":3,"tiers":["small","big"],
+		 "limits":{"max_runners":10,"max_vcpu":0,"max_job_duration":"2h"}},
+		{"id":"tiny","url":"https://github.com/tiny","installation_id":4,"tiers":["big"],"limits":{"max_vcpu":1}}]`)
+	code, out, errOut := runConfig(t, append([]string{"check", "--json"}, flags...)...)
+	var r checkReport
+	if err := json.Unmarshal([]byte(out), &r); err != nil || code != 0 {
+		t.Fatalf("exit %d, %v\n%s%s", code, err, out, errOut)
+	}
+	if r.Limits != nil {
+		t.Fatalf("the install has limits it was not given: %+v", r.Limits)
+	}
+	if len(r.Tenants) != 3 {
+		t.Fatalf("tenants = %+v", r.Tenants)
+	}
+	want := []checkTenant{
+		{ID: "new", Tiers: []string{"small"}, Limits: config.Limits{Runners: 2, VCPU: 2, JobDuration: 30 * time.Minute}},
+		{ID: "raised", Tiers: []string{"small", "big"}, Limits: config.Limits{Runners: 10, JobDuration: 2 * time.Hour}},
+		{ID: "tiny", Tiers: []string{}, Limits: config.Limits{Runners: 2, VCPU: 1, JobDuration: 30 * time.Minute}},
+	}
+	for i, w := range want {
+		got := r.Tenants[i]
+		if got.ID != w.ID || strings.Join(got.Tiers, ",") != strings.Join(w.Tiers, ",") || got.Limits.Runners != w.Limits.Runners || got.Limits.VCPU != w.Limits.VCPU {
+			t.Errorf("tenant %d = %+v, want %+v", i, got, w)
+		}
+	}
+	warnings := strings.Join(r.Warnings, "\n")
+	for _, w := range []string{`tenant "new": tier "big": 4 vCPU is above the limit of 2`, `tenant "tiny": no tier is within its limits`} {
+		if !strings.Contains(warnings, w) {
+			t.Errorf("warnings lack %q:\n%s", w, warnings)
+		}
+	}
+	if notes := strings.Join(r.Notes, "\n"); !strings.Contains(notes, `tenant "new" sets no limits, so it runs under the defaults: 2 runner(s)`) || strings.Contains(notes, `"raised"`) {
+		t.Errorf("notes:\n%s", notes)
+	}
+	if strings.Contains(warnings, `"raised"`) {
+		t.Errorf("a tenant with no vCPU limit is warned of:\n%s", warnings)
+	}
+	// The JSON carries the job limit as the catalog writes it.
+	if !strings.Contains(out, `"max_job_duration": "2h0m0s"`) {
+		t.Errorf("the job limit is not a duration string:\n%s", out)
+	}
+
+	// Text: the limits and the warnings, with exit 0: a warning stops nothing.
+	code, out, _ = runConfig(t, append([]string{"check"}, flags...)...)
+	for _, w := range []string{"3 tenant(s):", "2 runner(s), 2 vCPU per tier, 30m0s per job", `warning: tenant "new"`} {
+		if code != 0 || !strings.Contains(out, w) {
+			t.Errorf("exit %d, text lacks %q:\n%s", code, w, out)
+		}
+	}
+}
+
+// Limits that make no sense are refused, naming where they are set.
+func TestConfigCheckRefusesBadLimits(t *testing.T) {
+	for limits, want := range map[string]string{
+		`{"max_runners":-1}`:          `tenant "t1": limits.max_runners must be >= 0`,
+		`{"max_job_duration":"30s"}`:  `tenant "t1": limits.max_job_duration 30s is too short`,
+		`{"max_job_duration":30}`:     `a duration is a string`,
+		`{"max_job_duration":"soon"}`: `invalid duration`,
+		`{"max_runner":2}`:            `unknown field "max_runner"`,
+	} {
+		flags := writeTenantConfig(t, `[{"id":"t1","url":"https://github.com/t1","installation_id":2,"tiers":["small"],"limits":`+limits+`}]`)
+		code, out, errOut := runConfig(t, append([]string{"check"}, flags...)...)
+		if code == 0 || !strings.Contains(out+errOut, want) {
+			t.Errorf("%s: exit %d, want %q:\n%s%s", limits, code, want, out, errOut)
+		}
+	}
+}
+
+// The install's own limits come from flags, and a vCPU limit that leaves it
+// nothing to serve is refused rather than serving nothing.
+func TestConfigCheckInstallLimits(t *testing.T) {
+	flags := writeTenantConfig(t, `[]`)
+	code, out, errOut := runConfig(t, append([]string{"check", "--json", "--limit-runners", "1", "--limit-vcpu", "2", "--limit-job-duration", "2m"}, flags...)...)
+	var r checkReport
+	if err := json.Unmarshal([]byte(out), &r); err != nil || code != 0 {
+		t.Fatalf("exit %d, %v\n%s%s", code, err, out, errOut)
+	}
+	if r.Limits == nil || *r.Limits != (config.Limits{Runners: 1, VCPU: 2, JobDuration: 2 * time.Minute}) {
+		t.Fatalf("limits = %+v", r.Limits)
+	}
+	if len(r.Warnings) != 1 || !strings.Contains(r.Warnings[0], `install: tier "big": 4 vCPU is above the limit of 2`) {
+		t.Fatalf("warnings = %q", r.Warnings)
+	}
+	code, out, _ = runConfig(t, append([]string{"check", "--limit-vcpu", "1"}, flags...)...)
+	if code != 1 || !strings.Contains(out, "--limit-vcpu 1 leaves the install no tier to serve") {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	code, out, _ = runConfig(t, append([]string{"check", "--limit-job-duration", "10s"}, flags...)...)
+	if code != 1 || !strings.Contains(out, "--limit-job-duration 10s is too short") {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+}
+
+// Warm runners never end by themselves: a runner limit they would fill would
+// hold a job on a tier without one for good.
+func TestConfigCheckLimitAboveWarmRunners(t *testing.T) {
+	dir := t.TempDir()
+	tiers := filepath.Join(dir, "tiers.json")
+	tier := func(name string, min int) string {
+		return fmt.Sprintf(`{"name":"%s","provisioner":"ec2","min":%d,"max":4,"ec2":{"instance_types":["c8a.large"],"ami":"ami-0aaaaaaaaaaaaaaaa","subnets":["subnet-0aaaaaaaaaaaaaaaa"],"security_groups":["sg-0aaaaaaaaaaaaaaaa"],"market":"on-demand"}}`, name, min)
+	}
+	if err := os.WriteFile(tiers, []byte("["+tier("warm", 2)+","+tier("cold", 0)+"]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	flags := []string{"--url", "https://github.com/home", "--app-client-id", "Iv1", "--app-installation-id", "1",
+		"--app-kms-key", "alias/github-app", "--tiers", tiers, "--jit-addr", "10.0.0.5:8098"}
+	code, out, _ := runConfig(t, append([]string{"check", "--limit-runners", "2"}, flags...)...)
+	if code != 1 || !strings.Contains(out, "--limit-runners 2 must be above the 2 warm runner(s)") {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	if code, out, _ := runConfig(t, append([]string{"check", "--limit-runners", "3"}, flags...)...); code != 0 {
+		t.Fatalf("a limit above the warm runners: exit %d:\n%s", code, out)
+	}
 }

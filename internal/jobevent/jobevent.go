@@ -23,6 +23,12 @@ const (
 	Started      Kind = "started"       // GitHub reports the job started
 	Completed    Kind = "completed"     // GitHub reports the job ended
 	InstanceGone Kind = "instance_gone" // the machine went away
+
+	// Held: the job was assigned while its tenant could start no runner for
+	// it (Reason says why), so it waits.
+	Held Kind = "held"
+	// Stopped: firerunner ended the runner for its tenant's limits (Reason).
+	Stopped Kind = "stopped"
 )
 
 // Event is one thing that happened. Fields a source does not know stay empty.

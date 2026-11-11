@@ -748,6 +748,52 @@ func TestStatusShowsTheReaper(t *testing.T) {
 	}
 }
 
+// status shows the tenants' limits, the jobs a limit holds and why, and the
+// runners it ended, in text and JSON.
+func TestStatusShowsTenantLimitsAndHolds(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	f := health.File{PID: 1, WrittenAt: now,
+		Tiers: []health.Tier{{Name: "acme/small", State: health.Connected, Since: now,
+			Held:    &health.Held{Jobs: 2, Reason: `tenant "acme" is at its limit of 2 runner(s) at once`, Since: now.Add(-time.Minute)},
+			Stopped: map[string]int{"job_duration": 1}}},
+		Tenants: []health.Tenant{
+			{ID: "", Limits: health.Limits{JobDuration: "0s"}},
+			{ID: "acme", Running: 2, Limits: health.Limits{Runners: 2, VCPU: 2, JobDuration: "30m0s"},
+				Refused: []string{`tier "big": 4 vCPU is above the limit of 2`}},
+			{ID: "tiny", Limits: health.Limits{Runners: 2, VCPU: 1, JobDuration: "30m0s"}, NotServed: "none of its tiers is within its limits"},
+		}}
+	if err := health.Write(filepath.Join(dir, health.FileName), f); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: dir, TapPrefix: "fr", NetBase: 16}}
+	var text bytes.Buffer
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	out := text.String()
+	for _, want := range []string{
+		`acme/small HELD: 2 job(s) waiting for 1m0s: tenant "acme" is at its limit of 2 runner(s) at once`,
+		"acme/small runners ended at the job limit: 1",
+		"tenants:", "TENANT", "(install)", "acme       2        2            2         30m0s",
+		`acme not served tier "big": 4 vCPU is above the limit of 2`,
+		"tiny NOT SERVED: none of its tiers is within its limits",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status missing %q\n%s", want, out)
+		}
+	}
+	var js bytes.Buffer
+	if err := Status(cfg, "test", &js, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"held": {`, `"reason": "tenant \"acme\" is at its limit`, `"tenants": [`, `"max_job_duration": "30m0s"`, `"not_served": "none of its tiers`} {
+		if !strings.Contains(js.String(), want) {
+			t.Errorf("status --json missing %q\n%s", want, js.String())
+		}
+	}
+}
+
 func TestStatusShowsFallbacksAndBreakers(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()

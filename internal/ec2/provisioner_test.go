@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -447,6 +449,43 @@ func TestLaunch_CancelWhileIdleTerminates(t *testing.T) {
 	if s := h.f.state(inst.id); s != types.InstanceStateNameShuttingDown {
 		t.Fatalf("instance state %q, want shutting-down", s)
 	}
+}
+
+// A runner its tenant's limits end is terminated like an idle one, busy or not,
+// and the log says why.
+func TestLaunch_CancelWithCauseTerminatesAndSaysWhy(t *testing.T) {
+	var logs strings.Builder
+	var mu sync.Mutex
+	h := newHarness(t, func(o *Options) {
+		o.Logger = slog.New(slog.NewTextHandler(lockedWriter{&mu, &logs}, nil))
+	})
+	ctx, cancel := context.WithCancelCause(context.Background())
+	errc := h.launch(ctx)
+	inst := h.instance(t)
+	h.fetch(inst.ip)
+	h.f.setState(inst.id, types.InstanceStateNameRunning)
+	cancel(errors.New("its job ran past the limit of 30m0s"))
+	eventually(t, "a terminate call", func() bool { return len(h.f.terminatedIDs()) > 0 })
+	if err := waitErr(t, errc); err != nil {
+		t.Fatalf("Launch after cancel = %v, want nil", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(logs.String(), `reason="its job ran past the limit of 30m0s"`) {
+		t.Fatalf("the termination's reason is not the cause:\n%s", logs.String())
+	}
+}
+
+// lockedWriter serialises writes to w.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 func TestLaunch_CancelDuringCapacityWalk(t *testing.T) {

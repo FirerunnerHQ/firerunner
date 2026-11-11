@@ -326,8 +326,9 @@ func (p *Provisioner) Name() string { return "ec2" }
 // runner, hands it jit over the VPC, and blocks until the instance is shutting
 // down or terminated.
 //
-// Cancelling ctx means the scheduler is removing an idle runner, so the
-// instance is terminated. Busy detection does not come from here: the listener
+// Cancelling ctx means the scheduler is removing the runner, so the instance
+// is terminated: an idle runner, or one its tenant's limits end, whose
+// context's cause then says why. Busy detection does not come from here: the listener
 // marks the runner busy from GitHub's JobStarted message, so onBusy is unused.
 func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.RunnerSpec, _ func()) error {
 	path := PathCold
@@ -633,7 +634,7 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 		select {
 		case <-done:
 			done = nil // terminate once; keep waiting for it to take effect
-			w.terminate(context.WithoutCancel(ctx), "runner removed while idle")
+			w.terminate(context.WithoutCancel(ctx), endReason(ctx))
 		case s := <-w.states:
 			if !w.terminating && !w.awaitStart && !w.interrupted && endingState(s.name) {
 				if why := w.interruption(ctx, ip, s); why != "" {
@@ -747,6 +748,15 @@ func (w *waiter) recordPhases(r jitserver.Report) {
 	if !r.Exited.IsZero() {
 		w.record(jobevent.Event{Kind: jobevent.Exited, At: r.Exited, ExitCode: r.ExitCode})
 	}
+}
+
+// endReason says why ctx ended the runner: its cause, when the scheduler
+// gave one, else an idle runner's removal.
+func endReason(ctx context.Context) string {
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+		return cause.Error()
+	}
+	return "runner removed while idle"
 }
 
 // terminate asks EC2 to terminate the instance. The first request is logged

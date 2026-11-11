@@ -25,6 +25,9 @@ type Tenant struct {
 	Tiers []string `json:"tiers"`
 	// RunnerGroup defaults to the install's --runner-group.
 	RunnerGroup string `json:"runner_group,omitempty"`
+	// Limits bound what it runs; left out, it gets the defaults
+	// (EffectiveLimits).
+	Limits *TenantLimits `json:"limits,omitempty"`
 }
 
 var tenantID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
@@ -95,6 +98,9 @@ func (c *Config) validateTenants() error {
 			}
 			seen[name] = true
 		}
+		if err := t.EffectiveLimits().validate(fmt.Sprintf("tenant %q: ", t.ID), catalogLimitNames); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -114,10 +120,12 @@ func accountOf(raw string) string {
 	return strings.ToLower(u.Host + "/" + org)
 }
 
-// TenantTiers returns the catalog tiers t gets. Their caches are off, as the
-// cache has no boundary between tenants yet (#168), and they keep no hot runners
-// or pool, which would multiply by the tenants however idle they are.
-func (c *Config) TenantTiers(t Tenant) []Tier {
+// TenantTiers returns the catalog tiers t gets, and why it leaves out any it
+// lists: a tier above the tenant's vCPU limit is not served to it. Their caches
+// are off, as the cache has no boundary between tenants yet (#168), and they
+// keep no hot runners or pool, which would multiply by the tenants however idle
+// they are.
+func (c *Config) TenantTiers(t Tenant) ([]Tier, []string) {
 	var tiers []Tier
 	for _, name := range t.Tiers {
 		for _, tier := range c.Tiers {
@@ -131,5 +139,5 @@ func (c *Config) TenantTiers(t Tenant) []Tier {
 			tiers = append(tiers, tier)
 		}
 	}
-	return tiers
+	return withinVCPU(tiers, t.EffectiveLimits().VCPU)
 }

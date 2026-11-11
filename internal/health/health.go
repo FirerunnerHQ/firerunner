@@ -74,6 +74,40 @@ type Tier struct {
 	// "job" when its job had started (GitHub marks it failed), "idle"
 	// before.
 	Interruptions map[string]int `json:"interruptions,omitempty"`
+	// Held is the jobs waiting because the tier's tenant is at a limit, when
+	// any.
+	Held *Held `json:"held,omitempty"`
+	// Stopped counts runners ended for their tenant's limits, by kind:
+	// "job_duration" for a job that ran past its limit.
+	Stopped map[string]int `json:"stopped,omitempty"`
+}
+
+// Held is the launches a tier's tenant holds back, and why.
+type Held struct {
+	Jobs   int       `json:"jobs"`
+	Reason string    `json:"reason"`
+	Since  time.Time `json:"since"`
+}
+
+// Tenant is one tenant a daemon serves, with the limits it runs under. ID is
+// empty for the install's own.
+type Tenant struct {
+	ID     string `json:"id"`
+	Limits Limits `json:"limits"`
+	// Running is how many runners it has now, across its tiers.
+	Running int `json:"running"`
+	// Refused says why tiers it lists are not served to it.
+	Refused []string `json:"refused,omitempty"`
+	// NotServed says why it is not served at all, when it is not.
+	NotServed string `json:"not_served,omitempty"`
+}
+
+// Limits are a tenant's; 0 is no limit.
+type Limits struct {
+	Runners int `json:"max_runners"`
+	VCPU    int `json:"max_vcpu"`
+	// JobDuration is a duration string, "0s" for none.
+	JobDuration string `json:"max_job_duration"`
 }
 
 // Pending is a tier's assigned-but-not-started jobs.
@@ -231,6 +265,32 @@ func (tr *Tracker) Interrupted(duringJob bool) {
 	}
 }
 
+// SetHeld records how many jobs wait on the tier's tenant, and why; 0 clears
+// it. Since stays put while the reason does.
+func (tr *Tracker) SetHeld(jobs int, reason string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if jobs <= 0 {
+		tr.t.Held = nil
+		return
+	}
+	since := tr.now()
+	if h := tr.t.Held; h != nil && h.Reason == reason {
+		since = h.Since
+	}
+	tr.t.Held = &Held{Jobs: jobs, Reason: reason, Since: since}
+}
+
+// Stopped counts a runner ended for its tenant's limits.
+func (tr *Tracker) Stopped(kind string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.t.Stopped == nil {
+		tr.t.Stopped = map[string]int{}
+	}
+	tr.t.Stopped[kind]++
+}
+
 // OfflineRemoved counts an untracked offline runner removed.
 func (tr *Tracker) OfflineRemoved() {
 	tr.mu.Lock()
@@ -273,6 +333,11 @@ func (tr *Tracker) Snapshot() Tier {
 		p.ByEvent = maps.Clone(p.ByEvent)
 		t.Pending = &p
 	}
+	if t.Held != nil {
+		h := *t.Held
+		t.Held = &h
+	}
+	t.Stopped = maps.Clone(t.Stopped)
 	t.Launches = maps.Clone(t.Launches)
 	t.Fallbacks = maps.Clone(t.Fallbacks)
 	t.Interruptions = maps.Clone(t.Interruptions)
@@ -302,6 +367,9 @@ type File struct {
 	// JITRefused is the EC2 JIT endpoint's connections refused at its caps,
 	// when the daemon serves one.
 	JITRefused *ConnRefusals `json:"jit_refused,omitempty"`
+	// Tenants are the tenants the daemon serves, the install's own first,
+	// when any of them runs under limits.
+	Tenants []Tenant `json:"tenants,omitempty"`
 }
 
 // ConnRefusals is a listener's connections refused at its connection caps.

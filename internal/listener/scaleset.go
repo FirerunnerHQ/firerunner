@@ -54,6 +54,10 @@ type Config struct {
 	OnRunnerID func(runner string, id int64)
 	// Events, if set, is told of each job's assignment, start and end.
 	Events jobevent.Sink
+	// Held, if set, says how many of the tier's wanted runners its tenant
+	// holds back, and why, as of the plan a message just made. That many of
+	// the message's newest assigned jobs are logged and recorded as held.
+	Held func() (jobs int, reason string)
 	// Pending, if set, keeps the tier's assigned-but-not-started jobs, read
 	// from each message before the library acts on it.
 	Pending *assigned.Jobs
@@ -383,6 +387,7 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		onJobStarted: s.cfg.OnJobStarted,
 		onBusy:       onBusy,
 		onCompleted:  onCompleted,
+		held:         s.cfg.Held,
 		events:       s.cfg.Events,
 		tier:         s.cfg.Name,
 		maxRunners:   s.cfg.MaxRunners,
@@ -651,6 +656,7 @@ type scaler struct {
 	onDesired    DesiredFunc
 	onBusy       BusyFunc
 	onCompleted  CompletedFunc
+	held         func() (int, string)
 	events       jobevent.Sink
 	tier         string
 	capacity     CapacityFunc
@@ -727,7 +733,33 @@ func (a *scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 		count = st.TotalAssignedJobs
 	}
 	_, err := a.HandleDesiredRunnerCount(ctx, count)
+	a.recordHeld(msg.JobAssignedMessages)
 	return err
+}
+
+// recordHeld logs and records as held the newest of the jobs a message
+// assigned, as many as the tier's tenant now holds back, with the reason:
+// the plan the message made launched for the older ones first.
+func (a *scaler) recordHeld(assigned []*scaleset.JobAssigned) {
+	if a.held == nil || len(assigned) == 0 {
+		return
+	}
+	n, why := a.held()
+	if n <= 0 || why == "" {
+		return
+	}
+	var jobs []*scaleset.JobAssigned
+	for _, j := range assigned {
+		if j != nil {
+			jobs = append(jobs, j)
+		}
+	}
+	for _, j := range jobs[max(0, len(jobs)-n):] {
+		a.log.Info("job held", "jobId", j.JobID, "repository", j.OwnerName+"/"+j.RepositoryName, "reason", why)
+		e := jobEvent(jobevent.Held, a.tier, j.JobMessageBase)
+		e.Reason = why
+		jobevent.Record(a.events, e)
+	}
 }
 
 func (a *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
