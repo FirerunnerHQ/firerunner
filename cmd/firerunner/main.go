@@ -267,10 +267,11 @@ func cacheServe(args []string) error {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	ln, err := cacheListen(*addr)
+	ln, err := cacheListen(*addr, log)
 	if err != nil {
 		return err
 	}
+	srv.SetConnRefusals(ln.Refused)
 	log.Info("cache-server listening", "addr", *addr, "dir", *dir, "max_size", *maxSize, "artifact_upstream", *artifactUpstream, "s3_bucket", *s3Bucket, "s3_prefix", *s3Prefix)
 	if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
@@ -309,13 +310,18 @@ type cacheFlags struct {
 
 // cacheListen listens on addr for cache-server. Every guest reaches it, so the
 // connections one address, and all together, may hold are capped, as the JIT
-// endpoint's are.
-func cacheListen(addr string) (net.Listener, error) {
+// endpoint's are, and refusals are logged to log, spaced out. Connections
+// from this host are exempt, so `firerunner status` and a local scraper
+// still reach /stats and /metrics when guests fill the caps.
+func cacheListen(addr string, log *slog.Logger) (*jitserver.Limited, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	return jitserver.LimitListener(ln, cacheserver.MaxConnsPerSource, cacheserver.MaxConns), nil
+	l := jitserver.LimitListener(ln, cacheserver.MaxConnsPerSource, cacheserver.MaxConns)
+	l.ExemptLocal()
+	l.WarnTo(log)
+	return l, nil
 }
 
 // newCacheFlagSet registers the cache-server flags.
@@ -709,16 +715,19 @@ func publishHealth(path string, trackers func() []*health.Tracker, fill func(*he
 
 // serveJIT starts the endpoint EC2 instances fetch their JIT configs from, on
 // the control VM's VPC address. Binding fails fast if the address is not this
-// host's. The returned func shuts it down.
-func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitserver.Server, func(), error) {
+// host's. The returned listener counts the connections its caps refused, and
+// the returned func shuts it down.
+func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitserver.Server, *jitserver.Limited, func(), error) {
 	jit := jitserver.New(cfg.JITTTL, log.With("component", "jitserver"))
-	ln, err := net.Listen("tcp", cfg.JITAddr)
+	tcp, err := net.Listen("tcp", cfg.JITAddr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("--jit-addr: %w", err)
+		return nil, nil, nil, fmt.Errorf("--jit-addr: %w", err)
 	}
 	// Every runner can reach this port: bound what one source, and all of
 	// them, may hold open, so a job cannot crowd out other runners' fetches.
-	ln = jitserver.LimitListener(ln, jitserver.MaxConnsPerSource, jitserver.MaxConns)
+	// Nothing local reads it, so this host's own connections are capped too.
+	ln := jitserver.LimitListener(tcp, jitserver.MaxConnsPerSource, jitserver.MaxConns)
+	ln.WarnTo(log.With("component", "jitserver"))
 	srv := jit.HTTPServer()
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -726,11 +735,24 @@ func serveJIT(ctx context.Context, cfg *config.Config, log *slog.Logger) (*jitse
 		}
 	}()
 	log.Info("serving EC2 JIT configs", "addr", cfg.JITAddr, "url", jitserver.URL(cfg.JITEndpoint()))
-	return jit, func() {
+	return jit, ln, func() {
 		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}, nil
+}
+
+// healthRefusals is a listener's refusals for the health file, nil without
+// a listener.
+func healthRefusals(l *jitserver.Limited) *health.ConnRefusals {
+	if l == nil {
+		return nil
+	}
+	byCap, last := l.Refused()
+	if !last.IsZero() {
+		last = last.UTC()
+	}
+	return &health.ConnRefusals{ByCap: byCap, Last: last}
 }
 
 // loadCacheCAs returns the results host's CA and, when a tier has a git cache,
@@ -1024,11 +1046,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if cfg.UsesFirecracker() {
 		s.fc = provisioner.NewFirecracker(cfg.Firecracker, log)
 	}
+	var jitListener *jitserver.Limited
 	if cfg.UsesEC2() {
-		jit, stopJIT, err := serveJIT(ctx, cfg, log)
+		jit, ln, stopJIT, err := serveJIT(ctx, cfg, log)
 		if err != nil {
 			return err
 		}
+		jitListener = ln
 		// Instances still running their jobs fetch nothing more, but stop the
 		// endpoint only after the drain all the same.
 		defer stopJIT()
@@ -1074,6 +1098,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			f.EC2Breakers = healthBreakers(s.ec2Client.Breakers())
 		}
 		f.CacheCredentials = healthCacheCredentials(cacheCreds)
+		f.JITRefused = healthRefusals(jitListener)
 	}, log)
 
 	// Drive every tier's listener concurrently. A listener reconnects its own
