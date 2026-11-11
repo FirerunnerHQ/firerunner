@@ -8,6 +8,77 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-11-11
+
+### Added
+
+- cache-server counts the connections its caps refuse, by cap, and the
+  uploads and downloads `--body-idle-timeout` cuts, by direction, in `/stats`
+  and `/metrics` (`firerunner_cache_conn_refused_total{cap}`,
+  `firerunner_cache_idle_cuts_total{direction}`), and logs each kind at most
+  once a minute. The EC2 JIT endpoint counts its refusals too.
+  `firerunner status` shows both, and `firerunner doctor` warns for an hour
+  after the latest refusal.
+- Each tenant in the `--tenants` catalog runs under limits: by default at most 2
+  runners at once across its tiers, only tiers of at most 2 vCPU, and 30 minutes
+  per job. Raise them in its entry's `limits` (`max_runners`, `max_vcpu`,
+  `max_job_duration`; 0 lifts one). A job past the runner limit waits, and
+  `firerunner status` shows why; a job past its duration has its runner ended;
+  a tier above the vCPU limit is not served to that tenant, with a warning.
+  `firerunner config check` shows each tenant's limits, and the job events
+  record `held` jobs and `stopped` runners with the reason. The install's own
+  tiers take limits from `--limit-runners`, `--limit-vcpu` and
+  `--limit-job-duration`, and have none by default.
+- `firerunner tenant suspend ID --reason TEXT`, `tenant resume ID` and `tenant
+  list` keep which tenants are suspended where the daemon's new
+  `--tenant-state` (`FR_TENANT_STATE`) names: a JSON file, or `ssm:` and an SSM
+  path. The daemon reads it at start and every 15 seconds; a suspended tenant's
+  launches are held, and every runner it has is ended at once, busy or not. Its
+  reaper ends one a restart left behind. `firerunner status` shows the reason
+  and the time, and `doctor` warns while the states cannot be read.
+- CloudFormation: the control VM reads suspensions from
+  `<prefix>/control/tenant-state`; update the stack to give its role that read.
+
+### Changed
+
+- Upgrading with a `--tenants` catalog: a tenant entry without `limits` now
+  runs under the defaults above, so a tenant on tiers of more than 2 vCPU stops
+  being served them, and its jobs past 30 minutes end. Add `limits` to each
+  entry that needs more before upgrading; `firerunner config check` notes every
+  tenant that sets none.
+
+### Fixed
+
+- `firerunner status`, `doctor` and local scrapers reach cache-server's
+  `/stats` and `/metrics` even when guests fill its connection caps:
+  connections from the host itself are no longer capped.
+- `firerunner tenant` reads the daemon's settings file for its state store
+  when no `FR_*` variable is set, as `status` and `doctor` do, so on a control
+  VM `firerunner tenant list` needs no `--state`; `--env-file` chooses another
+  file or none.
+
+### Security
+
+- The EC2 reaper deregisters a runner at GitHub only when the instance's
+  runner tag is signed by this install: firerunner now tags each job instance
+  `firerunner:runner-mac`, an HMAC under the `--ec2-pool-key-file` key. A
+  running instance without a valid one, including one still running from a
+  release before this, is left to `--max-vm-lifetime`. Without a key file, a
+  restarted firerunner deregisters no runner an earlier process launched;
+  `doctor` and the startup log now warn of a missing key on any EC2 install,
+  not only one with a pool.
+- Before handing a pool instance a job, firerunner checks that its image and
+  EBS volumes are still the ones it was launched with (signed in the new
+  `firerunner:pool-disk-mac` tag), that its security groups are exactly the
+  tier's, its subnet one of the tier's, its type the one it was launched as,
+  and that it has no instance profile, one network interface, no public
+  address and IMDSv2-only metadata. One that differs is never started, and
+  is terminated. **Upgrading discards existing pool instances once:** they
+  carry no disk MAC, so they are terminated and the pool refills.
+- `network.yaml`'s runner subnets deny outbound SMTP (TCP 25, 465 and 587)
+  through a network ACL, so job code on an EC2 runner cannot send mail; a
+  security group can only allow. A VPC of your own needs the same.
+
 ## [0.1.14] - 2026-11-10
 
 ### Changed
@@ -442,7 +513,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.15
 [0.1.14]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.14
 [0.1.13]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.13
 [0.1.12]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.12
