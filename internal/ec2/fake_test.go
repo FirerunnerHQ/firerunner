@@ -104,7 +104,9 @@ import (
 // changed them since. Whether it lists a pending instance's volumes is
 // unchecked: volumesLate leaves them out, and firerunner must handle both.
 // A volume's AttachTime is when it was attached, and stays across a stop and
-// start (EC2 API Reference, EbsInstanceBlockDevice; not yet observed).
+// start (EC2 API Reference, EbsInstanceBlockDevice; observed 2026-11-11: an
+// instance's root volume kept its ID, AttachTime and DeleteOnTermination
+// across a stop and a start).
 //
 // Not modelled, so no test may rely on it: the rebalance recommendation and
 // two-minute warning before a spot interruption; the
