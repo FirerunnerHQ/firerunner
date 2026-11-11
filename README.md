@@ -758,7 +758,9 @@ VM's group must allow TCP to the `--jit-addr` port **from the runners' group
 only**. Never expose that port publicly. A job can reach that port too, so
 firerunner holds at most 4 connections open per source address and 4096 in
 all, closes each after one request, and refuses the rest at once; a runner
-retries a refused config fetch.
+retries a refused config fetch. Refusals are logged at most once a minute per
+cap; `firerunner status` counts them by cap, and `firerunner doctor` warns for
+an hour after the latest.
 
 **Verifying a deployment end to end.** These steps create real, billable
 resources. [`scripts/e2e/`](scripts/e2e/README.md) has tested helpers for them:
@@ -1162,8 +1164,22 @@ firerunner cache-server --dir /var/lib/firerunner/cache \
 
 The server also exposes `GET /stats` (JSON: entry count, bytes, hits, misses,
 saves, evictions) and `GET /metrics` (Prometheus text, no client library
-needed) for scraping. `firerunner status` reads `/stats` and shows the live
-entry count, size vs. cap, and hit rate under the `dep cache` row.
+needed) for scraping. `firerunner status` reads `/stats` (at `--ec2-cache-addr`
+when only EC2 tiers cache) and shows the live
+entry count, size vs. cap, and hit rate under the `dep cache` row, with the
+connections refused at the caps and the transfers cut by `--body-idle-timeout`
+when there are any. `/stats` has them as `conn_refused`,
+`conn_refused_by_cap` (`per_source`, `total`), `conn_refused_last`,
+`idle_cuts`, `idle_cuts_by_direction` (`request`: a body that stopped
+arriving; `response`: one left unread, counted when a handler's write fails,
+so a small response's final flush is not) and `idle_cut_last`; `/metrics` as
+`firerunner_cache_conn_refused_total{cap}` and
+`firerunner_cache_idle_cuts_total{direction}`. Each is also logged as a
+warning, at most once a minute per cap or direction, and `firerunner doctor`
+warns for an hour after the latest refusal. Connections from the host itself
+(loopback, or from the address they reach) are neither capped nor counted, so
+`status`, `doctor` and a local scraper still get through when guests fill the
+caps; a guest's connection never comes from either.
 
 **Pointing microVMs at it.** Two pieces are needed because the *real* GitHub
 runner overwrites `ACTIONS_RESULTS_URL` with the value from its per-job message:
@@ -1424,7 +1440,7 @@ a response the client stops reading for as long, a download above all, ends
 its connection too; a transfer that keeps moving is never cut, however long
 it takes. A download goes out a megabyte at a time under the bound, so a
 client must read one within it (1 MiB a minute by default). One address may hold at most 64 connections to the cache server,
-and all of them together 4096.
+and all of them together 4096; connections from the host itself are exempt.
 
 The cache is a pure accelerator — every job still passes with caching disabled,
 so when in doubt, leave it off.

@@ -299,6 +299,26 @@ type File struct {
 	// CacheCredentials is the cache role's credentials file, when the
 	// daemon keeps one (--cache-role-arn).
 	CacheCredentials *CacheCredentials `json:"cache_credentials,omitempty"`
+	// JITRefused is the EC2 JIT endpoint's connections refused at its caps,
+	// when the daemon serves one.
+	JITRefused *ConnRefusals `json:"jit_refused,omitempty"`
+}
+
+// ConnRefusals is a listener's connections refused at its connection caps.
+type ConnRefusals struct {
+	// ByCap counts them by cap: "per_source" or "total".
+	ByCap map[string]uint64 `json:"by_cap"`
+	// Last is the latest refusal's time, zero before the first.
+	Last time.Time `json:"last,omitzero"`
+}
+
+// Total is the refusals at every cap.
+func (c ConnRefusals) Total() uint64 {
+	var n uint64
+	for _, v := range c.ByCap {
+		n += v
+	}
+	return n
 }
 
 // CacheCredentials is how the daemon's refresh of the cache role's
