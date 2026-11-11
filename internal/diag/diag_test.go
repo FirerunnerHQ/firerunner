@@ -794,6 +794,66 @@ func TestStatusShowsTenantLimitsAndHolds(t *testing.T) {
 	}
 }
 
+// status shows a suspended tenant with the operator's reason and time, and
+// where the states are read from; doctor passes while the reads succeed, and
+// warns while they fail.
+func TestStatusAndDoctorShowSuspensions(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	since := now.Add(-time.Hour).UTC()
+	f := health.File{PID: 1, WrittenAt: now,
+		Tiers: []health.Tier{{Name: "acme/small", State: health.Connected, Since: now}},
+		Tenants: []health.Tenant{
+			{ID: "acme", State: "suspended", Reason: "abuse report", Since: since, Limits: health.Limits{JobDuration: "0s"}},
+			{ID: "new", State: "held", Reason: `tenant "new" is held: its state has not been read yet`, Limits: health.Limits{JobDuration: "0s"}},
+		},
+		TenantStates: &health.TenantStates{Store: "ssm:/fr/control/tenant-state", LastRead: now.Add(-5 * time.Second)}}
+	write := func() {
+		if err := health.Write(filepath.Join(dir, health.FileName), f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	cfg := &config.Config{Firecracker: provisioner.FirecrackerConfig{WorkDir: dir, TapPrefix: "fr", NetBase: 16}}
+	var text bytes.Buffer
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"acme SUSPENDED since " + since.Format(time.RFC3339) + " (1h0m ago): abuse report",
+		`new HELD: tenant "new" is held: its state has not been read yet`,
+		"tenant states from ssm:/fr/control/tenant-state, read 5s ago",
+	} {
+		if !strings.Contains(text.String(), want) {
+			t.Errorf("status missing %q\n%s", want, text.String())
+		}
+	}
+	check := func() Check {
+		for _, c := range listenerChecks(cfg.Firecracker, now) {
+			if c.Name == "tenant-state" {
+				return c
+			}
+		}
+		t.Fatal("no tenant-state check")
+		return Check{}
+	}
+	if c := check(); c.Level != levelPass || !strings.Contains(c.Detail, "suspended: acme") {
+		t.Fatalf("doctor = %+v", c)
+	}
+	f.TenantStates.LastError, f.TenantStates.LastErrorAt = "AccessDeniedException", now
+	write()
+	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "AccessDeniedException") {
+		t.Fatalf("doctor while reads fail = %+v", c)
+	}
+	text.Reset()
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "last read failed 0s ago, keeping the last states: AccessDeniedException") {
+		t.Errorf("status:\n%s", text.String())
+	}
+}
+
 func TestStatusShowsFallbacksAndBreakers(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
