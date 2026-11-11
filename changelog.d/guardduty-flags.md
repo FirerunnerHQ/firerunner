@@ -11,7 +11,9 @@
   not count a finding again.
 - `firerunner tenant clear-flag ID` clears a flag once reviewed; `tenant list`
   shows flags beside suspensions; `tenant findings` lists the findings on an
-  owner's instances and the tenant each names, and writes nothing.
+  owner's instances and the tenant each names, and writes nothing. Where AWS
+  refuses a `suspend`, `resume` or `clear-flag`, as on a control VM, the
+  command says to run it with operator credentials, and prints it.
 - CloudFormation: the control VM reads GuardDuty findings while the region has
   a detector at boot, and writes flags under
   `<prefix>/control/tenant-state-flags`; update the stack to give its role

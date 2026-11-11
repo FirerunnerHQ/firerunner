@@ -14,6 +14,7 @@ import (
 	awsgd "github.com/aws/aws-sdk-go-v2/service/guardduty"
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/guardduty"
@@ -159,6 +160,11 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) (cod
 	r := tenantReport{}
 	fail := func(where fmt.Stringer, err error) int {
 		fmt.Fprintf(stderr, "firerunner tenant %s: %s: %v\n", a.action, where, err)
+		if a.action != "list" && accessDenied(err) {
+			// The control VM's role reads tenant state and writes flags,
+			// but changing either is an operator's act: say where to run it.
+			fmt.Fprintf(stderr, "These AWS credentials may not change tenant state; a control VM's role is not meant to. Run it where you hold operator credentials:\n  firerunner tenant %s %s --state %s\n", a.action, a.ids[0], a.spec)
+		}
 		return 1
 	}
 	var store tenantstate.Store
@@ -429,4 +435,18 @@ func openTenant() tenantOpeners {
 			return awsgd.NewFromConfig(awsCfg), account, nil
 		},
 	}
+}
+
+// accessDenied reports whether err is AWS refusing the caller's credentials
+// the call.
+func accessDenied(err error) bool {
+	var ae smithy.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	switch ae.ErrorCode() {
+	case "AccessDenied", "AccessDeniedException", "UnauthorizedOperation":
+		return true
+	}
+	return false
 }
