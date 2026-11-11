@@ -93,6 +93,19 @@ those installations too, on the same GitHub App and tier catalog:
 [{"id": "acme", "url": "https://github.com/acme", "installation_id": 1234, "tiers": ["firerunner-ubuntu-24.04-2"]}]
 ```
 
+Each runs under limits, so that signing up is no route to free compute: by
+default at most 2 runners at once across its tiers, only tiers of at most 2 vCPU,
+and 30 minutes per job. Raise them in its entry, where 0 lifts one:
+
+```json
+"limits": {"max_runners": 10, "max_vcpu": 8, "max_job_duration": "2h"}
+```
+
+A tier above its vCPU limit is not served to it, with a warning in the log and in
+`firerunner config check`. A job past the runner limit waits, and `firerunner
+status` says why; a job past its duration has its runner ended, and fails. A
+changed list takes effect when the VM is replaced, as its other parameters do.
+
 Each gets its own scale sets and the owner tag `<owner>/<id>`, which the VM's role
 and the reaper Lambda also cover. A tenant that stops is tried again by itself,
 and shows in `firerunner status` meanwhile; the others are not touched. A tenant's

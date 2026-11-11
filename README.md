@@ -204,6 +204,32 @@ What keeps one installation's jobs from another's:
   tag (`<owner>/<id>`), which scopes the reaper and stopped pools, so a pool
   instance never moves between them.
 
+Each installation runs under limits from its entry in the tenants file, so that
+an account is no route to free compute: by default at most 2 runners at once
+across its tiers, only tiers of at most 2 vCPU, and 30 minutes per job. An
+operator raises them per installation, and 0 lifts one:
+
+```json
+[{"id": "acme", "url": "https://github.com/acme", "installation_id": 1234,
+  "tiers": ["firerunner-ubuntu-24.04-2"],
+  "limits": {"max_runners": 10, "max_vcpu": 8, "max_job_duration": "2h"}}]
+```
+
+- **Runners** count across the installation's tiers. A job past the limit
+  waits in GitHub's queue, and `firerunner status` shows the tier as `HELD`
+  with the reason; the log and the job events record it as `held`.
+- **vCPUs:** a tier above the limit is not served to that installation, and
+  the log and `firerunner config check` warn of it. A tier's vCPUs are its
+  largest instance type's, read from the type's size (`large` 2, `xlarge` 4,
+  `Nxlarge` 4N); a size it cannot read, such as `metal`, counts as above any
+  limit.
+- **Job duration** counts from the job's start. A job past it has its runner
+  ended, and fails; the job events record the runner as `stopped`. Its
+  machines also live at most the limit plus 15 minutes from launch.
+
+The install's own tiers are not limited unless `--limit-runners`,
+`--limit-vcpu` and `--limit-job-duration` (`FR_LIMIT_*`) say so.
+
 What it does not separate: the daemon itself, which holds every installation's
 App access and signs for them all, and the account's API limits and quotas.
 For a boundary between those too, run each installation's runners in its own
@@ -535,7 +561,9 @@ firerunner also terminates an instance in these cases:
 
 - it is idle when the scale set shrinks;
 - it never fetched its config (this backs off, as a failed microVM boot does);
-- it is older than `--max-vm-lifetime`.
+- it is older than `--max-vm-lifetime`, or, for a tenant with a job limit,
+  than that limit plus 15 minutes;
+- its job ran past its tenant's job limit (see *Sharing an AWS account*).
 
 Instances and volumes are tagged `firerunner:tier`, `firerunner:runner` and
 `firerunner:owner` (this host's name).
