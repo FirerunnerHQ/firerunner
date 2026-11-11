@@ -19,6 +19,10 @@ func TestCacheListenLetsThisHostPastTheCaps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The caps a guest meets, which this host's connections cannot show.
+	if per, total := ln.Limits(); per != cacheserver.MaxConnsPerSource || total != cacheserver.MaxConns {
+		t.Fatalf("caps %d per source, %d in all; want %d, %d", per, total, cacheserver.MaxConnsPerSource, cacheserver.MaxConns)
+	}
 	srv, err := cacheserver.New(t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)

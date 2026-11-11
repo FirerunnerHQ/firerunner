@@ -100,6 +100,9 @@ func (l *Limited) ExemptLocal() { l.exemptLocal = true }
 // went unlogged since the last. Call before Accept.
 func (l *Limited) WarnTo(log *slog.Logger) { l.log = log }
 
+// Limits returns the caps: per source address, and in all.
+func (l *Limited) Limits() (perSource, total int) { return l.perSource, l.total }
+
 // Refused returns the connections refused so far, by cap, and when the
 // latest was (zero before the first).
 func (l *Limited) Refused() (byCap map[string]uint64, last time.Time) {
