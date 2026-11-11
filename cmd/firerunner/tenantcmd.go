@@ -21,25 +21,27 @@ import (
 )
 
 const tenantUsage = `usage:
-  firerunner tenant suspend ID --reason TEXT [--state SPEC] [--json]
+  firerunner tenant suspend ID --reason TEXT [--state SPEC] [--env-file FILE|none] [--json]
       hold every launch of the tenant and end every runner it has, busy or
       not: its running jobs fail
-  firerunner tenant resume ID [--state SPEC] [--json]
+  firerunner tenant resume ID [--state SPEC] [--env-file FILE|none] [--json]
       lift a suspension; a flag for review stays until cleared
-  firerunner tenant clear-flag ID [--state SPEC] [--json]
+  firerunner tenant clear-flag ID [--state SPEC] [--env-file FILE|none] [--json]
       clear the tenant's flag for review, once reviewed
-  firerunner tenant list [--state SPEC] [--json]
+  firerunner tenant list [--state SPEC] [--env-file FILE|none] [--json]
       list the suspended tenants, and those flagged for review
   firerunner tenant findings [--owner OWNER] [--since DURATION]
-      [--min-severity N] [--json]
-      list the GuardDuty findings on OWNER's EC2 instances and the tenant
-      each names, as a daemon with --guardduty reads them; writes nothing
+      [--min-severity N] [--env-file FILE|none] [--json]
+      list the GuardDuty findings on OWNER's EC2 instances in this account
+      and the tenant each names; writes nothing
 
 ID is a tenant's id in the --tenants catalog, or _install for the install's
 own tiers. SPEC is where the daemon reads tenant states, as its
 --tenant-state: ssm:<path> (one SSM parameter per suspended tenant; uses this
 shell's AWS credentials and region, FR_AWS_REGION or AWS_REGION) or an
-absolute file path. Default FR_TENANT_STATE. Flags are kept beside it, under
+absolute file path. Default FR_TENANT_STATE; with no FR_* variable set, the
+daemon's settings file is read for it, as status and doctor do (--env-file
+FILE reads another, --env-file none none). Flags are kept beside it, under
 its name with -flags added.
 
 A running daemon reads the states every 15 seconds: within that, a suspended
@@ -129,7 +131,18 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) (cod
 		fmt.Fprint(stdout, tenantUsage)
 		return 0
 	}
-	a, help, err := parseTenantArgs(args)
+	switch args[0] {
+	case "suspend", "resume", "clear-flag", "list", "findings":
+	default:
+		return usageErr("firerunner tenant: unknown action %q", args[0])
+	}
+	// On the daemon's host, its settings, the state store included, are in
+	// its EnvironmentFile, as for status and doctor.
+	rest, err := diagEnv("tenant", args[1:], stderr)
+	if err != nil {
+		return usageErr("firerunner tenant: %v", err)
+	}
+	a, help, err := parseTenantArgs(append([]string{args[0]}, rest...))
 	if help {
 		fmt.Fprint(stdout, tenantUsage)
 		return 0
