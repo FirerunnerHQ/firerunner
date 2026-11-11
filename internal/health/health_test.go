@@ -38,6 +38,38 @@ func TestTrackerCountsInterruptions(t *testing.T) {
 	}
 }
 
+// A hold keeps its start while its reason stays, and clears at 0.
+func TestTrackerHeldAndStopped(t *testing.T) {
+	now := time.Unix(1000, 0)
+	tr := NewTracker("a")
+	tr.now = func() time.Time { return now }
+	tr.SetHeld(1, "at its limit")
+	now = now.Add(time.Minute)
+	tr.SetHeld(3, "at its limit")
+	snap := tr.Snapshot()
+	if h := snap.Held; h == nil || h.Jobs != 3 || !h.Since.Equal(time.Unix(1000, 0)) {
+		t.Fatalf("held = %+v", h)
+	}
+	tr.SetHeld(1, "suspended")
+	if h := tr.Snapshot().Held; !h.Since.Equal(now) {
+		t.Fatalf("a new reason kept the old start: %+v", h)
+	}
+	if snap.Held.Jobs != 3 {
+		t.Fatal("a snapshot shares its hold with the tracker")
+	}
+	tr.SetHeld(0, "")
+	if tr.Snapshot().Held != nil {
+		t.Fatal("a hold of 0 jobs was kept")
+	}
+	tr.Stopped("job_duration")
+	tr.Stopped("job_duration")
+	snap = tr.Snapshot()
+	tr.Stopped("job_duration")
+	if snap.Stopped["job_duration"] != 2 {
+		t.Fatalf("stopped = %v", snap.Stopped)
+	}
+}
+
 func TestTrackerTransitions(t *testing.T) {
 	now := time.Unix(1000, 0)
 	tr := NewTracker("a")

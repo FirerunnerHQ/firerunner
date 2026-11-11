@@ -54,6 +54,10 @@ type Config struct {
 	OnRunnerID func(runner string, id int64)
 	// Events, if set, is told of each job's assignment, start and end.
 	Events jobevent.Sink
+	// Held, if set, says why a job assigned now would wait for a runner (its
+	// tenant is at a limit), or "". A job assigned meanwhile is logged and
+	// recorded as held, with that reason.
+	Held func() string
 	// Pending, if set, keeps the tier's assigned-but-not-started jobs, read
 	// from each message before the library acts on it.
 	Pending *assigned.Jobs
@@ -369,7 +373,7 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		s.recycle = nil
 		s.mu.Unlock()
 	}()
-	ts := trackedSession{session: sess, health: s.health, pending: s.cfg.Pending, events: s.cfg.Events, tier: s.cfg.Name, offered: s.cfg.OnJobOffered, log: s.log, chaos: chaosExitAfterDelete()}
+	ts := trackedSession{session: sess, health: s.health, pending: s.cfg.Pending, events: s.cfg.Events, held: s.cfg.Held, tier: s.cfg.Name, offered: s.cfg.OnJobOffered, log: s.log, chaos: chaosExitAfterDelete()}
 	l, err := sslistener.New(ts, sslistener.Config{
 		ScaleSetID: s.scaleSetID,
 		MaxRunners: s.cfg.MaxRunners,
@@ -475,6 +479,7 @@ type trackedSession struct {
 	pending *assigned.Jobs
 	offered func(jobidentity.Job)
 	events  jobevent.Sink
+	held    func() string
 	tier    string
 	log     *slog.Logger
 	// chaos exits the process after DeleteMessage (see chaosExitAfterDelete).
@@ -514,11 +519,24 @@ func (t trackedSession) GetMessage(ctx context.Context, lastMessageID, maxCapaci
 		}
 	}
 	if err == nil && m != nil {
+		why := ""
+		if t.held != nil && len(m.JobAssignedMessages) > 0 {
+			why = t.held()
+		}
 		for _, a := range m.JobAssignedMessages {
-			if a != nil {
-				e := jobEvent(jobevent.Assigned, t.tier, a.JobMessageBase)
-				e.At = a.ScaleSetAssignTime
-				jobevent.Record(t.events, e)
+			if a == nil {
+				continue
+			}
+			e := jobEvent(jobevent.Assigned, t.tier, a.JobMessageBase)
+			e.At = a.ScaleSetAssignTime
+			jobevent.Record(t.events, e)
+			if why != "" {
+				if t.log != nil {
+					t.log.Info("job held", "jobId", a.JobID, "repository", a.OwnerName+"/"+a.RepositoryName, "reason", why)
+				}
+				h := jobEvent(jobevent.Held, t.tier, a.JobMessageBase)
+				h.Reason = why
+				jobevent.Record(t.events, h)
 			}
 		}
 	}

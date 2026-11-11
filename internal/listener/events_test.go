@@ -71,3 +71,32 @@ func TestJobEvents(t *testing.T) {
 		}
 	}
 }
+
+// A job assigned while its tenant is at a limit is recorded as held, with the
+// reason, beside its assignment; one assigned with room is not.
+func TestJobHeldWithReason(t *testing.T) {
+	base := scaleset.JobMessageBase{JobID: "job-1", OwnerName: "owner", RepositoryName: "repo"}
+	events := &eventLog{}
+	why := `tenant "acme" is at its limit of 2 runner(s) at once`
+	f := newFakeSession(0, false)
+	ts := trackedSession{session: f, events: events, tier: "tier-a", held: func() string { return why }}
+	f.msgs <- &scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: base}}}
+	if _, err := ts.GetMessage(context.Background(), 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(events.got) != 2 || events.got[0].Kind != jobevent.Assigned || events.got[1].Kind != jobevent.Held {
+		t.Fatalf("events = %+v", events.got)
+	}
+	if h := events.got[1]; h.Reason != why || h.JobID != "job-1" || h.Tier != "tier-a" || h.Repository != "owner/repo" {
+		t.Fatalf("held event = %+v", h)
+	}
+
+	why = ""
+	f.msgs <- &scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: base}}}
+	if _, err := ts.GetMessage(context.Background(), 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(events.got) != 3 || events.got[2].Kind != jobevent.Assigned {
+		t.Fatalf("a job assigned with room was recorded as held: %+v", events.got)
+	}
+}

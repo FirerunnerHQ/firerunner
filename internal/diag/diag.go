@@ -440,6 +440,13 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				}
 				fmt.Fprintln(w)
 			}
+			if h := t.Held; h != nil {
+				fmt.Fprintf(w, "  %s HELD: %d job(s) waiting for %s: %s\n",
+					t.Name, h.Jobs, humanDuration(time.Since(h.Since).Truncate(time.Second)), h.Reason)
+			}
+			if n := t.Stopped["job_duration"]; n > 0 {
+				fmt.Fprintf(w, "  %s runners ended at the job limit: %d\n", t.Name, n)
+			}
 			if len(t.Launches) > 0 {
 				fmt.Fprintf(w, "  %s launches: %d from the pool, %d cold, %d cold with the pool kept\n",
 					t.Name, t.Launches["pool"], t.Launches["cold"], t.Launches["kept"])
@@ -459,6 +466,7 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				fmt.Fprintf(w, "  %s repairs: %d session recycle(s), %d lost runner(s) cancelled, %d offline runner(s) removed\n", t.Name, t.Recycles, t.LostRunners, t.OfflineRemoved)
 			}
 		}
+		renderTenants(w, l.Tenants)
 		if rp := l.Reaper; rp != nil {
 			mode := ""
 			if rp.DryRun {
@@ -512,6 +520,40 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			fmt.Fprintf(vtw, "  %s\t%s\t%s\n", v.Name, v.RootfsHuman, humanDuration(time.Duration(v.AgeSeconds)*time.Second))
 		}
 		vtw.Flush()
+	}
+}
+
+// renderTenants lists the tenants a daemon serves and the limits each runs
+// under.
+func renderTenants(w io.Writer, tenants []health.Tenant) {
+	if len(tenants) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\ntenants:\n")
+	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "  TENANT\tRUNNING\tMAX RUNNERS\tMAX VCPU\tMAX JOB")
+	limit := func(n int) string {
+		if n == 0 {
+			return "-"
+		}
+		return fmt.Sprint(n)
+	}
+	for _, t := range tenants {
+		job := t.Limits.JobDuration
+		if job == "0s" || job == "" {
+			job = "-"
+		}
+		fmt.Fprintf(tw, "  %s\t%d\t%s\t%s\t%s\n", or(t.ID, "(install)"), t.Running, limit(t.Limits.Runners), limit(t.Limits.VCPU), job)
+	}
+	tw.Flush()
+	for _, t := range tenants {
+		name := or(t.ID, "(install)")
+		if t.NotServed != "" {
+			fmt.Fprintf(w, "  %s NOT SERVED: %s\n", name, t.NotServed)
+		}
+		for _, why := range t.Refused {
+			fmt.Fprintf(w, "  %s not served %s\n", name, why)
+		}
 	}
 }
 
