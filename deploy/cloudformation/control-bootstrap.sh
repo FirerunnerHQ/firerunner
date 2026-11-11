@@ -41,6 +41,9 @@
 #   tenant-state/<id>  a suspended tenant's record, written by
 #                    "firerunner tenant suspend" (optional; the daemon reads
 #                    the path itself, every 15 s)
+#   tenant-state-flags/<id>  a tenant flagged for review by GuardDuty
+#                    findings, written by the daemon (--guardduty), cleared by
+#                    "firerunner tenant clear-flag"
 #
 # On any failure it marks the instance unhealthy, so the group replaces it.
 set -euo pipefail
@@ -215,13 +218,37 @@ fi
 # error fails the boot: a VM that dropped the suspensions on a throttled call
 # would serve a suspended tenant.
 state_path="$FR_PREFIX/control/tenant-state"
+states=''
 if out=$(aws ssm get-parameters-by-path --path "$state_path" --max-items 1 2>&1 > /dev/null); then
 	setenv FR_TENANT_STATE "ssm:$state_path"
+	states=1
 elif [[ "$out" == *AccessDenied* ]]; then
 	log "cannot read $state_path: tenant suspension is off; update the stack to let the VM read it"
 else
 	log "reading $state_path: $out"
 	false
+fi
+# GuardDuty findings on the install's instances flag their tenants for review,
+# beside the states, while the account has a detector in this region. A flag
+# never suspends. A stack made before the VM's role could read GuardDuty
+# leaves it off; any other error turns it on, and the daemon's own reads say
+# what fails in firerunner doctor.
+# Decided at boot: a detector enabled later counts once the VM is replaced.
+if [ -n "$states" ]; then
+	gd_err=$(mktemp)
+	if detectors=$(aws guardduty list-detectors --query 'length(DetectorIds)' --output text 2> "$gd_err"); then
+		if [ "$detectors" != 0 ]; then
+			setenv FR_GUARDDUTY true
+		else
+			log "GuardDuty has no detector in $AWS_REGION: no finding flags a tenant; enable it, then replace the VM"
+		fi
+	elif grep -q AccessDenied "$gd_err"; then
+		log "cannot read GuardDuty: tenants are not flagged from its findings; update the stack to let the VM read them"
+	else
+		log "listing GuardDuty detectors: $(cat "$gd_err"); reading findings all the same"
+		setenv FR_GUARDDUTY true
+	fi
+	rm -f "$gd_err"
 fi
 if [ -n "${FR_POOL_KEY_SECRET:-}" ]; then
 	# In a root-only file (umask 077), never the env: firerunner reads it.

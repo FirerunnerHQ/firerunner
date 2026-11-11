@@ -478,6 +478,17 @@ func renderStatusText(r StatusReport, w io.Writer) {
 					humanDuration(time.Since(ts.LastErrorAt).Truncate(time.Second)), truncate(ts.LastError, 200))
 			}
 		}
+		if g := l.GuardDuty; g != nil {
+			last := "never"
+			if !g.LastPoll.IsZero() {
+				last = humanDuration(time.Since(g.LastPoll).Truncate(time.Second)) + " ago"
+			}
+			fmt.Fprintf(w, "  GuardDuty findings of severity %g and above read %s from %d detector(s); flags in %s\n", g.MinSeverity, last, g.Detectors, g.Flags)
+			if g.Failing() {
+				fmt.Fprintf(w, "  last read of findings failed %s ago: %s\n",
+					humanDuration(time.Since(g.LastErrorAt).Truncate(time.Second)), truncate(g.LastError, 200))
+			}
+		}
 		if rp := l.Reaper; rp != nil {
 			mode := ""
 			if rp.DryRun {
@@ -568,6 +579,11 @@ func renderTenants(w io.Writer, tenants []health.Tenant) {
 			fmt.Fprintf(w, "  %s SUSPENDED%s: %s\n", name, since, t.Reason)
 		case "held":
 			fmt.Fprintf(w, "  %s HELD: %s\n", name, t.Reason)
+		}
+		if fl := t.Flag; fl != nil {
+			fmt.Fprintf(w, "  %s FLAGGED for review, not suspended: %s, severity %g, on tier %s instance %s; %d finding(s) or update(s) from %s to %s (finding %s)\n",
+				name, fl.Type, fl.Severity, or(fl.Tier, "?"), or(fl.Instance, "?"), fl.Count,
+				fl.First.UTC().Format(time.RFC3339), fl.Last.UTC().Format(time.RFC3339), or(fl.Finding, "?"))
 		}
 		if t.NotServed != "" {
 			fmt.Fprintf(w, "  %s NOT SERVED: %s\n", name, t.NotServed)
@@ -787,6 +803,9 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 	if c := tenantStatesCheck(li.File, now); c != nil {
 		checks = append(checks, *c)
 	}
+	if c := guardDutyCheck(li.File, now); c != nil {
+		checks = append(checks, *c)
+	}
 	for _, t := range li.Tiers {
 		name := "listener[" + t.Name + "]"
 		switch t.State {
@@ -831,6 +850,44 @@ func tenantStatesCheck(f health.File, now time.Time) *Check {
 		detail = "suspended: " + strings.Join(suspended, ", ")
 	}
 	c := pass("tenant-state", "read from %s; %s", ts.Store, detail)
+	return &c
+}
+
+// guardDutyCheck judges the daemon's reading of GuardDuty findings, nil when
+// it reads none: WARN while any tenant is flagged for review (until an
+// operator suspends it or clears the flag, the warning stays), while reads
+// fail, or while the region has no detector; else PASS.
+func guardDutyCheck(f health.File, now time.Time) *Check {
+	g := f.GuardDuty
+	if g == nil {
+		return nil
+	}
+	var flagged []string
+	for _, t := range f.Tenants {
+		if fl := t.Flag; fl != nil {
+			flagged = append(flagged, fmt.Sprintf("%s (%s, severity %g, %d finding(s) or update(s), last %s ago)", or(t.ID, "(install)"),
+				fl.Type, fl.Severity, fl.Count, humanDuration(now.Sub(fl.Last).Truncate(time.Second))))
+		}
+	}
+	var c Check
+	switch {
+	case len(flagged) > 0:
+		failing := ""
+		if g.Failing() {
+			failing = fmt.Sprintf("; and reading findings fails (%s ago): %s", humanDuration(now.Sub(g.LastErrorAt).Truncate(time.Second)), truncate(g.LastError, 200))
+		}
+		c = warn("guardduty", "flagged for review: %s; review, then firerunner tenant suspend ID or firerunner tenant clear-flag ID%s",
+			strings.Join(flagged, "; "), failing)
+	case g.Failing():
+		c = warn("guardduty", "reading findings fails (%s ago): %s; no tenant is flagged meanwhile",
+			humanDuration(now.Sub(g.LastErrorAt).Truncate(time.Second)), truncate(g.LastError, 200))
+	case g.LastPoll.IsZero():
+		c = pass("guardduty", "findings not read yet")
+	case g.Detectors == 0:
+		c = warn("guardduty", "GuardDuty has no detector in this region: enable it, or no finding flags a tenant")
+	default:
+		c = pass("guardduty", "read %s ago, severity %g and above; no tenant flagged", humanDuration(now.Sub(g.LastPoll).Truncate(time.Second)), g.MinSeverity)
+	}
 	return &c
 }
 

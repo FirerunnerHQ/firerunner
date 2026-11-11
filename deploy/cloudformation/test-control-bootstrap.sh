@@ -43,6 +43,14 @@ ssm)
 	[ -f "$f" ] || { echo "An error occurred (ParameterNotFound) when calling the GetParameter operation" >&2; exit 254; }
 	cat "$f"
 	;;
+guardduty)
+	# One detector, unless $STATE/gd-none; the call is recorded.
+	echo "$*" >> "$STATE/guardduty"
+	[ ! -f "$STATE/gd-denied" ] || { echo "An error occurred (AccessDeniedException) when calling the ListDetectors operation" >&2; exit 254; }
+	[ ! -f "$STATE/gd-throttled" ] || { echo "An error occurred (ThrottlingException) when calling the ListDetectors operation" >&2; exit 254; }
+	[ ! -f "$STATE/gd-warn" ] || echo "WARNING: the CLI says something on stderr" >&2
+	if [ -f "$STATE/gd-none" ]; then echo 0; else echo 1; fi
+	;;
 secretsmanager)
 	# The secret is $STATE/pool-key; the call is recorded.
 	echo "$*" >> "$STATE/secretsmanager"
@@ -179,6 +187,36 @@ touch "$STATE/ssm-path-throttled"
 expect "tenant state throttled: the boot fails" "$(cat "$STATE/out" 2>/dev/null)" bash -c "! PATH='$TMP/bin:$PATH' SYSTEMCTL='$TMP/bin/systemctl' bash '$SCRIPT' '$TMP' > '$STATE/out' 2>&1"
 expect "tenant state throttled: says why" "$(cat "$STATE/out")" grep -q "ThrottlingException" "$STATE/out"
 expect "tenant state throttled: marked unhealthy" "$(cat "$STATE/autoscaling" 2>/dev/null)" grep -q "set-instance-health" "$STATE/autoscaling"
+# GuardDuty findings flag tenants beside the states: on while the region has a
+# detector and the role may read it; off, with a hint, when it may not, or
+# when there is no detector; on after any other error, which the daemon
+# reports. Never without the states, where the flags are kept.
+setup
+expect "guardduty: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "guardduty: on" "$(envfile)" grep -qx "FR_GUARDDUTY=true" <(envfile)
+setup
+touch "$STATE/gd-none"
+expect "guardduty no detector: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "guardduty no detector: off" "$(envfile)" bash -c "! grep -q FR_GUARDDUTY '$FR_ROOT/etc/firerunner/firerunner.env'"
+expect "guardduty no detector: says so" "$(cat "$STATE/out")" grep -q "GuardDuty has no detector" "$STATE/out"
+setup
+touch "$STATE/gd-none" "$STATE/gd-warn"
+expect "guardduty no detector, a CLI warning: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "guardduty no detector, a CLI warning: off" "$(envfile)" bash -c "! grep -q FR_GUARDDUTY '$FR_ROOT/etc/firerunner/firerunner.env'"
+setup
+touch "$STATE/gd-denied"
+expect "guardduty denied: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "guardduty denied: off" "$(envfile)" bash -c "! grep -q FR_GUARDDUTY '$FR_ROOT/etc/firerunner/firerunner.env'"
+expect "guardduty denied: says to update the stack" "$(cat "$STATE/out")" grep -q "update the stack to let the VM read them" "$STATE/out"
+setup
+touch "$STATE/gd-throttled"
+expect "guardduty throttled: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "guardduty throttled: on" "$(envfile)" grep -qx "FR_GUARDDUTY=true" <(envfile)
+setup
+touch "$STATE/ssm-path-denied"
+expect "guardduty without states: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "guardduty without states: off" "$(envfile)" bash -c "! grep -q FR_GUARDDUTY '$FR_ROOT/etc/firerunner/firerunner.env'"
+expect "guardduty without states: not asked" "" test ! -f "$STATE/guardduty"
 setup
 expect "no job events: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "no job events: nothing in the env" "$(envfile)" bash -c "! grep -q FR_JOB_EVENTS '$FR_ROOT/etc/firerunner/firerunner.env'"

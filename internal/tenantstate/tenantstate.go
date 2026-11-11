@@ -134,12 +134,28 @@ func (f *FileStore) Delete(ctx context.Context, id string) error {
 	return f.update(ctx, func(st States) { delete(st, id) })
 }
 
-// update rewrites the file with change applied, by rename after a sync, so
-// the daemon never reads half of it, even after a crash. Writers take a lock
-// file beside it, so two never lose each other's change. It is readable by
-// all: it holds no secret, and the daemon may run as another user.
+// update rewrites the file with change applied (see rewrite).
 func (f *FileStore) update(ctx context.Context, change func(States)) error {
-	lock, err := os.OpenFile(f.Path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	return rewrite(f.Path, func() ([]byte, error) {
+		st, err := f.Load(ctx)
+		if errors.Is(err, errEmpty) {
+			st, err = States{}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		change(st)
+		return json.MarshalIndent(st, "", "  ")
+	})
+}
+
+// rewrite replaces the file at path whole with what next returns, by rename
+// after a sync, so a reader never sees half of it, even after a crash.
+// Writers take a lock file beside it, and next reads the file under that
+// lock, so two never lose each other's change. It is readable by all: it
+// holds no secret, and the daemon may run as another user.
+func rewrite(path string, next func() ([]byte, error)) error {
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
@@ -147,19 +163,11 @@ func (f *FileStore) update(ctx context.Context, change func(States)) error {
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("lock %s: %w", lock.Name(), err)
 	}
-	st, err := f.Load(ctx)
-	if errors.Is(err, errEmpty) {
-		st, err = States{}, nil
-	}
+	b, err := next()
 	if err != nil {
 		return err
 	}
-	change(st)
-	b, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(f.Path), ".tenant-state-")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tenant-state-")
 	if err != nil {
 		return err
 	}
@@ -179,10 +187,10 @@ func (f *FileStore) update(ctx context.Context, change func(States)) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp.Name(), f.Path); err != nil {
+	if err := os.Rename(tmp.Name(), path); err != nil {
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(f.Path))
+	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
@@ -247,9 +255,11 @@ func (s *SSMStore) Delete(ctx context.Context, id string) error {
 }
 
 // IDs returns the states' ids, sorted.
-func (st States) IDs() []string {
-	ids := make([]string, 0, len(st))
-	for id := range st {
+func (st States) IDs() []string { return sortedKeys(st) }
+
+func sortedKeys[V any](m map[string]V) []string {
+	ids := make([]string, 0, len(m))
+	for id := range m {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)

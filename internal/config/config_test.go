@@ -1218,3 +1218,40 @@ func TestFromFlags_CacheRole(t *testing.T) {
 		}
 	}
 }
+
+// --guardduty keeps its flags beside the tenant states: it needs them. Its
+// severity is GuardDuty's 1 to 10. An install with no EC2 tier is accepted
+// (a bootstrap may set it for any stack); the daemon reads nothing then.
+func TestFromFlags_GuardDuty(t *testing.T) {
+	ec2Only := writeTiers(t, `[`+ec2TierJSON+`]`)
+	fcOnly := writeTiers(t, `[{"name":"local","vcpu":2,"mem_mib":4096,"golden":"/g/base.ext4","min":0,"max":4}]`)
+	args := func(extra ...string) []string {
+		return append(append(append(baseArgs(), jitAddr...), "--tiers", ec2Only, "--tenant-state", "/var/lib/fr/tenant-state.json"), extra...)
+	}
+	c, err := FromFlags(args())
+	if err != nil || c.GuardDuty || c.GuardDutyMinSeverity != 4 {
+		t.Fatalf("defaults: on %v, min %v, %v", c.GuardDuty, c.GuardDutyMinSeverity, err)
+	}
+	t.Setenv("FR_GUARDDUTY", "true")
+	t.Setenv("FR_GUARDDUTY_MIN_SEVERITY", "7.5")
+	c, err = FromFlags(args())
+	if err != nil || !c.GuardDuty || c.GuardDutyMinSeverity != 7.5 {
+		t.Fatalf("from the env: on %v, min %v, %v", c.GuardDuty, c.GuardDutyMinSeverity, err)
+	}
+	for name, a := range map[string][]string{
+		"no tenant state": append(append(baseArgs(), jitAddr...), "--tiers", ec2Only),
+		"severity 0.5":    args("--guardduty-min-severity", "0.5"),
+		"severity 11":     args("--guardduty-min-severity", "11"),
+	} {
+		if _, err := FromFlags(a); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if c, err := FromFlags(append(baseArgs(), "--tiers", fcOnly, "--tenant-state", "/var/lib/fr/tenant-state.json")); err != nil || c.UsesEC2() {
+		t.Errorf("no EC2 tier: %v", err)
+	}
+	t.Setenv("FR_GUARDDUTY_MIN_SEVERITY", "high")
+	if _, err := FromFlags(args()); err == nil {
+		t.Error("a severity that is not a number: accepted")
+	}
+}

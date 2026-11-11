@@ -106,6 +106,22 @@ type Tenant struct {
 	Reason string `json:"reason,omitempty"`
 	// Since is when it was suspended.
 	Since time.Time `json:"since,omitzero"`
+	// Flag is set while GuardDuty findings have flagged it for review
+	// (--guardduty). It does not suspend.
+	Flag *Flag `json:"flag,omitempty"`
+}
+
+// Flag is a tenant's flag for review: what the latest GuardDuty finding on
+// one of its machines was, the highest severity, and how many flagged it.
+type Flag struct {
+	Type     string    `json:"type"`
+	Severity float64   `json:"severity"`
+	Tier     string    `json:"tier,omitempty"`
+	Instance string    `json:"instance,omitempty"`
+	Finding  string    `json:"finding,omitempty"`
+	Count    int       `json:"count"`
+	First    time.Time `json:"first"`
+	Last     time.Time `json:"last"`
 }
 
 // TenantStates is how the daemon's reading of the tenants' states goes
@@ -121,6 +137,25 @@ type TenantStates struct {
 // Failing reports whether the latest read failed.
 func (s TenantStates) Failing() bool {
 	return s.LastError != "" && !s.LastErrorAt.Before(s.LastRead)
+}
+
+// GuardDuty is how the daemon's reading of GuardDuty findings goes
+// (--guardduty).
+type GuardDuty struct {
+	// Flags is where it keeps the flags and its cursor.
+	Flags       string  `json:"flags"`
+	MinSeverity float64 `json:"min_severity"`
+	// Detectors is how many the last read found: 0 means GuardDuty is off
+	// in the region, and no finding flags a tenant.
+	Detectors   int       `json:"detectors"`
+	LastPoll    time.Time `json:"last_poll,omitzero"`
+	LastError   string    `json:"last_error,omitempty"`
+	LastErrorAt time.Time `json:"last_error_at,omitzero"`
+}
+
+// Failing reports whether the latest read failed.
+func (g GuardDuty) Failing() bool {
+	return g.LastError != "" && !g.LastErrorAt.Before(g.LastPoll)
 }
 
 // Limits are a tenant's; 0 is no limit.
@@ -389,11 +424,14 @@ type File struct {
 	// when the daemon serves one.
 	JITRefused *ConnRefusals `json:"jit_refused,omitempty"`
 	// Tenants are the tenants the daemon serves, the install's own first,
-	// when any of them runs under limits, or is suspended.
+	// when any of them runs under limits, or is suspended or flagged.
 	Tenants []Tenant `json:"tenants,omitempty"`
 	// TenantStates is how reading the tenants' states goes, when the daemon
 	// reads them.
 	TenantStates *TenantStates `json:"tenant_states,omitempty"`
+	// GuardDuty is how reading GuardDuty findings goes, when the daemon
+	// reads them.
+	GuardDuty *GuardDuty `json:"guardduty,omitempty"`
 }
 
 // ConnRefusals is a listener's connections refused at its connection caps.

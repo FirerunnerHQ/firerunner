@@ -70,6 +70,12 @@ type Config struct {
 	// TenantState is where tenant suspensions are kept: a file, or "ssm:"
 	// and an SSM path (see tenantstate). Empty, none are read.
 	TenantState string
+	// GuardDuty reads GuardDuty's findings on the install's EC2 instances
+	// and flags the tenant each names for review, beside TenantState
+	// (tenantstate.FlagsSpec), at GuardDutyMinSeverity and above. A flag
+	// never suspends.
+	GuardDuty            bool
+	GuardDutyMinSeverity float64
 
 	CacheJobsDir string
 	// CacheRoleARN, when set, is a role the daemon assumes to keep
@@ -415,6 +421,8 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.IntVar(&c.Limits.VCPU, "limit-vcpu", er.int("FR_LIMIT_VCPU", 0), "serve the install only the tiers of at most this many vCPUs, leaving the others out with a warning (0 = no limit). A tenant sets its own in the --tenants catalog")
 	fs.DurationVar(&c.Limits.JobDuration, "limit-job-duration", er.duration("FR_LIMIT_JOB_DURATION", 0), "end the runner of an install's job that has run this long, failing the job (0 = no limit; at least 1m). A tenant sets its own in the --tenants catalog")
 	fs.StringVar(&c.TenantState, "tenant-state", env("FR_TENANT_STATE", ""), "where tenant suspensions are kept (firerunner tenant suspend): an absolute file path, or ssm: and an SSM path holding one parameter per suspended tenant. Read at start and every 15 s; a suspended tenant's launches are held and its runners ended. Off when empty")
+	fs.BoolVar(&c.GuardDuty, "guardduty", er.boolean("FR_GUARDDUTY", false), "read AWS GuardDuty's findings on the install's EC2 instances every 2 minutes and flag the tenant each names, by its firerunner:owner tag, for review in firerunner status and doctor. A flag never suspends: review it, then firerunner tenant suspend or clear-flag. Flags are kept beside --tenant-state, which it needs")
+	fs.Float64Var(&c.GuardDutyMinSeverity, "guardduty-min-severity", er.float("FR_GUARDDUTY_MIN_SEVERITY", 4), "the least GuardDuty severity that flags a tenant: 1-10; 4 is Medium, 7 High")
 	fs.StringVar(&c.TiersPath, "tiers", env("FR_TIERS", ""), "path to a JSON tier catalog (array of {name,labels,provisioner,min,max} plus {vcpu,mem_mib,golden,toolcache} for a firecracker tier or an ec2 block for an ec2 tier). When set, firerunner serves every tier from this one process and developers pick one with runs-on: <name>; --max-runners is the slot budget shared by the firecracker tiers. When unset, a single firecracker tier is derived from --name/--vcpu/--mem-mib/--golden.")
 
 	fs.StringVar(&c.Firecracker.Binary, "firecracker-bin", env("FR_FIRECRACKER_BIN", "firecracker"), "path to firecracker binary")
@@ -676,6 +684,14 @@ func (c *Config) validate() error {
 		if err := tenantstate.CheckSpec(c.TenantState); err != nil {
 			return fmt.Errorf("--tenant-state %w", err)
 		}
+	}
+	// Without an EC2 tier, --guardduty reads nothing (the daemon says so):
+	// GuardDuty's findings name EC2 instances.
+	if c.GuardDuty && c.TenantState == "" {
+		return errors.New("--guardduty needs --tenant-state: flags are kept beside the tenant states")
+	}
+	if c.GuardDuty && (c.GuardDutyMinSeverity < 1 || c.GuardDutyMinSeverity > 10) {
+		return fmt.Errorf("--guardduty-min-severity %g: GuardDuty's severities run from 1 to 10", c.GuardDutyMinSeverity)
 	}
 	tiers, refused := c.InstallTiers()
 	if len(tiers) == 0 {
@@ -1192,6 +1208,18 @@ func (r *envReader) boolean(key string, def bool) bool {
 			return def
 		}
 		return b
+	}
+	return def
+}
+
+func (r *envReader) float(key string, def float64) float64 {
+	if v, ok := os.LookupEnv(key); ok {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			r.fail(key, v, err)
+			return def
+		}
+		return f
 	}
 	return def
 }

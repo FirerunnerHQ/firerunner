@@ -256,6 +256,44 @@ held. `_install` names the install's own tiers, which are never held for an
 unread state; suspending it leaves a stopped EC2 pool stopped, but does not
 shrink it (a tenant keeps no pool).
 
+**Flagging an installation for review.** With `--guardduty` (`FR_GUARDDUTY`)
+and AWS GuardDuty enabled in the region, the daemon reads GuardDuty's findings
+on its EC2 instances every 2 minutes. A finding of severity
+`--guardduty-min-severity` (`FR_GUARDDUTY_MIN_SEVERITY`, default 4, GuardDuty's
+Medium) or above, not archived, flags the installation whose machine it names,
+by the instance's `firerunner:owner` tag: a mining pool's name looked up from a
+job, for example, raises `CryptoCurrency:EC2/BitcoinTool.B!DNS` within minutes.
+Only findings in the daemon's own account count, not a GuardDuty
+administrator's members'. A flag never suspends. `firerunner status` shows it,
+with the latest finding's type, tier and instance, the highest severity, and
+how many findings or updates of one flagged it; `firerunner doctor` warns while
+any is flagged; the log warns once per finding and per update of one (GuardDuty
+updates a finding while the activity recurs), and the job events record each
+as `flagged`. Review it, then suspend the installation, or clear the flag:
+
+```bash
+firerunner tenant list --state /etc/firerunner/tenant-state.json
+firerunner tenant findings --owner my-install --since 24h
+firerunner tenant clear-flag acme --state /etc/firerunner/tenant-state.json
+```
+
+`tenant findings` lists the findings on an owner's instances over `--since`
+and the installation each names, by the tag as the daemon maps it but for any
+id, in the tenants file or not; it writes nothing. Flags, and how far the
+daemon has read, are kept beside the states, under their name with `-flags`
+added (`tenant-state-flags.json`, or `<path>-flags/<id>`), so a restart
+neither counts a finding again nor misses one; resuming a suspension does not
+clear a flag. A flag cleared stays cleared until GuardDuty reports a new
+finding or updates one. The exceptions: a crash between writing a flag and
+the cursor counts a finding twice; a clear in the moment a poll writes that
+installation's flag is lost; more than 40 findings within 15 minutes move the
+cursor past the oldest, which then cannot be listed late; and a cursor that
+does not parse is read as none, looking back 24 hours. The owner tag
+is not signed: anyone who may tag instances in the account could make a
+finding name another installation, which costs a review, never a suspension.
+Suppression rules archive findings, which then flag nothing. Without an EC2
+tier, GuardDuty is not read.
+
 What it does not separate: the daemon itself, which holds every installation's
 App access and signs for them all, and the account's API limits and quotas.
 For a boundary between those too, run each installation's runners in its own

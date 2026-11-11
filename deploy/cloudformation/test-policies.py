@@ -21,8 +21,8 @@ def block(name):
     return text[text.index("\n", begin):end]
 
 
-a, b = block("control.yaml"), block("byoc-role.yaml")
-if a != b:
+runner_compute, byoc_block = block("control.yaml"), block("byoc-role.yaml")
+if runner_compute != byoc_block:
     sys.exit("FAIL the runner-compute policy differs between control.yaml and byoc-role.yaml")
 print("ok   runner-compute policy identical in control.yaml and byoc-role.yaml")
 
@@ -179,7 +179,7 @@ if "Type: AWS::SecretsManager::Secret" not in pool_key or "PasswordLength: 64" n
         "GenerateSecretString:" not in pool_key or "SecretString:" in pool_key.replace("GenerateSecretString:", ""):
     sys.exit("FAIL control.yaml: PoolKey must be a generated 64-character secret")
 grants = re.findall(r"secretsmanager:[A-Za-z*]+", control)
-if grants != ["secretsmanager:GetSecretValue"] or "secretsmanager" in a:
+if grants != ["secretsmanager:GetSecretValue"] or "secretsmanager" in runner_compute:
     sys.exit(f"FAIL control.yaml: the secrets grants are {grants}; want GetSecretValue alone, outside runner-compute")
 get = control_policy.split("Action: secretsmanager:GetSecretValue", 1)[1].split("- Effect", 1)[0]
 if get.strip() != "Resource: !Ref PoolKey":
@@ -204,3 +204,25 @@ on_acl = re.findall(r"SubnetNetworkAclAssociation\n(?:    Condition: \w+\n)?    
 if sorted(subnets) != sorted(on_acl) or not subnets:
     sys.exit(f"FAIL network.yaml: subnets {subnets} on the runner ACL {on_acl}")
 print("ok   network.yaml: the runner subnets deny outbound SMTP")
+
+# The control VM reads the tenant states and never writes them: only an
+# operator suspends. It writes the flags beside them (GuardDuty, --guardduty)
+# and deletes none, so it can neither suspend a tenant nor clear a flag. It
+# writes no other parameter under the prefix, where its GitHub credentials
+# live. GuardDuty it only reads, and only this account's detectors here.
+prefix = 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/control/'
+by_path = re.findall(r"Action: ssm:GetParametersByPath\n\s+Resource: !Sub \"(.*)\"", control_policy)
+if by_path != [prefix + "tenant-state", prefix + "tenant-state-flags"]:
+    sys.exit(f"FAIL control.yaml: the control role reads by path {by_path}; want the tenant states and flags")
+ssm_writes = re.findall(r"ssm:(?:Put|Delete|Label|Add|Remove|\*)[A-Za-z*]*", control_role)
+put = control_policy.split("Action: ssm:PutParameter", 1)[1].split("- Effect", 1)[0] if ssm_writes else ""
+if ssm_writes != ["ssm:PutParameter"] or put.strip().splitlines()[0] != f'Resource: !Sub "{prefix}tenant-state-flags/*"':
+    sys.exit(f"FAIL control.yaml: the control role's SSM writes are {ssm_writes}; want PutParameter on the flags alone")
+gd = re.findall(r"guardduty:[A-Za-z*]+", control)
+if gd != ["guardduty:ListDetectors", "guardduty:ListFindings", "guardduty:GetFindings"]:
+    sys.exit(f"FAIL control.yaml: the GuardDuty grants are {gd}; want ListDetectors, ListFindings and GetFindings")
+read = control_policy.split("Action: [guardduty:ListFindings, guardduty:GetFindings]", 1)[1].split("- Effect", 1)[0]
+if read.strip().splitlines()[0] != 'Resource: !Sub "arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*"' or \
+        "guardduty" in runner_compute:
+    sys.exit("FAIL control.yaml: GuardDuty findings must be read only from this account's detectors, outside runner-compute")
+print("ok   control.yaml: the control VM writes only tenant flags, and only reads GuardDuty")
