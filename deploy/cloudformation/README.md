@@ -118,7 +118,9 @@ every 2 minutes and flags for review the tenant whose machine a finding of
 Medium severity or above names (`FR_GUARDDUTY`; see the main README). It never
 suspends one. The flags, and how far the VM has read, are under
 `<prefix>/control/tenant-state-flags`, which the VM's role may write; it may
-not delete them or write the states. Review a flag, then:
+not delete them or write the states. So run `suspend`, `resume` and
+`clear-flag` where you hold operator credentials, not on the VM; there, the
+command says so and prints the command to run. Review a flag, then:
 
 ```sh
 firerunner tenant list --state ssm:<prefix>/control/tenant-state
