@@ -7,14 +7,18 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/ghauth"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
+	"github.com/firerunnerhq/firerunner/internal/provisioner"
+	"github.com/firerunnerhq/firerunner/internal/scheduler"
 )
 
 // A tenant's EC2 tier carries its own owner tag and hears of its own runners'
@@ -41,6 +45,99 @@ func TestEC2OptionsAreTheTenants(t *testing.T) {
 	}
 }
 
+// A tenant's job limit also bounds its machines' lives, from launch, so a
+// machine whose job's start is never reported still ends; the install's own
+// backstop applies when it is shorter.
+func TestMaxLifetimeFollowsTheJobLimit(t *testing.T) {
+	for _, c := range []struct{ install, job, want time.Duration }{
+		{6 * time.Hour, 0, 6 * time.Hour},
+		{6 * time.Hour, 30 * time.Minute, 45 * time.Minute},
+		{0, 30 * time.Minute, 45 * time.Minute},
+		{20 * time.Minute, 30 * time.Minute, 20 * time.Minute},
+		{0, 0, 0},
+	} {
+		if got := maxLifetime(c.install, c.job); got != c.want {
+			t.Errorf("maxLifetime(%s, %s) = %s, want %s", c.install, c.job, got, c.want)
+		}
+	}
+	s := &shard{cfg: &config.Config{Firecracker: provisioner.FirecrackerConfig{MaxVMLifetime: 6 * time.Hour}}, log: slog.New(slog.DiscardHandler)}
+	tier := config.Tier{Name: "t", EC2: &config.EC2Tier{InstanceTypes: []string{"c8a.large"}}}
+	o := s.ec2Options(tenant{Owner: "o/t1", Limits: config.Limits{JobDuration: 30 * time.Minute}}, tier, tenantHooks{}, health.NewTracker("t"), assigned.New(nil))
+	if o.MaxLifetime != 45*time.Minute {
+		t.Fatalf("a limited tenant's tier lives %s", o.MaxLifetime)
+	}
+}
+
+// An EC2 instance's job report marks its runner busy, which starts the job
+// limit's clock, once the tier's scheduler exists; the cache hook still hears.
+func TestInstanceJobReportMarksBusy(t *testing.T) {
+	var heard []string
+	var sched atomic.Pointer[scheduler.Scheduler]
+	f := alsoMarkBusy(func(r string) { heard = append(heard, r) }, sched.Load)
+	f("runner-1") // before the scheduler: no panic, the hook hears
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	launched := make(chan struct{})
+	s := scheduler.New(scheduler.Options{Max: 1, Logger: slog.New(slog.DiscardHandler), JIT: oneJIT{},
+		Provisioner: blockingProv{launched}})
+	sched.Store(s)
+	s.Reconcile(ctx, 1)
+	<-launched
+	if idle := s.IdleRunners(-time.Hour); len(idle) != 1 {
+		t.Fatalf("idle %v before the report", idle)
+	}
+	f("runner-2")
+	if len(heard) != 2 {
+		t.Fatalf("heard %v", heard)
+	}
+	if idle := s.IdleRunners(-time.Hour); len(idle) != 0 {
+		t.Fatalf("idle %v: the report did not mark the runner busy", idle)
+	}
+	alsoMarkBusy(nil, sched.Load)("runner-3") // no cache hook
+}
+
+type oneJIT struct{}
+
+func (oneJIT) Generate(context.Context, core.RunnerSpec) (string, string, error) {
+	return "runner-2", "jit", nil
+}
+
+// blockingProv's runner runs until its context ends.
+type blockingProv struct{ launched chan<- struct{} }
+
+func (p blockingProv) Launch(ctx context.Context, _, _ string, _ core.RunnerSpec, _ func()) error {
+	close(p.launched)
+	<-ctx.Done()
+	return nil
+}
+
+func (blockingProv) Name() string { return "fake" }
+
+// The health file lists the tenants with their limits only when there is
+// something to say: an install alone and unlimited lists none.
+func TestLiveTenantsReportLimits(t *testing.T) {
+	install := &servedTenant{t: tenant{}, bound: scheduler.NewTenant("", 0)}
+	l := &liveTenants{}
+	l.add(install)
+	if got := l.tenants(); got != nil {
+		t.Fatalf("an unlimited install alone: %+v", got)
+	}
+	acme := &servedTenant{t: tenant{ID: "acme", Limits: config.Limits{Runners: 2, VCPU: 2, JobDuration: 30 * time.Minute}, Refused: []string{"big"}},
+		bound: scheduler.NewTenant("acme", 2)}
+	l.add(acme)
+	l.skip(tenant{ID: "aaa", Limits: config.Limits{VCPU: 1}}, "none of its tiers is within its limits")
+	got := l.tenants()
+	if len(got) != 3 || got[0].ID != "" || got[1].ID != "aaa" || got[2].ID != "acme" {
+		t.Fatalf("tenants = %+v", got)
+	}
+	if a := got[2]; a.Limits != (health.Limits{Runners: 2, VCPU: 2, JobDuration: "30m0s"}) || len(a.Refused) != 1 {
+		t.Fatalf("acme = %+v", a)
+	}
+	if got[1].NotServed == "" {
+		t.Fatalf("a tenant not served does not say why: %+v", got[1])
+	}
+}
+
 // A tier's listener reports the IDs of the runners it registers to the
 // tenant's hook, which the job identity matches runners by.
 func TestListenerReportsRunnerIDs(t *testing.T) {
@@ -48,7 +145,7 @@ func TestListenerReportsRunnerIDs(t *testing.T) {
 	var gotName string
 	var gotID int64
 	hooks := tenantHooks{onRunnerID: func(name string, id int64) { gotName, gotID = name, id }}
-	c := s.listenerConfig(tenant{Owner: "tenant-1"}, config.Tier{Name: "t"}, hooks, health.NewTracker("t"), assigned.New(nil), slog.New(slog.DiscardHandler))
+	c := s.listenerConfig(tenant{Owner: "tenant-1"}, config.Tier{Name: "t"}, hooks, health.NewTracker("t"), assigned.New(nil), slog.New(slog.DiscardHandler), nil)
 	if c.OnRunnerID == nil {
 		t.Fatal("the listener does not report runner IDs")
 	}
@@ -139,9 +236,38 @@ func TestListenerConfigIsTheTenantsApp(t *testing.T) {
 	s := &shard{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler)}
 	jwt := ghauth.NewJWT("Iv1", nil)
 	ten := tenant{URL: "https://github.com/acme", Auth: ghauth.App{InstallationID: 7, JWT: jwt}}
-	lc := s.listenerConfig(ten, config.Tier{Name: "t", Max: 3}, tenantHooks{}, health.NewTracker("t"), assigned.New(nil), s.log)
+	lc := s.listenerConfig(ten, config.Tier{Name: "t", Max: 3}, tenantHooks{}, health.NewTracker("t"), assigned.New(nil), s.log, nil)
 	if lc.App.InstallationID != 7 || lc.App.JWT != jwt || lc.URL != ten.URL || lc.MaxRunners != 3 {
 		t.Fatalf("listener config = %+v", lc)
+	}
+}
+
+// A tier's scheduler and listener share its tenant's bound and limits: the
+// scheduler holds launches past the bound and ends jobs past the limit,
+// reporting both in the tier's health, and the listener records a job
+// assigned meanwhile as held.
+func TestTierGetsItsTenantsLimits(t *testing.T) {
+	s := &shard{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler)}
+	ten := tenant{ID: "acme", Limits: config.Limits{Runners: 1, JobDuration: 30 * time.Minute}}
+	bound := scheduler.NewTenant("acme", 1)
+	tracker := health.NewTracker("acme/t")
+	tier := config.Tier{Name: "t", Max: 3}
+	o := s.schedulerOptions(ten, tier, bound, tracker, nil, nil, s.log)
+	if o.Tenant != bound || o.MaxJob != 30*time.Minute || o.Max != 3 {
+		t.Fatalf("scheduler options = %+v", o)
+	}
+	o.OnHold(2, "at its limit")
+	if h := tracker.Snapshot().Held; h == nil || h.Jobs != 2 {
+		t.Fatalf("a hold is not in the tier's health: %+v", h)
+	}
+	o.OnStop(scheduler.Stop{Runner: "r", Kind: scheduler.StopJobDuration, Reason: "past"})
+	if n := tracker.Snapshot().Stopped[scheduler.StopJobDuration]; n != 1 {
+		t.Fatalf("a stop is not in the tier's health: %d", n)
+	}
+
+	lc := s.listenerConfig(ten, tier, tenantHooks{}, tracker, assigned.New(nil), s.log, bound)
+	if lc.Held == nil || lc.Held() != "" {
+		t.Fatal("the listener does not ask the tenant's bound")
 	}
 }
 

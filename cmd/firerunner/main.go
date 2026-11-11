@@ -1110,6 +1110,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		f.CacheCredentials = healthCacheCredentials(cacheCreds)
 		f.JITRefused = healthRefusals(jitListener)
+		f.Tenants = live.tenants()
 	}, log)
 
 	// Drive every tier's listener concurrently. A listener reconnects its own
@@ -1128,6 +1129,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		et.warnRefused(log)
 		if len(et.Tiers) == 0 {
 			log.Error("tenant not served: none of its tiers is within its limits", "tenant", et.ID, "limits", et.Limits.String())
+			live.skip(et, "none of its tiers is within its limits")
 			continue
 		}
 		l := s.loop(et, live)

@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/firerunnerhq/firerunner/internal/assigned"
@@ -103,11 +105,37 @@ type servedTenant struct {
 	scheds      []*scheduler.Scheduler
 	runnerList  *ghrunners.Client
 	reaperState func() *health.Reaper
+	// bound is the tenant's limit on runners across its tiers.
+	bound *scheduler.Tenant
+}
+
+// schedulerOptions is what a tier's scheduler gets from its tenant: the
+// tenant's bound across its tiers and its job limit, reported in the tier's
+// health.
+func (s *shard) schedulerOptions(t tenant, tier config.Tier, bound *scheduler.Tenant, tracker *health.Tracker, prov provisioner.Provisioner, jit *listener.JITSource, log *slog.Logger) scheduler.Options {
+	o := scheduler.Options{
+		Max:         tier.Max,
+		Min:         tier.SizesAt(time.Now()).Min,
+		Spec:        tier.Spec(),
+		Provisioner: prov,
+		Logger:      log,
+		Pending:     tierPending(tier, &s.pending),
+		Tenant:      bound,
+		MaxJob:      t.Limits.JobDuration,
+		OnHold:      tracker.SetHeld,
+		OnStop:      s.stopRecorder(tier.Name, tracker),
+	}
+	if jit != nil {
+		o.JIT, o.Remover = jit, jit
+	}
+	return o
 }
 
 // listenerConfig is what a tier's scale set listener gets from its tenant.
-func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tracker *health.Tracker, jobs *assigned.Jobs, log *slog.Logger) listener.Config {
+// A job assigned while bound holds launches is recorded as held.
+func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tracker *health.Tracker, jobs *assigned.Jobs, log *slog.Logger, bound *scheduler.Tenant) listener.Config {
 	return listener.Config{
+		Held:         bound.Holding,
 		URL:          t.URL,
 		OnJobStarted: hooks.onJobStarted,
 		OnJobOffered: hooks.onJobOffered,
@@ -142,7 +170,7 @@ func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracke
 		Pooled:      tier.MaxPool() > 0,
 		JIT:         s.jit,
 		JITURL:      jitserver.URL(s.cfg.JITEndpoint()),
-		MaxLifetime: s.cfg.Firecracker.MaxVMLifetime,
+		MaxLifetime: maxLifetime(s.cfg.Firecracker.MaxVMLifetime, t.Limits.JobDuration),
 		UsePool:     jobs.ClaimPool,
 		Cache:       s.ec2Cache,
 		Events:      s.events,
@@ -151,6 +179,32 @@ func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracke
 		FellBack:    tracker.FellBack,
 		Interrupted: tracker.Interrupted,
 		Logger:      s.log.With("tier", t.tierKey(tier.Name)),
+	}
+}
+
+// jobLifetimeSlack is how much longer than a tenant's job limit its machine
+// may live, from launch: boot, the wait for the job, and the end. It ends a
+// machine whose job's start was never reported, which the job limit cannot.
+const jobLifetimeSlack = 15 * time.Minute
+
+// maxLifetime is the lifetime backstop for a tenant's machines: the
+// install's, or its job limit plus slack when that is shorter. 0 is none.
+func maxLifetime(install, job time.Duration) time.Duration {
+	if job <= 0 {
+		return install
+	}
+	if limit := job + jobLifetimeSlack; install <= 0 || limit < install {
+		return limit
+	}
+	return install
+}
+
+// stopRecorder reports a runner a tier's scheduler ended for its tenant's
+// limits: in the tier's health and the job events.
+func (s *shard) stopRecorder(tier string, tracker *health.Tracker) func(scheduler.Stop) {
+	return func(st scheduler.Stop) {
+		tracker.Stopped(st.Kind)
+		jobevent.Record(s.events, jobevent.Event{Kind: jobevent.Stopped, Tier: tier, Runner: st.Runner, Reason: st.Reason})
 	}
 }
 
@@ -216,7 +270,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	if t.ID != "" {
 		log = log.With("tenant", t.ID)
 	}
-	st := &servedTenant{t: t, tiers: t.Tiers, log: log}
+	st := &servedTenant{t: t, tiers: t.Tiers, log: log, bound: scheduler.NewTenant(t.ID, t.Limits.Runners)}
 
 	// The REST runner list behind --runner-sweep, shared by the tenant's tiers.
 	if cfg.RunnerSweep != "off" {
@@ -234,15 +288,24 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	st.trackers = make([]*health.Tracker, len(t.Tiers))
 	tierHealth := map[string]*health.Tracker{}
 	tierJobs := map[string]*assigned.Jobs{}
+	// An EC2 instance's report that its job started marks its runner busy,
+	// as the guest console does for a microVM: GitHub's JobStarted can come
+	// as late as the job's end, and a job's limit counts from its start.
+	// The scheduler is built after the provisioner, so it is found here.
+	tierScheds := map[string]*atomic.Pointer[scheduler.Scheduler]{}
 	for i, tier := range t.Tiers {
 		st.trackers[i] = health.NewTracker(t.tierKey(tier.Name))
 		tierHealth[tier.Name] = st.trackers[i]
 		tierJobs[tier.Name] = assigned.New(poolPolicy(tier))
+		tierScheds[tier.Name] = &atomic.Pointer[scheduler.Scheduler]{}
 	}
 	var newEC2 func(config.Tier) provisioner.Provisioner
 	if s.ec2Client != nil {
 		newEC2 = func(tier config.Tier) provisioner.Provisioner {
-			p := s.ec2Client.Tier(s.ec2Options(t, tier, hooks, tierHealth[tier.Name], tierJobs[tier.Name]))
+			o := s.ec2Options(t, tier, hooks, tierHealth[tier.Name], tierJobs[tier.Name])
+			sched := tierScheds[tier.Name]
+			o.OnRunnerJob = alsoMarkBusy(o.OnRunnerJob, sched.Load)
+			p := s.ec2Client.Tier(o)
 			// A tier's stopped pool fills and refills in the background for
 			// the life of the process; its instances stay stopped on exit and
 			// are found again on the next start.
@@ -269,27 +332,23 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	// before we start booting microVMs.
 	for i, tier := range t.Tiers {
 		tlog := log.With("tier", tier.Name)
-		lis, err := listener.New(ctx, s.listenerConfig(t, tier, hooks, st.trackers[i], tierJobs[tier.Name], tlog), t.Owner)
+		lis, err := listener.New(ctx, s.listenerConfig(t, tier, hooks, st.trackers[i], tierJobs[tier.Name], tlog, st.bound), t.Owner)
 		if err != nil {
 			st.close(context.WithoutCancel(ctx))
 			return nil, fmt.Errorf("tier %q: %w", tier.Name, err)
 		}
 		st.listeners = append(st.listeners, lis)
 		jit := lis.JIT()
-		st.scheds = append(st.scheds, scheduler.New(scheduler.Options{
-			Max:         tier.Max,
-			Min:         tier.SizesAt(time.Now()).Min,
-			Spec:        tier.Spec(),
-			Provisioner: st.provs[i],
-			JIT:         jit,
-			Remover:     jit,
-			Logger:      tlog,
-			Pending:     tierPending(tier, &s.pending),
-		}))
+		sched := scheduler.New(s.schedulerOptions(t, tier, st.bound, st.trackers[i], st.provs[i], jit, tlog))
+		tierScheds[tier.Name].Store(sched)
+		st.scheds = append(st.scheds, sched)
 	}
 
 	if s.ec2Client != nil && cfg.EC2Reaper != "off" {
-		reaper := s.ec2Client.NewReaper(reaperOptions(cfg, t.Owner, t.Tiers, st.listeners, log))
+		ro := reaperOptions(cfg, t.Owner, t.Tiers, st.listeners, log)
+		// An orphan of a limited tenant, after a restart, ends by its limit.
+		ro.MaxLifetime = maxLifetime(ro.MaxLifetime, t.Limits.JobDuration)
+		reaper := s.ec2Client.NewReaper(ro)
 		go reaper.Run(ctx)
 		st.reaperState = func() *health.Reaper {
 			rep, ok := reaper.Last()
@@ -303,6 +362,34 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 		}
 	}
 	return st, nil
+}
+
+// alsoMarkBusy adds marking the runner busy, on the scheduler sched returns
+// once there is one, to an instance's job report.
+func alsoMarkBusy(onJob func(string), sched func() *scheduler.Scheduler) func(string) {
+	return func(runner string) {
+		if onJob != nil {
+			onJob(runner)
+		}
+		if s := sched(); s != nil {
+			s.MarkBusy(runner)
+		}
+	}
+}
+
+// health is what the health file says of the tenant.
+func (st *servedTenant) health() health.Tenant {
+	h := tenantHealth(st.t)
+	h.Running = st.bound.Running()
+	return h
+}
+
+// tenantHealth is a tenant's limits for the health file.
+func tenantHealth(t tenant) health.Tenant {
+	return health.Tenant{
+		ID: t.ID, Refused: t.Refused,
+		Limits: health.Limits{Runners: t.Limits.Runners, VCPU: t.Limits.VCPU, JobDuration: t.Limits.JobDuration.String()},
+	}
 }
 
 // names returns each tier's shard-wide name, in runs' order.
@@ -320,6 +407,34 @@ type liveTenants struct {
 	mu      sync.Mutex
 	served  []*servedTenant
 	waiting map[string]*health.Tracker
+	// skipped are tenants never started: no tier is within their limits.
+	skipped []health.Tenant
+}
+
+// skip records a tenant that is not served, and why.
+func (l *liveTenants) skip(t tenant, why string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	h := tenantHealth(t)
+	h.NotServed = why
+	l.skipped = append(l.skipped, h)
+}
+
+// tenants reports the tenants and their limits, the install's own first; nil
+// when the install serves only itself, with no limits.
+func (l *liveTenants) tenants() []health.Tenant {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []health.Tenant
+	for _, st := range l.served {
+		out = append(out, st.health())
+	}
+	out = append(out, l.skipped...)
+	slices.SortStableFunc(out, func(a, b health.Tenant) int { return strings.Compare(a.ID, b.ID) })
+	if len(out) == 1 && out[0].ID == "" && out[0].Limits == (health.Limits{JobDuration: "0s"}) && len(out[0].Refused) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (l *liveTenants) add(st *servedTenant) {
