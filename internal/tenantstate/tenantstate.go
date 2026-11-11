@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -93,6 +94,9 @@ func Open(spec string, newSSM func() (SSMAPI, error)) (Store, error) {
 	return &FileStore{Path: spec}, nil
 }
 
+// errEmpty is a file store's file with nothing in it.
+var errEmpty = errors.New("empty: not written by firerunner tenant")
+
 // FileStore keeps the states in one JSON file, {"<id>": {"reason", "since"}}.
 // A missing file holds no suspension.
 type FileStore struct{ Path string }
@@ -110,7 +114,9 @@ func (f *FileStore) Load(context.Context) (States, error) {
 	}
 	st := States{}
 	if len(strings.TrimSpace(string(b))) == 0 {
-		return st, nil
+		// Never written whole: the suspensions it held are unknown, so it
+		// is an error, and a daemon keeps the last states it read.
+		return nil, fmt.Errorf("%s: %w", f.Path, errEmpty)
 	}
 	if err := json.Unmarshal(b, &st); err != nil {
 		return nil, fmt.Errorf("%s: %w", f.Path, err)
@@ -128,11 +134,23 @@ func (f *FileStore) Delete(ctx context.Context, id string) error {
 	return f.update(ctx, func(st States) { delete(st, id) })
 }
 
-// update rewrites the file with change applied, by rename, so the daemon
-// never reads half of it. It is readable by all: it holds no secret, and the
-// daemon may run as another user.
+// update rewrites the file with change applied, by rename after a sync, so
+// the daemon never reads half of it, even after a crash. Writers take a lock
+// file beside it, so two never lose each other's change. It is readable by
+// all: it holds no secret, and the daemon may run as another user.
 func (f *FileStore) update(ctx context.Context, change func(States)) error {
+	lock, err := os.OpenFile(f.Path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock %s: %w", lock.Name(), err)
+	}
 	st, err := f.Load(ctx)
+	if errors.Is(err, errEmpty) {
+		st, err = States{}, nil
+	}
 	if err != nil {
 		return err
 	}
@@ -150,6 +168,10 @@ func (f *FileStore) update(ctx context.Context, change func(States)) error {
 		tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Chmod(0o644); err != nil {
 		tmp.Close()
 		return err
@@ -157,7 +179,15 @@ func (f *FileStore) update(ctx context.Context, change func(States)) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), f.Path)
+	if err := os.Rename(tmp.Name(), f.Path); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(f.Path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // SSMStore keeps each suspension as a String parameter <Path>/<id> holding

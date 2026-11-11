@@ -75,6 +75,15 @@ func TestFileStore(t *testing.T) {
 	if st, _ := f.Load(ctx); len(st) != 1 || st.IDs()[0] != Install {
 		t.Fatalf("after delete: %v", st)
 	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Load(ctx); err == nil {
+		t.Fatal("an empty file (a crash mid-write) read as no suspension")
+	}
+	if err := f.Put(ctx, "acme", Record{Reason: "again"}); err != nil {
+		t.Fatalf("put over an empty file: %v", err)
+	}
 	if err := os.WriteFile(path, []byte("{nope"), 0o644); err != nil {
 		t.Fatal(err)
 	}
