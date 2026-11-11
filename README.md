@@ -256,6 +256,35 @@ held. `_install` names the install's own tiers, which are never held for an
 unread state; suspending it leaves a stopped EC2 pool stopped, but does not
 shrink it (a tenant keeps no pool).
 
+**Flagging an installation for review.** With `--guardduty` (`FR_GUARDDUTY`)
+and AWS GuardDuty enabled in the region, the daemon reads GuardDuty's findings
+on its EC2 instances every 2 minutes. A finding of severity
+`--guardduty-min-severity` (`FR_GUARDDUTY_MIN_SEVERITY`, default 4, GuardDuty's
+Medium) or above, not archived, flags the installation whose machine it names,
+by the instance's `firerunner:owner` tag: a mining pool's name looked up from a
+job, for example, raises `CryptoCurrency:EC2/BitcoinTool.B!DNS` within minutes.
+A flag never suspends. `firerunner status` shows it, with the finding's type,
+severity, tier, instance and count; `firerunner doctor` warns while any is
+flagged; the log warns once per finding, and the job events record it as
+`flagged`. Review it, then suspend the installation, or clear the flag:
+
+```bash
+firerunner tenant list --state /etc/firerunner/tenant-state.json
+firerunner tenant findings --owner my-install --since 24h
+firerunner tenant clear-flag acme --state /etc/firerunner/tenant-state.json
+```
+
+`tenant findings` lists what the daemon would read, and writes nothing. Flags,
+and how far the daemon has read, are kept beside the states, under their name
+with `-flags` added (`tenant-state-flags.json`, or
+`<path>-flags/<id>`), so a restart neither flags a finding twice nor misses
+one; resuming a suspension does not clear a flag. A flag cleared stays cleared
+unless GuardDuty updates the finding again or reports a new one. The owner tag
+is not signed: anyone who may tag instances in the account could make a
+finding name another installation, which costs a review, never a suspension.
+Suppression rules archive findings, which then flag nothing. Without an EC2
+tier, GuardDuty is not read.
+
 What it does not separate: the daemon itself, which holds every installation's
 App access and signs for them all, and the account's API limits and quotas.
 For a boundary between those too, run each installation's runners in its own
