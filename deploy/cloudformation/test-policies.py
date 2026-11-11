@@ -187,3 +187,20 @@ if get.strip() != "Resource: !Ref PoolKey":
 if "FR_POOL_KEY_SECRET=${PoolKey}" not in resource("LaunchTemplate"):
     sys.exit("FAIL control.yaml: the control VM is not told the pool key's secret")
 print("ok   control.yaml: only the control role reads the pool key, and only it")
+
+# The runner subnets deny outbound SMTP through their network ACL, numbered
+# ahead of the allow-all rule (ACL rules apply lowest number first), and every
+# subnet is on that ACL.
+network = open(os.path.join(HERE, "network.yaml")).read()
+entries = re.findall(r"^  (\w+):\n    Type: AWS::EC2::NetworkAclEntry\n    Properties: \{(.*)\}$", network, re.M)
+deny = {int(re.search(r"From: (\d+)", p).group(1)): int(re.search(r"RuleNumber: (\d+)", p).group(1))
+        for _, p in entries if "RuleAction: deny" in p and "Egress: true" in p and "Protocol: 6" in p}
+allow_out = [int(re.search(r"RuleNumber: (\d+)", p).group(1)) for _, p in entries
+             if "RuleAction: allow" in p and "Egress: true" in p]
+if sorted(deny) != [25, 465, 587] or len(allow_out) != 1 or max(deny.values()) >= allow_out[0]:
+    sys.exit(f"FAIL network.yaml: outbound SMTP must be denied ahead of the allow-all rule: deny {deny}, allow {allow_out}")
+subnets = re.findall(r"^  (Subnet[A-Z]):\n    Type: AWS::EC2::Subnet$", network, re.M)
+on_acl = re.findall(r"SubnetNetworkAclAssociation\n(?:    Condition: \w+\n)?    Properties: \{ SubnetId: !Ref (Subnet[A-Z]), NetworkAclId: !Ref RunnerAcl \}", network)
+if sorted(subnets) != sorted(on_acl) or not subnets:
+    sys.exit(f"FAIL network.yaml: subnets {subnets} on the runner ACL {on_acl}")
+print("ok   network.yaml: the runner subnets deny outbound SMTP")

@@ -110,6 +110,11 @@ You need:
   aws cloudformation describe-stacks --stack-name firerunner-network \
     --query 'Stacks[0].Outputs'   # VpcId, SubnetIds, RunnerSecurityGroupId
   ```
+
+  Its subnets' network ACL denies outbound SMTP (TCP 25, 465 and 587), so
+  job code cannot send mail from them; everything else is as the default
+  ACL. A VPC of your own needs the same, as a security group can only
+  allow.
 - A runner AMI published to an SSM parameter under the prefix
   (see [`images/`](../../images/)).
 - A release of firerunner: a `v*` tag publishes one.
