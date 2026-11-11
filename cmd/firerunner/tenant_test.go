@@ -126,14 +126,14 @@ func TestLiveTenantsReportLimits(t *testing.T) {
 	install := &servedTenant{t: tenant{}, bound: scheduler.NewTenant("", 0)}
 	l := &liveTenants{}
 	l.add(install)
-	if got := l.tenants(); got != nil {
+	if got := l.tenants(nil); got != nil {
 		t.Fatalf("an unlimited install alone: %+v", got)
 	}
 	acme := &servedTenant{t: tenant{ID: "acme", Limits: config.Limits{Runners: 2, VCPU: 2, JobDuration: 30 * time.Minute}, Refused: []string{"big"}},
 		bound: scheduler.NewTenant("acme", 2)}
 	l.add(acme)
 	l.skip(tenant{ID: "aaa", Limits: config.Limits{VCPU: 1}}, "none of its tiers is within its limits")
-	got := l.tenants()
+	got := l.tenants(nil)
 	if len(got) != 3 || got[0].ID != "" || got[1].ID != "aaa" || got[2].ID != "acme" {
 		t.Fatalf("tenants = %+v", got)
 	}

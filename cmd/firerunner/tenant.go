@@ -26,6 +26,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/reconcile"
 	"github.com/firerunnerhq/firerunner/internal/schedule"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
+	"github.com/firerunnerhq/firerunner/internal/tenantstate"
 )
 
 // tenant is one GitHub organization's or repository's install on a shard: who
@@ -61,6 +62,9 @@ type shard struct {
 	ec2Cache  *ec2.CacheOptions
 	cacheJobs *jobidentity.Registry
 	pending   scheduler.PendingLaunches
+	// states reads which tenants are suspended (--tenant-state); nil when
+	// none are kept.
+	states *tenantstate.Watcher
 }
 
 // tenantHooks are the callbacks that give a tenant's jobs a cache identity.
@@ -292,7 +296,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	if t.ID != "" {
 		log = log.With("tenant", t.ID)
 	}
-	st := &servedTenant{t: t, tiers: t.Tiers, log: log, bound: scheduler.NewTenant(t.ID, t.Limits.Runners)}
+	st := &servedTenant{t: t, tiers: t.Tiers, log: log, bound: s.newBound(t, log)}
 
 	// The REST runner list behind --runner-sweep, shared by the tenant's tiers.
 	if cfg.RunnerSweep != "off" {
@@ -367,10 +371,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 	}
 
 	if s.ec2Client != nil && cfg.EC2Reaper != "off" {
-		ro := reaperOptions(cfg, t.Owner, t.Tiers, st.listeners, log)
-		// An orphan of a limited tenant, after a restart, ends by its limit.
-		ro.MaxLifetime = maxLifetime(ro.MaxLifetime, t.Limits.JobDuration)
-		reaper := s.ec2Client.NewReaper(ro)
+		reaper := s.ec2Client.NewReaper(s.tenantReaperOptions(t, st.listeners, log))
 		go reaper.Run(ctx)
 		st.reaperState = func() *health.Reaper {
 			rep, ok := reaper.Last()
@@ -399,10 +400,84 @@ func alsoMarkBusy(onJob func(string), sched func() *scheduler.Scheduler) func(st
 	}
 }
 
-// health is what the health file says of the tenant.
-func (st *servedTenant) health() health.Tenant {
+// newBound returns the bound on a tenant's runners, in the state last read:
+// before any of its tiers serves, so a suspension outlives a restart.
+func (s *shard) newBound(t tenant, log *slog.Logger) *scheduler.Tenant {
+	b := scheduler.NewTenant(t.ID, t.Limits.Runners)
+	s.applyState(t.ID, b, log)
+	return b
+}
+
+// tenantReaperOptions are the reaper's for a tenant: an orphan of a limited
+// tenant, after a restart, ends by its limit, and a suspended tenant's at
+// once.
+func (s *shard) tenantReaperOptions(t tenant, listeners []*listener.ScaleSet, log *slog.Logger) ec2.ReaperOptions {
+	ro := reaperOptions(s.cfg, t.Owner, t.Tiers, listeners, log)
+	ro.MaxLifetime = maxLifetime(ro.MaxLifetime, t.Limits.JobDuration)
+	ro.Suspended = s.suspension(t.ID)
+	return ro
+}
+
+// stateKey is a tenant's id in the tenant states: the install's own is
+// tenantstate.Install.
+func stateKey(id string) string {
+	if id == "" {
+		return tenantstate.Install
+	}
+	return id
+}
+
+// applyState suspends, holds or resumes a tenant's bound by the states
+// read: suspended while it has a record; held, for a tenant of the catalog,
+// until a read succeeds, so a restart never serves a tenant whose
+// suspension it could not read; active otherwise. The install is not held:
+// it is its operator's.
+func (s *shard) applyState(id string, bound *scheduler.Tenant, log *slog.Logger) {
+	if s.states == nil {
+		return
+	}
+	states, known := s.states.States()
+	r, suspended := states[stateKey(id)]
+	switch {
+	case suspended:
+		if bound.Suspend(r.Reason) {
+			log.Warn("tenant suspended: holding its launches and ending its runners", "tenant", stateKey(id), "reason", r.Reason, "since", r.Since)
+		}
+	case !known && id != "":
+		if bound.Hold("its state has not been read yet") {
+			log.Warn("tenant held until its state is read", "tenant", id, "store", s.states.Status().Store)
+		}
+	default:
+		if bound.Resume() {
+			log.Info("tenant resumed", "tenant", stateKey(id))
+		}
+	}
+}
+
+// suspension returns why tenant id is suspended, or "", by the latest
+// states read.
+func (s *shard) suspension(id string) func() string {
+	return func() string {
+		if s.states == nil {
+			return ""
+		}
+		states, _ := s.states.States()
+		return states[stateKey(id)].Reason
+	}
+}
+
+// health is what the health file says of the tenant, with its state.
+func (st *servedTenant) health(states tenantstate.States) health.Tenant {
 	h := tenantHealth(st.t)
 	h.Running = st.bound.Running()
+	suspended, why := st.bound.State()
+	switch {
+	case suspended:
+		r := states[stateKey(st.t.ID)]
+		h.State, h.Reason, h.Since = "suspended", r.Reason, r.Since
+	case why != "":
+		h.State, h.Reason = "held", why
+	}
 	return h
 }
 
@@ -442,19 +517,31 @@ func (l *liveTenants) skip(t tenant, why string) {
 	l.skipped = append(l.skipped, h)
 }
 
-// tenants reports the tenants and their limits, the install's own first; nil
-// when the install serves only itself, with no limits.
-func (l *liveTenants) tenants() []health.Tenant {
+// tenants reports the tenants, their limits and states, the install's own
+// first; nil when the install serves only itself, with no limits, and is
+// not suspended.
+func (l *liveTenants) tenants(states tenantstate.States) []health.Tenant {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var out []health.Tenant
 	for _, st := range l.served {
-		out = append(out, st.health())
+		out = append(out, st.health(states))
 	}
 	out = append(out, l.skipped...)
 	slices.SortStableFunc(out, func(a, b health.Tenant) int { return strings.Compare(a.ID, b.ID) })
-	if len(out) == 1 && out[0].ID == "" && out[0].Limits == (health.Limits{JobDuration: "0s"}) && len(out[0].Refused) == 0 {
+	if len(out) == 1 && out[0].ID == "" && out[0].Limits == (health.Limits{JobDuration: "0s"}) && len(out[0].Refused) == 0 && out[0].State == "" {
 		return nil
+	}
+	return out
+}
+
+// bounds returns each served tenant's id and bound.
+func (l *liveTenants) bounds() map[string]*scheduler.Tenant {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := map[string]*scheduler.Tenant{}
+	for _, st := range l.served {
+		out[st.t.ID] = st.bound
 	}
 	return out
 }
