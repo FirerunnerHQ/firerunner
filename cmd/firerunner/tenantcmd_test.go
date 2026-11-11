@@ -29,11 +29,11 @@ func runTenantOn(t *testing.T, gd guardduty.API, args ...string) (int, string, s
 	code := tenantCmd(args, &out, &errOut, tenantOpeners{
 		states: func(spec string) (tenantstate.Store, error) { return tenantstate.Open(spec, nil) },
 		flags:  func(spec string) (tenantstate.FlagStore, error) { return tenantstate.OpenFlags(spec, nil) },
-		guardDuty: func() (guardduty.API, error) {
+		guardDuty: func() (guardduty.API, string, error) {
 			if gd == nil {
 				t.Fatal("GuardDuty opened")
 			}
-			return gd, nil
+			return gd, "", nil
 		},
 	})
 	return code, out.String(), errOut.String()

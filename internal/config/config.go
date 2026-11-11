@@ -690,7 +690,7 @@ func (c *Config) validate() error {
 	if c.GuardDuty && c.TenantState == "" {
 		return errors.New("--guardduty needs --tenant-state: flags are kept beside the tenant states")
 	}
-	if c.GuardDutyMinSeverity < 1 || c.GuardDutyMinSeverity > 10 {
+	if c.GuardDuty && (c.GuardDutyMinSeverity < 1 || c.GuardDutyMinSeverity > 10) {
 		return fmt.Errorf("--guardduty-min-severity %g: GuardDuty's severities run from 1 to 10", c.GuardDutyMinSeverity)
 	}
 	tiers, refused := c.InstallTiers()

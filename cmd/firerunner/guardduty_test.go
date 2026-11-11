@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -116,7 +117,7 @@ func TestWatchFindingsFlagsWithoutSuspending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.watchFindings(ctx, cfg, "inst", gd, flags, s.log)
+	s.watchFindings(ctx, cfg, "inst", gd, flags, nil, s.log)
 	waitFor(t, "the first read of findings", func() bool { return !s.findings.Status().LastPoll.IsZero() })
 
 	states, _ := s.states.States()
@@ -173,13 +174,13 @@ func TestTenantFlagCommands(t *testing.T) {
 		t.Fatal("suspend failed")
 	}
 	code, out, errOut := runTenant(t, "list", "--state", path)
-	if code != 0 || !strings.Contains(out, "acme\tflagged for review: CryptoCurrency:EC2/BitcoinTool.B!DNS, severity 8, 1 finding(s) from 2026-11-11T03:07:23Z") ||
+	if code != 0 || !strings.Contains(out, "acme\tflagged for review: CryptoCurrency:EC2/BitcoinTool.B!DNS, severity 8, 1 finding(s) or update(s) from 2026-11-11T03:07:23Z") ||
 		!strings.Contains(out, "beta\tsuspended since") {
 		t.Fatalf("list: exit %d\n%s%s", code, out, errOut)
 	}
 	code, out, _ = runTenant(t, "clear-flag", "acme", "--state", path, "--json")
 	var r tenantReport
-	if err := json.Unmarshal([]byte(out), &r); err != nil || code != 0 || r.ID != "acme" || !strings.HasSuffix(r.Flags, "tenant-state-flags.json") {
+	if err := json.Unmarshal([]byte(out), &r); err != nil || code != 0 || r.ID != "acme" || r.State != "cleared" || !strings.HasSuffix(r.Flags, "tenant-state-flags.json") {
 		t.Fatalf("clear-flag: exit %d, %+v, %v\n%s", code, r, err, out)
 	}
 	code, out, _ = runTenant(t, "list", "--state", path, "--json")
@@ -187,8 +188,22 @@ func TestTenantFlagCommands(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &r); err != nil || code != 0 || len(r.Flagged) != 0 || len(r.Suspended) != 1 {
 		t.Fatalf("list after clear-flag: exit %d, %+v, %v", code, r, err)
 	}
-	if code, out, _ := runTenant(t, "clear-flag", "acme", "--state", path); code != 0 || !strings.Contains(out, "cleared the flag on acme") {
+	if code, out, _ := runTenant(t, "clear-flag", "acme", "--state", path); code != 0 || !strings.Contains(out, "acme is not flagged") {
 		t.Fatalf("a second clear-flag: exit %d\n%s", code, out)
+	}
+
+	// Flags that cannot be read fail list, after it prints the
+	// suspensions; a bad severity setting never blocks a suspension.
+	if err := os.WriteFile(flags.String(), []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut = runTenant(t, "list", "--state", path)
+	if code != 1 || !strings.Contains(out, "beta\tsuspended since") || !strings.Contains(errOut, "tenant-state-flags.json") {
+		t.Fatalf("list with unreadable flags: exit %d\n%s%s", code, out, errOut)
+	}
+	t.Setenv("FR_GUARDDUTY_MIN_SEVERITY", "high")
+	if code, out, errOut := runTenant(t, "suspend", "gamma", "--reason", "abuse", "--state", path); code != 0 {
+		t.Fatalf("suspend with a bad severity setting: exit %d\n%s%s", code, out, errOut)
 	}
 }
 

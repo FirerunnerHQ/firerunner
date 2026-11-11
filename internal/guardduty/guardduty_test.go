@@ -2,6 +2,7 @@ package guardduty
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -60,7 +61,8 @@ func (r *rig) poller() *Poller {
 	return &Poller{
 		API: r.gd, Store: r.store, Tenant: Owners("inst", []string{"acme"}),
 		MinSeverity: DefaultMinSeverity, now: r.clock.now,
-		OnFlag: func(f Flagged) { r.flagged = append(r.flagged, f) },
+		Account: func(context.Context) (string, error) { return ownAccount, nil },
+		OnFlag:  func(f Flagged) { r.flagged = append(r.flagged, f) },
 	}
 }
 
@@ -192,7 +194,7 @@ func TestChecksHoldWithoutTheCriteria(t *testing.T) {
 		t.Fatalf("flagged %+v, want only the good one", r.flagged)
 	}
 	// List, which tenant findings shows as is, drops them too.
-	found, _, err := List(context.Background(), r.gd, t0.Add(-FirstLookback), DefaultMinSeverity)
+	found, _, err := List(context.Background(), r.gd, Query{Since: t0.Add(-FirstLookback), MinSeverity: DefaultMinSeverity, Account: ownAccount})
 	if err != nil || len(found) != 1 || found[0].ID != "good" {
 		t.Fatalf("List = %+v, %v; want only the good one", found, err)
 	}
@@ -209,15 +211,18 @@ func TestFirstReadLooksBack(t *testing.T) {
 	}
 }
 
-// failingStore fails its writes while fail is set.
+// failingStore fails its flag writes while fail is set, those for failFor
+// only, and its cursor writes while failCursor is.
 type failingStore struct {
 	tenantstate.FlagStore
-	fail    bool
-	cursors int
+	fail       bool
+	failFor    string
+	failCursor bool
+	cursors    int
 }
 
 func (f *failingStore) PutFlag(ctx context.Context, id string, fl tenantstate.Flag) error {
-	if f.fail {
+	if f.fail || (f.failFor != "" && id == f.failFor) {
 		return errors.New("ThrottlingException")
 	}
 	return f.FlagStore.PutFlag(ctx, id, fl)
@@ -225,7 +230,131 @@ func (f *failingStore) PutFlag(ctx context.Context, id string, fl tenantstate.Fl
 
 func (f *failingStore) PutCursor(ctx context.Context, c tenantstate.Cursor) error {
 	f.cursors++
+	if f.failCursor {
+		return errors.New("ThrottlingException")
+	}
 	return f.FlagStore.PutCursor(ctx, c)
+}
+
+// A cursor that cannot be written, again and again, never makes a finding
+// count again: the poller keeps its own. Nor does a flag written for one
+// tenant when another's write fails; the other's finding is heard once its
+// flag is written.
+func TestFailedWritesNeverCountTwice(t *testing.T) {
+	r := newRig(t)
+	// Flags are written in id order: _install's first, then acme's.
+	fs := &failingStore{FlagStore: r.store, failCursor: true, failFor: "acme"}
+	r.store = fs
+	r.gd.add("f-acme", mining, 8, t0, false, tags("inst/acme"))
+	r.gd.add("f-inst", mining, 8, t0, false, tags("inst"))
+	p := r.poller()
+	for range 3 {
+		r.clock.add(Settle)
+		if err := p.Poll(context.Background()); err == nil {
+			t.Fatal("a failed write: no error")
+		}
+	}
+	fl, _, _ := r.store.LoadFlags(context.Background())
+	if fl[tenantstate.Install].Count != 1 || len(r.flagged) != 1 || r.flagged[0].ID != "f-inst" {
+		t.Fatalf("after failed writes: install %+v, heard %+v", fl[tenantstate.Install], r.flagged)
+	}
+	fs.failFor = ""
+	r.clock.add(Settle)
+	_ = p.Poll(context.Background())
+	fs.failCursor = false
+	r.clock.add(Settle)
+	mustPoll(t, p)
+	fl, _, _ = r.store.LoadFlags(context.Background())
+	if fl["acme"].Count != 1 || fl[tenantstate.Install].Count != 1 || len(r.flagged) != 2 {
+		t.Fatalf("after the writes succeed: %+v, heard %d", fl, len(r.flagged))
+	}
+}
+
+// More findings in the window than the cursor holds count once each, poll
+// after poll: the cursor moves past those it lets go.
+func TestBurstPastTheCap(t *testing.T) {
+	r := newRig(t)
+	for i := range maxSeen + 5 {
+		r.gd.add(fmt.Sprintf("f%03d", i), mining, 8, t0.Add(time.Duration(i)*time.Second), false, tags("inst/acme"))
+	}
+	r.clock.add(time.Minute)
+	for range 4 {
+		mustPoll(t, r.poller()) // a fresh poller: the stored cursor alone
+		r.clock.add(DefaultInterval)
+	}
+	fl, cur, _ := r.store.LoadFlags(context.Background())
+	if fl["acme"].Count != maxSeen+5 || len(r.flagged) != maxSeen+5 || len(cur.Seen) > maxSeen {
+		t.Fatalf("count %d, heard %d, cursor holds %d", fl["acme"].Count, len(r.flagged), len(cur.Seen))
+	}
+}
+
+// A finding GuardDuty lists only after a poll that should have seen it, but
+// within Settle, still flags.
+func TestLateListing(t *testing.T) {
+	r := newRig(t)
+	p := r.poller()
+	mustPoll(t, p)
+	r.clock.add(DefaultInterval)
+	r.gd.add("late", mining, 8, t0.Add(-time.Minute), false, tags("inst/acme"))
+	mustPoll(t, p)
+	if len(r.flagged) != 1 || r.flagged[0].ID != "late" {
+		t.Fatalf("flagged %+v, want the late one", r.flagged)
+	}
+}
+
+// Findings in another account, as a GuardDuty administrator lists its
+// members', never flag, whatever their tags.
+func TestOtherAccountIgnored(t *testing.T) {
+	for _, ignore := range []bool{false, true} {
+		r := newRig(t)
+		r.gd.ignoreCriteria = ignore
+		r.gd.add("member", mining, 8, t0, false, tags("inst/acme"))
+		r.gd.findings[0].AccountId = aws.String("210987654321")
+		r.gd.add("own", mining, 8, t0, false, tags("inst/acme"))
+		mustPoll(t, r.poller())
+		if len(r.flagged) != 1 || r.flagged[0].ID != "own" {
+			t.Fatalf("criteria ignored %v: flagged %+v", ignore, r.flagged)
+		}
+		// GuardDuty is asked for this account's alone, too.
+		if got := r.gd.criteria["accountId"].Equals; len(got) != 1 || got[0] != ownAccount {
+			t.Fatalf("the accountId criterion = %v", got)
+		}
+	}
+}
+
+// The account is asked until it answers; until then nothing is read.
+func TestAccountRetried(t *testing.T) {
+	r := newRig(t)
+	r.gd.add("f1", mining, 8, t0, false, tags("inst/acme"))
+	p := r.poller()
+	asked := 0
+	p.Account = func(context.Context) (string, error) {
+		asked++
+		if asked == 1 {
+			return "", errors.New("ExpiredToken")
+		}
+		return ownAccount, nil
+	}
+	if err := p.Poll(context.Background()); err == nil || len(r.flagged) != 0 {
+		t.Fatalf("without the account: %v, flagged %d", err, len(r.flagged))
+	}
+	mustPoll(t, p)
+	mustPoll(t, p)
+	if asked != 2 || len(r.flagged) != 1 {
+		t.Fatalf("asked %d times, flagged %d", asked, len(r.flagged))
+	}
+}
+
+// A full cursor, with ids and times as GuardDuty's, fits one SSM parameter.
+func TestCursorFitsOneParameter(t *testing.T) {
+	cur := tenantstate.Cursor{Since: t0.Add(123456789 * time.Nanosecond), Seen: map[string]time.Time{}}
+	for i := range maxSeen {
+		cur.Seen[fmt.Sprintf("%032x", i)] = t0.Add(time.Duration(i)*time.Millisecond + 987654321)
+	}
+	b, err := json.Marshal(cur)
+	if err != nil || len(b) >= 4096 {
+		t.Fatalf("%d bytes, %v: an SSM String parameter holds 4096", len(b), err)
+	}
 }
 
 // A flag that cannot be written leaves the cursor where it was, so the next

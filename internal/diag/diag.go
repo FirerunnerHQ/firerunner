@@ -581,7 +581,7 @@ func renderTenants(w io.Writer, tenants []health.Tenant) {
 			fmt.Fprintf(w, "  %s HELD: %s\n", name, t.Reason)
 		}
 		if fl := t.Flag; fl != nil {
-			fmt.Fprintf(w, "  %s FLAGGED for review, not suspended: %s, severity %g, on tier %s instance %s; %d finding(s) from %s to %s (finding %s)\n",
+			fmt.Fprintf(w, "  %s FLAGGED for review, not suspended: %s, severity %g, on tier %s instance %s; %d finding(s) or update(s) from %s to %s (finding %s)\n",
 				name, fl.Type, fl.Severity, or(fl.Tier, "?"), or(fl.Instance, "?"), fl.Count,
 				fl.First.UTC().Format(time.RFC3339), fl.Last.UTC().Format(time.RFC3339), or(fl.Finding, "?"))
 		}
@@ -865,15 +865,19 @@ func guardDutyCheck(f health.File, now time.Time) *Check {
 	var flagged []string
 	for _, t := range f.Tenants {
 		if fl := t.Flag; fl != nil {
-			flagged = append(flagged, fmt.Sprintf("%s (%s, severity %g, %d finding(s), last %s ago)", or(t.ID, "(install)"),
+			flagged = append(flagged, fmt.Sprintf("%s (%s, severity %g, %d finding(s) or update(s), last %s ago)", or(t.ID, "(install)"),
 				fl.Type, fl.Severity, fl.Count, humanDuration(now.Sub(fl.Last).Truncate(time.Second))))
 		}
 	}
 	var c Check
 	switch {
 	case len(flagged) > 0:
-		c = warn("guardduty", "flagged for review: %s; review, then firerunner tenant suspend ID or firerunner tenant clear-flag ID",
-			strings.Join(flagged, "; "))
+		failing := ""
+		if g.Failing() {
+			failing = fmt.Sprintf("; and reading findings fails (%s ago): %s", humanDuration(now.Sub(g.LastErrorAt).Truncate(time.Second)), truncate(g.LastError, 200))
+		}
+		c = warn("guardduty", "flagged for review: %s; review, then firerunner tenant suspend ID or firerunner tenant clear-flag ID%s",
+			strings.Join(flagged, "; "), failing)
 	case g.Failing():
 		c = warn("guardduty", "reading findings fails (%s ago): %s; no tenant is flagged meanwhile",
 			humanDuration(now.Sub(g.LastErrorAt).Truncate(time.Second)), truncate(g.LastError, 200))

@@ -13,6 +13,7 @@ import (
 
 	awsgd "github.com/aws/aws-sdk-go-v2/service/guardduty"
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
+	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/guardduty"
@@ -98,9 +99,11 @@ type tenantFinding struct {
 
 // tenantOpeners open what the tenant subcommand reads and writes.
 type tenantOpeners struct {
-	states    func(spec string) (tenantstate.Store, error)
-	flags     func(spec string) (tenantstate.FlagStore, error)
-	guardDuty func() (guardduty.API, error)
+	states func(spec string) (tenantstate.Store, error)
+	flags  func(spec string) (tenantstate.FlagStore, error)
+	// guardDuty returns the client and this account's id, whose findings
+	// alone count ("" for every account's).
+	guardDuty func() (guardduty.API, string, error)
 }
 
 // tenantArgs are the subcommand's parsed arguments.
@@ -114,7 +117,7 @@ type tenantArgs struct {
 }
 
 // tenantCmd runs "firerunner tenant ..." and returns the exit status.
-func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) int {
+func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) (code int) {
 	usageErr := func(format string, a ...any) int {
 		fmt.Fprintf(stderr, format+"\n%s", append(a, tenantUsage)...)
 		return 2
@@ -147,6 +150,7 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) int 
 	}
 	var store tenantstate.Store
 	var flags tenantstate.FlagStore
+	var flagsErr error
 	if a.action != "clear-flag" {
 		if store, err = open.states(a.spec); err != nil {
 			fmt.Fprintf(stderr, "firerunner tenant: %v\n", err)
@@ -174,8 +178,17 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) int 
 		}
 		r.ID, r.State = a.ids[0], "active"
 	case "clear-flag":
-		if err := flags.DeleteFlag(ctx, a.ids[0]); err != nil {
+		fl, _, err := flags.LoadFlags(ctx)
+		if err != nil {
 			return fail(flags, err)
+		}
+		if _, ok := fl[a.ids[0]]; ok {
+			if err := flags.DeleteFlag(ctx, a.ids[0]); err != nil {
+				return fail(flags, err)
+			}
+			r.State = "cleared"
+		} else {
+			r.State = "not flagged"
 		}
 		r.ID = a.ids[0]
 	case "list":
@@ -186,14 +199,21 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) int 
 		for _, id := range st.IDs() {
 			r.Suspended = append(r.Suspended, tenantSuspension{ID: id, Reason: st[id].Reason, Since: st[id].Since})
 		}
+		// The suspensions are printed even when the flags cannot be
+		// read, as by credentials from before flags were kept.
 		fl, _, err := flags.LoadFlags(ctx)
 		if err != nil {
-			return fail(flags, err)
+			flagsErr = err
 		}
 		for _, id := range fl.IDs() {
 			r.Flagged = append(r.Flagged, tenantFlag{ID: id, Flag: fl[id]})
 		}
 	}
+	defer func() {
+		if flagsErr != nil {
+			code = fail(flags, flagsErr)
+		}
+	}()
 	if a.asJSON {
 		writeJSON(stdout, r)
 		return 0
@@ -204,7 +224,11 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) int 
 	case "resume":
 		fmt.Fprintf(stdout, "resumed %s in %s\nA running daemon launches for its waiting jobs within %s.\n", r.ID, r.Store, tenantstate.DefaultInterval)
 	case "clear-flag":
-		fmt.Fprintf(stdout, "cleared the flag on %s in %s\nA running daemon's status drops it within %s; a new finding flags it again.\n", r.ID, r.Flags, guardduty.DefaultInterval)
+		if r.State == "not flagged" {
+			fmt.Fprintf(stdout, "%s is not flagged in %s\n", r.ID, r.Flags)
+			break
+		}
+		fmt.Fprintf(stdout, "cleared the flag on %s in %s\nA running daemon's status drops it within %s; a new finding, or an update of one, flags it again.\n", r.ID, r.Flags, guardduty.DefaultInterval)
 	case "list":
 		if len(r.Suspended) == 0 {
 			fmt.Fprintf(stdout, "no tenant suspended in %s\n", r.Store)
@@ -213,7 +237,7 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) int 
 			fmt.Fprintf(stdout, "%s\tsuspended since %s: %s\n", s.ID, s.Since.Format(time.RFC3339), s.Reason)
 		}
 		for _, f := range r.Flagged {
-			fmt.Fprintf(stdout, "%s\tflagged for review: %s, severity %g, %d finding(s) from %s to %s, latest %s on %s\n",
+			fmt.Fprintf(stdout, "%s\tflagged for review: %s, severity %g, %d finding(s) or update(s) from %s to %s, latest %s on %s\n",
 				f.ID, f.Type, f.Severity, f.Count, f.First.Format(time.RFC3339), f.Last.Format(time.RFC3339), f.Finding, f.Instance)
 		}
 	}
@@ -230,7 +254,8 @@ func parseTenantArgs(args []string) (a tenantArgs, help bool, err error) {
 	default:
 		return a, false, fmt.Errorf("firerunner tenant: unknown action %q", a.action)
 	}
-	if v := os.Getenv("FR_GUARDDUTY_MIN_SEVERITY"); v != "" {
+	// Read only for findings: a bad value must never block a suspension.
+	if v := os.Getenv("FR_GUARDDUTY_MIN_SEVERITY"); v != "" && a.action == "findings" {
 		if a.minSeverity, err = strconv.ParseFloat(v, 64); err != nil {
 			return a, false, fmt.Errorf("FR_GUARDDUTY_MIN_SEVERITY=%q is not a number", v)
 		}
@@ -314,15 +339,17 @@ func parseTenantArgs(args []string) (a tenantArgs, help bool, err error) {
 	return a, false, nil
 }
 
-// tenantFindings lists the findings a daemon owning a.owner would read, and
-// the tenant each names. It writes nothing: neither a flag nor the cursor.
-func tenantFindings(ctx context.Context, a tenantArgs, stdout, stderr io.Writer, open func() (guardduty.API, error)) int {
-	api, err := open()
+// tenantFindings lists the findings on a.owner's instances in this account
+// and the tenant each names, by the owner tag as a daemon maps it, over
+// a.since rather than a daemon's cursor, and for any tenant id, in the
+// catalog or not. It writes nothing: neither a flag nor the cursor.
+func tenantFindings(ctx context.Context, a tenantArgs, stdout, stderr io.Writer, open func() (guardduty.API, string, error)) int {
+	api, account, err := open()
 	if err != nil {
 		fmt.Fprintf(stderr, "firerunner tenant findings: %v\n", err)
 		return 1
 	}
-	found, detectors, err := guardduty.List(ctx, api, time.Now().Add(-a.since), a.minSeverity)
+	found, detectors, err := guardduty.List(ctx, api, guardduty.Query{Since: time.Now().Add(-a.since), MinSeverity: a.minSeverity, Account: account})
 	if err != nil {
 		fmt.Fprintf(stderr, "firerunner tenant findings: %v\n", err)
 		return 1
@@ -375,14 +402,18 @@ func openTenant() tenantOpeners {
 	return tenantOpeners{
 		states: func(spec string) (tenantstate.Store, error) { return tenantstate.Open(spec, newSSM) },
 		flags:  func(spec string) (tenantstate.FlagStore, error) { return tenantstate.OpenFlags(spec, newSSM) },
-		guardDuty: func() (guardduty.API, error) {
+		guardDuty: func() (guardduty.API, string, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			awsCfg, err := loadAWSConfig(ctx, &config.Config{AWSRegion: os.Getenv("FR_AWS_REGION")})
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
-			return awsgd.NewFromConfig(awsCfg), nil
+			account, err := callerAccount(awssts.NewFromConfig(awsCfg))(ctx)
+			if err != nil {
+				return nil, "", err
+			}
+			return awsgd.NewFromConfig(awsCfg), account, nil
 		},
 	}
 }

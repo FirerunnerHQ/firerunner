@@ -536,10 +536,26 @@ func (l *liveTenants) tenants(states tenantstate.States, flags tenantstate.Flags
 		out = append(out, st.health(states))
 	}
 	out = append(out, l.skipped...)
+	healthFlag := func(fl tenantstate.Flag) *health.Flag {
+		return &health.Flag{Type: fl.Type, Severity: fl.Severity, Tier: fl.Tier, Instance: fl.Instance,
+			Finding: fl.Finding, Count: fl.Count, First: fl.First, Last: fl.Last}
+	}
+	listed := map[string]bool{}
 	for i := range out {
+		listed[stateKey(out[i].ID)] = true
 		if fl, ok := flags[stateKey(out[i].ID)]; ok {
-			out[i].Flag = &health.Flag{Type: fl.Type, Severity: fl.Severity, Tier: fl.Tier, Instance: fl.Instance,
-				Finding: fl.Finding, Count: fl.Count, First: fl.First, Last: fl.Last}
+			out[i].Flag = healthFlag(fl)
+		}
+	}
+	// A flag on a tenant not served now (starting, or out of the catalog)
+	// still shows, so doctor never passes while one is open.
+	for _, id := range flags.IDs() {
+		if !listed[id] {
+			hid := id
+			if id == tenantstate.Install {
+				hid = ""
+			}
+			out = append(out, health.Tenant{ID: hid, NotServed: "not served by this daemon now", Flag: healthFlag(flags[id])})
 		}
 	}
 	slices.SortStableFunc(out, func(a, b health.Tenant) int { return strings.Compare(a.ID, b.ID) })

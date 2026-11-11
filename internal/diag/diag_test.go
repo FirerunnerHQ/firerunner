@@ -957,7 +957,7 @@ func TestStatusAndDoctorShowFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"acme FLAGGED for review, not suspended: CryptoCurrency:EC2/BitcoinTool.B!DNS, severity 8, on tier small instance i-0aaa; 2 finding(s) from " +
+		"acme FLAGGED for review, not suspended: CryptoCurrency:EC2/BitcoinTool.B!DNS, severity 8, on tier small instance i-0aaa; 2 finding(s) or update(s) from " +
 			first.Format(time.RFC3339) + " to " + last.Format(time.RFC3339) + " (finding f-1)",
 		"GuardDuty findings of severity 4 and above read 30s ago from 1 detector(s); flags in ssm:/fr/control/tenant-state-flags",
 	} {
@@ -983,7 +983,7 @@ func TestStatusAndDoctorShowFlags(t *testing.T) {
 		t.Fatal("no guardduty check")
 		return Check{}
 	}
-	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "acme (CryptoCurrency:EC2/BitcoinTool.B!DNS, severity 8, 2 finding(s), last 1h0m ago)") ||
+	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "acme (CryptoCurrency:EC2/BitcoinTool.B!DNS, severity 8, 2 finding(s) or update(s), last 1h0m ago)") ||
 		!strings.Contains(c.Detail, "clear-flag") {
 		t.Fatalf("doctor with a flag = %+v", c)
 	}
@@ -1001,6 +1001,11 @@ func TestStatusAndDoctorShowFlags(t *testing.T) {
 	write()
 	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "AccessDeniedException") {
 		t.Fatalf("doctor while reads fail = %+v", c)
+	}
+	f.Tenants[0].Flag = flag
+	write()
+	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "flagged for review: acme") || !strings.Contains(c.Detail, "AccessDeniedException") {
+		t.Fatalf("doctor with a flag while reads fail = %+v", c)
 	}
 	f.GuardDuty = nil
 	write()

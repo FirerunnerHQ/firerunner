@@ -14,6 +14,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/guardduty/types"
 )
 
+// ownAccount is the account the fake's findings are in, AWS's documentation
+// example; a test moves one to another.
+const ownAccount = "123456789012"
+
 // fakeGD is an in-memory GuardDuty: one detector's findings, listed by the
 // criteria the package sends (it rejects any it does not know, so a typo in
 // one fails a test rather than widening the list), a page of two at a time.
@@ -25,6 +29,8 @@ type fakeGD struct {
 	// ignoreCriteria lists every finding, as a criterion GuardDuty dropped
 	// would: the package's own checks must hold without them.
 	ignoreCriteria bool
+	// criteria are the last ListFindings call's.
+	criteria map[string]types.Condition
 	// gets counts GetFindings calls; got the ids asked for.
 	gets int
 	got  []string
@@ -40,7 +46,7 @@ func (f *fakeGD) add(id, typ string, sev float64, updated time.Time, archived bo
 		ts = append(ts, types.Tag{Key: aws.String(k), Value: aws.String(v)})
 	}
 	f.findings = append(f.findings, types.Finding{
-		Id: aws.String(id), Type: aws.String(typ), Severity: aws.Float64(sev),
+		AccountId: aws.String(ownAccount), Id: aws.String(id), Type: aws.String(typ), Severity: aws.Float64(sev),
 		UpdatedAt: aws.String(updated.UTC().Format("2006-01-02T15:04:05.000Z")),
 		Resource: &types.Resource{ResourceType: aws.String("Instance"), InstanceDetails: &types.InstanceDetails{
 			InstanceId: aws.String("i-" + id), Tags: ts,
@@ -98,6 +104,10 @@ func (f *fakeGD) matches(fd types.Finding, c map[string]types.Condition) (bool, 
 			if cond.GreaterThanOrEqual == nil || updated.UnixMilli() < *cond.GreaterThanOrEqual {
 				return false, nil
 			}
+		case "accountId":
+			if !slices.Contains(cond.Equals, aws.ToString(fd.AccountId)) {
+				return false, nil
+			}
 		case "severity":
 			if cond.GreaterThanOrEqual == nil || aws.ToFloat64(fd.Severity) < float64(*cond.GreaterThanOrEqual) {
 				return false, nil
@@ -115,6 +125,7 @@ func (f *fakeGD) ListFindings(_ context.Context, in *guardduty.ListFindingsInput
 	if f.err != nil {
 		return nil, f.err
 	}
+	f.criteria = in.FindingCriteria.Criterion
 	if !slices.Contains(f.detectors, aws.ToString(in.DetectorId)) {
 		return nil, errors.New("BadRequestException: no such detector")
 	}

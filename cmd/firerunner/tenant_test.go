@@ -148,6 +148,11 @@ func TestLiveTenantsReportLimits(t *testing.T) {
 	if got[1].NotServed == "" {
 		t.Fatalf("a tenant not served does not say why: %+v", got[1])
 	}
+	// A flag on a tenant this daemon does not serve still shows.
+	got = l.tenants(nil, tenantstate.Flags{"gone": {Type: "x", Count: 1}, "acme": {Type: "y", Count: 1}})
+	if len(got) != 4 || got[3].ID != "gone" || got[3].Flag == nil || got[3].NotServed == "" || got[2].Flag == nil || got[2].Flag.Type != "y" {
+		t.Fatalf("tenants with flags = %+v", got)
+	}
 }
 
 // A tier's listener reports the IDs of the runners it registers to the

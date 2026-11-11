@@ -692,14 +692,14 @@ func (s *shard) watchStates(ctx context.Context, cfg *config.Config, live *liveT
 // of this shard whose machines they name: the install, by its owner tag, and
 // each tenant of the catalog, by owner/<id>. It records each flag as an event
 // too. It never suspends a tenant: it is given no tenant state to write.
-func (s *shard) watchFindings(ctx context.Context, cfg *config.Config, owner string, api guardduty.API, store tenantstate.FlagStore, log *slog.Logger) {
+func (s *shard) watchFindings(ctx context.Context, cfg *config.Config, owner string, api guardduty.API, store tenantstate.FlagStore, account func(context.Context) (string, error), log *slog.Logger) {
 	ids := make([]string, 0, len(cfg.Tenants))
 	for _, t := range cfg.Tenants {
 		ids = append(ids, t.ID)
 	}
 	glog := log.With("component", "guardduty")
 	s.findings = &guardduty.Poller{
-		API: api, Store: store, Tenant: guardduty.Owners(owner, ids),
+		API: api, Store: store, Account: account, Tenant: guardduty.Owners(owner, ids),
 		MinSeverity: cfg.GuardDutyMinSeverity, Interval: guardduty.DefaultInterval, Log: glog,
 		OnFlag: func(f guardduty.Flagged) {
 			jobevent.Record(s.events, jobevent.Event{Kind: jobevent.Flagged, Tier: f.Tier, Instance: f.Instance,
@@ -716,18 +716,31 @@ func (s *shard) watchFindings(ctx context.Context, cfg *config.Config, owner str
 // never calls GuardDuty.
 func readsFindings(cfg *config.Config) bool { return cfg.GuardDuty && cfg.UsesEC2() }
 
-// openFindings returns the GuardDuty client and the flag store beside
-// --tenant-state, with the daemon's AWS configuration.
-func openFindings(ctx context.Context, cfg *config.Config) (guardduty.API, tenantstate.FlagStore, error) {
+// openFindings returns the GuardDuty client, the flag store beside
+// --tenant-state and this account's id, with the daemon's AWS configuration.
+func openFindings(ctx context.Context, cfg *config.Config) (guardduty.API, tenantstate.FlagStore, func(context.Context) (string, error), error) {
 	awsCfg, err := loadAWSConfig(ctx, cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("--guardduty: %w", err)
+		return nil, nil, nil, fmt.Errorf("--guardduty: %w", err)
 	}
 	store, err := tenantstate.OpenFlags(cfg.TenantState, func() (tenantstate.SSMAPI, error) { return awsssm.NewFromConfig(awsCfg), nil })
 	if err != nil {
-		return nil, nil, fmt.Errorf("--guardduty: %w", err)
+		return nil, nil, nil, fmt.Errorf("--guardduty: %w", err)
 	}
-	return awsgd.NewFromConfig(awsCfg), store, nil
+	return awsgd.NewFromConfig(awsCfg), store, callerAccount(awssts.NewFromConfig(awsCfg)), nil
+}
+
+// callerAccount returns the account of the credentials in use, which needs
+// no grant: a GuardDuty administrator's detector lists its members' findings
+// too, and only this account's may flag.
+func callerAccount(c *awssts.Client) func(context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) {
+		out, err := c.GetCallerIdentity(ctx, &awssts.GetCallerIdentityInput{})
+		if err != nil {
+			return "", err
+		}
+		return aws.ToString(out.Account), nil
+	}
 }
 
 // healthGuardDuty is the findings' reading for the health file.
@@ -1181,11 +1194,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		log.Warn("--guardduty: no EC2 tier, whose machines GuardDuty's findings would name; findings are not read")
 	}
 	if readsFindings(cfg) {
-		api, store, err := openFindings(ctx, cfg)
+		api, store, account, err := openFindings(ctx, cfg)
 		if err != nil {
 			return err
 		}
-		s.watchFindings(ctx, cfg, owner, api, store, log)
+		s.watchFindings(ctx, cfg, owner, api, store, account, log)
 	}
 
 	served, err := s.start(ctx, t, hooks)

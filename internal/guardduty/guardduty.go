@@ -57,9 +57,8 @@ const (
 	// again, in case GuardDuty lists it late or the clocks differ.
 	Settle = 15 * time.Minute
 	// maxSeen bounds the cursor's findings, so that it stays within one
-	// SSM parameter (4 KB). Past it, the oldest go: a finding read again
-	// after that counts twice, which a flag only asking for review
-	// tolerates.
+	// SSM parameter (4 KB). Past it, the cursor moves past the oldest
+	// (see advance).
 	maxSeen = 40
 	// pageSize is the most ids ListFindings returns and GetFindings takes.
 	pageSize = 50
@@ -80,11 +79,23 @@ type Finding struct {
 	Runner   string
 }
 
+// Query chooses the findings List returns.
+type Query struct {
+	// Since is the oldest update time.
+	Since time.Time
+	// MinSeverity is the least severity.
+	MinSeverity float64
+	// Account, when set, is the only account whose findings count: a
+	// GuardDuty administrator's detector lists its members' findings too,
+	// whose instances may carry any tag.
+	Account string
+}
+
 // List returns the findings on EC2 instances that carry an owner tag,
-// updated at or after since, not archived (a suppression rule archives what
-// an operator chose to ignore), of severity at least min, oldest update
-// first, and how many detectors it read.
-func List(ctx context.Context, api API, since time.Time, min float64) ([]Finding, int, error) {
+// updated at or after q.Since, not archived (a suppression rule archives what
+// an operator chose to ignore), of severity at least q.MinSeverity, in
+// q.Account, oldest update first, and how many detectors it read.
+func List(ctx context.Context, api API, q Query) ([]Finding, int, error) {
 	var detectors []string
 	p := guardduty.NewListDetectorsPaginator(api, &guardduty.ListDetectorsInput{})
 	for p.HasMorePages() {
@@ -96,24 +107,32 @@ func List(ctx context.Context, api API, since time.Time, min float64) ([]Finding
 	}
 	var out []Finding
 	for _, d := range detectors {
-		fs, err := listDetector(ctx, api, d, since, min)
+		fs, err := listDetector(ctx, api, d, q)
 		if err != nil {
 			return nil, len(detectors), err
 		}
 		out = append(out, fs...)
 	}
-	slices.SortStableFunc(out, func(a, b Finding) int { return a.UpdatedAt.Compare(b.UpdatedAt) })
+	slices.SortStableFunc(out, func(a, b Finding) int {
+		if c := a.UpdatedAt.Compare(b.UpdatedAt); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
 	return out, len(detectors), nil
 }
 
-func listDetector(ctx context.Context, api API, detector string, since time.Time, min float64) ([]Finding, error) {
+func listDetector(ctx context.Context, api API, detector string, q Query) ([]Finding, error) {
 	criteria := &types.FindingCriteria{Criterion: map[string]types.Condition{
 		"resource.resourceType":             {Equals: []string{"Instance"}},
 		"resource.instanceDetails.tags.key": {Equals: []string{tagOwner}},
 		"service.archived":                  {Equals: []string{"false"}},
-		"updatedAt":                         {GreaterThanOrEqual: aws.Int64(since.UnixMilli())},
-		"severity":                          {GreaterThanOrEqual: aws.Int64(int64(math.Floor(min)))},
+		"updatedAt":                         {GreaterThanOrEqual: aws.Int64(q.Since.UnixMilli())},
+		"severity":                          {GreaterThanOrEqual: aws.Int64(int64(math.Floor(q.MinSeverity)))},
 	}}
+	if q.Account != "" {
+		criteria.Criterion["accountId"] = types.Condition{Equals: []string{q.Account}}
+	}
 	var ids []string
 	p := guardduty.NewListFindingsPaginator(api, &guardduty.ListFindingsInput{
 		DetectorId: aws.String(detector), FindingCriteria: criteria, MaxResults: aws.Int32(pageSize),
@@ -134,7 +153,9 @@ func listDetector(ctx context.Context, api API, detector string, since time.Time
 		for _, f := range got.Findings {
 			// The criteria choose these already; read them again, so a
 			// criterion GuardDuty ignored never flags.
-			if fd, ok := finding(f, detector); ok && fd.Severity >= min && !fd.UpdatedAt.Before(since) {
+			fd, ok := finding(f, detector)
+			if ok && fd.Severity >= q.MinSeverity && !fd.UpdatedAt.Before(q.Since) &&
+				(q.Account == "" || aws.ToString(f.AccountId) == q.Account) {
 				out = append(out, fd)
 			}
 		}
@@ -217,43 +238,58 @@ type Poller struct {
 	// owners' instances are not this install's.
 	Tenant      func(owner string) (string, bool)
 	MinSeverity float64
-	Interval    time.Duration
-	Log         *slog.Logger
-	// OnFlag hears each finding that flags a tenant, once.
+	// Account returns this account's id, so that a GuardDuty
+	// administrator's members' findings never flag; nil reads every
+	// account's. It is asked until it answers.
+	Account  func(ctx context.Context) (string, error)
+	Interval time.Duration
+	Log      *slog.Logger
+	// OnFlag hears each finding, or update of one, that flags a tenant,
+	// once its flag is written.
 	OnFlag func(Flagged)
 	// tick and now replace the ticker and the clock in tests.
 	tick <-chan time.Time
 	now  func() time.Time
+
+	// polling serialises polls; account and cur are theirs.
+	polling sync.Mutex
+	account string
+	// cur is the cursor as this process last advanced it: a cursor that
+	// cannot be written never makes a finding count again.
+	cur *tenantstate.Cursor
 
 	mu     sync.Mutex
 	flags  tenantstate.Flags
 	status Status
 }
 
-// Poll reads the flags, the findings since the cursor, and flags each tenant
-// a new finding names. It writes the flags before the cursor: a crash
+// Poll reads the cursor, the findings since it, and flags each tenant a new
+// finding, or a new update of one, names. It reads the flags again just
+// before writing them, so that an operator's clear meanwhile is lost only in
+// the moment between, and writes the flags before the cursor: a crash
 // between counts a finding twice, rather than missing it.
 func (p *Poller) Poll(ctx context.Context) error {
+	p.polling.Lock()
+	defer p.polling.Unlock()
 	start := p.clock().UTC()
-	flags, cur, err := p.Store.LoadFlags(ctx)
+	_, stored, err := p.Store.LoadFlags(ctx)
 	if err != nil {
 		return p.fail(start, fmt.Errorf("read flags from %s: %w", p.Store, err))
 	}
-	// An operator's clear shows even when the findings cannot be read.
-	p.mu.Lock()
-	p.flags = maps.Clone(flags)
-	p.mu.Unlock()
+	cur := merge(stored, p.cur)
 	if cur.Since.IsZero() {
 		cur.Since = start.Add(-FirstLookback)
 	}
-	if cur.Seen == nil {
-		cur.Seen = map[string]time.Time{}
+	if p.account == "" && p.Account != nil {
+		if p.account, err = p.Account(ctx); err != nil {
+			return p.fail(start, fmt.Errorf("this account's id: %w", err))
+		}
 	}
-	found, detectors, err := List(ctx, p.API, cur.Since, p.MinSeverity)
+	found, detectors, err := List(ctx, p.API, Query{Since: cur.Since, MinSeverity: p.MinSeverity, Account: p.account})
 	if err != nil {
 		return p.fail(start, err)
 	}
-	changed := map[string]bool{}
+	byTenant := map[string][]Finding{}
 	for _, f := range found {
 		id, ok := p.Tenant(f.Owner)
 		if !ok {
@@ -262,34 +298,42 @@ func (p *Poller) Poll(ctx context.Context) error {
 		if seen, ok := cur.Seen[f.ID]; ok && !f.UpdatedAt.After(seen) {
 			continue
 		}
-		cur.Seen[f.ID] = f.UpdatedAt
-		fl := flags[id]
-		if fl.Count == 0 {
-			fl.First = f.UpdatedAt
-		}
-		fl.Count++
-		fl.Type, fl.Tier, fl.Instance, fl.Finding, fl.Last = f.Type, f.Tier, f.Instance, f.ID, f.UpdatedAt
-		fl.Severity = max(fl.Severity, f.Severity)
-		flags[id] = fl
-		changed[id] = true
-		if p.Log != nil {
-			p.Log.Warn("GuardDuty finding on a tenant's machine: the tenant is flagged for review, not suspended",
-				"tenant", id, "type", f.Type, "severity", f.Severity, "tier", f.Tier, "instance", f.Instance,
-				"runner", f.Runner, "finding", f.ID, "updated", f.UpdatedAt, "count", f.Count)
-		}
-		if p.OnFlag != nil {
-			p.OnFlag(Flagged{Tenant: id, Finding: f})
-		}
+		byTenant[id] = append(byTenant[id], f)
 	}
-	for _, id := range slices.Sorted(maps.Keys(changed)) {
-		if err := p.Store.PutFlag(ctx, id, flags[id]); err != nil {
+	flags, _, err := p.Store.LoadFlags(ctx)
+	if err != nil {
+		return p.fail(start, fmt.Errorf("read flags from %s: %w", p.Store, err))
+	}
+	// An operator's clear shows even when a write below fails.
+	p.mu.Lock()
+	p.flags = maps.Clone(flags)
+	p.mu.Unlock()
+	for _, id := range slices.Sorted(maps.Keys(byTenant)) {
+		fl := flags[id]
+		for _, f := range byTenant[id] {
+			if fl.Count == 0 {
+				fl.First = f.UpdatedAt
+			}
+			fl.Count++
+			fl.Type, fl.Tier, fl.Instance, fl.Finding, fl.Last = f.Type, f.Tier, f.Instance, f.ID, f.UpdatedAt
+			fl.Severity = max(fl.Severity, f.Severity)
+		}
+		if err := p.Store.PutFlag(ctx, id, fl); err != nil {
+			p.cur = &cur
 			return p.fail(start, fmt.Errorf("flag %s in %s: %w", id, p.Store, err))
 		}
+		flags[id] = fl
+		p.mu.Lock()
+		p.flags = maps.Clone(flags)
+		p.mu.Unlock()
+		for _, f := range byTenant[id] {
+			cur.Seen[f.ID] = f.UpdatedAt
+			p.heard(id, f)
+		}
 	}
-	p.mu.Lock()
-	p.flags = flags
-	p.mu.Unlock()
-	if err := p.Store.PutCursor(ctx, advance(cur, start)); err != nil {
+	cur = advance(cur, start)
+	p.cur = &cur
+	if err := p.Store.PutCursor(ctx, cur); err != nil {
 		return p.fail(start, fmt.Errorf("write the cursor to %s: %w", p.Store, err))
 	}
 	p.mu.Lock()
@@ -298,8 +342,45 @@ func (p *Poller) Poll(ctx context.Context) error {
 	return nil
 }
 
+// heard logs and reports a finding that flagged tenant id.
+func (p *Poller) heard(id string, f Finding) {
+	if p.Log != nil {
+		p.Log.Warn("GuardDuty finding on a tenant's machine: the tenant is flagged for review, not suspended",
+			"tenant", id, "type", f.Type, "severity", f.Severity, "tier", f.Tier, "instance", f.Instance,
+			"runner", f.Runner, "finding", f.ID, "updated", f.UpdatedAt, "count", f.Count)
+	}
+	if p.OnFlag != nil {
+		p.OnFlag(Flagged{Tenant: id, Finding: f})
+	}
+}
+
+// merge joins the stored cursor with this process's own, which a failed
+// write may have kept from the store: the later Since, and each finding's
+// latest update time.
+func merge(stored tenantstate.Cursor, own *tenantstate.Cursor) tenantstate.Cursor {
+	out := tenantstate.Cursor{Since: stored.Since, Seen: maps.Clone(stored.Seen)}
+	if out.Seen == nil {
+		out.Seen = map[string]time.Time{}
+	}
+	if own == nil {
+		return out
+	}
+	if own.Since.After(out.Since) {
+		out.Since = own.Since
+	}
+	for id, at := range own.Seen {
+		if at.After(out.Seen[id]) {
+			out.Seen[id] = at
+		}
+	}
+	return out
+}
+
 // advance moves the cursor to Settle before now, never back, and keeps the
-// findings seen since then, at most maxSeen of the latest.
+// findings seen since then. Past maxSeen of them, it moves Since past the
+// update time of those it lets go, latest first kept, so that a finding it
+// no longer holds is never listed again: in such a burst, a finding listed
+// later than Settle allows is missed, rather than one counted on every poll.
 func advance(cur tenantstate.Cursor, now time.Time) tenantstate.Cursor {
 	if s := now.Add(-Settle); s.After(cur.Since) {
 		cur.Since = s
@@ -311,9 +392,17 @@ func advance(cur tenantstate.Cursor, now time.Time) tenantstate.Cursor {
 		}
 	}
 	if len(seen) > maxSeen {
-		ids := slices.SortedFunc(maps.Keys(seen), func(a, b string) int { return seen[b].Compare(seen[a]) })
-		for _, id := range ids[maxSeen:] {
-			delete(seen, id)
+		ids := slices.SortedFunc(maps.Keys(seen), func(a, b string) int {
+			if c := seen[b].Compare(seen[a]); c != 0 {
+				return c
+			}
+			return strings.Compare(a, b)
+		})
+		cur.Since = seen[ids[maxSeen]].Add(time.Millisecond)
+		for id, at := range seen {
+			if at.Before(cur.Since) {
+				delete(seen, id)
+			}
 		}
 	}
 	cur.Seen = seen
