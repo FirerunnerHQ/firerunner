@@ -63,6 +63,9 @@ type Config struct {
 	TiersPath   string
 	TenantsPath string
 	Tenants     []Tenant
+	// Limits are the install's own (--limit-*): none by default, as the
+	// install is its operator's. Tenants set theirs in the catalog.
+	Limits Limits
 
 	CacheJobsDir string
 	// CacheRoleARN, when set, is a role the daemon assumes to keep
@@ -403,7 +406,10 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.IntVar(&c.VCPU, "vcpu", er.int("FR_VCPU", 4), "vCPUs per microVM")
 	fs.IntVar(&c.MemMiB, "mem-mib", er.int("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
 
-	fs.StringVar(&c.TenantsPath, "tenants", env("FR_TENANTS", ""), "path to a JSON array of tenants served beside this install, each {id,url,installation_id,tiers}, using its GitHub App and tier catalog. Their tiers run with caches off and no hot runners or pool.")
+	fs.StringVar(&c.TenantsPath, "tenants", env("FR_TENANTS", ""), "path to a JSON array of tenants served beside this install, each {id,url,installation_id,tiers,limits}, using its GitHub App and tier catalog. Their tiers run with caches off and no hot runners or pool. A tenant's limits default to 2 runners, tiers of at most 2 vCPU and 30 minutes per job")
+	fs.IntVar(&c.Limits.Runners, "limit-runners", er.int("FR_LIMIT_RUNNERS", 0), "most runners the install's own tiers have at once, together (0 = no limit). A tenant sets its own in the --tenants catalog")
+	fs.IntVar(&c.Limits.VCPU, "limit-vcpu", er.int("FR_LIMIT_VCPU", 0), "serve the install only the tiers of at most this many vCPUs, leaving the others out with a warning (0 = no limit). A tenant sets its own in the --tenants catalog")
+	fs.DurationVar(&c.Limits.JobDuration, "limit-job-duration", er.duration("FR_LIMIT_JOB_DURATION", 0), "end the runner of an install's job that has run this long, failing the job (0 = no limit; at least 1m). A tenant sets its own in the --tenants catalog")
 	fs.StringVar(&c.TiersPath, "tiers", env("FR_TIERS", ""), "path to a JSON tier catalog (array of {name,labels,provisioner,min,max} plus {vcpu,mem_mib,golden,toolcache} for a firecracker tier or an ec2 block for an ec2 tier). When set, firerunner serves every tier from this one process and developers pick one with runs-on: <name>; --max-runners is the slot budget shared by the firecracker tiers. When unset, a single firecracker tier is derived from --name/--vcpu/--mem-mib/--golden.")
 
 	fs.StringVar(&c.Firecracker.Binary, "firecracker-bin", env("FR_FIRECRACKER_BIN", "firecracker"), "path to firecracker binary")
@@ -657,6 +663,12 @@ func (c *Config) validate() error {
 	}
 	if err := c.validateTenants(); err != nil {
 		return err
+	}
+	if err := c.Limits.validate("", flagLimitNames); err != nil {
+		return err
+	}
+	if tiers, refused := c.InstallTiers(); len(tiers) == 0 {
+		return fmt.Errorf("--limit-vcpu %d leaves the install no tier to serve: %s", c.Limits.VCPU, strings.Join(refused, "; "))
 	}
 	if err := c.validateJIT(); err != nil {
 		return err

@@ -1012,11 +1012,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	defer stopCreds()
 
 	// A static install is one tenant, made from its flags.
+	tiers, refused := cfg.InstallTiers()
 	t := tenant{
 		Owner: owner, URL: cfg.URL, RunnerGroup: cfg.RunnerGroup, KeepOnClose: cfg.Owner != "",
 		Token: cfg.Token,
-		Tiers: cfg.EffectiveTiers(),
+		Tiers: tiers, Limits: cfg.Limits, Refused: refused,
 	}
+	t.warnRefused(log)
 	if appJWT != nil {
 		t.Auth = ghauth.App{InstallationID: cfg.AppInstallID, JWT: appJWT}
 	}
@@ -1122,7 +1124,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// there touches nobody else. They end with runCtx, and drain themselves.
 	var tenants sync.WaitGroup
 	for _, c := range cfg.Tenants {
-		l := s.loop(extraTenant(cfg, c, owner, appJWT), live)
+		et := extraTenant(cfg, c, owner, appJWT)
+		et.warnRefused(log)
+		if len(et.Tiers) == 0 {
+			log.Error("tenant not served: none of its tiers is within its limits", "tenant", et.ID, "limits", et.Limits.String())
+			continue
+		}
+		l := s.loop(et, live)
 		tenants.Go(func() { l.run(runCtx) })
 	}
 

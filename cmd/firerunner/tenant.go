@@ -40,6 +40,10 @@ type tenant struct {
 	// Auth is App's installation, with JWTs signed once for the whole shard.
 	Auth  ghauth.App
 	Tiers []config.Tier
+	// Limits bound what it runs; Refused says why tiers it lists are not
+	// served to it (above its vCPU limit).
+	Limits  config.Limits
+	Refused []string
 }
 
 // shard holds what a process's tenants share. Its EC2 client carries the
@@ -156,10 +160,11 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner string, jwt *ghauth.
 	if group == "" {
 		group = cfg.RunnerGroup
 	}
+	tiers, refused := cfg.TenantTiers(c)
 	return tenant{
 		ID: c.ID, Owner: owner + "/" + c.ID, URL: c.URL, RunnerGroup: group, KeepOnClose: cfg.Owner != "",
 		Auth:  ghauth.App{InstallationID: c.InstallationID, JWT: jwt},
-		Tiers: cfg.TenantTiers(c),
+		Tiers: tiers, Limits: c.EffectiveLimits(), Refused: refused,
 	}
 }
 
@@ -182,6 +187,17 @@ func (s *shard) loop(t tenant, live *liveTenants) *tenantLoop {
 			st.close(context.Background())
 		},
 		live: live, log: s.log, min: tenantRetryMin, max: tenantRetryMax,
+	}
+}
+
+// warnRefused logs each tier the tenant lists but is not served, and why.
+func (t tenant) warnRefused(log *slog.Logger) {
+	for _, why := range t.Refused {
+		if t.ID != "" {
+			log.Warn("tier not served to the tenant", "tenant", t.ID, "why", why)
+			continue
+		}
+		log.Warn("tier not served (--limit-vcpu)", "why", why)
 	}
 }
 

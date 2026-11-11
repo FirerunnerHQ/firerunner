@@ -81,7 +81,7 @@ func TestValidateTenants(t *testing.T) {
 // change the catalog's own.
 func TestTenantTiersHaveNoCacheOrIdleMachines(t *testing.T) {
 	c := tenantConfig()
-	got := c.TenantTiers(goodTenant())
+	got, _ := c.TenantTiers(goodTenant())
 	if len(got) != 1 || got[0].Name != "cloud" {
 		t.Fatalf("tiers = %+v", got)
 	}

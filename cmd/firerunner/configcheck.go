@@ -24,6 +24,21 @@ type checkReport struct {
 	URL   string      `json:"url,omitempty"`
 	Auth  string      `json:"auth,omitempty"`
 	Tiers []checkTier `json:"tiers,omitempty"`
+	// Limits are the install's own (--limit-*), when it sets any.
+	Limits *config.Limits `json:"limits,omitempty"`
+	// Tenants are the --tenants catalog's, with the limits each runs under.
+	Tenants []checkTenant `json:"tenants,omitempty"`
+	// Warnings are what the daemon serves differently from what the
+	// configuration lists: a tier above a vCPU limit is not served.
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+type checkTenant struct {
+	ID  string `json:"id"`
+	URL string `json:"url"`
+	// Tiers are the tiers it is served.
+	Tiers  []string      `json:"tiers"`
+	Limits config.Limits `json:"limits"`
 }
 
 type checkTier struct {
@@ -156,6 +171,7 @@ func configCmd(args []string, stdout, stderr io.Writer) int {
 				r.Auth = "github-app"
 			}
 			r.Tiers = checkTiers(cfg.EffectiveTiers())
+			checkLimits(&r, cfg)
 		}
 	}
 
@@ -170,6 +186,33 @@ func configCmd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// checkLimits adds the limits the install and its tenants run under, and the
+// tiers those limits leave out.
+func checkLimits(r *checkReport, cfg *config.Config) {
+	if !cfg.Limits.None() {
+		l := cfg.Limits
+		r.Limits = &l
+	}
+	_, refused := cfg.InstallTiers()
+	for _, why := range refused {
+		r.Warnings = append(r.Warnings, "install: "+why+": not served (--limit-vcpu)")
+	}
+	for _, t := range cfg.Tenants {
+		tiers, refused := cfg.TenantTiers(t)
+		ct := checkTenant{ID: t.ID, URL: t.URL, Tiers: []string{}, Limits: t.EffectiveLimits()}
+		for _, tier := range tiers {
+			ct.Tiers = append(ct.Tiers, tier.Name)
+		}
+		for _, why := range refused {
+			r.Warnings = append(r.Warnings, fmt.Sprintf("tenant %q: %s: not served to it", t.ID, why))
+		}
+		if len(tiers) == 0 {
+			r.Warnings = append(r.Warnings, fmt.Sprintf("tenant %q: no tier is within its limits, so it is not served", t.ID))
+		}
+		r.Tenants = append(r.Tenants, ct)
+	}
 }
 
 func checkTiers(tiers []config.Tier) []checkTier {
@@ -210,7 +253,29 @@ func renderCheck(w io.Writer, r checkReport) {
 			fmt.Fprintf(w, "  %s replaces %s (firerunner migrate --catalog)\n", t.Name, strings.Join(t.Replaces, ", "))
 		}
 	}
+	if r.Limits != nil {
+		fmt.Fprintf(w, "install limits: %s\n", r.Limits)
+	}
+	if len(r.Tenants) > 0 {
+		fmt.Fprintf(w, "%d tenant(s):\n", len(r.Tenants))
+		ttw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(ttw, "  TENANT\tTIERS\tLIMITS")
+		for _, t := range r.Tenants {
+			fmt.Fprintf(ttw, "  %s\t%s\t%s\n", t.ID, orDash(strings.Join(t.Tiers, ",")), t.Limits)
+		}
+		ttw.Flush()
+	}
 	for _, n := range r.Notes {
 		fmt.Fprintf(w, "note: %s\n", n)
 	}
+	for _, n := range r.Warnings {
+		fmt.Fprintf(w, "warning: %s\n", n)
+	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }

@@ -125,6 +125,9 @@ func TestExtraTenant(t *testing.T) {
 	if got.URL != "https://github.com/acme" || got.RunnerGroup != "home" || !got.KeepOnClose {
 		t.Fatalf("tenant = %+v", got)
 	}
+	if got.Limits != (config.Limits{Runners: config.DefaultTenantRunners, VCPU: config.DefaultTenantVCPU, JobDuration: config.DefaultTenantJobDuration}) {
+		t.Fatalf("limits = %+v: a tenant with none set runs under the defaults", got.Limits)
+	}
 	if got := extraTenant(cfg, config.Tenant{ID: "t1", RunnerGroup: "own"}, "base", nil); got.RunnerGroup != "own" {
 		t.Fatalf("group = %q", got.RunnerGroup)
 	}
