@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 // from the snapshot), and powers off. The instance stops and waits. A spot
 // instance stays on a persistent request, still billed at the spot price
 // while running. A job claims a ready instance:
+//   - check that it is still as its launch made it (inspect), else discard it;
 //   - tag it claimed;
 //   - write the JIT endpoint into its user-data;
 //   - start it;
@@ -42,6 +45,12 @@ import (
 // after its launch, and one whose MAC is missing or wrong never joins the
 // pool: it is never registered for a JIT config nor started, and it is
 // terminated (see reject).
+//
+// The MAC proves who launched an instance, not that nobody changed it since.
+// So while it first warms, the pool also signs the image and volumes it was
+// launched with (TagPoolDiskMAC), and a claim starts it only while those, its
+// security groups, subnet and instance profile are still what the launch set
+// (see inspect).
 type Pool struct {
 	p      *Provisioner
 	target int
@@ -49,9 +58,15 @@ type Pool struct {
 	tick   time.Duration
 	now    func() time.Time
 
-	mu       sync.Mutex
-	ready    []pooled
-	warming  map[string]time.Time // instance -> when it was launched
+	mu      sync.Mutex
+	ready   []pooled
+	warming map[string]time.Time // instance -> when it was launched
+	// unsigned are instances this process launched whose disks it has not
+	// signed yet, with the image each was launched from. Only these are
+	// signed, and only while they run their first boot: a stopped instance's
+	// volumes can be swapped, and the image of one an earlier process
+	// launched is not known.
+	unsigned map[string]string
 	wake     chan struct{}
 	failures int
 	retryAt  time.Time
@@ -77,7 +92,7 @@ var warmMax = 10 * time.Minute
 func newPool(p *Provisioner, target int) *Pool {
 	return &Pool{
 		p: p, target: target, log: p.log.With("component", "pool"), tick: 15 * time.Second, now: time.Now,
-		warming: map[string]time.Time{}, wake: make(chan struct{}, 1),
+		warming: map[string]time.Time{}, unsigned: map[string]string{}, wake: make(chan struct{}, 1),
 	}
 }
 
@@ -227,9 +242,7 @@ func (pl *Pool) verify(i types.Instance) error {
 // spot request will not cancel is left, still unused, for the reaper.
 func (pl *Pool) reject(ctx context.Context, i types.Instance, why error) {
 	id := aws.ToString(i.InstanceId)
-	pl.mu.Lock()
-	delete(pl.warming, id)
-	pl.mu.Unlock()
+	pl.forget(id)
 	owner, state := tagValue(i.Tags, TagOwner), tagValue(i.Tags, TagPool)
 	if owner != pl.p.o.Owner || (state != PoolReady && state != PoolWarming) {
 		pl.log.Warn("pool instance failed its MAC check; not using it", "instance", id, "why", why, "owner", owner, "pool", state)
@@ -241,26 +254,70 @@ func (pl *Pool) reject(ctx context.Context, i types.Instance, why error) {
 	}
 }
 
-// signBackoff is the first wait between attempts to sign an instance EC2 does
-// not know yet; it doubles, signAttempts times in all (about 30 s).
-var (
-	signBackoff  = 500 * time.Millisecond
-	signAttempts = 6
-)
+// forget stops following an instance as warming or waiting for its disks to
+// be signed.
+func (pl *Pool) forget(id string) {
+	pl.mu.Lock()
+	delete(pl.warming, id)
+	delete(pl.unsigned, id)
+	pl.mu.Unlock()
+}
 
-// sign tags a pool instance this process just launched with its MAC. EC2 may
-// not know an instance for a few seconds after RunInstances names it
-// (InvalidInstanceID.NotFound), so that error is retried.
+// sign tags a pool instance this process just launched with its MAC.
 func (pl *Pool) sign(ctx context.Context, id string) error {
-	mac := pl.p.c.poolMAC(pl.p.o.Owner, pl.p.o.Tier, id)
-	wait := signBackoff
-	for attempt := 1; ; attempt++ {
-		err := pl.tag(ctx, id, TagPoolMAC, mac)
-		if err == nil || !isCode(err, errNotFound) || attempt == signAttempts {
-			return err
+	return pl.p.c.tagNew(ctx, id, TagPoolMAC, pl.p.c.poolMAC(pl.p.o.Owner, pl.p.o.Tier, id))
+}
+
+// signDisks tags an instance this process launched, and has not signed the
+// disks of yet, with the MAC of its image and volumes (TagPoolDiskMAC), once
+// EC2 lists its root volume. Only while it runs its first boot: its root
+// volume cannot be detached then, while a stopped one's could have been
+// swapped. Until it is signed markReady refuses it, so one never signed is
+// rejected when it stops, and the pool launches another.
+func (pl *Pool) signDisks(ctx context.Context, i types.Instance) {
+	id := aws.ToString(i.InstanceId)
+	pl.mu.Lock()
+	launchedFrom, waiting := pl.unsigned[id]
+	pl.mu.Unlock()
+	if !waiting || (i.State.Name != types.InstanceStateNamePending && i.State.Name != types.InstanceStateNameRunning) {
+		return
+	}
+	image, root, volumes, listed := diskOf(i)
+	if !listed {
+		return // not yet; the next pass looks again
+	}
+	if image != launchedFrom {
+		// Not the image the launch asked for: never sign it, so it never
+		// joins the pool.
+		pl.log.Warn("pool instance does not run the image it was launched from; not signing its disks", "instance", id, "image", image, "launchedFrom", launchedFrom)
+		pl.mu.Lock()
+		delete(pl.unsigned, id)
+		pl.mu.Unlock()
+		return
+	}
+	mac := pl.p.c.diskMAC(pl.p.o.Owner, pl.p.o.Tier, id, image, root, volumes)
+	if err := pl.tag(ctx, id, TagPoolDiskMAC, mac); err != nil {
+		pl.log.Warn("sign pool instance disks; retrying", "instance", id, "err", err)
+		return
+	}
+	pl.mu.Lock()
+	delete(pl.unsigned, id)
+	pl.mu.Unlock()
+}
+
+// signNewDisks describes a just-launched instance once and signs its disks
+// if EC2 lists them already; refresh signs them later otherwise.
+func (pl *Pool) signNewDisks(ctx context.Context, id string) {
+	out, err := pl.p.c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{id}})
+	if err != nil {
+		return // EC2 may not list it yet; refresh tries again
+	}
+	for _, r := range out.Reservations {
+		for _, i := range r.Instances {
+			if aws.ToString(i.InstanceId) == id {
+				pl.signDisks(ctx, i)
+			}
 		}
-		time.Sleep(wait)
-		wait *= 2
 	}
 }
 
@@ -289,10 +346,9 @@ func (pl *Pool) refresh(ctx context.Context) {
 			case types.InstanceStateNameStopped:
 				pl.markReady(ctx, i)
 			case types.InstanceStateNameShuttingDown, types.InstanceStateNameTerminated:
-				pl.mu.Lock()
-				delete(pl.warming, aws.ToString(i.InstanceId))
-				pl.mu.Unlock()
+				pl.forget(aws.ToString(i.InstanceId))
 			default:
+				pl.signDisks(ctx, i)
 				id := aws.ToString(i.InstanceId)
 				pl.mu.Lock()
 				since, ok := pl.warming[id]
@@ -300,9 +356,7 @@ func (pl *Pool) refresh(ctx context.Context) {
 				if ok && !since.IsZero() && pl.now().Sub(since) > warmMax {
 					pl.log.Warn("pool instance did not finish warming; discarding it", "instance", id, "warming", pl.now().Sub(since).Round(time.Second))
 					if pl.discard(ctx, id, aws.ToString(i.SpotInstanceRequestId)) {
-						pl.mu.Lock()
-						delete(pl.warming, id)
-						pl.mu.Unlock()
+						pl.forget(id)
 					}
 				}
 			}
@@ -311,10 +365,14 @@ func (pl *Pool) refresh(ctx context.Context) {
 }
 
 // markReady tags a stopped pool instance ready and adds it to the pool, if
-// its MAC holds.
+// its MACs hold: its launch's, and its disks'.
 func (pl *Pool) markReady(ctx context.Context, i types.Instance) {
 	id := aws.ToString(i.InstanceId)
-	if err := pl.verify(i); err != nil {
+	err := pl.verify(i)
+	if err == nil {
+		err = pl.p.c.verifyDiskMAC(i, pl.p.o.Owner, pl.p.o.Tier)
+	}
+	if err != nil {
 		pl.reject(ctx, i, err)
 		return
 	}
@@ -325,6 +383,7 @@ func (pl *Pool) markReady(ctx context.Context, i types.Instance) {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
 	delete(pl.warming, id)
+	delete(pl.unsigned, id)
 	pl.ready = append(pl.ready, pooled{
 		id: id, ip: aws.ToString(i.PrivateIpAddress),
 		spotReq: aws.ToString(i.SpotInstanceRequestId), itype: string(i.InstanceType),
@@ -372,8 +431,10 @@ func (pl *Pool) fill(ctx context.Context) {
 		pl.log.Info("warming pool instance", "instance", id, "type", inst.InstanceType)
 		pl.mu.Lock()
 		pl.warming[id] = pl.now()
+		pl.unsigned[id] = img.id
 		pl.failures = 0
 		pl.mu.Unlock()
+		pl.signNewDisks(context.WithoutCancel(ctx), id)
 	}
 }
 
@@ -415,6 +476,26 @@ func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 		// From here this process owns the instance: the reaper must leave
 		// it alone even once it is tagged claimed.
 		pl.p.c.track(in.id)
+		if err := pl.inspect(ctx, in.id, in.itype); err != nil {
+			switch {
+			case errors.Is(err, errChanged):
+				pl.log.Warn("pool instance changed since its launch; not using it, terminating it", "instance", in.id, "why", err)
+				if !pl.discard(context.WithoutCancel(ctx), in.id, in.spotReq) {
+					pl.log.Warn("could not terminate the changed pool instance; it stays out of the pool", "instance", in.id)
+				}
+				pl.p.c.untrack(in.id)
+				continue
+			case instanceGone(err):
+				pl.log.Warn("pool instance could not be described; discarding it", "instance", in.id, "err", err)
+				pl.discard(context.WithoutCancel(ctx), in.id, in.spotReq)
+				pl.p.c.untrack(in.id)
+				continue
+			default:
+				pl.requeue(context.WithoutCancel(ctx), in, false)
+				pl.p.c.untrack(in.id)
+				return pooled{}, fmt.Errorf("describe: %w", err)
+			}
+		}
 		tagged, err := pl.prepare(ctx, in, runner)
 		switch {
 		case err == nil:
@@ -441,6 +522,76 @@ func (pl *Pool) claim(ctx context.Context, runner string) (pooled, error) {
 	}
 }
 
+// errChanged reports a pool instance no longer as its launch made it.
+var errChanged = errors.New("changed since its launch")
+
+// inspect describes a ready instance just before a claim prepares it, and
+// returns errChanged unless it is still as its launch made it: signed by this
+// install, with the image and volumes it was launched with, exactly the
+// tier's security groups, in one of the tier's subnets, of the type it was
+// launched as, with no instance profile, a single network interface, no
+// public address and IMDSv2-only metadata. The MACs alone prove only who
+// launched it; whoever may modify an instance could have swapped its root
+// volume or opened its security groups while it was stopped.
+func (pl *Pool) inspect(ctx context.Context, id, itype string) error {
+	out, err := pl.p.c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{id}})
+	if err != nil {
+		return err
+	}
+	var inst *types.Instance
+	for _, r := range out.Reservations {
+		for _, i := range r.Instances {
+			if aws.ToString(i.InstanceId) == id {
+				inst = &i
+			}
+		}
+	}
+	if inst == nil {
+		return fmt.Errorf("%w: not described", errChanged)
+	}
+	var why []string
+	if err := pl.verify(*inst); err != nil {
+		why = append(why, err.Error())
+	}
+	if err := pl.p.c.verifyDiskMAC(*inst, pl.p.o.Owner, pl.p.o.Tier); err != nil {
+		why = append(why, err.Error())
+	}
+	e := pl.p.o.EC2
+	var groups []string
+	for _, g := range inst.SecurityGroups {
+		groups = append(groups, aws.ToString(g.GroupId))
+	}
+	slices.Sort(groups)
+	if want := slices.Sorted(slices.Values(e.SecurityGroups)); !slices.Equal(groups, want) {
+		why = append(why, fmt.Sprintf("security groups %v, want %v", groups, want))
+	}
+	if subnet := aws.ToString(inst.SubnetId); !slices.Contains(e.Subnets, subnet) {
+		why = append(why, fmt.Sprintf("subnet %q is not one of the tier's", subnet))
+	}
+	if p := inst.IamInstanceProfile; p != nil {
+		why = append(why, fmt.Sprintf("instance profile %s, want none", aws.ToString(p.Arn)))
+	}
+	if n := len(inst.NetworkInterfaces); n > 1 {
+		why = append(why, fmt.Sprintf("%d network interfaces, want 1", n))
+	}
+	// Stopped, it has a public address only if one was associated with it.
+	if ip := aws.ToString(inst.PublicIpAddress); ip != "" {
+		why = append(why, fmt.Sprintf("public address %s, want none while stopped", ip))
+	}
+	// A bigger type costs more; the claim also reports the type it was given.
+	if it := string(inst.InstanceType); it != itype || !slices.Contains(e.InstanceTypes, it) {
+		why = append(why, fmt.Sprintf("instance type %s, want %s", it, itype))
+	}
+	want := launchMetadataOptions()
+	if mo := inst.MetadataOptions; mo == nil || mo.HttpTokens != want.HttpTokens || aws.ToInt32(mo.HttpPutResponseHopLimit) != aws.ToInt32(want.HttpPutResponseHopLimit) {
+		why = append(why, "metadata options are not IMDSv2-only with one hop")
+	}
+	if len(why) > 0 {
+		return fmt.Errorf("%w: %s", errChanged, strings.Join(why, "; "))
+	}
+	return nil
+}
+
 // rewarm moves an instance back to warming: tagged so (and no longer naming
 // a runner), and followed by refresh until it stops again, ends, or
 // overstays warmMax. It is followed even if the retag fails.
@@ -450,6 +601,7 @@ func (pl *Pool) rewarm(ctx context.Context, id string) {
 		Tags: []types.Tag{
 			{Key: aws.String(TagPool), Value: aws.String(PoolWarming)},
 			{Key: aws.String(TagRunner), Value: aws.String("")},
+			{Key: aws.String(TagRunnerMAC), Value: aws.String("")},
 		},
 	}); err != nil {
 		pl.log.Warn("retag pool instance warming", "instance", id, "err", err)
@@ -547,6 +699,7 @@ func (pl *Pool) requeue(ctx context.Context, in pooled, tagged bool) {
 		Tags: []types.Tag{
 			{Key: aws.String(TagPool), Value: aws.String(PoolReady)},
 			{Key: aws.String(TagRunner), Value: aws.String("")},
+			{Key: aws.String(TagRunnerMAC), Value: aws.String("")},
 		},
 	})
 	if err != nil {
@@ -567,6 +720,7 @@ func (pl *Pool) prepare(ctx context.Context, in pooled, runner string) (tagged b
 		Tags: []types.Tag{
 			{Key: aws.String(TagPool), Value: aws.String(PoolClaimed)},
 			{Key: aws.String(TagRunner), Value: aws.String(runner)},
+			{Key: aws.String(TagRunnerMAC), Value: aws.String(pl.p.c.runnerMAC(pl.p.o.Owner, pl.p.o.Tier, runner, in.id))},
 			{Key: aws.String("Name"), Value: aws.String(runner)},
 		},
 	}); err != nil {

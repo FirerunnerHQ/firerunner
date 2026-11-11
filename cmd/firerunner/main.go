@@ -883,17 +883,26 @@ func newEC2Client(ctx context.Context, cfg *config.Config, log *slog.Logger) (*e
 }
 
 // setPoolKey gives the client the deployment's pool key. With none, the
-// client keeps its own random key, and a tier keeping a pool is warned of
-// once: no pool instance survives a restart, as none can be trusted.
+// client keeps its own random key, and an EC2 install is warned once: no
+// later process trusts what this one signed, so no pool instance survives a
+// restart, and no runner this process launched is deregistered by a later
+// one's reaper.
 func setPoolKey(c *ec2.Client, key []byte, tiers []config.Tier, log *slog.Logger) error {
 	if key != nil {
 		return c.SetPoolKey(key)
 	}
-	if len(pooledTiers(tiers)) > 0 {
-		log.Warn("no --ec2-pool-key-file: pool instances are signed with a key of this process's own, so the warm pool is rebuilt after every restart")
+	for _, t := range tiers {
+		if t.IsEC2() {
+			log.Warn(noPoolKeyWarning)
+			break
+		}
 	}
 	return nil
 }
+
+// noPoolKeyWarning is logged, and doctor reports it, for an EC2 install
+// without --ec2-pool-key-file.
+const noPoolKeyWarning = "no --ec2-pool-key-file: this process signs pool instances and runner tags with a key of its own, so after a restart the warm pool is rebuilt, and the reaper deregisters no runner an earlier process launched (their instances end at --max-vm-lifetime)"
 
 // openJobEvents returns where job events go, and how to close it. The store
 // connects in the background, so a database that is down costs the record, never

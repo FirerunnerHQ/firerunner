@@ -109,7 +109,8 @@ func TestLaunch_ClaimsFromPool(t *testing.T) {
 	in := h.f.instance(pooledID)
 	// Claimed: tagged, told where to fetch its config, started, and then its
 	// spot request cancelled.
-	if in.tags[TagPool] != PoolClaimed || in.tags[TagRunner] != "runner-1" {
+	if in.tags[TagPool] != PoolClaimed || in.tags[TagRunner] != "runner-1" ||
+		in.tags[TagRunnerMAC] != h.p.c.runnerMAC("test-owner", "cloud-4c", "runner-1", pooledID) {
 		t.Fatalf("claimed tags = %v", in.tags)
 	}
 	if in.userData != "FIRERUNNER_JIT_URL=http://10.0.0.5:8098/jit\nFIRERUNNER_DOCKER_STORAGE=memory\n" {
@@ -415,8 +416,8 @@ func TestPool_ClaimRewarmsAReadyInstanceStartedAgain(t *testing.T) {
 	if ids := h.f.terminatedIDs(); len(ids) != 0 {
 		t.Fatalf("terminated %v: an instance warming up again must be kept", ids)
 	}
-	if got := h.f.instance(first).tags[TagPool]; got != PoolWarming {
-		t.Fatalf("restarted instance tagged %q, want warming", got)
+	if tags := h.f.instance(first).tags; tags[TagPool] != PoolWarming || tags[TagRunner] != "" || tags[TagRunnerMAC] != "" {
+		t.Fatalf("restarted instance tagged %v, want warming and no runner", tags)
 	}
 	// It powers off after warming, as a new one does, and is ready again.
 	h.f.setState(first, types.InstanceStateNameStopped)
@@ -602,7 +603,7 @@ func TestPool_RequeueAfterTaggingClearsTheRunner(t *testing.T) {
 		t.Fatal("claim succeeded")
 	}
 	in := h.f.instance(id)
-	if in.tags[TagPool] != PoolReady || in.tags[TagRunner] != "" {
+	if in.tags[TagPool] != PoolReady || in.tags[TagRunner] != "" || in.tags[TagRunnerMAC] != "" {
 		t.Fatalf("tags after a failed claim = %v, want ready and no runner", in.tags)
 	}
 	if r, _ := h.p.pool.Ready(); r != 1 {

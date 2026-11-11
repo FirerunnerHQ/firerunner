@@ -523,6 +523,7 @@ func TestPooledTiers(t *testing.T) {
 func TestSetPoolKey(t *testing.T) {
 	pooled := []config.Tier{{Name: "pooled", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{Pool: 1}}}
 	cold := []config.Tier{{Name: "cold", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{}}}
+	fc := []config.Tier{{Name: "fc"}}
 	for _, c := range []struct {
 		name      string
 		key       []byte
@@ -532,14 +533,16 @@ func TestSetPoolKey(t *testing.T) {
 	}{
 		{"key", bytes.Repeat([]byte("k"), 64), pooled, false, false},
 		{"no key, a pool", nil, pooled, true, true},
-		{"no key, no pool", nil, cold, true, false},
+		// The reaper trusts only runner tags signed with the key.
+		{"no key, no pool", nil, cold, true, true},
+		{"no key, no EC2 tier", nil, fc, true, false},
 	} {
 		var logs bytes.Buffer
 		client := ec2.NewClient(nil, nil, 0, nil)
 		if err := setPoolKey(client, c.key, c.tiers, slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
-		if client.PoolKeyEphemeral() != c.ephemeral || strings.Contains(logs.String(), "rebuilt after every restart") != c.warned {
+		if client.PoolKeyEphemeral() != c.ephemeral || strings.Contains(logs.String(), "no --ec2-pool-key-file") != c.warned {
 			t.Errorf("%s: ephemeral %v, log %q", c.name, client.PoolKeyEphemeral(), logs.String())
 		}
 	}

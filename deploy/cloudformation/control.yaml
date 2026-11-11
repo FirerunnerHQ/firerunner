@@ -260,11 +260,14 @@ Resources:
                 Action: autoscaling:SetInstanceHealth
                 Resource: !Sub "arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-control"
 
-  # Signs the EC2 pool's instances (the firerunner:pool-mac tag), so a
-  # restarted or replaced control VM reuses the pool instances this install
-  # launched and trusts no others: anyone who may tag an instance in the
-  # account can copy the other tags. Only the control role may read it. It is
-  # generated here and never leaves AWS but for the control VM's disk.
+  # Signs the EC2 pool's instances (the firerunner:pool-mac and
+  # firerunner:pool-disk-mac tags) and job instances' runner tags
+  # (firerunner:runner-mac), so a restarted or replaced control VM reuses the
+  # pool instances this install launched, trusts no others, and its reaper
+  # deregisters only runners this install launched: anyone who may tag an
+  # instance in the account can copy the other tags. Only the control role may
+  # read it. It is generated here and never leaves AWS but for the control
+  # VM's disk.
   # Changing GenerateSecretString makes a new value, and so discards the
   # pool once.
   PoolKey:

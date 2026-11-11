@@ -52,14 +52,17 @@ credentials are stack parameters and SSM parameters.
 ## The pool key
 
 The stack generates a Secrets Manager secret, `PoolKey`, that signs EC2 pool
-instances (`firerunner:pool-mac`; see the README's *Stopped pool*). Only the
-control role may read it. At boot the VM copies it to the root-only file
-`/etc/firerunner/pool-key` and points firerunner at it
-(`FR_EC2_POOL_KEY_FILE`), so a restarted or replaced VM reuses the pool
-instances this install launched and trusts no others.
+instances (`firerunner:pool-mac`, `firerunner:pool-disk-mac`; see the
+README's *Stopped pool*) and job instances' runner tags
+(`firerunner:runner-mac`). Only the control role may read it. At boot the VM
+copies it to the root-only file `/etc/firerunner/pool-key` and points
+firerunner at it (`FR_EC2_POOL_KEY_FILE`), so a restarted or replaced VM
+reuses the pool instances this install launched, trusts no others, and its
+reaper deregisters only the runners this install launched.
 
-- **Upgrading.** Pool instances launched by a release before the key carry no
-  MAC. The first VM with the key terminates them once and refills the pool.
+- **Upgrading.** Pool instances launched by a release before the key, or
+  before `firerunner:pool-disk-mac`, lack a MAC. The first VM that checks it
+  terminates them once and refills the pool.
 - **A stack made before `PoolKey`** has no secret: firerunner then signs with a
   random key per process and rebuilds the pool after every restart. Update
   the stack to keep it.

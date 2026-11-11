@@ -50,7 +50,8 @@ type ReaperOptions struct {
 //
 // It never ends a job: a running orphan is ended only once GitHub agrees to
 // deregister its runner (it has no job), or past MaxLifetime. A busy one is
-// left to finish; it powers off, and the next sweep ends it.
+// left to finish; it powers off, and the next sweep ends it. It deregisters a
+// runner only by a runner tag whose TagRunnerMAC holds for the instance.
 type Reaper struct {
 	c   *Client
 	o   ReaperOptions
@@ -254,6 +255,13 @@ func (r *Reaper) judge(ctx context.Context, i types.Instance, now time.Time, rep
 		}
 		if runner == "" {
 			return // nothing to ask GitHub; MaxLifetime ends it
+		}
+		// Anyone who may tag an instance can write a runner tag: on one of
+		// their own, it would have an idle runner of ours deregistered.
+		// Only a tag this install signed for this instance names a runner.
+		if err := r.c.verifyRunnerMAC(i, r.o.Owner, tier, runner); err != nil {
+			log.Warn("runner tag not signed for this instance; not deregistering by it, leaving the instance to the max lifetime", "why", err)
+			return
 		}
 		if r.o.DryRun {
 			log.Info("would deregister this orphan's runner and, unless it is busy, terminate it")

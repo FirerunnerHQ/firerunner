@@ -19,9 +19,15 @@ func (f *fakeEC2) put(tags map[string]string, state types.InstanceStateName, lau
 	f.next++
 	i := &fakeInstance{
 		id: fmt.Sprintf("i-%04d", f.next), ip: fmt.Sprintf("10.0.2.%d", f.next),
-		itype: "c7a.large", subnet: "subnet-a", state: state, tags: map[string]string{},
+		itype: "c7a.xlarge", subnet: "subnet-a", state: state, tags: map[string]string{},
 		volumeTags: map[string]string{}, spotTags: map[string]string{}, launched: launched,
+		// As the harness's tier launches them.
+		image: "ami-0abc", rootDevice: "/dev/sda1", groups: []string{"sg-1"},
 	}
+	i.volumes = map[string]string{i.rootDevice: "vol-" + i.id}
+	i.attachedAt = map[string]time.Time{i.rootDevice: launched}
+	i.kept = map[string]bool{}
+	i.tokens, i.hops = types.HttpTokensStateRequired, 1
 	for k, v := range tags {
 		i.tags[k] = v
 		i.volumeTags[k] = v // firerunner tags volumes like their instances
@@ -38,13 +44,24 @@ func (f *fakeEC2) put(tags map[string]string, state types.InstanceStateName, lau
 	return i.id
 }
 
-// signPool tags an instance with the pool MAC c's pool would have given it,
-// from its own owner and tier tags.
+// signPool tags an instance with the pool and disk MACs c's pool would have
+// given it, from its own owner and tier tags and its image and volumes now.
 func (f *fakeEC2) signPool(c *Client, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	i := f.instances[id]
 	i.tags[TagPoolMAC] = c.poolMAC(i.tags[TagOwner], i.tags[TagTier], id)
+	image, root, volumes, _ := diskOf(f.view(i))
+	i.tags[TagPoolDiskMAC] = c.diskMAC(i.tags[TagOwner], i.tags[TagTier], id, image, root, volumes)
+}
+
+// signRunner tags an instance with the runner MAC c would have given it, from
+// its own owner, tier and runner tags.
+func (f *fakeEC2) signRunner(c *Client, id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i := f.instances[id]
+	i.tags[TagRunnerMAC] = c.runnerMAC(i.tags[TagOwner], i.tags[TagTier], i.tags[TagRunner], id)
 }
 
 // githubRunners plays GitHub for the reaper: busy runners refuse removal.
@@ -109,7 +126,8 @@ func TestReaper_RunningOrphanIdleIsDeregisteredAndTerminated(t *testing.T) {
 	f := newFakeEC2(t)
 	id := f.put(job("idle-runner"), types.InstanceStateNameRunning, old, false)
 	g := &githubRunners{}
-	r, _ := reaperFor(f, g, nil)
+	r, c := reaperFor(f, g, nil)
+	f.signRunner(c, id)
 	r.Sweep(context.Background())
 	if !slices.Equal(g.removed, []string{"idle-runner"}) || f.state(id) != types.InstanceStateNameShuttingDown {
 		t.Fatalf("removed %v, state %q", g.removed, f.state(id))
@@ -122,7 +140,8 @@ func TestReaper_RunningOrphanBusyIsLeftUntilItStops(t *testing.T) {
 	f := newFakeEC2(t)
 	id := f.put(job("busy-runner", TagPool, PoolClaimed), types.InstanceStateNameRunning, old, true)
 	g := &githubRunners{busy: map[string]bool{"busy-runner": true}}
-	r, _ := reaperFor(f, g, nil)
+	r, c := reaperFor(f, g, nil)
+	f.signRunner(c, id)
 	rep, _ := r.Sweep(context.Background())
 	if f.state(id) != types.InstanceStateNameRunning || !slices.Equal(rep.Busy, []string{id}) {
 		t.Fatalf("busy orphan: state %q report %+v", f.state(id), rep)
@@ -205,7 +224,8 @@ func TestReaper_MaxLifetimeEndsEvenABusyOrphan(t *testing.T) {
 func TestReaper_LookupFailureLeavesTheOrphan(t *testing.T) {
 	f := newFakeEC2(t)
 	id := f.put(job("r"), types.InstanceStateNameRunning, old, false)
-	r, _ := reaperFor(f, &githubRunners{failing: true}, nil)
+	r, c := reaperFor(f, &githubRunners{failing: true}, nil)
+	f.signRunner(c, id)
 	r.Sweep(context.Background())
 	if f.state(id) != types.InstanceStateNameRunning {
 		t.Fatalf("state %q: terminated without knowing whether it ran a job", f.state(id))
@@ -262,7 +282,8 @@ func TestReaper_DryRunChangesNothing(t *testing.T) {
 	running := f.put(job("b"), types.InstanceStateNameRunning, old, false)
 	gone := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameTerminated, old, true)
 	g := &githubRunners{}
-	r, _ := reaperFor(f, g, func(o *ReaperOptions) { o.DryRun = true })
+	r, c := reaperFor(f, g, func(o *ReaperOptions) { o.DryRun = true })
+	f.signRunner(c, running)
 	rep, _ := r.Sweep(context.Background())
 	if len(rep.Instances) != 2 || len(rep.SpotRequests) != 1 {
 		t.Fatalf("dry-run report %+v, want 2 instances and 1 request", rep)
