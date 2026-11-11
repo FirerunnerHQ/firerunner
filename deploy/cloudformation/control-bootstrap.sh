@@ -233,19 +233,22 @@ fi
 # never suspends. A stack made before the VM's role could read GuardDuty
 # leaves it off; any other error turns it on, and the daemon's own reads say
 # what fails in firerunner doctor.
+# Decided at boot: a detector enabled later counts once the VM is replaced.
 if [ -n "$states" ]; then
-	if out=$(aws guardduty list-detectors --query 'length(DetectorIds)' --output text 2>&1); then
-		if [ "$out" != 0 ]; then
+	gd_err=$(mktemp)
+	if detectors=$(aws guardduty list-detectors --query 'length(DetectorIds)' --output text 2> "$gd_err"); then
+		if [ "$detectors" != 0 ]; then
 			setenv FR_GUARDDUTY true
 		else
-			log "GuardDuty has no detector in $AWS_REGION: no finding flags a tenant; enable it to have them flagged"
+			log "GuardDuty has no detector in $AWS_REGION: no finding flags a tenant; enable it, then replace the VM"
 		fi
-	elif [[ "$out" == *AccessDenied* ]]; then
+	elif grep -q AccessDenied "$gd_err"; then
 		log "cannot read GuardDuty: tenants are not flagged from its findings; update the stack to let the VM read them"
 	else
-		log "listing GuardDuty detectors: $out; reading findings all the same"
+		log "listing GuardDuty detectors: $(cat "$gd_err"); reading findings all the same"
 		setenv FR_GUARDDUTY true
 	fi
+	rm -f "$gd_err"
 fi
 if [ -n "${FR_POOL_KEY_SECRET:-}" ]; then
 	# In a root-only file (umask 077), never the env: firerunner reads it.

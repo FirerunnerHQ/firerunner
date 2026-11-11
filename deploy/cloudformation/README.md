@@ -129,8 +129,10 @@ firerunner tenant clear-flag acme --state ssm:<prefix>/control/tenant-state
 The role reads GuardDuty only: `ListDetectors`, which names no resource, and
 `ListFindings` and `GetFindings` on the account's detectors in the region. A
 stack made before that grant, or a region without a detector, leaves the
-reading off, and the VM's log says which. Set `FR_GUARDDUTY_MIN_SEVERITY` in the
-`env` parameter to flag from another severity.
+reading off, and the VM's log says which. The VM decides at boot: after
+enabling GuardDuty in the region, replace the VM. Set
+`FR_GUARDDUTY_MIN_SEVERITY` in the `env` parameter to flag from another
+severity.
 
 A tier above its vCPU limit is not served to it, with a warning in the log and in
 `firerunner config check`. A job past the runner limit waits, and `firerunner

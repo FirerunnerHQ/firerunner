@@ -48,6 +48,7 @@ guardduty)
 	echo "$*" >> "$STATE/guardduty"
 	[ ! -f "$STATE/gd-denied" ] || { echo "An error occurred (AccessDeniedException) when calling the ListDetectors operation" >&2; exit 254; }
 	[ ! -f "$STATE/gd-throttled" ] || { echo "An error occurred (ThrottlingException) when calling the ListDetectors operation" >&2; exit 254; }
+	[ ! -f "$STATE/gd-warn" ] || echo "WARNING: the CLI says something on stderr" >&2
 	if [ -f "$STATE/gd-none" ]; then echo 0; else echo 1; fi
 	;;
 secretsmanager)
@@ -198,6 +199,10 @@ touch "$STATE/gd-none"
 expect "guardduty no detector: boots" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "guardduty no detector: off" "$(envfile)" bash -c "! grep -q FR_GUARDDUTY '$FR_ROOT/etc/firerunner/firerunner.env'"
 expect "guardduty no detector: says so" "$(cat "$STATE/out")" grep -q "GuardDuty has no detector" "$STATE/out"
+setup
+touch "$STATE/gd-none" "$STATE/gd-warn"
+expect "guardduty no detector, a CLI warning: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "guardduty no detector, a CLI warning: off" "$(envfile)" bash -c "! grep -q FR_GUARDDUTY '$FR_ROOT/etc/firerunner/firerunner.env'"
 setup
 touch "$STATE/gd-denied"
 expect "guardduty denied: boots" "$(cat "$STATE/out" 2>/dev/null)" run
