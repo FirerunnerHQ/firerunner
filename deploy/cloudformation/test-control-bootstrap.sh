@@ -32,6 +32,7 @@ ssm)
 	if [ "$1" = get-parameters-by-path ]; then
 		echo "$*" >> "$STATE/ssm-paths"
 		[ ! -f "$STATE/ssm-path-denied" ] || { echo "An error occurred (AccessDeniedException) when calling the GetParametersByPath operation" >&2; exit 254; }
+		[ ! -f "$STATE/ssm-path-throttled" ] || { echo "An error occurred (ThrottlingException) when calling the GetParametersByPath operation: Rate exceeded" >&2; exit 254; }
 		echo '{"Parameters": []}'
 		exit 0
 	fi
@@ -173,6 +174,11 @@ touch "$STATE/ssm-path-denied"
 expect "tenant state denied: still boots" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "tenant state denied: off" "$(envfile)" bash -c "! grep -q FR_TENANT_STATE '$FR_ROOT/etc/firerunner/firerunner.env'"
 expect "tenant state denied: says to update the stack" "$(cat "$STATE/out")" grep -q "update the stack to let the VM read it" "$STATE/out"
+setup
+touch "$STATE/ssm-path-throttled"
+expect "tenant state throttled: the boot fails" "$(cat "$STATE/out" 2>/dev/null)" bash -c "! PATH='$TMP/bin:$PATH' SYSTEMCTL='$TMP/bin/systemctl' bash '$SCRIPT' '$TMP' > '$STATE/out' 2>&1"
+expect "tenant state throttled: says why" "$(cat "$STATE/out")" grep -q "ThrottlingException" "$STATE/out"
+expect "tenant state throttled: marked unhealthy" "$(cat "$STATE/autoscaling" 2>/dev/null)" grep -q "set-instance-health" "$STATE/autoscaling"
 setup
 expect "no job events: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "no job events: nothing in the env" "$(envfile)" bash -c "! grep -q FR_JOB_EVENTS '$FR_ROOT/etc/firerunner/firerunner.env'"

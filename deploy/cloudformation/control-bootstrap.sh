@@ -211,12 +211,17 @@ if [ -n "$tenants" ]; then
 fi
 # Suspensions live under this path; the daemon reads it every 15 s. A stack
 # made before the VM's role could read it leaves suspension off, rather than
-# a daemon that cannot read whether its tenants are suspended.
+# a daemon that cannot read whether its tenants are suspended. Any other
+# error fails the boot: a VM that dropped the suspensions on a throttled call
+# would serve a suspended tenant.
 state_path="$FR_PREFIX/control/tenant-state"
-if aws ssm get-parameters-by-path --path "$state_path" --max-items 1 > /dev/null 2>&1; then
+if out=$(aws ssm get-parameters-by-path --path "$state_path" --max-items 1 2>&1 > /dev/null); then
 	setenv FR_TENANT_STATE "ssm:$state_path"
-else
+elif [[ "$out" == *AccessDenied* ]]; then
 	log "cannot read $state_path: tenant suspension is off; update the stack to let the VM read it"
+else
+	log "reading $state_path: $out"
+	false
 fi
 if [ -n "${FR_POOL_KEY_SECRET:-}" ]; then
 	# In a root-only file (umask 077), never the env: firerunner reads it.
