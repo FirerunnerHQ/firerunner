@@ -74,6 +74,10 @@ type Record struct {
 	// Invalid says why a stored record could not be read; such a record
 	// holds its tenant, as someone wrote it.
 	Invalid string `json:"-"`
+	// Written is when the store last saw the record written: the SSM
+	// parameter's last modification, or for a file store the file's, which
+	// any tenant's write changes. Zero when the store does not say.
+	Written time.Time `json:"-"`
 }
 
 // Limits are what a tenant's plan lets it run. A limit not set leaves the
@@ -245,13 +249,21 @@ func (f *FileStore) String() string { return f.Path }
 
 // Load reads the file.
 func (f *FileStore) Load(context.Context) (Records, error) {
+	// Stat first: a write between the two then dates newer content older,
+	// never older content newer.
+	var written time.Time
+	if fi, err := os.Stat(f.Path); err == nil {
+		written = fi.ModTime()
+	}
 	raw, err := f.raw()
 	if err != nil {
 		return nil, err
 	}
 	rs := Records{}
 	for id, m := range raw {
-		rs[id] = decode(m)
+		r := decode(m)
+		r.Written = written
+		rs[id] = r
 	}
 	return rs, nil
 }
@@ -324,7 +336,9 @@ func (s *SSMStore) Load(ctx context.Context) (Records, error) {
 			return nil, err
 		}
 		for _, prm := range page.Parameters {
-			rs[strings.TrimPrefix(aws.ToString(prm.Name), s.Path+"/")] = decode([]byte(aws.ToString(prm.Value)))
+			r := decode([]byte(aws.ToString(prm.Value)))
+			r.Written = aws.ToTime(prm.LastModifiedDate)
+			rs[strings.TrimPrefix(aws.ToString(prm.Name), s.Path+"/")] = r
 		}
 	}
 	return rs, nil

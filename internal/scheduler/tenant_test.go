@@ -382,6 +382,36 @@ func TestTenantPlanLeavingATierOutWakes(t *testing.T) {
 	s[1].Drain()
 }
 
+// Each hold says what kind it is, beside its reason, for the counts of held
+// jobs by kind.
+func TestHoldKinds(t *testing.T) {
+	ctx, ten, prov, s, _ := tenantLab(t, 1)
+	kind := func() HoldKind { _, h := s[0].Holding(); return h.Kind }
+	s[0].Reconcile(ctx, 2)
+	a := prov.next(t)
+	if k := kind(); k != HoldLimit {
+		t.Fatalf("at its own limit: %q", k)
+	}
+	ten.SetPlan(Plan{Runners: 1})
+	ten.SetMax(2)
+	waitUntil(t, "plan_limit", func() bool { return kind() == HoldPlanLimit })
+	ten.SetPlan(Plan{Runners: 1, Tiers: []string{"b"}})
+	waitUntil(t, "plan_tier", func() bool { return kind() == HoldPlanTier })
+	ten.Hold("billing")
+	s[0].Reconcile(ctx, 2)
+	if k := kind(); k != HoldHeld {
+		t.Fatalf("held: %q", k)
+	}
+	ten.Suspend("abuse")
+	s[0].Reconcile(ctx, 2)
+	if k := kind(); k != HoldSuspended {
+		t.Fatalf("suspended: %q", k)
+	}
+	prov.finish(a)
+	s[0].Drain()
+	s[1].Drain()
+}
+
 func TestTenantSetMax(t *testing.T) {
 	ctx, ten, prov, s, hs := tenantLab(t, 1)
 	s[0].Reconcile(ctx, 3)

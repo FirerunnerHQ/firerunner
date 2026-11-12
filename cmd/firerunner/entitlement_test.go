@@ -73,7 +73,8 @@ func TestEntitlementsHoldAndReleaseAServedTenant(t *testing.T) {
 	s.entitlementHealth(&f)
 	open := false
 	for _, ht := range f.Tenants {
-		open = open || (ht.ID == "acme" && ht.Entitlement != nil && ht.Entitlement.FailOpen)
+		open = open || (ht.ID == "acme" && ht.Entitlement != nil && ht.Entitlement.FailOpen &&
+			ht.Entitlement.FailOpens == 1 && !ht.Entitlement.FailOpenSince.IsZero() && !ht.Entitlement.WrittenAt.IsZero())
 		if ht.ID == "" && ht.Entitlement != nil {
 			t.Fatalf("the install has an entitlement: %+v", ht.Entitlement)
 		}

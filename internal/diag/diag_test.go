@@ -755,8 +755,9 @@ func TestStatusShowsTenantLimitsAndHolds(t *testing.T) {
 	now := time.Now()
 	f := health.File{PID: 1, WrittenAt: now,
 		Tiers: []health.Tier{{Name: "acme/small", State: health.Connected, Since: now,
-			Held:    &health.Held{Jobs: 2, Reason: `tenant "acme" is at its limit of 2 runner(s) at once`, Since: now.Add(-time.Minute)},
-			Stopped: map[string]int{"job_duration": 1}}},
+			Held:     &health.Held{Jobs: 2, Reason: `tenant "acme" is at its limit of 2 runner(s) at once`, Since: now.Add(-time.Minute)},
+			Stopped:  map[string]int{"job_duration": 1},
+			HeldJobs: map[string]int{"limit": 3, "plan_tier": 1}}},
 		Tenants: []health.Tenant{
 			{ID: "", Limits: health.Limits{JobDuration: "0s"}},
 			{ID: "acme", Running: 2, Limits: health.Limits{Runners: 2, VCPU: 2, JobDuration: "30m0s"},
@@ -775,6 +776,7 @@ func TestStatusShowsTenantLimitsAndHolds(t *testing.T) {
 	for _, want := range []string{
 		`acme/small HELD: 2 job(s) waiting for 1m0s: tenant "acme" is at its limit of 2 runner(s) at once`,
 		"acme/small runners ended at the job limit: 1",
+		"acme/small jobs held since start, by what held them: limit 3, plan_tier 1",
 		"tenants:", "TENANT", "(install)", "acme       2        2            2         30m0s",
 		`acme not served tier "big": 4 vCPU is above the limit of 2`,
 		"tiny NOT SERVED: none of its tiers is within its limits",

@@ -55,9 +55,10 @@ type Config struct {
 	// Events, if set, is told of each job's assignment, start and end.
 	Events jobevent.Sink
 	// Held, if set, says how many of the tier's wanted runners its tenant
-	// holds back, and why, as of the plan a message just made. That many of
-	// the message's newest assigned jobs are logged and recorded as held.
-	Held func() (jobs int, reason string)
+	// holds back, of what kind and why, as of the plan a message just made.
+	// That many of the message's newest assigned jobs are logged and
+	// recorded as held, and counted by kind in the tier's health.
+	Held func() (jobs int, kind, reason string)
 	// Pending, if set, keeps the tier's assigned-but-not-started jobs, read
 	// from each message before the library acts on it.
 	Pending *assigned.Jobs
@@ -388,6 +389,7 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		onBusy:       onBusy,
 		onCompleted:  onCompleted,
 		held:         s.cfg.Held,
+		health:       s.cfg.Health,
 		events:       s.cfg.Events,
 		tier:         s.cfg.Name,
 		maxRunners:   s.cfg.MaxRunners,
@@ -668,7 +670,8 @@ type scaler struct {
 	onDesired    DesiredFunc
 	onBusy       BusyFunc
 	onCompleted  CompletedFunc
-	held         func() (int, string)
+	held         func() (int, string, string)
+	health       *health.Tracker
 	events       jobevent.Sink
 	tier         string
 	capacity     CapacityFunc
@@ -756,7 +759,7 @@ func (a *scaler) recordHeld(assigned []*scaleset.JobAssigned) {
 	if a.held == nil || len(assigned) == 0 {
 		return
 	}
-	n, why := a.held()
+	n, kind, why := a.held()
 	if n <= 0 || why == "" {
 		return
 	}
@@ -767,7 +770,10 @@ func (a *scaler) recordHeld(assigned []*scaleset.JobAssigned) {
 		}
 	}
 	for _, j := range jobs[max(0, len(jobs)-n):] {
-		a.log.Info("job held", "jobId", j.JobID, "repository", j.OwnerName+"/"+j.RepositoryName, "reason", why)
+		a.log.Info("job held", "jobId", j.JobID, "repository", j.OwnerName+"/"+j.RepositoryName, "kind", kind, "reason", why)
+		if a.health != nil {
+			a.health.HeldJob(kind)
+		}
 		e := jobEvent(jobevent.Held, a.tier, j.JobMessageBase)
 		e.Reason = why
 		jobevent.Record(a.events, e)

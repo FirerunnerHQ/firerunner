@@ -60,10 +60,12 @@ type entitlementReport struct {
 }
 
 type entitlementEntry struct {
-	ID       string              `json:"id"`
-	Record   entitlement.Record  `json:"record"`
-	Invalid  string              `json:"invalid,omitempty"`
-	Decision entitlementDecision `json:"decision"`
+	ID      string             `json:"id"`
+	Record  entitlement.Record `json:"record"`
+	Invalid string             `json:"invalid,omitempty"`
+	// WrittenAt is when the store last saw the record written.
+	WrittenAt time.Time           `json:"written_at,omitzero"`
+	Decision  entitlementDecision `json:"decision"`
 }
 
 type entitlementDecision struct {
@@ -224,7 +226,7 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 		}
 		for _, id := range rs.IDs() {
 			rec := rs[id]
-			rep.Records = append(rep.Records, entitlementEntry{ID: id, Record: rec, Invalid: rec.Invalid, Decision: decisionOf(entitlement.Decide(rec, true, now))})
+			rep.Records = append(rep.Records, entitlementEntry{ID: id, Record: rec, Invalid: rec.Invalid, WrittenAt: rec.Written, Decision: decisionOf(entitlement.Decide(rec, true, now))})
 		}
 	}
 	if asJSON {

@@ -125,6 +125,73 @@ func mustJSON(t *testing.T, r Record) string {
 	return string(b)
 }
 
+// A tenant launching on an expired record is noted from the read that finds
+// it so, until a read finds it renewed, and each time it begins is counted.
+// The store's write time comes with each record.
+func TestWatcherCountsFailOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "entitlements.json")
+	fs := &FileStore{Path: path}
+	put := func(r Record) {
+		t.Helper()
+		if err := fs.Put(context.Background(), "acme", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(Record{Account: Active, Budget: OK, ValidUntil: valid})
+	clock := now
+	w := &Watcher{Store: fs, now: func() time.Time { return clock }}
+	read := func() FailOpen {
+		t.Helper()
+		if err := w.Read(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return w.FailOpen("acme")
+	}
+	if f := read(); f.Count != 0 || !f.Since.IsZero() {
+		t.Fatalf("valid: %+v", f)
+	}
+	if r, _, _ := w.Decide("acme"); r.Written.IsZero() {
+		t.Fatal("the file's write time did not come with the record")
+	}
+	clock = valid.Add(time.Minute)
+	expiredAt := clock
+	if f := read(); f.Count != 1 || !f.Since.Equal(expiredAt) {
+		t.Fatalf("expired, active: %+v; want 1 since %v", f, expiredAt)
+	}
+	clock = clock.Add(time.Minute)
+	if f := read(); f.Count != 1 || !f.Since.Equal(expiredAt) {
+		t.Fatalf("still expired: %+v; want the same episode", f)
+	}
+	put(Record{Account: Active, Budget: OK, ValidUntil: clock.Add(time.Hour)})
+	if f := read(); f.Count != 1 || !f.Since.IsZero() {
+		t.Fatalf("renewed: %+v", f)
+	}
+	clock = clock.Add(2 * time.Hour)
+	if f := read(); f.Count != 2 || !f.Since.Equal(clock) {
+		t.Fatalf("expired again: %+v; want the second time", f)
+	}
+	// With the store down, an expiry by the clock alone still begins one.
+	put(Record{Account: Active, Budget: OK, ValidUntil: clock.Add(time.Hour)})
+	if f := read(); !f.Since.IsZero() {
+		t.Fatalf("renewed again: %+v", f)
+	}
+	w.Store = &failingStore{Store: fs, err: errors.New("throttled")}
+	clock = clock.Add(2 * time.Hour)
+	if err := w.Read(context.Background()); err == nil {
+		t.Fatal("a failed read reported no error")
+	}
+	if f := w.FailOpen("acme"); f.Count != 3 || !f.Since.Equal(clock) {
+		t.Fatalf("expired with the store down: %+v; want the third time", f)
+	}
+	w.Store = fs
+	if err := fs.Delete(context.Background(), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if f := read(); f.Count != 3 || !f.Since.IsZero() {
+		t.Fatalf("record gone: %+v; want it no longer launching, counted", f)
+	}
+}
+
 type failingStore struct {
 	Store
 	err error
@@ -166,6 +233,9 @@ func TestWatcherKeepsRecordsAndDecidesByTheClock(t *testing.T) {
 	}
 	if _, ok, d := w.Decide("acme"); !ok || !d.Hold {
 		t.Fatalf("expired trial with the store down: ok %v, %+v; want the kept record, held", ok, d)
+	}
+	if f := w.FailOpen("acme"); f.Count != 0 || !f.Since.IsZero() {
+		t.Fatalf("a held trial launches on nothing: %+v", f)
 	}
 	if st := w.Status(); !st.Known || st.LastError == "" {
 		t.Fatalf("status %+v", st)
