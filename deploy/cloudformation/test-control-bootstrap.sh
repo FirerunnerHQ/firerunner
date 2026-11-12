@@ -166,11 +166,13 @@ expect "job events: a shell-hostile password still boots" "$(cat "$STATE/out" 2>
 expect "job events: env names the file" "$(envfile)" grep -qx "FR_JOB_EVENTS_DSN_FILE=$FR_ROOT/etc/firerunner/job-events-dsn" <(envfile)
 expect "job events: the URL is not in the env file" "$(envfile)" bash -c "! grep -q 'postgres://' '$FR_ROOT/etc/firerunner/firerunner.env'"
 expect "job events: the file holds it unchanged" "" grep -qxF "postgres://u:p(w'\$x@db/fr" "$FR_ROOT/etc/firerunner/job-events-dsn"
+# The daemon reads the tenants from their parameter itself, whether or not
+# it exists yet: one added later needs no new VM.
 setup
 echo '[{"id":"t1"}]' > "$STATE/ssm/tenants"
 expect "tenants: boots" "$(cat "$STATE/out" 2>/dev/null)" run
-expect "tenants: env names the file" "$(envfile)" grep -qx "FR_TENANTS=$FR_ROOT/etc/firerunner/tenants.json" <(envfile)
-expect "tenants: the file holds them" "" grep -qxF '[{"id":"t1"}]' "$FR_ROOT/etc/firerunner/tenants.json"
+expect "tenants: env names the parameter" "$(envfile)" grep -qx "FR_TENANTS=ssm:/fr/control/tenants" <(envfile)
+expect "tenants: no copy on disk" "" test ! -e "$FR_ROOT/etc/firerunner/tenants.json"
 # Tenant suspensions: the daemon reads them from SSM when the role can, and
 # a stack whose role cannot leaves them off, with a hint, and still boots.
 setup
@@ -220,7 +222,7 @@ expect "guardduty without states: not asked" "" test ! -f "$STATE/guardduty"
 setup
 expect "no job events: succeeds" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "no job events: nothing in the env" "$(envfile)" bash -c "! grep -q FR_JOB_EVENTS '$FR_ROOT/etc/firerunner/firerunner.env'"
-expect "no tenants: nothing in the env" "$(envfile)" bash -c "! grep -q FR_TENANTS '$FR_ROOT/etc/firerunner/firerunner.env'"
+expect "no tenants yet: the env names the parameter" "$(envfile)" grep -qx "FR_TENANTS=ssm:/fr/control/tenants" <(envfile)
 
 # The pool key: fetched from its secret into a root-only file the env names,
 # never into the env itself, nor the log.
