@@ -109,6 +109,28 @@ type Tenant struct {
 	// Flag is set while GuardDuty findings have flagged it for review
 	// (--guardduty). It does not suspend.
 	Flag *Flag `json:"flag,omitempty"`
+	// Entitlement is what billing last said it may run, and what that
+	// allows now (--entitlements); nil for the install, or when off.
+	Entitlement *Entitlement `json:"entitlement,omitempty"`
+}
+
+// Entitlement is a tenant's entitlement record, as last read, and the
+// decision on it now.
+type Entitlement struct {
+	// None: the store holds no record for the tenant (it is held).
+	None       bool      `json:"none,omitempty"`
+	Plan       string    `json:"plan,omitempty"`
+	Account    string    `json:"account_state,omitempty"`
+	Budget     string    `json:"budget_state,omitempty"`
+	ValidUntil time.Time `json:"valid_until,omitzero"`
+	// Held: its launches wait, for Why.
+	Held bool `json:"held,omitempty"`
+	// FailOpen: the record has expired, and it launches on its last
+	// state, an active account.
+	FailOpen bool `json:"fail_open,omitempty"`
+	// Warning: its budget is near its cap.
+	Warning bool   `json:"warning,omitempty"`
+	Why     string `json:"why,omitempty"`
 }
 
 // Flag is a tenant's flag for review: what the latest GuardDuty finding on
@@ -432,6 +454,9 @@ type File struct {
 	// GuardDuty is how reading GuardDuty findings goes, when the daemon
 	// reads them.
 	GuardDuty *GuardDuty `json:"guardduty,omitempty"`
+	// Entitlements is how reading the tenants' entitlements goes, when the
+	// daemon reads them.
+	Entitlements *TenantStates `json:"entitlements,omitempty"`
 }
 
 // ConnRefusals is a listener's connections refused at its connection caps.
