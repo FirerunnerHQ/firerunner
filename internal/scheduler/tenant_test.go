@@ -29,8 +29,8 @@ func (h *holds) get() (int, string, int) {
 	return h.jobs, h.why, h.n
 }
 
-// tenantLab is two tiers of one tenant, each allowed 4 runners, sharing a
-// tenant bound of limit.
+// tenantLab is two tiers of one tenant, "a" and "b", each allowed 4 runners,
+// sharing a tenant bound of limit.
 func tenantLab(t *testing.T, limit int) (context.Context, *Tenant, *jobProv, [2]*Scheduler, [2]*holds) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -42,7 +42,7 @@ func tenantLab(t *testing.T, limit int) (context.Context, *Tenant, *jobProv, [2]
 	var hs [2]*holds
 	for i := range scheds {
 		hs[i] = &holds{}
-		scheds[i] = New(Options{Max: 4, Provisioner: prov, JIT: jit, Logger: testLogger(), Tenant: ten, OnHold: hs[i].record})
+		scheds[i] = New(Options{Max: 4, Provisioner: prov, JIT: jit, Logger: testLogger(), Tenant: ten, Tier: string(rune('a' + i)), OnHold: hs[i].record})
 	}
 	return ctx, ten, prov, scheds, hs
 }
@@ -247,6 +247,141 @@ func TestTenantWithoutLimitHoldsNothing(t *testing.T) {
 // A raised bound launches for the jobs held at the old one at once, without
 // waiting for a runner to end or another message; a lowered one stops
 // nothing, and holds launches until enough runners have ended.
+// A plan's runner limit narrows the tenant's own, and stops nothing; lifting
+// it launches for the jobs that waited.
+func TestTenantPlanRunners(t *testing.T) {
+	ctx, ten, prov, s, hs := tenantLab(t, 3)
+	if !ten.SetPlan(Plan{Runners: 1}) || ten.Max() != 1 {
+		t.Fatalf("plan of 1: max %d", ten.Max())
+	}
+	if ten.SetPlan(Plan{Runners: 1}) {
+		t.Fatal("the same plan again reported a change")
+	}
+	s[0].Reconcile(ctx, 3)
+	a := prov.next(t)
+	prov.noMore(t)
+	if jobs, why, _ := hs[0].get(); jobs != 2 || !strings.Contains(why, `tenant "acme" is at its plan's limit of 1 runner(s)`) {
+		t.Fatalf("held %d (%q), want 2 at the plan's limit", jobs, why)
+	}
+
+	// A plan wider than the tenant's own bound: the tenant's holds.
+	ten.SetPlan(Plan{Runners: 5})
+	b, c := prov.next(t), prov.next(t)
+	if ten.Max() != 3 {
+		t.Fatalf("max %d, want the tenant's own 3", ten.Max())
+	}
+	waitUntil(t, "nothing held", func() bool { j, _, _ := hs[0].get(); return j == 0 })
+
+	// Lowered below what runs: nothing stops.
+	ten.SetPlan(Plan{Runners: 1})
+	if got := s[0].Running(); got != 3 {
+		t.Fatalf("running %d after the plan lowered the bound, want 3", got)
+	}
+	ten.SetMax(0)
+	if ten.Max() != 1 {
+		t.Fatalf("max %d with no bound of its own, want the plan's 1", ten.Max())
+	}
+	for _, n := range []string{a, b, c} {
+		prov.finish(n)
+	}
+	s[0].Drain()
+	s[1].Drain()
+}
+
+// A plan that leaves a tier out holds that tier's jobs, with the reason, and
+// never lets them stand ahead of a tier it includes; including it again
+// launches them.
+func TestTenantPlanTiers(t *testing.T) {
+	ctx, ten, prov, s, hs := tenantLab(t, 1)
+	ten.SetPlan(Plan{Tiers: []string{"a"}})
+	s[1].Reconcile(ctx, 1)
+	prov.noMore(t)
+	if jobs, why, _ := hs[1].get(); jobs != 1 || !strings.Contains(why, `tenant "acme"'s plan does not include tier "b"`) {
+		t.Fatalf("tier b holds %d (%q), want 1 with the reason", jobs, why)
+	}
+	s[0].Reconcile(ctx, 1)
+	a := prov.next(t)
+	if ten.SetPlan(Plan{Tiers: []string{"a"}}) {
+		t.Fatal("the same tiers again reported a change")
+	}
+
+	// Included again: b waits at the limit, then launches when a ends.
+	if !ten.SetPlan(Plan{}) {
+		t.Fatal("lifting the tiers reported no change")
+	}
+	waitUntil(t, "b held at the limit", func() bool {
+		_, why, _ := hs[1].get()
+		return strings.Contains(why, "limit of 1 runner(s)")
+	})
+	message(ctx, s[0], 0, a)
+	prov.finish(a)
+	b := prov.next(t)
+	prov.finish(b)
+	s[0].Drain()
+	s[1].Drain()
+}
+
+// Including a tier wakes the tenant's schedulers even with no runner limit,
+// as no runner ends to do it.
+func TestTenantPlanTiersWithoutALimit(t *testing.T) {
+	ctx, ten, prov, s, hs := tenantLab(t, 0)
+	// No tier at all is a plan, not the absence of one.
+	if !ten.SetPlan(Plan{Tiers: []string{}}) || ten.Plan().Tiers == nil {
+		t.Fatalf("a plan of no tiers: %+v", ten.Plan())
+	}
+	s[0].Reconcile(ctx, 1)
+	if jobs, why, _ := hs[0].get(); jobs != 1 || !strings.Contains(why, `does not include tier "a"`) {
+		t.Fatalf("tier a holds %d (%q), want 1", jobs, why)
+	}
+	ten.SetPlan(Plan{Tiers: []string{"b", "a"}})
+	if got := ten.Plan().Tiers; !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("plan tiers %v", got)
+	}
+	a := prov.next(t)
+	prov.finish(a)
+	s[0].Drain()
+	s[1].Drain()
+}
+
+// With no bound of its own, a plan's limit still frees a place for another
+// tier when a runner ends.
+func TestTenantPlanLimitWakesOtherTiers(t *testing.T) {
+	ctx, ten, prov, s, hs := tenantLab(t, 0)
+	ten.SetPlan(Plan{Runners: 1})
+	s[0].Reconcile(ctx, 1)
+	a := prov.next(t)
+	s[1].Reconcile(ctx, 1)
+	if jobs, why, _ := hs[1].get(); jobs != 1 || !strings.Contains(why, "plan's limit of 1") {
+		t.Fatalf("tier b holds %d (%q), want 1 at the plan's limit", jobs, why)
+	}
+	message(ctx, s[0], 0, a)
+	prov.finish(a)
+	b := prov.next(t)
+	prov.finish(b)
+	s[0].Drain()
+	s[1].Drain()
+}
+
+// Leaving a tier out wakes the tenant's schedulers: the tier left out says
+// why its jobs wait now, rather than the limit it waited for before.
+func TestTenantPlanLeavingATierOutWakes(t *testing.T) {
+	ctx, ten, prov, s, hs := tenantLab(t, 1)
+	s[1].Reconcile(ctx, 2)
+	b := prov.next(t)
+	if jobs, why, _ := hs[1].get(); jobs != 1 || !strings.Contains(why, "limit of 1") {
+		t.Fatalf("tier b holds %d (%q), want 1 at the limit", jobs, why)
+	}
+	ten.SetPlan(Plan{Tiers: []string{"a"}})
+	waitUntil(t, "b's new reason", func() bool {
+		_, why, _ := hs[1].get()
+		return strings.Contains(why, `does not include tier "b"`)
+	})
+	prov.noMore(t)
+	prov.finish(b)
+	s[0].Drain()
+	s[1].Drain()
+}
+
 func TestTenantSetMax(t *testing.T) {
 	ctx, ten, prov, s, hs := tenantLab(t, 1)
 	s[0].Reconcile(ctx, 3)

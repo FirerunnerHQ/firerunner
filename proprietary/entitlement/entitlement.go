@@ -8,6 +8,11 @@
 // tenant's launches when Decide says so: a held job stays queued at GitHub
 // with its reason recorded, and starts once a record lets it.
 //
+// A record can also carry its plan's limits: fewer runners at once than the
+// tenants list gives the tenant, or only some of its tiers. The narrower of
+// the two holds; the daemon applies a change while the tenant runs, and
+// stops no runner for it.
+//
 // A record past its valid-until is judged by the account it last named,
 // because the operator pays for the compute while billing cannot be reached:
 // an active account goes on launching (fail open, as a stalled CI is worse
@@ -64,13 +69,44 @@ type Record struct {
 	// Reason is billing's words for a hold, shown with it ("the spend cap
 	// for November is reached").
 	Reason string `json:"reason,omitempty"`
+	// Limits are the plan's, when it has any.
+	Limits *Limits `json:"limits,omitempty"`
 	// Invalid says why a stored record could not be read; such a record
 	// holds its tenant, as someone wrote it.
 	Invalid string `json:"-"`
 }
 
+// Limits are what a tenant's plan lets it run. A limit not set leaves the
+// tenants list's in force.
+type Limits struct {
+	// MaxRunners, when positive, bounds its runners at once across its
+	// tiers; the narrower of this and its max_runners in the tenants list
+	// holds.
+	MaxRunners int `json:"max_runners,omitempty"`
+	// Tiers, when set, is the only tiers of its own it launches on; a job on
+	// another waits at GitHub with the reason. Omitted, every tier it is
+	// served launches.
+	Tiers []string `json:"tiers,omitempty"`
+}
+
+// Validate reports whether l can be applied.
+func (l Limits) Validate() error {
+	if l.MaxRunners < 0 {
+		return fmt.Errorf("limits.max_runners %d: want 0 (none) or more", l.MaxRunners)
+	}
+	if l.Tiers != nil && len(l.Tiers) == 0 {
+		return errors.New("limits.tiers is empty: omit it for every tier, or hold the tenant")
+	}
+	for _, t := range l.Tiers {
+		if t == "" {
+			return errors.New("limits.tiers names an empty tier")
+		}
+	}
+	return nil
+}
+
 // Validate reports whether r names a known account and budget and a time it
-// holds until.
+// holds until, and limits that can be applied.
 func (r Record) Validate() error {
 	switch r.Account {
 	case Trial, Active, PastDue, Suspended:
@@ -85,7 +121,18 @@ func (r Record) Validate() error {
 	if r.ValidUntil.IsZero() {
 		return errors.New("valid_until is required")
 	}
+	if r.Limits != nil {
+		return r.Limits.Validate()
+	}
 	return nil
+}
+
+// PlanLimits returns the record's limits, none when it carries none.
+func (r Record) PlanLimits() Limits {
+	if r.Limits == nil {
+		return Limits{}
+	}
+	return *r.Limits
 }
 
 // Records are the entitlements, by tenant id.

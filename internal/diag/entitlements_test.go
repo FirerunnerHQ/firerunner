@@ -26,7 +26,7 @@ func TestStatusAndDoctorShowEntitlements(t *testing.T) {
 			{ID: "acme", Limits: health.Limits{JobDuration: "0s"}, State: "held", Reason: `tenant "acme" is held: its spend cap is reached`,
 				Entitlement: &health.Entitlement{Plan: "team", Account: "active", Budget: "capped", ValidUntil: until, Held: true, Why: "its spend cap is reached"}},
 			{ID: "beta", Limits: health.Limits{JobDuration: "0s"},
-				Entitlement: &health.Entitlement{Account: "trial", Budget: "warning", ValidUntil: until, Warning: true}},
+				Entitlement: &health.Entitlement{Account: "trial", Budget: "warning", ValidUntil: until, MaxRunners: 2, Tiers: []string{"small"}, Warning: true}},
 		},
 		Entitlements: &health.TenantStates{Store: "ssm:/fr/control/entitlements", LastRead: now}}
 	write := func() {
@@ -42,7 +42,7 @@ func TestStatusAndDoctorShowEntitlements(t *testing.T) {
 	}
 	for _, want := range []string{
 		"acme entitlement: plan team, account active, budget capped, valid until " + until.Format(time.RFC3339) + "; HELD: its spend cap is reached",
-		"beta entitlement: account trial, budget warning, valid until " + until.Format(time.RFC3339) + "; near its spend cap",
+		"beta entitlement: account trial, budget warning, valid until " + until.Format(time.RFC3339) + ", plan's limit 2 runner(s), plan's tiers small; near its spend cap",
 	} {
 		if !strings.Contains(text.String(), want) {
 			t.Errorf("status missing %q\n%s", want, text.String())

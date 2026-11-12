@@ -125,6 +125,10 @@ type Entitlement struct {
 	Account    string    `json:"account_state,omitempty"`
 	Budget     string    `json:"budget_state,omitempty"`
 	ValidUntil time.Time `json:"valid_until,omitzero"`
+	// MaxRunners and Tiers are its plan's limits, when it has any: the
+	// tenant's Limits.Runners is the narrower bound in force.
+	MaxRunners int      `json:"max_runners,omitempty"`
+	Tiers      []string `json:"tiers,omitempty"`
 	// Held: its launches wait, for Why.
 	Held bool `json:"held,omitempty"`
 	// FailOpen: the record has expired, and it launches on its last

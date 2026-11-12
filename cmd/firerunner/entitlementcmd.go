@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 const entitlementUsage = `usage:
   firerunner entitlement set ID --account STATE --budget STATE
       [--plan NAME] [--reason TEXT] [--valid-for DURATION]
+      [--max-runners N] [--tiers NAME,...]
       [--store SPEC] [--env-file FILE|none] [--json]
       write what tenant ID may run, as billing would
   firerunner entitlement clear ID [--store SPEC] [--env-file FILE|none] [--json]
@@ -25,7 +28,12 @@ const entitlementUsage = `usage:
 Billing writes these records; this command is for operators and tests. ID is
 a tenant's id in the --tenants catalog (the install is never held). --account
 is trial, active, past_due or suspended; --budget is ok, warning or capped;
---valid-for defaults to 24h. A daemon reads the records every 30 seconds:
+--valid-for defaults to 24h. --max-runners and --tiers are the plan's
+limits: at most N runners at once across its tiers (the narrower of this and
+its max_runners in the tenants list holds), and only the tiers named launch;
+jobs on the others wait. Lowering them stops no runner (an idle warm runner
+on a tier left out takes one more job, and is not replaced). A daemon reads the
+records every 30 seconds:
 
   - no record, a suspended account, or a capped budget: the tenant's launches
     are held and its jobs wait at GitHub with the reason; running jobs go on;
@@ -112,7 +120,7 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 			}
 			asJSON = true
 			continue
-		case "--store", "--account", "--budget", "--plan", "--reason", "--valid-for":
+		case "--store", "--account", "--budget", "--plan", "--reason", "--valid-for", "--max-runners", "--tiers":
 			if !hasVal {
 				if i+1 >= len(rest) {
 					return usageErr("%s needs a value", name)
@@ -136,6 +144,18 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 				if validFor, err = time.ParseDuration(val); err != nil || validFor <= 0 {
 					return usageErr("--valid-for %q: give a duration such as 24h", val)
 				}
+			case "--max-runners":
+				n, err := strconv.Atoi(val)
+				if err != nil || n < 1 {
+					return usageErr("--max-runners %q: give a number of runners, 1 or more", val)
+				}
+				limits(&r).MaxRunners = n
+			case "--tiers":
+				tiers := strings.Split(val, ",")
+				if slices.Contains(tiers, "") {
+					return usageErr("--tiers %q: name the tiers, separated by commas", val)
+				}
+				limits(&r).Tiers = tiers
 			}
 			continue
 		}
@@ -144,7 +164,7 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 		}
 		ids = append(ids, arg)
 	}
-	for _, f := range []string{"--account", "--budget", "--plan", "--reason", "--valid-for"} {
+	for _, f := range []string{"--account", "--budget", "--plan", "--reason", "--valid-for", "--max-runners", "--tiers"} {
 		if set[f] && action != "set" {
 			return usageErr("%s is for set", f)
 		}
@@ -217,8 +237,8 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 		if rep.Decision.Held {
 			state = "is held: " + rep.Decision.Why
 		}
-		fmt.Fprintf(stdout, "set %s in %s: account %s, budget %s, valid until %s; it %s\nA running daemon applies it within %s.\n",
-			rep.ID, rep.Store, r.Account, r.Budget, r.ValidUntil.Format(time.RFC3339), state, entitlement.DefaultInterval)
+		fmt.Fprintf(stdout, "set %s in %s: account %s, budget %s%s, valid until %s; it %s\nA running daemon applies it within %s.\n",
+			rep.ID, rep.Store, r.Account, r.Budget, limitsText(r.PlanLimits()), r.ValidUntil.Format(time.RFC3339), state, entitlement.DefaultInterval)
 	case "clear":
 		fmt.Fprintf(stdout, "cleared %s's record in %s; with none, a running daemon holds its launches within %s.\n", rep.ID, rep.Store, entitlement.DefaultInterval)
 	case "list":
@@ -239,10 +259,30 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 			case e.Decision.Warning:
 				state = "launches, near its spend cap"
 			}
-			fmt.Fprintf(stdout, "%s\taccount %s\tbudget %s\tvalid until %s\t%s\n", e.ID, e.Record.Account, e.Record.Budget, e.Record.ValidUntil.Format(time.RFC3339), state)
+			fmt.Fprintf(stdout, "%s\taccount %s\tbudget %s%s\tvalid until %s\t%s\n", e.ID, e.Record.Account, e.Record.Budget, limitsText(e.Record.PlanLimits()), e.Record.ValidUntil.Format(time.RFC3339), state)
 		}
 	}
 	return 0
+}
+
+// limits returns r's limits, set to none first if it has none.
+func limits(r *entitlement.Record) *entitlement.Limits {
+	if r.Limits == nil {
+		r.Limits = &entitlement.Limits{}
+	}
+	return r.Limits
+}
+
+// limitsText says what a plan's limits are, after a record's budget.
+func limitsText(l entitlement.Limits) string {
+	s := ""
+	if l.MaxRunners > 0 {
+		s += fmt.Sprintf(", at most %d runner(s)", l.MaxRunners)
+	}
+	if l.Tiers != nil {
+		s += ", tiers " + strings.Join(l.Tiers, ",")
+	}
+	return s
 }
 
 // openEntitlements opens a store, with an SSM client from this shell's AWS

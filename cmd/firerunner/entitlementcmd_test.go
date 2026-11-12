@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -33,8 +34,13 @@ func TestEntitlementCommand(t *testing.T) {
 	if err != nil || rs["acme"].Budget != entitlement.Capped || rs["acme"].ValidUntil.IsZero() {
 		t.Fatalf("stored %+v, %v", rs, err)
 	}
-	if code, _, errOut := runEntitlement(t, "set", "beta", "--account", "trial", "--budget", "ok", "--valid-for", "1h", "--store", path, "--env-file", "none"); code != 0 {
-		t.Fatalf("set beta: %s", errOut)
+	code, out, errOut = runEntitlement(t, "set", "beta", "--account", "trial", "--budget", "ok", "--valid-for", "1h", "--max-runners", "2", "--tiers", "small,medium", "--store", path, "--env-file", "none")
+	if code != 0 || !strings.Contains(out, "budget ok, at most 2 runner(s), tiers small,medium") {
+		t.Fatalf("set beta: exit %d\n%s%s", code, out, errOut)
+	}
+	if rs, _ := (&entitlement.FileStore{Path: path}).Load(context.Background()); rs["beta"].Limits == nil ||
+		rs["beta"].Limits.MaxRunners != 2 || !slices.Equal(rs["beta"].Limits.Tiers, []string{"small", "medium"}) {
+		t.Fatalf("stored beta %+v", rs["beta"])
 	}
 	code, out, _ = runEntitlement(t, "list", "--store", path, "--env-file", "none", "--json")
 	var r entitlementReport
@@ -57,16 +63,20 @@ func TestEntitlementCommandUsage(t *testing.T) {
 	clearFREnv(t)
 	path := filepath.Join(t.TempDir(), "entitlements.json")
 	for name, args := range map[string][]string{
-		"bad account":      {"set", "acme", "--account", "paid", "--budget", "ok"},
-		"no budget":        {"set", "acme", "--account", "active"},
-		"the install":      {"set", "_install", "--account", "active", "--budget", "ok"},
-		"two ids":          {"clear", "a", "b"},
-		"list with an id":  {"list", "acme"},
-		"budget for clear": {"clear", "acme", "--budget", "ok"},
-		"zero validity":    {"set", "acme", "--account", "active", "--budget", "ok", "--valid-for", "0s"},
-		"unknown action":   {"grant", "acme"},
-		"unknown flag":     {"list", "--all"},
-		"relative store":   {"list", "--store", "entitlements.json"},
+		"bad account":          {"set", "acme", "--account", "paid", "--budget", "ok"},
+		"no budget":            {"set", "acme", "--account", "active"},
+		"the install":          {"set", "_install", "--account", "active", "--budget", "ok"},
+		"two ids":              {"clear", "a", "b"},
+		"list with an id":      {"list", "acme"},
+		"budget for clear":     {"clear", "acme", "--budget", "ok"},
+		"zero validity":        {"set", "acme", "--account", "active", "--budget", "ok", "--valid-for", "0s"},
+		"unknown action":       {"grant", "acme"},
+		"unknown flag":         {"list", "--all"},
+		"relative store":       {"list", "--store", "entitlements.json"},
+		"no runners":           {"set", "acme", "--account", "active", "--budget", "ok", "--max-runners", "0"},
+		"runners not a number": {"set", "acme", "--account", "active", "--budget", "ok", "--max-runners", "two"},
+		"an empty tier":        {"set", "acme", "--account", "active", "--budget", "ok", "--tiers", "small,"},
+		"tiers for list":       {"list", "--tiers", "small"},
 	} {
 		args := append(args, "--env-file", "none")
 		if !strings.Contains(strings.Join(args, " "), "--store") {
