@@ -127,6 +127,7 @@ type fakeInstance struct {
 	id, ip, itype, subnet string
 	spot                  bool
 	spotReq               string // persistent spot request, if any
+	clientToken           string // RunInstances' ClientToken, as AWS keeps it
 	shutdown              types.ShutdownBehavior
 	volumeTags            map[string]string // tags requested for the root volume
 	userData              string            // decoded
@@ -325,6 +326,7 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, opt
 		inst.userData = string(b)
 	}
 	inst.launched = f.now()
+	inst.clientToken = aws.ToString(in.ClientToken)
 	inst.spotTags = map[string]string{}
 	for _, ts := range in.TagSpecifications {
 		into := map[types.ResourceType]map[string]string{
@@ -370,6 +372,9 @@ func (f *fakeEC2) view(i *fakeInstance) types.Instance {
 	}
 	if i.spotReq != "" {
 		v.SpotInstanceRequestId = aws.String(i.spotReq)
+	}
+	if i.clientToken != "" {
+		v.ClientToken = aws.String(i.clientToken)
 	}
 	for k, val := range i.tags {
 		v.Tags = append(v.Tags, types.Tag{Key: aws.String(k), Value: aws.String(val)})
@@ -571,14 +576,31 @@ func (f *fakeEC2) CreateTags(_ context.Context, in *ec2.CreateTagsInput, _ ...fu
 		f.tagUnknown--
 		return nil, apiErr(errNotFound)
 	}
+	// A resource is an instance, or an instance's persistent spot request.
+	tags := map[string]map[string]string{}
 	for _, id := range in.Resources {
-		if _, ok := f.instances[id]; !ok {
+		if i, ok := f.instances[id]; ok {
+			tags[id] = i.tags
+			continue
+		}
+		for _, i := range f.instances {
+			if i.spotReq == id {
+				if i.spotTags == nil {
+					i.spotTags = map[string]string{}
+				}
+				tags[id] = i.spotTags
+			}
+		}
+		if tags[id] == nil {
+			if strings.HasPrefix(id, "sir-") {
+				return nil, apiErr(errRequestNotFound)
+			}
 			return nil, apiErr(errNotFound) // R7
 		}
 	}
 	for _, id := range in.Resources {
 		for _, t := range in.Tags {
-			f.instances[id].tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+			tags[id][aws.ToString(t.Key)] = aws.ToString(t.Value)
 		}
 	}
 	return &ec2.CreateTagsOutput{}, nil

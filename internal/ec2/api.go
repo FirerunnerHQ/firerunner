@@ -54,6 +54,14 @@ const (
 	// TagRunnerMAC binds TagRunner to its instance (see runnerMAC); the
 	// reaper deregisters no runner without it.
 	TagRunnerMAC = "firerunner:runner-mac"
+	// TagLaunchMAC binds an instance, from RunInstances on, to this install
+	// (see launchMAC): it signs the launch's ClientToken, which AWS records
+	// on the instance and nobody can change.
+	TagLaunchMAC = "firerunner:launch-mac"
+	// TagRequestMAC binds a pool instance's persistent spot request to this
+	// install (see requestMAC): the reaper cancels no request without it,
+	// and ends an instance the request relaunched by it.
+	TagRequestMAC = "firerunner:request-mac"
 )
 
 // Stopped-pool states, the values of TagPool.

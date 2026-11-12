@@ -21,6 +21,10 @@ const describeBatch = 100
 // seconds (eventual consistency).
 const errNotFound = "InvalidInstanceID.NotFound"
 
+// errRequestNotFound is errNotFound for a spot request: one RunInstances just
+// made may not be known yet either.
+const errRequestNotFound = "InvalidSpotInstanceRequestID.NotFound"
+
 // instanceState is an instance's state and, once AWS gives one, the code of
 // why it changed (StateReason), e.g. Server.SpotInstanceTermination.
 type instanceState struct {

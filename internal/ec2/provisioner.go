@@ -89,7 +89,7 @@ func (c *Client) tagNew(ctx context.Context, id, key, value string) error {
 			Resources: []string{id},
 			Tags:      []types.Tag{{Key: aws.String(key), Value: aws.String(value)}},
 		})
-		if err == nil || !isCode(err, errNotFound) || attempt == signAttempts {
+		if err == nil || !(isCode(err, errNotFound) || isCode(err, errRequestNotFound)) || attempt == signAttempts {
 			return err
 		}
 		select {
@@ -406,7 +406,7 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 // runner by the tag, and leaves a running orphan to MaxLifetime.
 func (p *Provisioner) signRunner(ctx context.Context, id, runner string) {
 	if err := p.c.tagNew(ctx, id, TagRunnerMAC, p.c.runnerMAC(p.o.Owner, p.o.Tier, runner, id)); err != nil {
-		p.log.Warn("could not sign the instance's runner tag; after a restart the reaper leaves it to the max lifetime", "runner", runner, "instance", id, "err", err)
+		p.log.Warn("could not sign the instance's runner tag; after a restart the reaper deregisters no runner by it, and leaves the instance to the max lifetime", "runner", runner, "instance", id, "err", err)
 	}
 }
 
@@ -933,6 +933,10 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 	} else {
 		tags = append(tags, types.Tag{Key: aws.String(TagRunner), Value: aws.String(name)})
 	}
+	token := clientToken(name, market, itype, subnet)
+	// The instance alone is tagged with the launch MAC: it binds the token
+	// AWS records on the instance.
+	instTags := append(slices.Clone(tags), types.Tag{Key: aws.String(TagLaunchMAC), Value: aws.String(p.c.launchMAC(p.o.Owner, p.o.Tier, token))})
 	in := &ec2.RunInstancesInput{
 		ImageId:          aws.String(img.id),
 		InstanceType:     types.InstanceType(itype),
@@ -945,11 +949,11 @@ func (p *Provisioner) input(name string, img image, market, itype, subnet string
 		UserData:        aws.String(base64.StdEncoding.EncodeToString([]byte(jitserver.UserData(p.o.JITURL, p.o.EC2.DockerStorage)))),
 		MetadataOptions: launchMetadataOptions(),
 		TagSpecifications: []types.TagSpecification{
-			{ResourceType: types.ResourceTypeInstance, Tags: tags},
+			{ResourceType: types.ResourceTypeInstance, Tags: instTags},
 			{ResourceType: types.ResourceTypeVolume, Tags: tags},
 		},
 		// Idempotent across SDK retries of this exact attempt.
-		ClientToken: aws.String(clientToken(name, market, itype, subnet)),
+		ClientToken: aws.String(token),
 		// The guest's poweroff ends the instance. One-time spot accepts this
 		// too; only a persistent spot request (the stopped pool) rejects it.
 		InstanceInitiatedShutdownBehavior: types.ShutdownBehaviorTerminate,

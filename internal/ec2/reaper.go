@@ -57,6 +57,11 @@ type ReaperOptions struct {
 // tenant is suspended. A busy one is
 // left to finish; it powers off, and the next sweep ends it. It deregisters a
 // runner only by a runner tag whose TagRunnerMAC holds for the instance.
+//
+// It ends nothing by its owner tag alone, which anyone who may tag an
+// instance can write: an instance must prove this install launched it (see
+// launchedHere), and a spot request must carry its TagRequestMAC. What does
+// not is left alone, logged, and reported as Unproven.
 type Reaper struct {
 	c   *Client
 	o   ReaperOptions
@@ -87,7 +92,11 @@ type ReapReport struct {
 	// Young are untracked instances inside the grace period (just launched
 	// or started); a later sweep looks at them again.
 	Young []string
-	Err   string
+	// Unproven are instances and spot requests with this install's owner
+	// tag that nothing proves it launched; they are left alone. One is
+	// either retagged by someone else, or one whose signing failed.
+	Unproven []string
+	Err      string
 }
 
 // NewReaper returns a Reaper over the client's account.
@@ -163,12 +172,19 @@ func (r *Reaper) Sweep(ctx context.Context) (ReapReport, error) {
 		}
 	}
 	now := r.now()
+	// The requests this install signed; an instance one launched is ours.
+	signed := map[string]bool{}
+	for _, s := range requests {
+		if r.c.verifyRequestMAC(s, r.o.Owner) == nil {
+			signed[aws.ToString(s.SpotInstanceRequestId)] = true
+		}
+	}
 	alive := map[string]bool{}
 	for _, i := range instances {
 		alive[aws.ToString(i.InstanceId)] = true
 	}
 	for _, i := range instances {
-		r.judge(ctx, i, now, &rep)
+		r.judge(ctx, i, now, signed, &rep)
 	}
 
 	// Persistent spot requests whose instance is gone would launch an
@@ -180,6 +196,11 @@ func (r *Reaper) Sweep(ctx context.Context) (ReapReport, error) {
 			continue
 		}
 		if now.Sub(aws.ToTime(s.CreateTime)) < r.o.Grace {
+			continue
+		}
+		if !signed[id] {
+			r.log.Warn("spot request left without an instance, with this install's owner tag but not its signature; not cancelling it", "request", id, "instance", inst, "why", r.c.verifyRequestMAC(s, r.o.Owner))
+			rep.Unproven = append(rep.Unproven, id)
 			continue
 		}
 		if r.o.DryRun {
@@ -198,12 +219,13 @@ func (r *Reaper) Sweep(ctx context.Context) (ReapReport, error) {
 	if len(rep.Instances)+len(rep.SpotRequests) > 0 {
 		level = slog.LevelInfo
 	}
-	r.log.Log(ctx, level, "reaper sweep", "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "busy", len(rep.Busy), "young", len(rep.Young))
+	r.log.Log(ctx, level, "reaper sweep", "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "busy", len(rep.Busy), "young", len(rep.Young), "unproven", len(rep.Unproven))
 	return rep, nil
 }
 
 // judge decides one of this install's instances: leave it, or reap it.
-func (r *Reaper) judge(ctx context.Context, i types.Instance, now time.Time, rep *ReapReport) {
+// signed holds the spot requests whose request MAC holds.
+func (r *Reaper) judge(ctx context.Context, i types.Instance, now time.Time, signed map[string]bool, rep *ReapReport) {
 	id := aws.ToString(i.InstanceId)
 	if r.c.isLive(id) {
 		return
@@ -212,36 +234,35 @@ func (r *Reaper) judge(ctx context.Context, i types.Instance, now time.Time, rep
 	spotReq := aws.ToString(i.SpotInstanceRequestId)
 	log := r.log.With("instance", id, "tier", tier, "runner", runner, "state", i.State.Name)
 
-	if pool == PoolReady || pool == PoolWarming {
+	inPool := pool == PoolReady || pool == PoolWarming
+	if inPool && r.o.PooledTiers[tier] && r.c.verifyPoolMAC(i, r.o.Owner, tier) == nil {
+		return // the pool's own
+	}
+	// Anything else nobody here tracks. Its MACs are tagged a moment after
+	// RunInstances, and LaunchTime is the latest start (a pool instance a
+	// job just started is young too), so leave it the grace period.
+	if now.Sub(aws.ToTime(i.LaunchTime)) < r.o.Grace {
+		rep.Young = append(rep.Young, id)
+		return
+	}
+	if err := r.c.launchedHere(i, r.o.Owner, signed); err != nil {
+		log.Warn("instance with this install's owner tag that nothing proves it launched; not ending it", "why", err)
+		rep.Unproven = append(rep.Unproven, id)
+		return
+	}
+	if inPool {
+		why := "pool instance of a tier that keeps no pool"
 		if r.o.PooledTiers[tier] {
-			macErr := r.c.verifyPoolMAC(i, r.o.Owner, tier)
-			if macErr == nil {
-				return // the pool's own
-			}
-			// Not signed with this install's key: the pool never uses it.
-			// One just launched is signed a moment after RunInstances, so
-			// leave it the grace period.
-			if now.Sub(aws.ToTime(i.LaunchTime)) < r.o.Grace {
-				rep.Young = append(rep.Young, id)
-				return
-			}
-			if r.reap(ctx, log, "pool instance failing its MAC check: "+macErr.Error(), id, spotReq) {
-				rep.Instances = append(rep.Instances, id)
-			}
-			return
+			// Ours by its runner MAC or its spot request (relaunched by
+			// AWS, say), but not a pool instance the pool can use.
+			why = "pool instance failing its MAC check: " + r.c.verifyPoolMAC(i, r.o.Owner, tier).Error()
 		}
-		if r.reap(ctx, log, "pool instance of a tier that keeps no pool", id, spotReq) {
+		if r.reap(ctx, log, why, id, spotReq) {
 			rep.Instances = append(rep.Instances, id)
 		}
 		return
 	}
 	// A job instance (claimed from a pool, or cold) nobody tracks.
-	// LaunchTime is the latest start, so a pool instance a job just
-	// started is young too.
-	if now.Sub(aws.ToTime(i.LaunchTime)) < r.o.Grace {
-		rep.Young = append(rep.Young, id)
-		return
-	}
 	switch i.State.Name {
 	case types.InstanceStateNameStopped, types.InstanceStateNameStopping:
 		// Its runner ran (or failed) and powered off, so its

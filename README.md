@@ -654,17 +654,18 @@ starting the instance:
   tags each pool instance it launches `firerunner:pool-mac`, an HMAC-SHA256
   of its owner, tier and instance ID under a key the control plane holds.
   After a restart, an instance whose MAC is missing or wrong is never given
-  a JIT config nor started: firerunner logs a warning naming it and
-  terminates it. Keep the key in a root-only file named by
+  a JIT config nor started, nor terminated: nothing proves this install
+  launched it, so firerunner logs a warning naming it, and the reaper
+  reports it (see *Proven before ended* below). Keep the key in a root-only file named by
   `--ec2-pool-key-file` (`FR_EC2_POOL_KEY_FILE`), at least 32 bytes, the
   same across restarts and replaced control VMs;
   [`control.yaml`](deploy/cloudformation/control.yaml) generates one in
   Secrets Manager. Without it, each process signs with a random key of its
-  own, so the pool is rebuilt after every restart. Changing the key
-  discards the pool once, as does the upgrade from a release before it:
-  older pool instances carry no MAC. Run one control plane per owner at a
-  time, as before: one without the key would discard the other's pool, and
-  the other its.
+  own, so the pool is rebuilt after every restart, and trusts the owner tag
+  to end the old one. Changing the key replaces the pool: firerunner
+  launches a new one, and `firerunner doctor` lists the old instances for
+  you to end by hand. Run one control plane per owner at a time, as before:
+  one without the key would discard the other's pool.
 - **Checked at claim.** The MAC proves which install launched an instance,
   not that nobody changed it since. So while an instance first boots,
   firerunner also tags it `firerunner:pool-disk-mac`, an HMAC of the image
@@ -756,13 +757,31 @@ running process tracks, and anything younger than 2 minutes.
   tags each job instance `firerunner:runner-mac`, an HMAC of its owner, tier,
   runner and instance ID under the `--ec2-pool-key-file` key, and
   deregisters a runner only when that MAC holds. An instance without one
-  (launched by a release before it, or without the key file) is left to
-  `--max-vm-lifetime`, and the reaper logs a warning naming it; with
-  `--max-vm-lifetime 0`, nothing ends it, so keep a lifetime on EC2.
+  (launched by a process without the key file, or whose signing failed) is
+  left to `--max-vm-lifetime`, and the reaper logs a warning naming it; with
+  `--max-vm-lifetime 0`,
+  nothing ends it, so keep a lifetime on EC2.
 - **A pool instance of a tier that no longer keeps a pool:** terminated.
-- **A pool instance whose `firerunner:pool-mac` fails:** terminated (see
-  *Signed* above).
+- **An instance AWS relaunched for a pool's spot request:** terminated; its
+  pool MAC names the instance it replaced.
 - **A persistent spot request whose instance is gone:** cancelled.
+- **Proven before ended.** The owner tag is not signed: anyone who may tag
+  an instance could put it on someone else's. With `--ec2-pool-key-file`,
+  the reaper ends an instance only if a MAC under the key proves this
+  install launched it. RunInstances itself tags each instance
+  `firerunner:launch-mac`, a MAC of its owner, tier and the launch's
+  `ClientToken`, which AWS keeps on the instance and nobody can change; so
+  an instance is provably this install's from its first moment, even if
+  firerunner dies before tagging anything else. Its `firerunner:pool-mac`
+  or `firerunner:runner-mac` proves it too, as does the
+  `firerunner:request-mac` of the spot request that launched it (an
+  instance AWS relaunched), which the pool tags on each persistent request.
+  The reaper cancels a request only by its MAC. Whatever it cannot prove it
+  leaves alone and logs, and `firerunner status` and `firerunner doctor`
+  list it: find who launched or tagged it in CloudTrail, and end it by hand
+  if it is yours (signed under a key since changed, or launched by a release
+  before these MACs). Without the key file, nothing an earlier process
+  signed can be checked, so the owner tag is trusted.
 
 Everything is found by the `firerunner:owner` tag, which defaults to the host
 name. **Set `--owner` (`FR_OWNER`) to a stable name when the control VM can be

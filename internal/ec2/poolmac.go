@@ -30,6 +30,16 @@ import (
 //     starts it only while its image and volumes still match.
 //   - TagRunnerMAC: the runner on a job instance, tagged wherever TagRunner
 //     is. The reaper deregisters a runner at GitHub only by a valid one.
+//   - TagRequestMAC: a pool instance's persistent spot request, tagged as
+//     soon as RunInstances names it.
+//   - TagLaunchMAC: every instance, tagged by RunInstances itself: it signs
+//     the launch's ClientToken, which AWS keeps on the instance, so it holds
+//     from the instance's first moment, with no window for a crash.
+//
+// The owner tag is not signed, so the reaper ends nothing by it alone: an
+// instance must carry a launch, pool or runner MAC of this install's, or have
+// been launched by a spot request with its request MAC (see launchedHere); a
+// request must carry its request MAC.
 
 // MinPoolKeyBytes is the shortest pool key SetPoolKey accepts.
 const MinPoolKeyBytes = 32
@@ -38,9 +48,11 @@ const MinPoolKeyBytes = 32
 // length-prefixed fields, so none may be a prefix of another (see
 // TestMAC_DomainsAreDistinct).
 const (
-	poolMACDomain   = "firerunner/ec2-pool-mac/v1"
-	diskMACDomain   = "firerunner/ec2-disk-mac/v1"
-	runnerMACDomain = "firerunner/ec2-runner-mac/v1"
+	poolMACDomain    = "firerunner/ec2-pool-mac/v1"
+	diskMACDomain    = "firerunner/ec2-disk-mac/v1"
+	runnerMACDomain  = "firerunner/ec2-runner-mac/v1"
+	requestMACDomain = "firerunner/ec2-request-mac/v1"
+	launchMACDomain  = "firerunner/ec2-launch-mac/v1"
 )
 
 // SetPoolKey sets the key that signs and verifies pool instances and runner
@@ -174,4 +186,64 @@ var (
 func (c *Client) verifyRunnerMAC(i types.Instance, owner, tier, runner string) error {
 	want := c.runnerMAC(owner, tier, runner, aws.ToString(i.InstanceId))
 	return checkMAC(tagValue(i.Tags, TagRunnerMAC), want, errNoRunnerMAC, errBadRunnerMAC)
+}
+
+// requestMAC signs a persistent spot request's owner, tier and ID.
+func (c *Client) requestMAC(owner, tier, req string) string {
+	return c.mac(requestMACDomain, owner, tier, req)
+}
+
+var (
+	errNoRequestMAC  = errors.New("no " + TagRequestMAC + " tag")
+	errBadRequestMAC = errors.New(TagRequestMAC + " does not match this install's pool key, owner, tier and request")
+)
+
+// verifyRequestMAC checks a spot request's TagRequestMAC against owner, the
+// tier it is tagged with, and its own ID. Without a pool key of its own
+// (PoolKeyEphemeral), nothing an earlier process signed can be checked, so
+// the owner tag is trusted, as doctor warns.
+func (c *Client) verifyRequestMAC(r types.SpotInstanceRequest, owner string) error {
+	if c.poolKeyEphemeral {
+		return nil
+	}
+	want := c.requestMAC(owner, tagValue(r.Tags, TagTier), aws.ToString(r.SpotInstanceRequestId))
+	return checkMAC(tagValue(r.Tags, TagRequestMAC), want, errNoRequestMAC, errBadRequestMAC)
+}
+
+// launchMAC signs a launch's owner, tier and ClientToken. A token names one
+// launch: RunInstances with it again returns that instance, or fails if
+// anything else differs, so the MAC cannot be carried to an instance
+// launched otherwise.
+func (c *Client) launchMAC(owner, tier, token string) string {
+	return c.mac(launchMACDomain, owner, tier, token)
+}
+
+// errNotLaunchedHere says why an instance is not provably this install's.
+var errNotLaunchedHere = errors.New("carries no " + TagLaunchMAC + ", " + TagPoolMAC + ", " + TagRunnerMAC + " or spot request " + TagRequestMAC + " of this install's pool key: the owner tag alone proves nothing, as anyone who may tag an instance can write it")
+
+// launchedHere reports whether this install launched the instance, by a
+// MAC only it could write: the launch MAC over its ClientToken; the pool MAC
+// for the owner and the tier it is tagged with; the runner MAC for those and
+// its runner tag; or its spot request's, when signedRequests (requests whose
+// request MAC holds; nil for none) has it. Without a pool key of its own,
+// the owner tag is trusted.
+func (c *Client) launchedHere(i types.Instance, owner string, signedRequests map[string]bool) error {
+	if c.poolKeyEphemeral {
+		return nil
+	}
+	tier := tagValue(i.Tags, TagTier)
+	if token := aws.ToString(i.ClientToken); token != "" &&
+		checkMAC(tagValue(i.Tags, TagLaunchMAC), c.launchMAC(owner, tier, token), errNotLaunchedHere, errNotLaunchedHere) == nil {
+		return nil
+	}
+	if c.verifyPoolMAC(i, owner, tier) == nil {
+		return nil
+	}
+	if runner := tagValue(i.Tags, TagRunner); runner != "" && c.verifyRunnerMAC(i, owner, tier, runner) == nil {
+		return nil
+	}
+	if req := aws.ToString(i.SpotInstanceRequestId); req != "" && signedRequests[req] {
+		return nil
+	}
+	return errNotLaunchedHere
 }

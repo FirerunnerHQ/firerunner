@@ -496,6 +496,9 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			}
 			fmt.Fprintf(w, "\nEC2 reaper: last sweep %s ago%s: %d instance(s) terminated, %d spot request(s) cancelled, %d left running a job, %d too young to judge\n",
 				humanDuration(time.Since(rp.At).Truncate(time.Second)), mode, len(rp.Instances), len(rp.SpotRequests), len(rp.Busy), len(rp.Young))
+			if len(rp.Unproven) > 0 {
+				fmt.Fprintf(w, "  %d left alone: this install's owner tag, but no MAC proves it launched them: %s\n", len(rp.Unproven), strings.Join(rp.Unproven, " "))
+			}
 			if rp.Error != "" {
 				fmt.Fprintf(w, "  error: %s\n", truncate(rp.Error, 200))
 			}
@@ -806,6 +809,9 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 	if c := guardDutyCheck(li.File, now); c != nil {
 		checks = append(checks, *c)
 	}
+	if c := reaperUnprovenCheck(li.File); c != nil {
+		checks = append(checks, *c)
+	}
 	for _, t := range li.Tiers {
 		name := "listener[" + t.Name + "]"
 		switch t.State {
@@ -888,6 +894,20 @@ func guardDutyCheck(f health.File, now time.Time) *Check {
 	default:
 		c = pass("guardduty", "read %s ago, severity %g and above; no tenant flagged", humanDuration(now.Sub(g.LastPoll).Truncate(time.Second)), g.MinSeverity)
 	}
+	return &c
+}
+
+// reaperUnprovenCheck warns while the EC2 reaper's latest sweep left
+// instances or spot requests alone that carry the install's owner tag but no
+// MAC of its pool key: someone else's, retagged, or the install's own whose
+// signing failed, or signed under a key since replaced. Nil without them.
+func reaperUnprovenCheck(f health.File) *Check {
+	rp := f.Reaper
+	if rp == nil || len(rp.Unproven) == 0 {
+		return nil
+	}
+	c := warn("ec2-reaper", "%d instance(s) or spot request(s) carry this install's owner tag, but no MAC of its pool key proves it launched them, so the reaper leaves them alone: %s. Find who launched or tagged each (CloudTrail RunInstances, CreateTags); if this install did (the pool key changed, or signing failed), end it by hand",
+		len(rp.Unproven), strings.Join(rp.Unproven, " "))
 	return &c
 }
 

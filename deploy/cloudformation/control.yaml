@@ -293,8 +293,9 @@ Resources:
   # instance in the account can copy the other tags. Only the control role may
   # read it. It is generated here and never leaves AWS but for the control
   # VM's disk.
-  # Changing GenerateSecretString makes a new value, and so discards the
-  # pool once.
+  # Changing GenerateSecretString makes a new value, and so replaces the
+  # pool: the old instances are left, for doctor to list and an operator to
+  # end.
   PoolKey:
     Type: AWS::SecretsManager::Secret
     Properties:
@@ -604,6 +605,9 @@ Outputs:
     Value: !Ref ControlSecurityGroup
   ParameterPrefix:
     Value: !Ref ParameterPrefix
+  PoolKeySecret:
+    Description: The pool key's secret; give it to reaper.yaml so that it ends only what this install launched.
+    Value: !Ref PoolKey
   CacheBucket:
     Condition: CacheS3
     Description: cache-server's bucket (prefix firerunner-cache/); kept when the stack is deleted.

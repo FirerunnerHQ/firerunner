@@ -491,7 +491,10 @@ type Reaper struct {
 	SpotRequests []string  `json:"spot_requests,omitempty"`
 	Busy         []string  `json:"busy,omitempty"`
 	Young        []string  `json:"young,omitempty"`
-	Error        string    `json:"error,omitempty"`
+	// Unproven are instances and spot requests with the install's owner
+	// tag that no MAC proves it launched: left alone, for an operator.
+	Unproven []string `json:"unproven,omitempty"`
+	Error    string   `json:"error,omitempty"`
 }
 
 // FileName is the state file's name inside the daemon's work dir.

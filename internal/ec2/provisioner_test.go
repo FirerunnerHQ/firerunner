@@ -288,7 +288,7 @@ func TestInput_PoolVolumeKeepsBaselineThroughput(t *testing.T) {
 		"a tier's setting wins": {500, 500},
 	} {
 		t.Run(name, func(t *testing.T) {
-			p := &Provisioner{}
+			p := &Provisioner{c: NewClient(newFakeEC2(t), nil, time.Hour, quietLog())}
 			p.o.EC2 = config.EC2Tier{RootVolumeThroughput: tc.explicit}
 			in := p.input("r", image{rootDevice: "/dev/sda1"}, config.MarketOnDemand, "c8a.xlarge", "subnet-a", forPool)
 			var got int32
