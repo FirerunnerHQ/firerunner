@@ -867,6 +867,12 @@ func entitlementLine(e *health.Entitlement) string {
 	if !e.ValidUntil.IsZero() {
 		s += ", valid until " + e.ValidUntil.UTC().Format(time.RFC3339)
 	}
+	if e.MaxRunners > 0 {
+		s += fmt.Sprintf(", plan's limit %d runner(s)", e.MaxRunners)
+	}
+	if e.Tiers != nil {
+		s += ", plan's tiers " + strings.Join(e.Tiers, ",")
+	}
 	switch {
 	case e.Held:
 		s += "; HELD: " + e.Why

@@ -57,10 +57,20 @@ func TestRecordValidate(t *testing.T) {
 	if err := good.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	good.Limits = &Limits{MaxRunners: 2, Tiers: []string{"small"}}
+	if err := good.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if l := (Record{}).PlanLimits(); l.MaxRunners != 0 || l.Tiers != nil {
+		t.Fatalf("a record without limits has %+v", l)
+	}
 	for name, r := range map[string]Record{
 		"account":     {Account: "paid", Budget: OK, ValidUntil: valid},
 		"budget":      {Account: Active, Budget: "fine", ValidUntil: valid},
 		"valid until": {Account: Active, Budget: OK},
+		"runners":     {Account: Active, Budget: OK, ValidUntil: valid, Limits: &Limits{MaxRunners: -1}},
+		"no tiers":    {Account: Active, Budget: OK, ValidUntil: valid, Limits: &Limits{Tiers: []string{}}},
+		"empty tier":  {Account: Active, Budget: OK, ValidUntil: valid, Limits: &Limits{Tiers: []string{"small", ""}}},
 	} {
 		if err := r.Validate(); err == nil {
 			t.Errorf("%s: a bad record validated", name)

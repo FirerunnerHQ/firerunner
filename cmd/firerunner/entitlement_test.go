@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -79,6 +80,64 @@ func TestEntitlementsHoldAndReleaseAServedTenant(t *testing.T) {
 	}
 	if !open || f.Entitlements == nil || f.Entitlements.Store != path {
 		t.Fatalf("health = %+v, %+v; want acme launching on an expired record", f.Tenants, f.Entitlements)
+	}
+}
+
+// A record's limits narrow a served tenant's at the next read, without a
+// restart: its runner limit is the narrower of the list's and the plan's, a
+// tier the plan leaves out launches nothing, and a record without limits
+// gives the list's back. status shows the limit in force and the plan's.
+func TestEntitlementLimitsNarrowAServedTenant(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "entitlements.json")
+	store := &entitlement.FileStore{Path: path}
+	s := &shard{log: slog.New(slog.DiscardHandler)}
+	live := &liveTenants{}
+	acme := &servedTenant{t: tenant{ID: "acme"}, bound: scheduler.NewTenant("acme", 4)}
+	live.add(acme)
+	if err := s.watchEntitlements(ctx, &config.Config{Entitlements: path}, live, s.log); err != nil {
+		t.Fatal(err)
+	}
+	day := time.Now().Add(24 * time.Hour)
+	write := func(l *entitlement.Limits) {
+		t.Helper()
+		r := entitlement.Record{Account: entitlement.Active, Budget: entitlement.OK, ValidUntil: day, Limits: l}
+		if err := store.Put(ctx, "acme", r); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.entitlements.Read(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(&entitlement.Limits{MaxRunners: 2, Tiers: []string{"small"}})
+	if got := acme.bound.Max(); got != 2 || !slices.Equal(acme.bound.Plan().Tiers, []string{"small"}) {
+		t.Fatalf("limit in force %d, plan %+v; want the plan's 2, on tier small", got, acme.bound.Plan())
+	}
+	f := health.File{Tenants: live.tenants(nil, nil)}
+	s.entitlementHealth(&f)
+	if h := f.Tenants[0]; h.Limits.Runners != 2 || h.Entitlement == nil || h.Entitlement.MaxRunners != 2 || !slices.Equal(h.Entitlement.Tiers, []string{"small"}) {
+		t.Fatalf("health = %+v, %+v", h, h.Entitlement)
+	}
+	write(&entitlement.Limits{MaxRunners: 9})
+	if got := acme.bound.Max(); got != 4 {
+		t.Fatalf("limit in force %d, want the list's 4: the narrower holds", got)
+	}
+	write(&entitlement.Limits{MaxRunners: 1})
+	write(nil)
+	if got := acme.bound.Max(); got != 4 {
+		t.Fatalf("limit in force %d with no limits in the record, want the list's 4", got)
+	}
+	// Held, it still takes the plan's limit, in force when it resumes.
+	if err := store.Put(ctx, "acme", entitlement.Record{Account: entitlement.Suspended, Budget: entitlement.OK, ValidUntil: day,
+		Limits: &entitlement.Limits{MaxRunners: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.entitlements.Read(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, why := acme.bound.State(); why == "" || acme.bound.Max() != 1 {
+		t.Fatalf("held %q with limit %d, want held with the plan's 1", why, acme.bound.Max())
 	}
 }
 

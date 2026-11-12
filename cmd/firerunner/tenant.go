@@ -139,6 +139,7 @@ func (s *shard) schedulerOptions(t tenant, tier config.Tier, bound *scheduler.Te
 		Logger:      log,
 		Pending:     tierPending(tier, &s.pending),
 		Tenant:      bound,
+		Tier:        tier.Name,
 		MaxJob:      t.Limits.JobDuration,
 		OnHold:      tracker.SetHeld,
 		OnStop:      s.stopRecorder(tier.Name, tracker),
@@ -479,12 +480,23 @@ func stateKey(id string) string {
 //     entitlement.Decide), a tenant of the catalog only;
 //   - active otherwise.
 //
-// The install is never held: it is its operator's.
+// The install is never held: it is its operator's. A tenant's entitlement
+// also sets its plan's limits, whatever else holds it, so they are in force
+// the moment it resumes.
 //
 // A hold refuses new launches only: a launch already granted runs its job.
 func (s *shard) applyState(id string, bound *scheduler.Tenant, log *slog.Logger) {
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	var ent *entitlement.Decision
+	if s.entitlements != nil && id != "" {
+		r, _, d := s.entitlements.Decide(id)
+		ent = &d
+		l := r.PlanLimits()
+		if bound.SetPlan(scheduler.Plan{Runners: l.MaxRunners, Tiers: l.Tiers}) {
+			log.Info("tenant's plan limits changed", "tenant", id, "max_runners", l.MaxRunners, "tiers", l.Tiers, "in_force", bound.Max())
+		}
+	}
 	if s.states != nil {
 		states, known := s.states.States()
 		if r, suspended := states[stateKey(id)]; suspended {
@@ -500,13 +512,11 @@ func (s *shard) applyState(id string, bound *scheduler.Tenant, log *slog.Logger)
 			return
 		}
 	}
-	if s.entitlements != nil && id != "" {
-		if _, _, d := s.entitlements.Decide(id); d.Hold {
-			if bound.Hold(d.Why) {
-				log.Warn("tenant held by its entitlement: its jobs wait", "tenant", id, "why", d.Why)
-			}
-			return
+	if ent != nil && ent.Hold {
+		if bound.Hold(ent.Why) {
+			log.Warn("tenant held by its entitlement: its jobs wait", "tenant", id, "why", ent.Why)
 		}
+		return
 	}
 	if bound.Resume() {
 		log.Info("tenant resumed", "tenant", stateKey(id))
@@ -552,7 +562,9 @@ func (s *shard) entitlementHealth(f *health.File) {
 // healthEntitlement is a tenant's entitlement record and the decision on it,
 // for the health file.
 func healthEntitlement(r entitlement.Record, ok bool, d entitlement.Decision) *health.Entitlement {
+	l := r.PlanLimits()
 	return &health.Entitlement{None: !ok, Invalid: r.Invalid, Plan: r.Plan, Account: string(r.Account), Budget: string(r.Budget), ValidUntil: r.ValidUntil,
+		MaxRunners: l.MaxRunners, Tiers: l.Tiers,
 		Held: d.Hold, FailOpen: d.FailOpen, Warning: d.Warning, Why: d.Why}
 }
 

@@ -270,7 +270,7 @@ func TestTierGetsItsTenantsLimits(t *testing.T) {
 	tracker := health.NewTracker("acme/t")
 	tier := config.Tier{Name: "t", Max: 3}
 	o := s.schedulerOptions(ten, tier, bound, tracker, nil, nil, s.log)
-	if o.Tenant != bound || o.MaxJob != 30*time.Minute || o.Max != 3 {
+	if o.Tenant != bound || o.Tier != "t" || o.MaxJob != 30*time.Minute || o.Max != 3 {
 		t.Fatalf("scheduler options = %+v", o)
 	}
 	o.OnHold(2, "at its limit")
