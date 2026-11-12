@@ -15,6 +15,7 @@ import (
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 
 	"github.com/firerunnerhq/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/listener"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
 )
 
@@ -525,6 +526,46 @@ func TestTenantLoopStopSeesWhyItEnded(t *testing.T) {
 		l.run(ctx)
 		if got := <-removed; got != want {
 			t.Errorf("%v: stop saw removed %v, want %v", cause, got, want)
+		}
+	}
+}
+
+// A tenant removed while not served, here skipped as none of its tiers is
+// within its limits, has the scale sets its tiers registered deleted by
+// name, on its own account; a tenant that changed keeps them.
+func TestRemovedTenantNotServedLeavesNoScaleSets(t *testing.T) {
+	for cause, want := range map[error]bool{errTenantRemoved: true, errTenantChanged: false} {
+		var mu sync.Mutex
+		var asked []string
+		s := &shard{log: slog.New(slog.DiscardHandler), cfg: &config.Config{RunnerGroup: "firerunner",
+			Tiers: []config.Tier{{Name: "big", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{InstanceTypes: []string{"c7i.4xlarge"}}}}},
+			removeByName: func(_ context.Context, c listener.Config) (bool, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				asked = append(asked, c.URL+" "+c.RunnerGroup+" "+c.Name)
+				return true, nil
+			}}
+		vcpu := 2
+		c := config.Tenant{ID: "acme", URL: "https://github.com/acme", InstallationID: 7, Tiers: []string{"big"},
+			Limits: &config.TenantLimits{MaxVCPU: &vcpu}}
+		ctx, cancel := context.WithCancelCause(context.Background())
+		live := &liveTenants{}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.runTenant(ctx, func() config.Tenant { return c }, nil, live, "inst", nil)
+		}()
+		waitFor(t, "skipped", func() bool { live.mu.Lock(); defer live.mu.Unlock(); return len(live.skipped) > 0 })
+		cancel(cause)
+		<-done
+		mu.Lock()
+		got := asked
+		mu.Unlock()
+		switch {
+		case want && (len(got) != 1 || got[0] != "https://github.com/acme firerunner big"):
+			t.Errorf("%v: asked to remove %v, want acme's big", cause, got)
+		case !want && len(got) != 0:
+			t.Errorf("%v: asked to remove %v, want none kept", cause, got)
 		}
 	}
 }

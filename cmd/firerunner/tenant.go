@@ -75,6 +75,9 @@ type shard struct {
 	entitlements *entitlement.Watcher
 	// tenants are the tenants of the list, once the list is read.
 	tenants atomic.Pointer[tenantSet]
+	// removeByName deletes a scale set by name; nil is
+	// listener.RemoveByName. Tests replace it.
+	removeByName func(context.Context, listener.Config) (bool, error)
 	// applyMu makes each applyState decide and apply as one step: the
 	// watchers and the tenant loops call it at once, and a decision taken
 	// on older inputs must not land after one taken on newer.
@@ -265,11 +268,17 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner string, jwt *ghauth.
 }
 
 // runTenant serves a tenant of the list until ctx ends, as cur returns its
-// entry each time it starts.
+// entry each time it starts. Removed from the list, it ends by deleting
+// every scale set its tiers have registered, served or not.
 func (s *shard) runTenant(ctx context.Context, cur func() config.Tenant, served func(*servedTenant), live *liveTenants, owner string, jwt *ghauth.JWT) {
 	get := func() tenant { return extraTenant(s.cfg, cur(), owner, jwt) }
 	et := get()
 	defer live.forget(et.ID)
+	defer func() {
+		if removedTenant(ctx) {
+			s.removeLeftovers(ctx, get(), cur().Tiers)
+		}
+	}()
 	et.warnRefused(s.log)
 	if len(et.Tiers) == 0 {
 		s.log.Error("tenant not served: none of its tiers is within its limits", "tenant", et.ID, "limits", et.Limits.String())
@@ -310,6 +319,32 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 			st.close(context.WithoutCancel(ctx))
 		},
 		live: live, log: s.log, min: tenantRetryMin, max: tenantRetryMax,
+	}
+}
+
+// removeLeftovers deletes, by name, the scale sets a removed tenant's tiers
+// registered, each tier it lists whether served or not. A run that served
+// it when it was removed has deleted its own, and finds none; this covers
+// the rest: a tenant in retry backoff or skipped when removed, and one whose
+// scale sets an earlier run kept (KeepOnClose). A tenant removed while no
+// daemon ran, or before one crashed mid-drain, is not covered.
+func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) {
+	remove := s.removeByName
+	if remove == nil {
+		remove = listener.RemoveByName
+	}
+	// Bounded: a GitHub that hangs must not hold up shutdown.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
+	defer cancel()
+	for _, name := range names {
+		cfg := s.listenerConfig(t, config.Tier{Name: name}, tenantHooks{}, nil, nil, s.log, nil)
+		removed, err := remove(rctx, cfg)
+		switch {
+		case err != nil:
+			s.log.Warn("scale set of a removed tenant left registered", "tenant", t.ID, "tier", name, "err", err)
+		case removed:
+			s.log.Info("deregistered runner scale set left by a removed tenant", "tenant", t.ID, "tier", name)
+		}
 	}
 }
 
