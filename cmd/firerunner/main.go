@@ -474,7 +474,11 @@ func tierProvisioner(t config.Tier, fc provisioner.Provisioner, newEC2 func(conf
 // every tier has stopped there is nothing left to serve, so it cancels ctx and
 // returns the first error. A tier that needs a fresh process
 // (listener.ErrRestart: its scale set was deleted) stops every tier at once,
-// so the daemon exits for its supervisor to restart and re-register it.
+// so the daemon exits for its supervisor to restart and re-register it. So
+// does a tier whose run panics (errPanicked): for a tenant of the list its
+// loop starts it again, and the install restarts, while other tenants'
+// tiers, served by their own loops, never see it. A panic in a goroutine a
+// tier's run starts in turn is not recovered here.
 func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, runs []func(context.Context) error, log *slog.Logger) error {
 	var (
 		wg      sync.WaitGroup
@@ -489,7 +493,14 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 			defer wg.Done()
 			tierCtx, tierCancel := context.WithCancel(ctx)
 			defer tierCancel()
-			err := run(tierCtx)
+			err := func() (err error) {
+				defer func() {
+					if p := recover(); p != nil {
+						err = recovered(p, fmt.Sprintf("tier %q", names[i]), log)
+					}
+				}()
+				return run(tierCtx)
+			}()
 			tierCancel()
 			if ctx.Err() != nil {
 				return
@@ -500,10 +511,14 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 			mu.Lock()
 			defer mu.Unlock()
 			stopped++
-			if first == nil || errors.Is(err, listener.ErrRestart) {
+			if first == nil || errors.Is(err, listener.ErrRestart) || errors.Is(err, errPanicked) {
 				first = fmt.Errorf("tier %q: %w", names[i], err)
 			}
 			switch {
+			case errors.Is(err, errPanicked):
+				log.Error("a tier panicked; stopping every tier to start them again", "tier", names[i], "err", err)
+				restart = true
+				cancel()
 			case errors.Is(err, listener.ErrRestart):
 				log.Error("restarting to register the scale set again; stopping every tier", "tier", names[i], "err", err)
 				restart = true

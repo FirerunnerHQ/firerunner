@@ -608,6 +608,14 @@ func renderTenants(w io.Writer, tenants []health.Tenant) {
 		if t.NotServed != "" {
 			fmt.Fprintf(w, "  %s NOT SERVED: %s\n", name, t.NotServed)
 		}
+		if r := t.Restarts; r != nil {
+			panics := ""
+			if r.Panics > 0 {
+				panics = fmt.Sprintf(", %d for a PANIC", r.Panics)
+			}
+			fmt.Fprintf(w, "  %s stopped and started again %d time(s) since the daemon started%s; last at %s: %s\n",
+				name, r.Count, panics, r.LastAt.UTC().Format(time.RFC3339), truncate(r.LastError, 200))
+		}
 		for _, why := range t.Refused {
 			fmt.Fprintf(w, "  %s not served %s\n", name, why)
 		}
@@ -832,6 +840,9 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 	if c := entitlementsCheck(li.File, now); c != nil {
 		checks = append(checks, *c)
 	}
+	if c := tenantPanicsCheck(li.File); c != nil {
+		checks = append(checks, *c)
+	}
 	if c := reaperUnprovenCheck(li.File); c != nil {
 		checks = append(checks, *c)
 	}
@@ -852,6 +863,23 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 		}
 	}
 	return checks
+}
+
+// tenantPanicsCheck warns while a tenant has panicked since the daemon
+// started: a bug, contained to that tenant, which started again. nil when
+// none has.
+func tenantPanicsCheck(f health.File) *Check {
+	var hit []string
+	for _, t := range f.Tenants {
+		if r := t.Restarts; r != nil && r.Panics > 0 {
+			hit = append(hit, fmt.Sprintf("%s (%d, last: %s)", or(t.ID, "(install)"), r.Panics, truncate(r.LastError, 120)))
+		}
+	}
+	if len(hit) == 0 {
+		return nil
+	}
+	c := warn("tenant-panics", "panicked and started again, other tenants unaffected: %s; a bug: report it with the stack in the daemon's log", strings.Join(hit, "; "))
+	return &c
 }
 
 // entitlementLine says what a tenant's entitlement record holds, and what it
