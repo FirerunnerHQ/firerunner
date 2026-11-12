@@ -101,7 +101,9 @@ setup() {
 sha() { if command -v sha256sum > /dev/null; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1; }
 deploy() {
 	local rc=0
-	PATH="$TMP/bin:$PATH" DEPLOY_POLL_SECONDS=0 DEPLOY_TIMEOUT_SECONDS=5 bash "$SCRIPT" "$@" > "$STATE/out" 2>&1 || rc=$?
+	# Generous: each case ends by its probes, not the clock, and make check
+	# runs this beside other suites; only "never active" times out, on its own.
+	PATH="$TMP/bin:$PATH" DEPLOY_POLL_SECONDS=0 DEPLOY_TIMEOUT_SECONDS=120 bash "$SCRIPT" "$@" > "$STATE/out" 2>&1 || rc=$?
 	echo "$rc" > "$STATE/rc"
 }
 rc() { [ "$(cat "$STATE/rc")" = "$1" ]; }
