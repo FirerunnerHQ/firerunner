@@ -138,3 +138,42 @@ func TestTenantsWithAKMSKey(t *testing.T) {
 		t.Fatalf("a KMS key refused: %v", err)
 	}
 }
+
+// An SSM parameter is read by the daemon, not at load: only its name is
+// checked here. Its lists are checked as a file's are, each time one is read.
+func TestTenantsInSSM(t *testing.T) {
+	c := tenantConfig()
+	c.TenantsPath = "ssm:/fr/control/tenants"
+	if err := c.validateTenants(); err != nil {
+		t.Fatalf("a parameter: %v", err)
+	}
+	for _, bad := range []string{"ssm:fr/control/tenants", "ssm:/fr/", "ssm:/fr//tenants", "ssm:"} {
+		c.TenantsPath = bad
+		if err := c.validateTenants(); err == nil {
+			t.Errorf("%q: accepted", bad)
+		}
+	}
+	if err := c.CheckTenants([]Tenant{goodTenant()}); err != nil {
+		t.Fatalf("a good list read: %v", err)
+	}
+	x := goodTenant()
+	x.Tiers = []string{"nope"}
+	if err := c.CheckTenants([]Tenant{x}); err == nil {
+		t.Fatal("a list naming an unknown tier: accepted")
+	}
+	c.AppClientID = ""
+	if err := c.CheckTenants(nil); err != nil {
+		t.Fatalf("no tenants needs no App: %v", err)
+	}
+}
+
+// A parameter is not a file: Parse reads nothing for it.
+func TestParseLeavesAParameterToTheDaemon(t *testing.T) {
+	c, err := Parse([]string{"--url", "https://github.com/o", "--token", "t", "--tenants", "ssm:/fr/control/tenants"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TenantsPath != "ssm:/fr/control/tenants" || c.Tenants != nil {
+		t.Fatalf("tenants %q %v", c.TenantsPath, c.Tenants)
+	}
+}
