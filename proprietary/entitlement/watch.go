@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"maps"
+	"sort"
 	"sync"
 	"time"
 )
@@ -28,12 +29,23 @@ type Watcher struct {
 	tick <-chan time.Time
 	now  func() time.Time
 
-	mu        sync.Mutex
-	records   Records
+	mu      sync.Mutex
+	records Records
+	// open is each tenant's launching on an expired record, as the reads
+	// have found it.
+	open      map[string]FailOpen
 	known     bool
 	lastRead  time.Time
 	lastErr   string
 	lastErrAt time.Time
+}
+
+// FailOpen is a tenant's launching on expired records: since when it has
+// (zero when it does not now), and how many times it has begun to since the
+// daemon started.
+type FailOpen struct {
+	Since time.Time
+	Count int
 }
 
 // Status is how reading the store goes.
@@ -58,7 +70,18 @@ func (w *Watcher) Read(ctx context.Context) error {
 	} else {
 		w.records, w.known, w.lastRead = rs, true, now
 	}
+	began := w.failOpen(now)
+	expired := make([]time.Time, len(began))
+	for i, id := range began {
+		expired[i] = w.records[id].ValidUntil
+	}
 	w.mu.Unlock()
+	for i, id := range began {
+		if w.Log != nil {
+			w.Log.Warn("tenant launching on an expired entitlement, as its account was active; billing has not renewed it",
+				"tenant", id, "valid_until", expired[i], "store", w.Store.String())
+		}
+	}
 	if err != nil && w.Log != nil {
 		w.Log.Warn("read entitlements; keeping the last until they expire", "store", w.Store.String(), "err", err)
 	}
@@ -89,6 +112,43 @@ func (w *Watcher) Run(ctx context.Context) {
 			_ = w.Read(ctx)
 		}
 	}
+}
+
+// failOpen notes which tenants launch on an expired record now, by the
+// records kept, and returns those that have just begun to. A tenant whose
+// record is gone stops. Callers must hold w.mu.
+func (w *Watcher) failOpen(now time.Time) []string {
+	if w.open == nil {
+		w.open = map[string]FailOpen{}
+	}
+	var began []string
+	for id, r := range w.records {
+		f := w.open[id]
+		switch d := Decide(r, true, now); {
+		case d.FailOpen && f.Since.IsZero():
+			f.Since, f.Count = now, f.Count+1
+			began = append(began, id)
+		case !d.FailOpen:
+			f.Since = time.Time{}
+		}
+		w.open[id] = f
+	}
+	for id, f := range w.open {
+		if _, ok := w.records[id]; !ok {
+			f.Since = time.Time{}
+			w.open[id] = f
+		}
+	}
+	sort.Strings(began)
+	return began
+}
+
+// FailOpen returns tenant id's launching on expired records, as of the
+// latest read.
+func (w *Watcher) FailOpen(id string) FailOpen {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.open[id]
 }
 
 // Records returns the latest records.

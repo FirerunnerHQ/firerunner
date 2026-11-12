@@ -60,10 +60,20 @@ func TestStatusAndDoctorShowEntitlements(t *testing.T) {
 	if c := check(); c.Level != levelPass || !strings.Contains(c.Detail, "held by billing: acme (its spend cap is reached)") || !strings.Contains(c.Detail, "near their spend cap: beta") {
 		t.Fatalf("doctor = %+v", c)
 	}
-	f.Tenants[2].Entitlement = &health.Entitlement{Account: "active", Budget: "ok", ValidUntil: now.Add(-time.Hour), FailOpen: true}
+	f.Tenants[2].Entitlement = &health.Entitlement{Account: "active", Budget: "ok", ValidUntil: now.Add(-time.Hour), FailOpen: true,
+		FailOpenSince: now.Add(-10 * time.Minute), FailOpens: 2, WrittenAt: now.Add(-25 * time.Hour)}
 	write()
-	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "launching on expired records") || !strings.Contains(c.Detail, "beta") {
+	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "launching on expired records") || !strings.Contains(c.Detail, "beta") ||
+		!strings.Contains(c.Detail, "launching on it for 10m") {
 		t.Fatalf("doctor with a fail-open tenant = %+v", c)
+	}
+	text.Reset()
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	if want := "written " + now.Add(-25*time.Hour).UTC().Format(time.RFC3339); !strings.Contains(text.String(), want) ||
+		!strings.Contains(text.String(), "launched on an expired record 2 time(s) since the daemon started") {
+		t.Fatalf("status of a fail-open tenant, want %q and its count:\n%s", want, text.String())
 	}
 	f.Tenants[2].Entitlement = &health.Entitlement{None: true, Held: true}
 	write()
