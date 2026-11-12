@@ -58,16 +58,19 @@ README's *Stopped pool*) and job instances' runner tags
 copies it to the root-only file `/etc/firerunner/pool-key` and points
 firerunner at it (`FR_EC2_POOL_KEY_FILE`), so a restarted or replaced VM
 reuses the pool instances this install launched, trusts no others, and its
-reaper deregisters only the runners this install launched.
+reaper ends only instances this install launched, and deregisters only its
+runners.
 
-- **Upgrading.** Pool instances launched by a release before the key, or
-  before `firerunner:pool-disk-mac`, lack a MAC. The first VM that checks it
-  terminates them once and refills the pool.
+- **Upgrading.** Pool instances launched by a release before
+  `firerunner:pool-disk-mac` lack that MAC: the first VM that checks it
+  terminates them once and refills the pool. The pool also signs the spot
+  requests of the instances it takes in (`firerunner:request-mac`).
 - **A stack made before `PoolKey`** has no secret: firerunner then signs with a
   random key per process and rebuilds the pool after every restart. Update
   the stack to keep it.
-- **Rotating the key** (a new secret value, then a VM refresh) discards the
-  pool once, the same way.
+- **Rotating the key** (a new secret value, then a VM refresh) replaces the
+  pool. Nothing proves the old instances this install's any more, so they
+  are left alone: `firerunner doctor` lists them, to end by hand.
 
 ## Job events (optional)
 
@@ -357,8 +360,15 @@ control VM is not there.
   ends the install's instances (by `Owner`) whose latest start is more than
   `MaxAgeMinutes` ago (default 720). That covers running instances, and used
   instances left stopped.
-- **Stopped pool instances (`ready`, `warming`) are kept.** It holds no pool
-  key; the control VM ends pool instances whose MAC fails.
+- **Stopped pool instances (`ready`, `warming`) are kept.**
+- **Proven before ended.** Set `PoolKeySecret` to `control.yaml`'s
+  `PoolKeySecret` output, and the function reads the key and ends an
+  instance only if a MAC under it proves the install launched it (its pool
+  or runner MAC, or its spot request's), as the control VM's reaper does;
+  anyone who may tag an instance could write the owner tag. It lists the
+  rest as `unproven` in its log, and ends none of them. Left empty, it
+  trusts the owner tag. If it cannot read the key, the run fails and ends
+  nothing.
 - **Spot requests.** It cancels a persistent spot request first. If that
   fails, it keeps the instance rather than leave the request open. A
   one-time request needs no cancel.

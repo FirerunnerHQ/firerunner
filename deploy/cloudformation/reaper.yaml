@@ -5,7 +5,8 @@ Description: >-
   or used and left stopped), in case firerunner itself is not there to
   (control VM down, a bug). Stopped pool instances are kept. It knows
   nothing of GitHub, so it also ends a job that runs past the limit: set it
-  above your longest job.
+  above your longest job. Given the install's pool key, it ends only what a
+  MAC under that key proves the install launched.
   See deploy/cloudformation/README.md.
 
 Parameters:
@@ -28,6 +29,18 @@ Parameters:
     AllowedValues: ["true", "false"]
     Default: "false"
     Description: Only log what would be ended.
+  PoolKeySecret:
+    Type: String
+    Default: ""
+    AllowedPattern: "(arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+)?"
+    Description: >-
+      The ARN of the install's pool key secret (control.yaml's PoolKeySecret
+      output). Given it, an instance is ended only if a MAC under the key proves
+      the install launched it; anyone who may tag an instance can write the
+      owner tag. Empty trusts the owner tag.
+
+Conditions:
+  HasPoolKey: !Not [!Equals [!Ref PoolKeySecret, ""]]
 
 Resources:
   Role:
@@ -51,6 +64,12 @@ Resources:
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !GetAtt LogGroup.Arn
+              - !If
+                - HasPoolKey
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref PoolKeySecret
+                - !Ref AWS::NoValue
 
   # Created here, not by Lambda on first run, so deleting the stack deletes
   # the logs too.
@@ -69,27 +88,73 @@ Resources:
       Timeout: 120
       Role: !GetAtt Role.Arn
       Environment:
-        Variables: { OWNER: !Ref Owner, MAX_AGE_MINUTES: !Ref MaxAgeMinutes, DRY_RUN: !Ref DryRun }
+        Variables: { OWNER: !Ref Owner, MAX_AGE_MINUTES: !Ref MaxAgeMinutes, DRY_RUN: !Ref DryRun, POOL_KEY_SECRET: !Ref PoolKeySecret }
       Code:
         ZipFile: |
-          import datetime, json, os
+          import datetime, hashlib, hmac, json, os, struct
           import boto3
 
           OWNER = os.environ["OWNER"]
           MAX_AGE = datetime.timedelta(minutes=int(os.environ["MAX_AGE_MINUTES"]))
           DRY_RUN = os.environ.get("DRY_RUN") == "true"
+          POOL_KEY_SECRET = os.environ.get("POOL_KEY_SECRET", "")
           # A stopped pool instance in these states is firerunner's to keep.
           POOL_KEPT = ("ready", "warming")
+          # As internal/ec2/poolmac.go signs them.
+          POOL_MAC, RUNNER_MAC, REQUEST_MAC = "firerunner/ec2-pool-mac/v1", "firerunner/ec2-runner-mac/v1", "firerunner/ec2-request-mac/v1"
 
 
           def tag(i, key):
               return next((t["Value"] for t in i.get("Tags", []) if t["Key"] == key), "")
 
 
-          def handler(event, context, ec2=None, now=None):
+          def mac(key, domain, *fields):
+              """The hex HMAC-SHA256 of the domain and the length-prefixed fields."""
+              m = hmac.new(key, domain.encode(), hashlib.sha256)
+              for f in fields:
+                  b = f.encode()
+                  m.update(struct.pack(">I", len(b)) + b)
+              return m.hexdigest()
+
+
+          def signed(got, want):
+              return got != "" and hmac.compare_digest(got, want)
+
+
+          def launched_here(ec2, key, i):
+              """Whether a MAC under the pool key proves the install launched i:
+              its pool MAC, its runner MAC, or its spot request's request MAC.
+              The owner tag alone proves nothing: anyone who may tag can write it."""
+              if key is None:
+                  return True
+              iid, owner, tier, runner = i["InstanceId"], tag(i, "firerunner:owner"), tag(i, "firerunner:tier"), tag(i, "firerunner:runner")
+              if signed(tag(i, "firerunner:pool-mac"), mac(key, POOL_MAC, owner, tier, iid)):
+                  return True
+              if runner and signed(tag(i, "firerunner:runner-mac"), mac(key, RUNNER_MAC, owner, tier, runner, iid)):
+                  return True
+              req = i.get("SpotInstanceRequestId")
+              if req:
+                  r = ec2.describe_spot_instance_requests(SpotInstanceRequestIds=[req])["SpotInstanceRequests"]
+                  if r and signed(tag(r[0], "firerunner:request-mac"), mac(key, REQUEST_MAC, owner, tag(r[0], "firerunner:tier"), req)):
+                      return True
+              return False
+
+
+          def pool_key(sm):
+              """The install's pool key, as firerunner reads it (surrounding space
+              trimmed), or None when none is given. A key that cannot be read fails
+              the run, so that nothing is ended unproven."""
+              if not POOL_KEY_SECRET:
+                  return None
+              sm = sm or boto3.client("secretsmanager")
+              return sm.get_secret_value(SecretId=POOL_KEY_SECRET)["SecretString"].strip().encode()
+
+
+          def handler(event, context, ec2=None, now=None, sm=None):
               ec2 = ec2 or boto3.client("ec2")
               now = now or datetime.datetime.now(datetime.timezone.utc)
-              out = {"ended": [], "would_end": [], "kept_open_request": [], "failed": [], "dry_run": DRY_RUN}
+              key = pool_key(sm)
+              out = {"ended": [], "would_end": [], "kept_open_request": [], "unproven": [], "failed": [], "dry_run": DRY_RUN}
               pages = ec2.get_paginator("describe_instances").paginate(Filters=[
                   {"Name": "tag:firerunner:owner", "Values": [OWNER, OWNER + "/*"]},
                   {"Name": "instance-state-name", "Values": ["pending", "running", "stopped"]},
@@ -103,6 +168,17 @@ Resources:
                           # LaunchTime is the latest start: a used instance left
                           # stopped ages from the start of its job.
                           if now - i["LaunchTime"] < MAX_AGE:
+                              continue
+                          try:
+                              proven = launched_here(ec2, key, i)
+                          except Exception as e:
+                              print(json.dumps({"instance": iid, "error": str(e)}))
+                              out["failed"].append(iid)
+                              continue
+                          if not proven:
+                              # Someone else's, retagged, or the install's own
+                              # whose signing failed: firerunner doctor lists it.
+                              out["unproven"].append(iid)
                               continue
                           if DRY_RUN:
                               out["would_end"].append(iid)
