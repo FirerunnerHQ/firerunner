@@ -56,6 +56,8 @@ class FakeEC2:
 
     def describe_spot_instance_requests(self, SpotInstanceRequestIds):
         req = SpotInstanceRequestIds[0]
+        if req.startswith("sir-gone"):
+            raise RuntimeError("InvalidSpotInstanceRequestID.NotFound")
         tags = [{"Key": k, "Value": v} for k, v in self.request_tags.get(req, {}).items()]
         return {"SpotInstanceRequests": [{"SpotInstanceRequestId": req, "Tags": tags,
                                           "Type": "one-time" if req in self.one_time else "persistent"}]}
@@ -87,6 +89,7 @@ VECTORS = {
     ("firerunner/ec2-pool-mac/v1", "acme", "small", "i-0aaa"): "afac3042f858ac4991846661b231d8737442fe01cfa237ffddcb448f5062a514",
     ("firerunner/ec2-runner-mac/v1", "acme/t1", "small", "runner-1", "i-0bbb"): "0998b25ee7b05b1e1ec6f07bdb111d569bebfa0bb3697a20b101c5307ceb4542",
     ("firerunner/ec2-request-mac/v1", "acme", "small", "sir-0ccc"): "868a83491aee3e25f37ecc2615cc691260a4af6167018b4f3bf0928ad955ccc4",
+    ("firerunner/ec2-launch-mac/v1", "acme", "small", "token-0ddd"): "dca78794a1f22b0ce988b1ace43b7b061d269824be44abc8b3ad577af18af2a1",
 }
 
 
@@ -185,7 +188,17 @@ class ProvenanceTest(unittest.TestCase):
                               "firerunner:runner-mac": self.mac("firerunner/ec2-runner-mac/v1", "acme/t1", "small", "r-1", "i-runner")})
         copied = dict(own, **{"firerunner:pool-mac": pool["firerunner:pool-mac"]})
         retiered = dict(pool, **{"firerunner:tier": "large"})
+        launched = dict(own, **{"firerunner:launch-mac": self.mac("firerunner/ec2-launch-mac/v1", "acme/t1", "small", "tok-1")})
+        crashed = inst("i-crashed", 800, tags=launched)
+        crashed["ClientToken"] = "tok-1"
+        moved = inst("i-moved-launch", 800, tags=launched)
+        moved["ClientToken"] = "tok-2"
         out, ec2, sm = self.sweep([
+            crashed,
+            moved,
+            inst("i-gone-request", 800, spot="sir-gone", tags=own),
+            inst("i-odd", 800, tags=dict(own, **{"firerunner:pool-mac": "\u00e9"})),
+            inst("i-tokenless", 800, tags=dict(own, **{"firerunner:launch-mac": self.mac("firerunner/ec2-launch-mac/v1", "acme/t1", "small", "")})),
             inst("i-pool", 800, state="stopped", pool="claimed", tags=pool),
             inst("i-runner", 800, tags=runner),
             inst("i-relaunched", 800, spot="sir-p", tags=own),
@@ -197,8 +210,9 @@ class ProvenanceTest(unittest.TestCase):
             "sir-p": {"firerunner:tier": "small", "firerunner:request-mac": self.mac("firerunner/ec2-request-mac/v1", "acme/t1", "small", "sir-p")},
             "sir-f": {"firerunner:tier": "small", "firerunner:request-mac": "ab" * 32},
         })
-        self.assertEqual(out["ended"], ["i-pool", "i-runner", "i-relaunched"])
-        self.assertEqual(out["unproven"], ["i-forged", "i-copied", "i-retiered", "i-forged-request"])
+        self.assertEqual(out["ended"], ["i-crashed", "i-pool", "i-runner", "i-relaunched"])
+        self.assertEqual(out["unproven"], ["i-moved-launch", "i-gone-request", "i-odd", "i-tokenless", "i-forged", "i-copied", "i-retiered", "i-forged-request"])
+        self.assertEqual(out["failed"], [])
         for iid in out["unproven"]:
             self.assertNotIn(("terminate", iid), ec2.calls)
         self.assertNotIn(("cancel", "sir-f"), ec2.calls)

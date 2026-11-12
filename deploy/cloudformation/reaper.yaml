@@ -102,6 +102,7 @@ Resources:
           POOL_KEPT = ("ready", "warming")
           # As internal/ec2/poolmac.go signs them.
           POOL_MAC, RUNNER_MAC, REQUEST_MAC = "firerunner/ec2-pool-mac/v1", "firerunner/ec2-runner-mac/v1", "firerunner/ec2-request-mac/v1"
+          LAUNCH_MAC = "firerunner/ec2-launch-mac/v1"
 
 
           def tag(i, key):
@@ -118,23 +119,33 @@ Resources:
 
 
           def signed(got, want):
-              return got != "" and hmac.compare_digest(got, want)
+              # As bytes: a tag anyone may write can hold any character.
+              return got != "" and hmac.compare_digest(got.encode(), want.encode())
 
 
           def launched_here(ec2, key, i):
               """Whether a MAC under the pool key proves the install launched i:
-              its pool MAC, its runner MAC, or its spot request's request MAC.
-              The owner tag alone proves nothing: anyone who may tag can write it."""
+              its launch MAC (over the ClientToken AWS keeps), its pool MAC, its
+              runner MAC, or its spot request's request MAC. The owner tag alone
+              proves nothing: anyone who may tag can write it."""
               if key is None:
                   return True
               iid, owner, tier, runner = i["InstanceId"], tag(i, "firerunner:owner"), tag(i, "firerunner:tier"), tag(i, "firerunner:runner")
+              token = i.get("ClientToken", "")
+              if token and signed(tag(i, "firerunner:launch-mac"), mac(key, LAUNCH_MAC, owner, tier, token)):
+                  return True
               if signed(tag(i, "firerunner:pool-mac"), mac(key, POOL_MAC, owner, tier, iid)):
                   return True
               if runner and signed(tag(i, "firerunner:runner-mac"), mac(key, RUNNER_MAC, owner, tier, runner, iid)):
                   return True
               req = i.get("SpotInstanceRequestId")
               if req:
-                  r = ec2.describe_spot_instance_requests(SpotInstanceRequestIds=[req])["SpotInstanceRequests"]
+                  try:
+                      r = ec2.describe_spot_instance_requests(SpotInstanceRequestIds=[req])["SpotInstanceRequests"]
+                  except Exception as e:
+                      # Gone, or never there: it proves nothing.
+                      print(json.dumps({"instance": iid, "request": req, "describe_error": str(e)}))
+                      return False
                   if r and signed(tag(r[0], "firerunner:request-mac"), mac(key, REQUEST_MAC, owner, tag(r[0], "firerunner:tier"), req)):
                       return True
               return False
@@ -169,13 +180,7 @@ Resources:
                           # stopped ages from the start of its job.
                           if now - i["LaunchTime"] < MAX_AGE:
                               continue
-                          try:
-                              proven = launched_here(ec2, key, i)
-                          except Exception as e:
-                              print(json.dumps({"instance": iid, "error": str(e)}))
-                              out["failed"].append(iid)
-                              continue
-                          if not proven:
+                          if not launched_here(ec2, key, i):
                               # Someone else's, retagged, or the install's own
                               # whose signing failed: firerunner doctor lists it.
                               out["unproven"].append(iid)
