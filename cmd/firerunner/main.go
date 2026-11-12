@@ -477,9 +477,10 @@ func tierProvisioner(t config.Tier, fc provisioner.Provisioner, newEC2 func(conf
 // so the daemon exits for its supervisor to restart and re-register it. So
 // does a tier whose run panics (errPanicked): for a tenant of the list its
 // loop starts it again, and the install restarts, while other tenants'
-// tiers, served by their own loops, never see it. A panic in a goroutine a
-// tier's run starts in turn is not recovered here.
-func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, runs []func(context.Context) error, log *slog.Logger) error {
+// tiers, served by their own loops, never see it. onPanic, when set, is
+// called at once on such a panic, before the other tiers have stopped. A
+// panic in a goroutine a tier's run starts in turn is not recovered here.
+func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, runs []func(context.Context) error, onPanic func(), log *slog.Logger) error {
 	var (
 		wg      sync.WaitGroup
 		mu      sync.Mutex
@@ -497,6 +498,9 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 				defer func() {
 					if p := recover(); p != nil {
 						err = recovered(p, fmt.Sprintf("tier %q", names[i]), log)
+						if onPanic != nil {
+							onPanic()
+						}
 					}
 				}()
 				return run(tierCtx)
@@ -1362,7 +1366,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 	}, log)
 
-	runErr := serveTiers(runCtx, cancel, served.names(), served.runs(cfg), log)
+	// A panic in one of the install's own tiers restarts the daemon, after
+	// a drain no longer than its runners' lifetime.
+	installPanic := sync.OnceFunc(func() { _ = guardAfterPanic(nil, panicStopLimit(served.t.Limits.JobDuration), "the install", log) })
+	runErr := serveTiers(runCtx, cancel, served.names(), served.runs(cfg), installPanic, log)
 	cancel()
 	// No tier is listening any more. Stop refreshing the health file before
 	// the drain, which can wait out long jobs: a file that keeps its last

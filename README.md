@@ -267,9 +267,12 @@ alone: it drains, and starts again by itself after 30 seconds, doubling up to
 5 minutes. The other installations keep serving. `firerunner status` counts
 each installation's restarts and the last error, and `firerunner doctor` warns
 while one has panicked (`tenant-panics`), a bug to report with the stack the
-daemon logs. A panic in the install's own tiers restarts the daemon, as
-before, and one in a goroutine a tier starts in turn (a launch, a runner's
-watcher) still ends the process.
+daemon logs. A panic may leave a lock held, so after one the installation
+has its job limit and 15 minutes to stop; if it has not, the daemon exits
+for systemd to restart it, as the panic would have before. A panic in the
+install's own tiers restarts the daemon after its drain, and one in a
+goroutine a tier starts in turn (a launch, a runner's watcher) still ends
+the process.
 
 **Suspending an installation.** An operator suspends one, for example on an
 abuse report, and resumes it later:

@@ -525,7 +525,7 @@ func TestTenantLoopStopSeesWhyItEnded(t *testing.T) {
 		l := &tenantLoop{
 			id: "t1", live: &liveTenants{}, log: slog.New(slog.DiscardHandler), min: time.Millisecond, max: time.Millisecond,
 			start: func(context.Context) (*servedTenant, error) { return &servedTenant{t: tenant{ID: "t1"}}, nil },
-			serve: func(ctx context.Context, _ context.CancelFunc, _ *servedTenant) error {
+			serve: func(ctx context.Context, _ context.CancelFunc, _ *servedTenant, _ func()) error {
 				cancel(cause)
 				<-ctx.Done()
 				return nil

@@ -335,7 +335,7 @@ func TestServeTiers_OneTierStoppingLeavesOthersRunning(t *testing.T) {
 		},
 	}
 	res := make(chan error, 1)
-	go func() { res <- serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler)) }()
+	go func() { res <- serveTiers(ctx, cancel, []string{"a", "b"}, runs, nil, slog.New(slog.DiscardHandler)) }()
 
 	time.Sleep(50 * time.Millisecond) // tier a has failed by now
 	select {
@@ -357,7 +357,7 @@ func TestServeTiers_AllTiersStoppedShutsDown(t *testing.T) {
 		func(context.Context) error { return errors.New("a: 401") },
 		func(context.Context) error { return errors.New("b: 403") },
 	}
-	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler))
+	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, nil, slog.New(slog.DiscardHandler))
 	// Which tier stopped first is up to the scheduler; either error names it.
 	if err == nil || !(strings.Contains(err.Error(), `tier "a": a: 401`) || strings.Contains(err.Error(), `tier "b": b: 403`)) {
 		t.Fatalf("err = %v, want one tier's error", err)
@@ -433,7 +433,7 @@ func TestServeTiers_StoppedTierContextIsCancelled(t *testing.T) {
 		func(c context.Context) error { ctxs <- c; <-c.Done(); return c.Err() },
 	}
 	res := make(chan error, 1)
-	go func() { res <- serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler)) }()
+	go func() { res <- serveTiers(ctx, cancel, []string{"a", "b"}, runs, nil, slog.New(slog.DiscardHandler)) }()
 	got := []context.Context{<-ctxs, <-ctxs}
 	var failed, live context.Context
 	deadline := time.Now().Add(2 * time.Second)
@@ -469,7 +469,7 @@ func TestServeTiers_RestartStopsEveryTier(t *testing.T) {
 		func(context.Context) error { return fmt.Errorf("%w: 404", listener.ErrRestart) },
 		func(c context.Context) error { <-c.Done(); return c.Err() },
 	}
-	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler))
+	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, nil, slog.New(slog.DiscardHandler))
 	if !errors.Is(err, listener.ErrRestart) {
 		t.Fatalf("serveTiers = %v, want ErrRestart", err)
 	}

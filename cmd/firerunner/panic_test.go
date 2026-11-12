@@ -13,6 +13,39 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
 )
 
+// fakeExit replaces exitProcess for a test, and reports the codes given.
+func fakeExit(t *testing.T) <-chan int {
+	t.Helper()
+	codes := make(chan int, 4)
+	old := exitProcess
+	exitProcess = func(code int) { codes <- code }
+	t.Cleanup(func() { exitProcess = old })
+	return codes
+}
+
+// After a recovered panic, what does not settle within its limit ends the
+// daemon for a restart; what settles does not.
+func TestGuardAfterPanic(t *testing.T) {
+	codes := fakeExit(t)
+	log := slog.New(slog.DiscardHandler)
+	guardAfterPanic(nil, time.Millisecond, "stuck", log)
+	if code := <-codes; code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	settled := make(chan struct{})
+	close(settled)
+	<-guardAfterPanic(settled, time.Millisecond, "settled", log)
+	guardAfterPanic(nil, time.Hour, "slow", log)
+	select {
+	case code := <-codes:
+		t.Fatalf("exit %d for a stop that settled, or within its limit", code)
+	default:
+	}
+	if got := panicStopLimit(30 * time.Minute); got != 30*time.Minute+jobLifetimeSlack {
+		t.Fatalf("panicStopLimit = %s", got)
+	}
+}
+
 // A tier whose run panics stops every tier it is served with, as a deleted
 // scale set does, and serveTiers returns the panic as an error: for a tenant
 // its loop starts it again, and nothing reaches the daemon.
@@ -23,7 +56,11 @@ func TestServeTiersRecoversAPanic(t *testing.T) {
 		func(context.Context) error { panic("nil map") },
 		func(c context.Context) error { <-c.Done(); return c.Err() },
 	}
-	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, slog.New(slog.DiscardHandler))
+	var told atomic.Int32
+	err := serveTiers(ctx, cancel, []string{"a", "b"}, runs, func() { told.Add(1) }, slog.New(slog.DiscardHandler))
+	if told.Load() != 1 {
+		t.Fatalf("onPanic called %d time(s), want once", told.Load())
+	}
 	if !errors.Is(err, errPanicked) || !strings.Contains(err.Error(), `tier "a"`) || !strings.Contains(err.Error(), "nil map") {
 		t.Fatalf("serveTiers = %v, want the panic as an error", err)
 	}
@@ -36,11 +73,19 @@ func TestServeTiersRecoversAPanic(t *testing.T) {
 // runs, the panic is counted, and the tenant starts again by itself. So does
 // one in its start.
 func TestTenantLoopRecoversAPanic(t *testing.T) {
-	for _, where := range []string{"serve", "start"} {
+	for _, where := range []string{"serve", "start", "added"} {
 		t.Run(where, func(t *testing.T) {
+			fakeExit(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			live := &liveTenants{}
+			if where == "added" {
+				live.onAdd = func(*servedTenant) {
+					if live.restarts == nil {
+						panic("added broke")
+					}
+				}
+			}
 			var tries, stops atomic.Int32
 			again := make(chan struct{})
 			l := &tenantLoop{
@@ -51,8 +96,8 @@ func TestTenantLoopRecoversAPanic(t *testing.T) {
 					}
 					return &servedTenant{t: tenant{ID: "acme"}, bound: scheduler.NewTenant("acme", 0)}, nil
 				},
-				serve: func(ctx context.Context, _ context.CancelFunc, _ *servedTenant) error {
-					if tries.Load() == 1 {
+				serve: func(ctx context.Context, _ context.CancelFunc, _ *servedTenant, _ func()) error {
+					if tries.Load() == 1 && where == "serve" {
 						panic("serve broke")
 					}
 					close(again)
@@ -65,9 +110,12 @@ func TestTenantLoopRecoversAPanic(t *testing.T) {
 			go func() { defer close(done); l.run(ctx) }()
 			<-again // it started again by itself
 			h := live.tenants(nil, nil)
+			if n := len(live.served); n != 1 {
+				t.Fatalf("%d tenant(s) listed as served, want the new try's alone", n)
+			}
 			cancel()
 			<-done
-			if want := map[string]int32{"serve": 2, "start": 1}[where]; stops.Load() != want {
+			if want := map[string]int32{"serve": 2, "start": 1, "added": 2}[where]; stops.Load() != want {
 				t.Fatalf("stopped %d time(s), want %d: a try that started stops, panic or not", stops.Load(), want)
 			}
 			var r *health.Restarts
@@ -81,6 +129,43 @@ func TestTenantLoopRecoversAPanic(t *testing.T) {
 			}
 		})
 	}
+}
+
+// After a panic the tenant leaves the health file at once, and a stop that
+// then hangs, on a lock the panic left held, ends the daemon for a restart
+// once its limit has passed.
+func TestTenantLoopStopHangingAfterAPanic(t *testing.T) {
+	codes := fakeExit(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	live := &liveTenants{}
+	stopping, release := make(chan struct{}), make(chan struct{})
+	l := &tenantLoop{
+		id: "acme", live: live, log: slog.New(slog.DiscardHandler), min: time.Hour, max: time.Hour, stopLimit: time.Millisecond,
+		start: func(context.Context) (*servedTenant, error) {
+			return &servedTenant{t: tenant{ID: "acme"}, bound: scheduler.NewTenant("acme", 0)}, nil
+		},
+		serve: func(context.Context, context.CancelFunc, *servedTenant, func()) error { panic("serve broke") },
+		stop: func(context.Context, *servedTenant) {
+			close(stopping)
+			<-release
+		},
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); l.run(ctx) }()
+	<-stopping
+	live.mu.Lock()
+	n := len(live.served)
+	live.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d served while its stop runs after a panic, want none", n)
+	}
+	if code := <-codes; code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	close(release)
+	cancel()
+	<-done
 }
 
 // A tenant between tries is listed with its restarts, and forgotten with
