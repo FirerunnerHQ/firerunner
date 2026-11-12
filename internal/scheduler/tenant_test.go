@@ -362,6 +362,26 @@ func TestTenantPlanLimitWakesOtherTiers(t *testing.T) {
 	s[1].Drain()
 }
 
+// Leaving a tier out wakes the tenant's schedulers: the tier left out says
+// why its jobs wait now, rather than the limit it waited for before.
+func TestTenantPlanLeavingATierOutWakes(t *testing.T) {
+	ctx, ten, prov, s, hs := tenantLab(t, 1)
+	s[1].Reconcile(ctx, 2)
+	b := prov.next(t)
+	if jobs, why, _ := hs[1].get(); jobs != 1 || !strings.Contains(why, "limit of 1") {
+		t.Fatalf("tier b holds %d (%q), want 1 at the limit", jobs, why)
+	}
+	ten.SetPlan(Plan{Tiers: []string{"a"}})
+	waitUntil(t, "b's new reason", func() bool {
+		_, why, _ := hs[1].get()
+		return strings.Contains(why, `does not include tier "b"`)
+	})
+	prov.noMore(t)
+	prov.finish(b)
+	s[0].Drain()
+	s[1].Drain()
+}
+
 func TestTenantSetMax(t *testing.T) {
 	ctx, ten, prov, s, hs := tenantLab(t, 1)
 	s[0].Reconcile(ctx, 3)

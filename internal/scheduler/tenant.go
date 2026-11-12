@@ -199,9 +199,12 @@ type Plan struct {
 }
 
 // SetPlan sets what the tenant's plan lets it run. Like SetMax, it stops no
-// runner: a tier left out keeps its runners, and launches nothing more. A
-// plan that lets more launch wakes the tenant's schedulers. It reports
-// whether anything changed.
+// runner: a tier left out keeps its runners, and launches nothing more. Any
+// change wakes the tenant's schedulers, unless it is held: one that lets more
+// launch frees places, and one that leaves a tier out moves the tiers behind
+// it up the line and changes why its own jobs wait. Set a hold before a
+// plan, so that no launch slips in between. It reports whether anything
+// changed.
 func (t *Tenant) SetPlan(p Plan) bool {
 	var tiers map[string]bool
 	if p.Tiers != nil {
@@ -216,13 +219,8 @@ func (t *Tenant) SetPlan(p Plan) bool {
 		t.mu.Unlock()
 		return false
 	}
-	was := t.limit()
-	added := tiers == nil && t.tiers != nil
-	for n := range tiers {
-		added = added || (t.tiers != nil && !t.tiers[n])
-	}
 	t.plan, t.tiers = runners, tiers
-	t.wakeIf(added || raised(was, t.limit()))
+	t.wakeIf(true)
 	return true
 }
 

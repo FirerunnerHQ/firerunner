@@ -340,8 +340,9 @@ A record can also carry its plan's limits (`"limits": {"max_runners": 2,
 installation's tiers, the narrower of this and its `max_runners` in the
 tenants list holding, and only the tiers named launching; a job on another
 waits at GitHub with the reason. A change applies at the next read, while the
-installation runs, and lowering a limit stops no runner. `status` shows the
-limit in force. Operators and tests write records as billing would:
+installation runs, and lowering a limit stops no runner: an idle warm runner
+on a tier left out still takes one more job, and is not replaced. `status`
+shows the limit in force. Operators and tests write records as billing would:
 
 ```bash
 firerunner entitlement set acme --account active --budget capped --reason "November's cap" --store /etc/firerunner/entitlements.json

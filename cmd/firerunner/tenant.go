@@ -482,19 +482,23 @@ func stateKey(id string) string {
 //
 // The install is never held: it is its operator's. A tenant's entitlement
 // also sets its plan's limits, whatever else holds it, so they are in force
-// the moment it resumes.
+// the moment it resumes; after any hold, since a plan wakes the tenant's
+// schedulers, and one woken before the hold could launch.
 //
 // A hold refuses new launches only: a launch already granted runs its job.
 func (s *shard) applyState(id string, bound *scheduler.Tenant, log *slog.Logger) {
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 	var ent *entitlement.Decision
+	setPlan := func() {}
 	if s.entitlements != nil && id != "" {
 		r, _, d := s.entitlements.Decide(id)
 		ent = &d
 		l := r.PlanLimits()
-		if bound.SetPlan(scheduler.Plan{Runners: l.MaxRunners, Tiers: l.Tiers}) {
-			log.Info("tenant's plan limits changed", "tenant", id, "max_runners", l.MaxRunners, "tiers", l.Tiers, "in_force", bound.Max())
+		setPlan = func() {
+			if bound.SetPlan(scheduler.Plan{Runners: l.MaxRunners, Tiers: l.Tiers}) {
+				log.Info("tenant's plan limits changed", "tenant", id, "max_runners", l.MaxRunners, "tiers", l.Tiers, "in_force", bound.Max())
+			}
 		}
 	}
 	if s.states != nil {
@@ -503,12 +507,14 @@ func (s *shard) applyState(id string, bound *scheduler.Tenant, log *slog.Logger)
 			if bound.Suspend(r.Reason) {
 				log.Warn("tenant suspended: holding its launches and ending its runners", "tenant", stateKey(id), "reason", r.Reason, "since", r.Since)
 			}
+			setPlan()
 			return
 		}
 		if !known && id != "" {
 			if bound.Hold("its state has not been read yet") {
 				log.Warn("tenant held until its state is read", "tenant", id, "store", s.states.Status().Store)
 			}
+			setPlan()
 			return
 		}
 	}
@@ -516,8 +522,12 @@ func (s *shard) applyState(id string, bound *scheduler.Tenant, log *slog.Logger)
 		if bound.Hold(ent.Why) {
 			log.Warn("tenant held by its entitlement: its jobs wait", "tenant", id, "why", ent.Why)
 		}
+		setPlan()
 		return
 	}
+	// Not held from here on, unless it already was: Resume wakes the
+	// schedulers then, and the plan does now.
+	setPlan()
 	if bound.Resume() {
 		log.Info("tenant resumed", "tenant", stateKey(id))
 	}

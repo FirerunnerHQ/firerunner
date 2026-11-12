@@ -31,7 +31,8 @@ is trial, active, past_due or suspended; --budget is ok, warning or capped;
 --valid-for defaults to 24h. --max-runners and --tiers are the plan's
 limits: at most N runners at once across its tiers (the narrower of this and
 its max_runners in the tenants list holds), and only the tiers named launch;
-jobs on the others wait. Lowering them stops no runner. A daemon reads the
+jobs on the others wait. Lowering them stops no runner (an idle warm runner
+on a tier left out takes one more job, and is not replaced). A daemon reads the
 records every 30 seconds:
 
   - no record, a suspended account, or a capped budget: the tenant's launches
