@@ -170,10 +170,24 @@ func TestWatcherCountsFailOpen(t *testing.T) {
 	if f := read(); f.Count != 2 || !f.Since.Equal(clock) {
 		t.Fatalf("expired again: %+v; want the second time", f)
 	}
+	// With the store down, an expiry by the clock alone still begins one.
+	put(Record{Account: Active, Budget: OK, ValidUntil: clock.Add(time.Hour)})
+	if f := read(); !f.Since.IsZero() {
+		t.Fatalf("renewed again: %+v", f)
+	}
+	w.Store = &failingStore{Store: fs, err: errors.New("throttled")}
+	clock = clock.Add(2 * time.Hour)
+	if err := w.Read(context.Background()); err == nil {
+		t.Fatal("a failed read reported no error")
+	}
+	if f := w.FailOpen("acme"); f.Count != 3 || !f.Since.Equal(clock) {
+		t.Fatalf("expired with the store down: %+v; want the third time", f)
+	}
+	w.Store = fs
 	if err := fs.Delete(context.Background(), "acme"); err != nil {
 		t.Fatal(err)
 	}
-	if f := read(); f.Count != 2 || !f.Since.IsZero() {
+	if f := read(); f.Count != 3 || !f.Since.IsZero() {
 		t.Fatalf("record gone: %+v; want it no longer launching, counted", f)
 	}
 }

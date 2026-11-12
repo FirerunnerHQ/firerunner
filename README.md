@@ -336,8 +336,8 @@ and what it allows, and `doctor` warns while reads fail, while an
 installation launches on an expired record (and for how long), or has none.
 `status --json` also counts, per tier, the jobs held since the daemon started
 by what held them (`held_jobs`: `limit`, `plan_limit`, `plan_tier`, `held`,
-`suspended`), and per installation the times it began launching on an expired
-record (`fail_opens`).
+`suspended`), and per installation the times, as of each read, its record
+began to let it launch though expired (`fail_opens`).
 
 A record can also carry its plan's limits (`"limits": {"max_runners": 2,
 "tiers": ["small"]}`): at most that many runners at once across the

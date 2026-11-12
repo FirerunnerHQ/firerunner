@@ -78,7 +78,7 @@ func (w *Watcher) Read(ctx context.Context) error {
 	w.mu.Unlock()
 	for i, id := range began {
 		if w.Log != nil {
-			w.Log.Warn("tenant launching on an expired entitlement, as its account was active; billing has not renewed it",
+			w.Log.Warn("tenant's entitlement expired with its account active: it goes on launching, unless something else holds it; billing has not renewed it",
 				"tenant", id, "valid_until", expired[i], "store", w.Store.String())
 		}
 	}
@@ -114,9 +114,10 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 }
 
-// failOpen notes which tenants launch on an expired record now, by the
-// records kept, and returns those that have just begun to. A tenant whose
-// record is gone stops. Callers must hold w.mu.
+// failOpen notes which tenants' records let them launch though expired, by
+// the records kept, and returns those that have just begun to. It judges
+// the record alone: a tenant also suspended, or not served here, counts too.
+// A tenant whose record is gone stops. Callers must hold w.mu.
 func (w *Watcher) failOpen(now time.Time) []string {
 	if w.open == nil {
 		w.open = map[string]FailOpen{}

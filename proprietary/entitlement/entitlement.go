@@ -75,8 +75,8 @@ type Record struct {
 	// holds its tenant, as someone wrote it.
 	Invalid string `json:"-"`
 	// Written is when the store last saw the record written: the SSM
-	// parameter's last modification, or the file's for a file store. Zero
-	// when the store does not say.
+	// parameter's last modification, or for a file store the file's, which
+	// any tenant's write changes. Zero when the store does not say.
 	Written time.Time `json:"-"`
 }
 
@@ -249,13 +249,15 @@ func (f *FileStore) String() string { return f.Path }
 
 // Load reads the file.
 func (f *FileStore) Load(context.Context) (Records, error) {
-	raw, err := f.raw()
-	if err != nil {
-		return nil, err
-	}
+	// Stat first: a write between the two then dates newer content older,
+	// never older content newer.
 	var written time.Time
 	if fi, err := os.Stat(f.Path); err == nil {
 		written = fi.ModTime()
+	}
+	raw, err := f.raw()
+	if err != nil {
+		return nil, err
 	}
 	rs := Records{}
 	for id, m := range raw {
