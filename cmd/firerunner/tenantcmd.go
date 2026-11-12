@@ -42,7 +42,7 @@ own tiers. SPEC is where the daemon reads tenant states, as its
 shell's AWS credentials and region, FR_AWS_REGION or AWS_REGION) or an
 absolute file path. Default FR_TENANT_STATE; with no FR_* variable set, the
 daemon's settings file is read for it, as status and doctor do (--env-file
-FILE reads another, --env-file none none). Flags are kept beside it, under
+FILE reads another, --env-file none reads none). Flags are kept beside it, under
 its name with -flags added.
 
 A running daemon reads the states every 15 seconds: within that, a suspended

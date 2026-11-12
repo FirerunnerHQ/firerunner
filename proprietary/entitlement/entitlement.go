@@ -198,16 +198,9 @@ func (f *FileStore) String() string { return f.Path }
 
 // Load reads the file.
 func (f *FileStore) Load(context.Context) (Records, error) {
-	b, err := os.ReadFile(f.Path)
-	if errors.Is(err, os.ErrNotExist) {
-		return Records{}, nil
-	}
+	raw, err := f.raw()
 	if err != nil {
 		return nil, err
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return nil, fmt.Errorf("%s: %w", f.Path, err)
 	}
 	rs := Records{}
 	for id, m := range raw {
@@ -216,28 +209,45 @@ func (f *FileStore) Load(context.Context) (Records, error) {
 	return rs, nil
 }
 
+// raw reads the file's records as written, one JSON value per tenant.
+func (f *FileStore) raw() (map[string]json.RawMessage, error) {
+	b, err := os.ReadFile(f.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]json.RawMessage{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	raw := map[string]json.RawMessage{}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("%s: %w", f.Path, err)
+	}
+	return raw, nil
+}
+
 // Put writes the tenant's record, replacing the file whole.
-func (f *FileStore) Put(ctx context.Context, id string, r Record) error {
-	return f.update(ctx, func(rs Records) { rs[id] = r })
-}
-
-// Delete removes the tenant's record.
-func (f *FileStore) Delete(ctx context.Context, id string) error {
-	return f.update(ctx, func(rs Records) { delete(rs, id) })
-}
-
-func (f *FileStore) update(ctx context.Context, change func(Records)) error {
-	rs, err := f.Load(ctx)
+func (f *FileStore) Put(_ context.Context, id string, r Record) error {
+	b, err := json.Marshal(r)
 	if err != nil {
 		return err
 	}
-	for id, r := range rs {
-		if r.Invalid != "" {
-			delete(rs, id) // rewritten by whoever writes it next
-		}
+	return f.update(func(raw map[string]json.RawMessage) { raw[id] = b })
+}
+
+// Delete removes the tenant's record.
+func (f *FileStore) Delete(_ context.Context, id string) error {
+	return f.update(func(raw map[string]json.RawMessage) { delete(raw, id) })
+}
+
+// update changes one tenant's record and keeps every other as written, an
+// unreadable one too, so that its writer can still see what it wrote.
+func (f *FileStore) update(change func(map[string]json.RawMessage)) error {
+	raw, err := f.raw()
+	if err != nil {
+		return err
 	}
-	change(rs)
-	b, err := json.MarshalIndent(rs, "", "  ")
+	change(raw)
+	b, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
 		return err
 	}

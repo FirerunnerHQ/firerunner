@@ -118,7 +118,9 @@ type Tenant struct {
 // decision on it now.
 type Entitlement struct {
 	// None: the store holds no record for the tenant (it is held).
-	None       bool      `json:"none,omitempty"`
+	None bool `json:"none,omitempty"`
+	// Invalid says why its record could not be read (it is held).
+	Invalid    string    `json:"invalid,omitempty"`
 	Plan       string    `json:"plan,omitempty"`
 	Account    string    `json:"account_state,omitempty"`
 	Budget     string    `json:"budget_state,omitempty"`

@@ -36,7 +36,7 @@ SPEC is the daemon's --entitlements: ssm:<path> (one SSM parameter per
 tenant; this shell's AWS credentials and region, FR_AWS_REGION or
 AWS_REGION) or an absolute file path. Default FR_ENTITLEMENTS; with no FR_*
 variable set, the daemon's settings file is read for it, as status and
-doctor do (--env-file FILE reads another, --env-file none none).
+doctor do (--env-file FILE reads another, --env-file none reads none).
 exit status: 0 done, 1 failed, 2 usage error
 `
 

@@ -97,8 +97,12 @@ func TestFileStore(t *testing.T) {
 	if err := s.Delete(ctx, "acme"); err != nil {
 		t.Fatal(err)
 	}
-	if rs, _ := s.Load(ctx); len(rs) != 0 {
-		t.Fatalf("after delete: %v", rs)
+	rs, _ = s.Load(ctx)
+	if _, ok := rs["acme"]; ok || rs["bad"].Invalid == "" {
+		t.Fatalf("after delete: %+v; want acme gone and the unreadable record kept as written", rs)
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), `"paid"`) {
+		t.Fatalf("the unreadable record was rewritten:\n%s", b)
 	}
 }
 

@@ -843,6 +843,9 @@ func entitlementLine(e *health.Entitlement) string {
 	if e.None {
 		return "no record: held"
 	}
+	if e.Invalid != "" {
+		return "UNREADABLE record (" + e.Invalid + "): held"
+	}
 	s := fmt.Sprintf("account %s, budget %s", e.Account, e.Budget)
 	if e.Plan != "" {
 		s = "plan " + e.Plan + ", " + s
@@ -863,9 +866,10 @@ func entitlementLine(e *health.Entitlement) string {
 
 // entitlementsCheck judges the daemon's reading of entitlements, nil when it
 // reads none: WARN while reads fail, while a tenant launches on an expired
-// record (billing has not renewed it), or while one has no record (it is
-// held for want of one); else PASS, naming the tenants held by their
-// entitlement and those near their cap, as billing decided.
+// record (billing has not renewed it), or while one has no record, or one
+// that cannot be read (it is held for want of one); else PASS, naming the
+// tenants held by their entitlement and those near their cap, as billing
+// decided.
 func entitlementsCheck(f health.File, now time.Time) *Check {
 	es := f.Entitlements
 	if es == nil {
@@ -878,6 +882,8 @@ func entitlementsCheck(f health.File, now time.Time) *Check {
 		case e == nil:
 		case e.None:
 			none = append(none, t.ID)
+		case e.Invalid != "":
+			none = append(none, fmt.Sprintf("%s (unreadable: %s)", t.ID, e.Invalid))
 		case e.FailOpen:
 			open = append(open, fmt.Sprintf("%s (expired %s)", t.ID, e.ValidUntil.UTC().Format(time.RFC3339)))
 		case e.Held:
@@ -894,7 +900,7 @@ func entitlementsCheck(f health.File, now time.Time) *Check {
 	case len(open) > 0:
 		c = warn("entitlements", "launching on expired records, as their accounts were active: %s; billing has not renewed them in %s", strings.Join(open, ", "), es.Store)
 	case len(none) > 0:
-		c = warn("entitlements", "no record in %s, so held: %s; billing writes one per tenant", es.Store, strings.Join(none, ", "))
+		c = warn("entitlements", "no readable record in %s, so held: %s; billing writes one per tenant", es.Store, strings.Join(none, ", "))
 	default:
 		detail := "every tenant may launch"
 		if len(held) > 0 {

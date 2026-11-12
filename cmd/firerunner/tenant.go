@@ -73,6 +73,10 @@ type shard struct {
 	// entitlements reads what each tenant may run (--entitlements); nil when
 	// off. It holds a tenant's launches, and never stops a runner.
 	entitlements *entitlement.Watcher
+	// applyMu makes each applyState decide and apply as one step: the
+	// watchers and the tenant loops call it at once, and a decision taken
+	// on older inputs must not land after one taken on newer.
+	applyMu sync.Mutex
 }
 
 // tenantHooks are the callbacks that give a tenant's jobs a cache identity.
@@ -447,7 +451,11 @@ func stateKey(id string) string {
 //   - active otherwise.
 //
 // The install is never held: it is its operator's.
+//
+// A hold refuses new launches only: a launch already granted runs its job.
 func (s *shard) applyState(id string, bound *scheduler.Tenant, log *slog.Logger) {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 	if s.states != nil {
 		states, known := s.states.States()
 		if r, suspended := states[stateKey(id)]; suspended {
@@ -486,6 +494,37 @@ func (s *shard) suspension(id string) func() string {
 		states, _ := s.states.States()
 		return states[stateKey(id)].Reason
 	}
+}
+
+// applyOnAdd has live judge each tenant as it is served, by the states and
+// entitlements read so far: a change read while a tenant starts is no
+// change by the time it is served. Both watchers set the same hook.
+func (s *shard) applyOnAdd(live *liveTenants) {
+	live.mu.Lock()
+	live.onAdd = func(st *servedTenant) { s.applyState(st.t.ID, st.bound, s.log.With("component", "tenant-state")) }
+	live.mu.Unlock()
+}
+
+// entitlementHealth sets each tenant's entitlement in the health file's
+// tenants, and how reading them goes; nothing when they are off.
+func (s *shard) entitlementHealth(f *health.File) {
+	if s.entitlements == nil {
+		return
+	}
+	st := s.entitlements.Status()
+	f.Entitlements = &health.TenantStates{Store: st.Store, LastRead: st.LastRead, LastError: st.LastError, LastErrorAt: st.LastErrorAt}
+	for i := range f.Tenants {
+		if f.Tenants[i].ID != "" {
+			f.Tenants[i].Entitlement = healthEntitlement(s.entitlements.Decide(f.Tenants[i].ID))
+		}
+	}
+}
+
+// healthEntitlement is a tenant's entitlement record and the decision on it,
+// for the health file.
+func healthEntitlement(r entitlement.Record, ok bool, d entitlement.Decision) *health.Entitlement {
+	return &health.Entitlement{None: !ok, Invalid: r.Invalid, Plan: r.Plan, Account: string(r.Account), Budget: string(r.Budget), ValidUntil: r.ValidUntil,
+		Held: d.Hold, FailOpen: d.FailOpen, Warning: d.Warning, Why: d.Why}
 }
 
 // health is what the health file says of the tenant, with its state.

@@ -684,9 +684,7 @@ func (s *shard) watchStates(ctx context.Context, cfg *config.Config, live *liveT
 		}
 	}
 	s.states = w
-	live.mu.Lock()
-	live.onAdd = func(st *servedTenant) { s.applyState(st.t.ID, st.bound, wlog) }
-	live.mu.Unlock()
+	s.applyOnAdd(live)
 	if err := w.Read(ctx); err != nil {
 		wlog.Error("tenant states not read; the catalog's tenants are held until they are", "store", store.String(), "err", err)
 	}
@@ -719,9 +717,7 @@ func (s *shard) watchEntitlements(ctx context.Context, cfg *config.Config, live 
 		}
 	}
 	s.entitlements = w
-	live.mu.Lock()
-	live.onAdd = func(st *servedTenant) { s.applyState(st.t.ID, st.bound, elog) }
-	live.mu.Unlock()
+	s.applyOnAdd(live)
 	if err := w.Read(ctx); err != nil {
 		elog.Error("entitlements not read; the catalog's tenants are held until they are", "store", store.String(), "err", err)
 	}
@@ -792,13 +788,6 @@ func healthGuardDuty(st guardduty.Status) *health.GuardDuty {
 }
 
 // healthTenantStates is the tenant states' reading for the health file.
-// healthEntitlement is a tenant's entitlement record and the decision on it,
-// for the health file.
-func healthEntitlement(r entitlement.Record, ok bool, d entitlement.Decision) *health.Entitlement {
-	return &health.Entitlement{None: !ok, Plan: r.Plan, Account: string(r.Account), Budget: string(r.Budget), ValidUntil: r.ValidUntil,
-		Held: d.Hold, FailOpen: d.FailOpen, Warning: d.Warning, Why: d.Why}
-}
-
 func healthTenantStates(st tenantstate.Status) *health.TenantStates {
 	return &health.TenantStates{Store: st.Store, LastRead: st.LastRead, LastError: st.LastError, LastErrorAt: st.LastErrorAt}
 }
@@ -1303,15 +1292,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			f.GuardDuty = healthGuardDuty(s.findings.Status())
 		}
 		f.Tenants = live.tenants(states, flags)
-		if s.entitlements != nil {
-			st := s.entitlements.Status()
-			f.Entitlements = &health.TenantStates{Store: st.Store, LastRead: st.LastRead, LastError: st.LastError, LastErrorAt: st.LastErrorAt}
-			for i := range f.Tenants {
-				if f.Tenants[i].ID != "" {
-					f.Tenants[i].Entitlement = healthEntitlement(s.entitlements.Decide(f.Tenants[i].ID))
-				}
-			}
-		}
+		s.entitlementHealth(f)
 	}, log)
 
 	// Drive every tier's listener concurrently. A listener reconnects its own

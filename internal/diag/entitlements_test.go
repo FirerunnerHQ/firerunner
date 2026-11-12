@@ -67,8 +67,20 @@ func TestStatusAndDoctorShowEntitlements(t *testing.T) {
 	}
 	f.Tenants[2].Entitlement = &health.Entitlement{None: true, Held: true}
 	write()
-	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "no record") || !strings.Contains(c.Detail, "beta") {
+	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "no readable record") || !strings.Contains(c.Detail, "beta") {
 		t.Fatalf("doctor with no record = %+v", c)
+	}
+	f.Tenants[2].Entitlement = &health.Entitlement{Invalid: `account_state "paid"`, Held: true}
+	write()
+	if c := check(); c.Level != levelWarn || !strings.Contains(c.Detail, "beta (unreadable: account_state \"paid\")") {
+		t.Fatalf("doctor with an unreadable record = %+v", c)
+	}
+	text.Reset()
+	if err := Status(cfg, "test", &text, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "beta entitlement: UNREADABLE record") {
+		t.Fatalf("status with an unreadable record:\n%s", text.String())
 	}
 	f.Entitlements.LastError, f.Entitlements.LastErrorAt = "AccessDeniedException", now.Add(time.Second)
 	write()
