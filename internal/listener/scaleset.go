@@ -634,6 +634,18 @@ func (s *ScaleSet) Close(ctx context.Context) error {
 	return nil
 }
 
+// Remove closes the session and deletes the scale set, whether this process
+// created it or found it registered: its tenant is gone, and so are the
+// labels its jobs would wait on.
+func (s *ScaleSet) Remove(ctx context.Context) error {
+	_ = s.session.Close(ctx)
+	if err := s.client.DeleteRunnerScaleSet(ctx, s.scaleSetID); err != nil {
+		return fmt.Errorf("delete runner scale set: %w", err)
+	}
+	s.log.Info("deregistered runner scale set: its tenant was removed", "scaleSetID", s.scaleSetID)
+	return nil
+}
+
 // scaler adapts GitHub's scale-set callbacks onto firerunner's DesiredFunc.
 // Because every microVM is ephemeral and self-terminating, job start marks the
 // VM busy for shutdown drain and dispatches trusted identity resolution, and
