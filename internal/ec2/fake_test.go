@@ -571,14 +571,31 @@ func (f *fakeEC2) CreateTags(_ context.Context, in *ec2.CreateTagsInput, _ ...fu
 		f.tagUnknown--
 		return nil, apiErr(errNotFound)
 	}
+	// A resource is an instance, or an instance's persistent spot request.
+	tags := map[string]map[string]string{}
 	for _, id := range in.Resources {
-		if _, ok := f.instances[id]; !ok {
+		if i, ok := f.instances[id]; ok {
+			tags[id] = i.tags
+			continue
+		}
+		for _, i := range f.instances {
+			if i.spotReq == id {
+				if i.spotTags == nil {
+					i.spotTags = map[string]string{}
+				}
+				tags[id] = i.spotTags
+			}
+		}
+		if tags[id] == nil {
+			if strings.HasPrefix(id, "sir-") {
+				return nil, apiErr(errRequestNotFound)
+			}
 			return nil, apiErr(errNotFound) // R7
 		}
 	}
 	for _, id := range in.Resources {
 		for _, t := range in.Tags {
-			f.instances[id].tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+			tags[id][aws.ToString(t.Key)] = aws.ToString(t.Value)
 		}
 	}
 	return &ec2.CreateTagsOutput{}, nil

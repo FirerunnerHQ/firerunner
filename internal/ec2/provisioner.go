@@ -89,7 +89,7 @@ func (c *Client) tagNew(ctx context.Context, id, key, value string) error {
 			Resources: []string{id},
 			Tags:      []types.Tag{{Key: aws.String(key), Value: aws.String(value)}},
 		})
-		if err == nil || !isCode(err, errNotFound) || attempt == signAttempts {
+		if err == nil || !(isCode(err, errNotFound) || isCode(err, errRequestNotFound)) || attempt == signAttempts {
 			return err
 		}
 		select {

@@ -384,7 +384,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*served
 			}
 			return &health.Reaper{
 				At: rep.At, DryRun: rep.DryRun, Instances: rep.Instances, SpotRequests: rep.SpotRequests,
-				Busy: rep.Busy, Young: rep.Young, Error: rep.Err,
+				Busy: rep.Busy, Young: rep.Young, Unproven: rep.Unproven, Error: rep.Err,
 			}
 		}
 	}
@@ -641,12 +641,14 @@ func (l *liveTenants) reaper() *health.Reaper {
 			sum.SpotRequests = slices.Clone(r.SpotRequests)
 			sum.Busy = slices.Clone(r.Busy)
 			sum.Young = slices.Clone(r.Young)
+			sum.Unproven = slices.Clone(r.Unproven)
 			continue
 		}
 		sum.Instances = append(sum.Instances, r.Instances...)
 		sum.SpotRequests = append(sum.SpotRequests, r.SpotRequests...)
 		sum.Busy = append(sum.Busy, r.Busy...)
 		sum.Young = append(sum.Young, r.Young...)
+		sum.Unproven = append(sum.Unproven, r.Unproven...)
 		if r.At.After(sum.At) {
 			sum.At = r.At
 		}

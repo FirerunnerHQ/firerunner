@@ -123,8 +123,10 @@ func TestPoolMAC_ShortKeyRefused(t *testing.T) {
 func TestPoolMAC_ForgedInstancesAreNeverStartedOrRegistered(t *testing.T) {
 	// Someone in the account launched stopped instances with the right owner,
 	// tier and pool tags, and the runner security group. Rediscovery finds
-	// them first; none may be told a JIT config or started. Each is
-	// terminated, its persistent request cancelled first.
+	// them first; none may be told a JIT config or started. Nor is any
+	// terminated, or its request cancelled: the owner tag alone does not
+	// make an instance the pool's to end, and the tags may have been put on
+	// someone else's.
 	h := poolHarness(t, 4, config.MarketSpot)
 	if err := h.p.c.SetPoolKey(testKey); err != nil {
 		t.Fatal(err)
@@ -152,16 +154,19 @@ func TestPoolMAC_ForgedInstancesAreNeverStartedOrRegistered(t *testing.T) {
 	h.f.mu.Unlock()
 
 	h.runPool(t)
-	eventually(t, "the forged instances terminated", func() bool {
-		for id := range forged {
-			if h.f.state(id) != types.InstanceStateNameShuttingDown {
-				return false
-			}
-		}
-		return true
-	})
+	eventually(t, "the genuine instance ready", func() bool { r, _ := h.p.pool.Ready(); return r == 1 })
 	if r, _ := h.p.pool.Ready(); r != 1 {
 		t.Fatalf("ready = %d, want only the genuine instance", r)
+	}
+	for id, how := range forged {
+		if s := h.f.state(id); s == types.InstanceStateNameShuttingDown || s == types.InstanceStateNameTerminated {
+			t.Errorf("%s (%s): %s, though nothing proves the pool launched it", id, how, s)
+		}
+		h.f.mu.Lock()
+		if h.f.cancelled[h.f.instances[id].spotReq] {
+			t.Errorf("%s (%s): its spot request was cancelled", id, how)
+		}
+		h.f.mu.Unlock()
 	}
 	// A job takes the pool's one ready instance: the genuine one.
 	errc := h.launch(context.Background())
@@ -245,7 +250,12 @@ func TestPoolMAC_SameKeyReusesAfterRestart(t *testing.T) {
 	p.pool.discard(context.Background(), in.id, in.spotReq)
 }
 
-func TestPoolMAC_NewKeyOrNoKeyDiscardsThePool(t *testing.T) {
+// After the key changes, the old pool is never used, and a new one is
+// launched. With no key of its own, the process trusts the owner tag, as
+// doctor warns, and ends the old pool; with a new key, nothing proves the old
+// instances this install's, so they are left alone (the reaper reports them
+// unproven, for an operator to end).
+func TestPoolMAC_NewKeyOrNoKeyReplacesThePool(t *testing.T) {
 	for name, key := range map[string][]byte{
 		"new key": []byte(strings.Repeat("n", MinPoolKeyBytes)),
 		"no key":  nil, // a random key of the process's own
@@ -256,8 +266,10 @@ func TestPoolMAC_NewKeyOrNoKeyDiscardsThePool(t *testing.T) {
 			if (key == nil) != p.c.PoolKeyEphemeral() {
 				t.Fatalf("ephemeral = %v", p.c.PoolKeyEphemeral())
 			}
-			eventually(t, "the old instance discarded", func() bool { return h.f.state(id) == types.InstanceStateNameShuttingDown })
 			eventually(t, "a replacement warming", func() bool { _, w := p.pool.Ready(); return w == 1 })
+			if ended := h.f.state(id) == types.InstanceStateNameShuttingDown; ended != (key == nil) {
+				t.Fatalf("old instance %s: ended = %v, want %v", id, ended, key == nil)
+			}
 			if r, _ := p.pool.Ready(); r != 0 {
 				t.Fatalf("ready = %d: the old instance joined the pool", r)
 			}
