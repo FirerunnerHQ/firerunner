@@ -1295,6 +1295,9 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				b.SetMax(max)
 			}
 		},
+		removed: func(c config.Tenant) {
+			s.removeLeftovers(runCtx, extraTenant(cfg, c, owner, appJWT), c.Tiers)
+		},
 	}
 	s.tenants.Store(tenants)
 	var catalog *tenantCatalog

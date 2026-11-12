@@ -268,17 +268,11 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner string, jwt *ghauth.
 }
 
 // runTenant serves a tenant of the list until ctx ends, as cur returns its
-// entry each time it starts. Removed from the list, it ends by deleting
-// every scale set its tiers have registered, served or not.
+// entry each time it starts.
 func (s *shard) runTenant(ctx context.Context, cur func() config.Tenant, served func(*servedTenant), live *liveTenants, owner string, jwt *ghauth.JWT) {
 	get := func() tenant { return extraTenant(s.cfg, cur(), owner, jwt) }
 	et := get()
 	defer live.forget(et.ID)
-	defer func() {
-		if removedTenant(ctx) {
-			s.removeLeftovers(ctx, get(), cur().Tiers)
-		}
-	}()
 	et.warnRefused(s.log)
 	if len(et.Tiers) == 0 {
 		s.log.Error("tenant not served: none of its tiers is within its limits", "tenant", et.ID, "limits", et.Limits.String())
@@ -323,22 +317,25 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 }
 
 // removeLeftovers deletes, by name, the scale sets a removed tenant's tiers
-// registered, each tier it lists whether served or not. A run that served
-// it when it was removed has deleted its own, and finds none; this covers
-// the rest: a tenant in retry backoff or skipped when removed, and one whose
-// scale sets an earlier run kept (KeepOnClose). A tenant removed while no
-// daemon ran, or before one crashed mid-drain, is not covered.
+// registered in its runner group, each tier its last entry lists, served or
+// not. A run that served it when it was removed has deleted its own, and
+// finds none; this covers the rest: a tenant in retry backoff, skipped, or
+// waiting on a run before it when removed, and one whose scale sets an
+// earlier run kept (KeepOnClose). Not covered: a tier or runner group an
+// earlier entry named, and a tenant removed while no daemon ran, or before
+// one crashed mid-drain.
 func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) {
 	remove := s.removeByName
 	if remove == nil {
 		remove = listener.RemoveByName
 	}
-	// Bounded: a GitHub that hangs must not hold up shutdown.
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
-	defer cancel()
 	for _, name := range names {
 		cfg := s.listenerConfig(t, config.Tier{Name: name}, tenantHooks{}, nil, nil, s.log, nil)
+		// Bounded per tier: a GitHub that hangs must not hold up shutdown,
+		// and a slow first tier must not use up the rest's time.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
 		removed, err := remove(rctx, cfg)
+		cancel()
 		switch {
 		case err != nil:
 			s.log.Warn("scale set of a removed tenant left registered", "tenant", t.ID, "tier", name, "err", err)

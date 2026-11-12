@@ -5,9 +5,11 @@ import (
 	"errors"
 	"log/slog"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +38,8 @@ type setLab struct {
 	// that started while another on its account had not returned.
 	active   map[string]int
 	overlaps []string
+	// removed records each removed tenant's entry the set hands on.
+	removed []string
 }
 
 type tenantStart struct {
@@ -83,6 +87,11 @@ func newSetLab(t *testing.T) *setLab {
 			l.mu.Lock()
 			defer l.mu.Unlock()
 			l.maxes = append(l.maxes, id+"="+strconv.Itoa(max))
+		},
+		removed: func(c config.Tenant) {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			l.removed = append(l.removed, c.ID+" "+strings.Join(c.Tiers, ","))
 		},
 	}
 	t.Cleanup(func() {
@@ -530,43 +539,81 @@ func TestTenantLoopStopSeesWhyItEnded(t *testing.T) {
 	}
 }
 
-// A tenant removed while not served, here skipped as none of its tiers is
-// within its limits, has the scale sets its tiers registered deleted by
-// name, on its own account; a tenant that changed keeps them.
-func TestRemovedTenantNotServedLeavesNoScaleSets(t *testing.T) {
-	for cause, want := range map[error]bool{errTenantRemoved: true, errTenantChanged: false} {
-		var mu sync.Mutex
-		var asked []string
-		s := &shard{log: slog.New(slog.DiscardHandler), cfg: &config.Config{RunnerGroup: "firerunner",
-			Tiers: []config.Tier{{Name: "big", Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{InstanceTypes: []string{"c7i.4xlarge"}}}}},
-			removeByName: func(_ context.Context, c listener.Config) (bool, error) {
-				mu.Lock()
-				defer mu.Unlock()
-				asked = append(asked, c.URL+" "+c.RunnerGroup+" "+c.Name)
-				return true, nil
-			}}
-		vcpu := 2
-		c := config.Tenant{ID: "acme", URL: "https://github.com/acme", InstallationID: 7, Tiers: []string{"big"},
-			Limits: &config.TenantLimits{MaxVCPU: &vcpu}}
-		ctx, cancel := context.WithCancelCause(context.Background())
-		live := &liveTenants{}
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			s.runTenant(ctx, func() config.Tenant { return c }, nil, live, "inst", nil)
-		}()
-		waitFor(t, "skipped", func() bool { live.mu.Lock(); defer live.mu.Unlock(); return len(live.skipped) > 0 })
-		cancel(cause)
-		<-done
-		mu.Lock()
-		got := asked
-		mu.Unlock()
-		switch {
-		case want && (len(got) != 1 || got[0] != "https://github.com/acme firerunner big"):
-			t.Errorf("%v: asked to remove %v, want acme's big", cause, got)
-		case !want && len(got) != 0:
-			t.Errorf("%v: asked to remove %v, want none kept", cause, got)
-		}
+// A removed tenant's entry is handed on to delete what its tiers registered:
+// once its run has ended, before a run after it on the account starts, and
+// also when it was removed while still waiting on a run before it, so never
+// served. A tenant changed, or the daemon stopping, hands on nothing.
+func TestTenantSetHandsOnARemovedTenant(t *testing.T) {
+	l := newSetLab(t)
+	removed := func() []string { l.mu.Lock(); defer l.mu.Unlock(); return slices.Clone(l.removed) }
+	a := listed("a", 2, "x")
+	l.set.apply([]config.Tenant{a})
+	l.started("a")
+	// Changed: the old run keeps its scale sets, and drains.
+	b := a
+	b.Tiers = []string{"small", "big"}
+	l.set.apply([]config.Tenant{b})
+	l.ended("a", errTenantChanged)
+	// Removed while the new run still waits on the old: it never serves.
+	l.set.apply(nil)
+	if got := removed(); len(got) != 0 {
+		t.Fatalf("handed on %v before the runs ended", got)
+	}
+	l.finish("a")
+	waitFor(t, "a handed on", func() bool { return len(removed()) == 1 })
+	if got := removed(); got[0] != "a small,big" {
+		t.Fatalf("handed on %v, want a's last entry", got)
+	}
+
+	// Served when removed: handed on once its run ends.
+	l.set.apply([]config.Tenant{a})
+	l.started("a")
+	l.set.apply(nil)
+	l.ended("a", errTenantRemoved)
+	l.finish("a")
+	waitFor(t, "a handed on again", func() bool { return len(removed()) == 2 })
+	l.noOverlap()
+}
+
+// The daemon stopping hands on nothing: a stop keeps every scale set.
+func TestTenantSetStopHandsOnNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	var handed atomic.Int32
+	set := &tenantSet{ctx: ctx, log: slog.New(slog.DiscardHandler), setMax: func(string, int) {},
+		run: func(ctx context.Context, _ func() config.Tenant, _ func(*servedTenant)) {
+			close(started)
+			<-ctx.Done()
+		},
+		removed: func(config.Tenant) { handed.Add(1) },
+	}
+	set.apply([]config.Tenant{listed("a", 2, "x")})
+	<-started
+	cancel()
+	set.wait()
+	if n := handed.Load(); n != 0 {
+		t.Fatalf("handed on %d at a stop", n)
+	}
+}
+
+// removeLeftovers asks for each tier the entry lists by name, on the
+// tenant's own account and runner group, each within its own time.
+func TestRemoveLeftovers(t *testing.T) {
+	var asked []string
+	s := &shard{log: slog.New(slog.DiscardHandler), cfg: &config.Config{RunnerGroup: "firerunner"},
+		removeByName: func(ctx context.Context, c listener.Config) (bool, error) {
+			if _, ok := ctx.Deadline(); !ok {
+				t.Error("no deadline")
+			}
+			asked = append(asked, c.URL+" "+c.RunnerGroup+" "+c.Name)
+			return c.Name == "small", nil
+		}}
+	c := config.Tenant{ID: "acme", URL: "https://github.com/acme", InstallationID: 7, Tiers: []string{"small", "big"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the run's context has ended: the deletion still runs
+	s.removeLeftovers(ctx, extraTenant(s.cfg, c, "inst", nil), c.Tiers)
+	if want := []string{"https://github.com/acme firerunner small", "https://github.com/acme firerunner big"}; !slices.Equal(asked, want) {
+		t.Fatalf("asked %v, want %v", asked, want)
 	}
 }
 
