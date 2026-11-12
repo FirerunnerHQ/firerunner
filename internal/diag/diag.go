@@ -467,6 +467,17 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			}
 		}
 		renderTenants(w, l.Tenants)
+		if tc := l.TenantCatalog; tc != nil {
+			last := "never"
+			if !tc.LastRead.IsZero() {
+				last = humanDuration(time.Since(tc.LastRead).Truncate(time.Second)) + " ago"
+			}
+			fmt.Fprintf(w, "  tenants list from %s, read %s\n", tc.Store, last)
+			if tc.Failing() {
+				fmt.Fprintf(w, "  last read failed %s ago, serving the tenants as they were: %s\n",
+					humanDuration(time.Since(tc.LastErrorAt).Truncate(time.Second)), truncate(tc.LastError, 200))
+			}
+		}
 		if ts := l.TenantStates; ts != nil {
 			last := "never"
 			if !ts.LastRead.IsZero() {
@@ -806,6 +817,9 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 		return []Check{warn("listeners", "listener state last updated %s ago; is the daemon running?", humanDuration(now.Sub(li.WrittenAt).Truncate(time.Second)))}
 	}
 	var checks []Check
+	if c := tenantCatalogCheck(li.File, now); c != nil {
+		checks = append(checks, *c)
+	}
 	if c := tenantStatesCheck(li.File, now); c != nil {
 		checks = append(checks, *c)
 	}
@@ -911,6 +925,28 @@ func entitlementsCheck(f health.File, now time.Time) *Check {
 		}
 		c = pass("entitlements", "read from %s; %s", es.Store, detail)
 	}
+	return &c
+}
+
+// tenantCatalogCheck judges the daemon's reading of its tenants list, nil
+// when it has none: WARN while reads fail or the list read is rejected (the
+// tenants are served as they were, and a tenant added or removed meanwhile
+// is not), else PASS.
+func tenantCatalogCheck(f health.File, now time.Time) *Check {
+	tc := f.TenantCatalog
+	if tc == nil {
+		return nil
+	}
+	if tc.Failing() {
+		c := warn("tenant-catalog", "reading %s fails (%s ago): %s; the tenants are served as they were", tc.Store,
+			humanDuration(now.Sub(tc.LastErrorAt).Truncate(time.Second)), truncate(tc.LastError, 200))
+		return &c
+	}
+	if tc.LastRead.IsZero() {
+		c := warn("tenant-catalog", "%s not read yet", tc.Store)
+		return &c
+	}
+	c := pass("tenant-catalog", "read from %s %s ago", tc.Store, humanDuration(now.Sub(tc.LastRead).Truncate(time.Second)))
 	return &c
 }
 

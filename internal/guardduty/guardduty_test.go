@@ -59,7 +59,7 @@ func newRig(t *testing.T) *rig {
 // poller is a fresh poller on the rig's store, as after a restart.
 func (r *rig) poller() *Poller {
 	return &Poller{
-		API: r.gd, Store: r.store, Tenant: Owners("inst", []string{"acme"}),
+		API: r.gd, Store: r.store, Tenant: Owners("inst"),
 		MinSeverity: DefaultMinSeverity, now: r.clock.now,
 		Account: func(context.Context) (string, error) { return ownAccount, nil },
 		OnFlag:  func(f Flagged) { r.flagged = append(r.flagged, f) },
@@ -85,7 +85,6 @@ func TestPollFlagsTheTenantOnce(t *testing.T) {
 	at := t0.Add(-4 * time.Minute)
 	r.gd.add("f-acme", mining, 8, at, false, tags("inst/acme"))
 	r.gd.add("f-other", mining, 8, at, false, tags("someone-else/acme"))
-	r.gd.add("f-unknown", mining, 8, at, false, tags("inst/stranger"))
 	r.gd.add("f-low", "Recon:EC2/PortProbeUnprotectedPort", 2, at, false, tags("inst/acme"))
 	r.gd.add("f-archived", mining, 8, at, true, tags("inst/acme"))
 	p := r.poller()
@@ -436,8 +435,8 @@ func TestAdvance(t *testing.T) {
 }
 
 func TestOwners(t *testing.T) {
-	served := Owners("inst", []string{"acme"})
-	anyID := Owners("inst", nil)
+	served := Owners("inst")
+	anyID := served
 	for _, c := range []struct {
 		owner string
 		f     func(string) (string, bool)
@@ -445,7 +444,6 @@ func TestOwners(t *testing.T) {
 	}{
 		{"inst", served, tenantstate.Install},
 		{"inst/acme", served, "acme"},
-		{"inst/other", served, ""},
 		{"inst/other", anyID, "other"},
 		{"inst/_install", anyID, ""},
 		{"inst/Bad ID", anyID, ""},

@@ -354,7 +354,7 @@ func TestTenantLoopRetriesAFailedStart(t *testing.T) {
 			<-ctx.Done()
 			return nil
 		},
-		stop: func(st *servedTenant) { stopped <- st },
+		stop: func(_ context.Context, st *servedTenant) { stopped <- st },
 	}
 	done := make(chan struct{})
 	go func() { l.run(ctx); close(done) }()
@@ -395,7 +395,7 @@ func TestTenantLoopEndsATriesContext(t *testing.T) {
 			return nil, errors.New("done")
 		},
 		serve: func(context.Context, context.CancelFunc, *servedTenant) error { return errors.New("restart") },
-		stop:  func(*servedTenant) { <-ended },
+		stop:  func(context.Context, *servedTenant) { <-ended },
 	}
 	l.run(ctx)
 	if tries != 2 {

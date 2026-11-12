@@ -376,7 +376,7 @@ func tenantFindings(ctx context.Context, a tenantArgs, stdout, stderr io.Writer,
 	if detectors == 0 {
 		fmt.Fprintln(stderr, "firerunner tenant findings: GuardDuty has no detector in this region")
 	}
-	tenantOf := guardduty.Owners(a.owner, nil)
+	tenantOf := guardduty.Owners(a.owner)
 	r := tenantReport{}
 	for _, f := range found {
 		id, ok := tenantOf(f.Owner)

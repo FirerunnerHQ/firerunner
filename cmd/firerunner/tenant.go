@@ -260,12 +260,32 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner string, jwt *ghauth.
 	}
 }
 
-// loop builds the loop that keeps t running on this shard.
-func (s *shard) loop(t tenant, live *liveTenants) *tenantLoop {
+// runTenant serves a tenant of the list until ctx ends, as cur returns its
+// entry each time it starts.
+func (s *shard) runTenant(ctx context.Context, cur func() config.Tenant, served func(*servedTenant), live *liveTenants, owner string, jwt *ghauth.JWT) {
+	get := func() tenant { return extraTenant(s.cfg, cur(), owner, jwt) }
+	et := get()
+	defer live.forget(et.ID)
+	et.warnRefused(s.log)
+	if len(et.Tiers) == 0 {
+		s.log.Error("tenant not served: none of its tiers is within its limits", "tenant", et.ID, "limits", et.Limits.String())
+		live.skip(et, "none of its tiers is within its limits")
+		<-ctx.Done()
+		return
+	}
+	l := s.loop(get, live)
+	l.served = served
+	l.run(ctx)
+}
+
+// loop builds the loop that keeps a tenant running on this shard. Each try
+// starts the tenant as get returns it then: the tenants list may have
+// changed it since the last.
+func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 	return &tenantLoop{
-		id: t.ID,
+		id: get().ID,
 		start: func(ctx context.Context) (*servedTenant, error) {
-			st, err := s.start(ctx, t, tenantHooks{})
+			st, err := s.start(ctx, get(), tenantHooks{})
 			if err == nil {
 				st.logTiers()
 			}
@@ -274,9 +294,13 @@ func (s *shard) loop(t tenant, live *liveTenants) *tenantLoop {
 		serve: func(ctx context.Context, cancel context.CancelFunc, st *servedTenant) error {
 			return serveTiers(ctx, cancel, st.names(), st.runs(s.cfg), st.log)
 		},
-		stop: func(st *servedTenant) {
+		stop: func(ctx context.Context, st *servedTenant) {
 			st.drain()
-			st.close(context.Background())
+			if removedTenant(ctx) {
+				st.remove(context.WithoutCancel(ctx))
+				return
+			}
+			st.close(context.WithoutCancel(ctx))
 		},
 		live: live, log: s.log, min: tenantRetryMin, max: tenantRetryMax,
 	}
@@ -531,6 +555,8 @@ func healthEntitlement(r entitlement.Record, ok bool, d entitlement.Decision) *h
 func (st *servedTenant) health(states tenantstate.States) health.Tenant {
 	h := tenantHealth(st.t)
 	h.Running = st.bound.Running()
+	// The tenants list may have changed it since the tenant started.
+	h.Limits.Runners = st.bound.Max()
 	suspended, why := st.bound.State()
 	switch {
 	case suspended:
@@ -650,6 +676,15 @@ func (l *liveTenants) remove(st *servedTenant) {
 	l.served = slices.DeleteFunc(l.served, func(x *servedTenant) bool { return x == st })
 }
 
+// forget drops what it says of a tenant not served, once its loop has
+// ended: waiting for a retry, or skipped.
+func (l *liveTenants) forget(id string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.waiting, id)
+	l.skipped = slices.DeleteFunc(l.skipped, func(h health.Tenant) bool { return h.ID == id })
+}
+
 // wait records that a tenant is down until its next try.
 func (l *liveTenants) wait(id string, err error, backoff time.Duration) {
 	l.mu.Lock()
@@ -726,10 +761,13 @@ const (
 // goes wrong with it stays with it: a session it must register again, an App
 // since removed, a start that fails. Its goroutines end with each try.
 type tenantLoop struct {
-	id       string
-	start    func(ctx context.Context) (*servedTenant, error)
-	serve    func(ctx context.Context, cancel context.CancelFunc, st *servedTenant) error
-	stop     func(st *servedTenant)
+	id    string
+	start func(ctx context.Context) (*servedTenant, error)
+	serve func(ctx context.Context, cancel context.CancelFunc, st *servedTenant) error
+	// stop is given the loop's context, whose cause says why it ended.
+	stop func(ctx context.Context, st *servedTenant)
+	// served, when set, is called with each start once it is served.
+	served   func(st *servedTenant)
 	live     *liveTenants
 	log      *slog.Logger
 	min, max time.Duration
@@ -765,9 +803,12 @@ func (l *tenantLoop) try(ctx context.Context, wait *time.Duration) error {
 	began := time.Now()
 	l.live.add(st)
 	defer l.live.remove(st)
+	if l.served != nil {
+		l.served(st)
+	}
 	err = l.serve(tctx, cancel, st)
 	cancel()
-	l.stop(st)
+	l.stop(ctx, st)
 	if time.Since(began) > l.max {
 		*wait = l.min
 	}
@@ -781,6 +822,16 @@ func (l *tenantLoop) try(ctx context.Context, wait *time.Duration) error {
 func (st *servedTenant) close(ctx context.Context) {
 	for _, l := range st.listeners {
 		_ = l.Close(ctx)
+	}
+}
+
+// remove closes the tenant's sessions and deletes its scale sets: the
+// tenants list no longer names it.
+func (st *servedTenant) remove(ctx context.Context) {
+	for i, l := range st.listeners {
+		if err := l.Remove(ctx); err != nil {
+			st.log.Warn("scale set of a removed tenant left registered", "tier", st.tiers[i].Name, "err", err)
+		}
 	}
 }
 

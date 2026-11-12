@@ -728,16 +728,15 @@ func (s *shard) watchEntitlements(ctx context.Context, cfg *config.Config, live 
 // watchFindings reads GuardDuty's findings at once and every
 // guardduty.DefaultInterval until ctx ends, flagging for review the tenants
 // of this shard whose machines they name: the install, by its owner tag, and
-// each tenant of the catalog, by owner/<id>. It records each flag as an event
+// each tenant, by owner/<id>. It records each flag as an event
 // too. It never suspends a tenant: it is given no tenant state to write.
 func (s *shard) watchFindings(ctx context.Context, cfg *config.Config, owner string, api guardduty.API, store tenantstate.FlagStore, account func(context.Context) (string, error), log *slog.Logger) {
-	ids := make([]string, 0, len(cfg.Tenants))
-	for _, t := range cfg.Tenants {
-		ids = append(ids, t.ID)
-	}
 	glog := log.With("component", "guardduty")
+	// Any tenant under the install's owner tag: the tenants list changes
+	// while the daemon runs, and a tenant just removed may still have
+	// machines finishing their jobs.
 	s.findings = &guardduty.Poller{
-		API: api, Store: store, Account: account, Tenant: guardduty.Owners(owner, ids),
+		API: api, Store: store, Account: account, Tenant: guardduty.Owners(owner),
 		MinSeverity: cfg.GuardDutyMinSeverity, Interval: guardduty.DefaultInterval, Log: glog,
 		OnFlag: func(f guardduty.Flagged) {
 			jobevent.Record(s.events, jobevent.Event{Kind: jobevent.Flagged, Tier: f.Tier, Instance: f.Instance,
@@ -1254,7 +1253,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	log.Info("firerunner starting",
 		"url", cfg.URL,
 		"tiers", len(served.tiers),
-		"tenants", len(cfg.Tenants),
+		"tenants", cfg.TenantsPath,
 		"maxRunners", cfg.MaxRunners,
 	)
 	served.logTiers()
@@ -1269,6 +1268,48 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			return fmt.Errorf("setup network: %w", err)
 		}
 		go s.fc.RefreshNetwork(ctx)
+	}
+
+	// Drive every tier's listener concurrently. A listener reconnects its own
+	// session; one that stops on a fatal error leaves the other tiers running.
+	// runCtx ends on SIGTERM, or once every tier has stopped. microVMs and the
+	// warm-pool top-up bind to runCtx too, so either way listeners stop,
+	// Reconcile no-ops, and Drain settles.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Each other tenant has a loop of its own, so that a slow start or a
+	// failure there touches nobody else. The list is read again every
+	// tenantsInterval, and tenants start, change and stop to match it. They
+	// end with runCtx, and drain themselves.
+	tenants := &tenantSet{
+		ctx: runCtx, log: log,
+		run: func(ctx context.Context, cur func() config.Tenant, served func(*servedTenant)) {
+			s.runTenant(ctx, cur, served, live, owner, appJWT)
+		},
+		setMax: func(id string, max int) {
+			if b, ok := live.bounds()[id]; ok {
+				b.SetMax(max)
+			}
+		},
+	}
+	var catalog *tenantCatalog
+	if cfg.TenantsPath != "" {
+		src, err := openTenants(cfg.TenantsPath, func() (ssmGetAPI, error) {
+			awsCfg, err := loadAWSConfig(ctx, cfg)
+			if err != nil {
+				return nil, err
+			}
+			return awsssm.NewFromConfig(awsCfg), nil
+		})
+		if err != nil {
+			return fmt.Errorf("--tenants: %w", err)
+		}
+		catalog = &tenantCatalog{src: src, check: cfg.CheckTenants, set: tenants, log: log.With("component", "tenants")}
+		if err := catalog.read(runCtx); err != nil {
+			log.Error("tenants list not read; serving the install alone until it is", "source", src.String(), "err", err)
+		}
+		go catalog.run(runCtx)
 	}
 
 	// Publish each tier's listener health for status and doctor.
@@ -1293,30 +1334,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		f.Tenants = live.tenants(states, flags)
 		s.entitlementHealth(f)
-	}, log)
-
-	// Drive every tier's listener concurrently. A listener reconnects its own
-	// session; one that stops on a fatal error leaves the other tiers running.
-	// runCtx ends on SIGTERM, or once every tier has stopped. microVMs and the
-	// warm-pool top-up bind to runCtx too, so either way listeners stop,
-	// Reconcile no-ops, and Drain settles.
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Each other tenant has a loop of its own, so that a slow start or a failure
-	// there touches nobody else. They end with runCtx, and drain themselves.
-	var tenants sync.WaitGroup
-	for _, c := range cfg.Tenants {
-		et := extraTenant(cfg, c, owner, appJWT)
-		et.warnRefused(log)
-		if len(et.Tiers) == 0 {
-			log.Error("tenant not served: none of its tiers is within its limits", "tenant", et.ID, "limits", et.Limits.String())
-			live.skip(et, "none of its tiers is within its limits")
-			continue
+		f.TenantCatalog = nil
+		if catalog != nil {
+			f.TenantCatalog = catalog.status()
 		}
-		l := s.loop(et, live)
-		tenants.Go(func() { l.run(runCtx) })
-	}
+	}, log)
 
 	runErr := serveTiers(runCtx, cancel, served.names(), served.runs(cfg), log)
 	cancel()
@@ -1327,7 +1349,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	log.Info("shutdown signalled, draining in-flight microVMs")
 	served.drain()
-	tenants.Wait()
+	tenants.wait()
 	log.Info("firerunner stopped")
 
 	if runErr != nil && ctx.Err() == nil {

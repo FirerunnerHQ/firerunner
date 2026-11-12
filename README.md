@@ -204,7 +204,7 @@ What keeps one installation's jobs from another's:
   tag (`<owner>/<id>`), which scopes the reaper and stopped pools, so a pool
   instance never moves between them.
 
-Each installation runs under limits from its entry in the tenants file, so that
+Each installation runs under limits from its entry in the tenants list, so that
 an account is no route to free compute: by default at most 2 runners at once
 across its tiers, only tiers of at most 2 vCPU, and 30 minutes per job. An
 operator raises them per installation, and 0 lifts one:
@@ -232,6 +232,25 @@ operator raises them per installation, and 0 lifts one:
 The install's own tiers are not limited unless `--limit-runners`,
 `--limit-vcpu` and `--limit-job-duration` (`FR_LIMIT_*`) say so.
 
+**Changing the tenants list while the daemon runs.** `--tenants` names a file,
+or `ssm:` and an SSM parameter holding the list. The daemon reads it at start
+and every 30 seconds, and follows it without a restart:
+
+- An installation **added** starts serving.
+- One **removed** takes no more jobs. Its runners finish the jobs they have,
+  within its job limit, and its scale sets are then deleted.
+- One whose `max_runners` alone **changed** gets the new limit at once. A
+  lower limit ends no runner; launches wait until enough have ended.
+- One **changed** otherwise (tiers, installation, URL, group, vCPU or job
+  limit) stops as a removed one does, but keeps its scale sets, and starts
+  again as listed once its runners have finished. Its new jobs wait at GitHub
+  meanwhile.
+
+A list that cannot be read, or that `config check` would reject, changes
+nothing: the installations are served as they were, `firerunner status` shows
+why, and `firerunner doctor` warns. An SSM parameter that does not exist lists
+no installations, so deleting it removes them all.
+
 **Suspending an installation.** An operator suspends one, for example on an
 abuse report, and resumes it later:
 
@@ -251,7 +270,7 @@ reaper's next sweep (5 minutes). The reason and the time show in `firerunner
 status`; jobs queued meanwhile wait, recorded as `held`, and run after a
 resume. A suspension holds across restarts until it is lifted. While the states
 cannot be read, the last ones read stay in force, and `firerunner doctor`
-warns; until a first read succeeds, the installations in the tenants file are
+warns; until a first read succeeds, the installations in the tenants list are
 held. `_install` names the install's own tiers, which are never held for an
 unread state; suspending it leaves a stopped EC2 pool stopped, but does not
 shrink it (a tenant keeps no pool).
@@ -279,7 +298,7 @@ firerunner tenant clear-flag acme --state /etc/firerunner/tenant-state.json
 
 `tenant findings` lists the findings on an owner's instances over `--since`
 and the installation each names, by the tag as the daemon maps it but for any
-id, in the tenants file or not; it writes nothing. Flags, and how far the
+id, in the tenants list or not; it writes nothing. Flags, and how far the
 daemon has read, are kept beside the states, under their name with `-flags`
 added (`tenant-state-flags.json`, or `<path>-flags/<id>`), so a restart
 neither counts a finding again nor misses one; resuming a suspension does not
@@ -297,7 +316,7 @@ tier, GuardDuty is not read.
 **Entitlements: what billing lets each installation run.** With
 `--entitlements` (`FR_ENTITLEMENTS`), a JSON file or `ssm:` and an SSM path
 with one parameter per installation, the daemon reads, at start and every 30
-seconds, what billing last said each installation in the tenants file may
+seconds, what billing last said each installation in the tenants list may
 run: its account state (`trial`, `active`, `past_due`, `suspended`), its
 budget state (`ok`, `warning`, `capped`) and until when the record holds.
 Billing writes the records and knows the prices; firerunner never does. An

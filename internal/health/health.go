@@ -459,6 +459,10 @@ type File struct {
 	// Entitlements is how reading the tenants' entitlements goes, when the
 	// daemon reads them.
 	Entitlements *TenantStates `json:"entitlements,omitempty"`
+	// TenantCatalog is how reading the tenants list goes (--tenants), when
+	// the daemon has one. A list read but rejected counts as a failed read:
+	// the tenants served stay as they were.
+	TenantCatalog *TenantStates `json:"tenant_catalog,omitempty"`
 }
 
 // ConnRefusals is a listener's connections refused at its connection caps.
