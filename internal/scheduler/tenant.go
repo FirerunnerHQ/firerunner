@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 )
@@ -21,14 +22,19 @@ import (
 // rather than at its own tier's next message.
 //
 // A tenant can also be held, which refuses every launch, or suspended, which
-// also stops every runner it has (see Suspend).
+// also stops every runner it has (see Suspend). Its plan can narrow its bound
+// and leave tiers out (see SetPlan).
 //
 // It is safe for concurrent use.
 type Tenant struct {
 	name string
-	max  int
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// max is the bound the tenant was given (SetMax), and plan the one its
+	// plan sets (SetPlan); the narrower holds, 0 for none.
+	max, plan int
+	// tiers, when not nil, is the only tiers the plan lets launch.
+	tiers   map[string]bool
 	running int
 	scheds  []*Scheduler
 	// line is the schedulers whose launches the tenant holds back, in the
@@ -75,13 +81,23 @@ func (t *Tenant) take(s *Scheduler, n int) (int, string) {
 	if t.heldWhy != "" {
 		return 0, t.heldWhy
 	}
+	if !t.allows(s) {
+		return 0, fmt.Sprintf("%s's plan does not include tier %q", t.who(), s.opts.Tier)
+	}
 	granted := n
-	if t.max > 0 {
-		ahead := slices.Index(t.line, s)
-		if ahead < 0 {
-			ahead = len(t.line)
+	if limit := t.limit(); limit > 0 {
+		// Only a tier the plan lets launch is ahead: one it leaves out
+		// would wait in line for ever.
+		ahead := 0
+		for _, x := range t.line {
+			if x == s {
+				break
+			}
+			if t.allows(x) {
+				ahead++
+			}
 		}
-		granted = max(0, min(n, t.max-t.running-ahead))
+		granted = max(0, min(n, limit-t.running-ahead))
 	}
 	t.running += granted
 	if i := slices.Index(t.line, s); granted > 0 && i >= 0 {
@@ -108,7 +124,33 @@ func (t *Tenant) wait(s *Scheduler, waiting bool) {
 }
 
 func (t *Tenant) atLimit() string {
-	return fmt.Sprintf("%s is at its limit of %d runner(s) at once", t.who(), t.max)
+	limit := t.limit()
+	if limit == t.plan && limit != t.max {
+		return fmt.Sprintf("%s is at its plan's limit of %d runner(s) at once", t.who(), limit)
+	}
+	return fmt.Sprintf("%s is at its limit of %d runner(s) at once", t.who(), limit)
+}
+
+// limit is the bound in force: the narrower of the tenant's and its plan's,
+// 0 for none. Callers must hold t.mu.
+func (t *Tenant) limit() int {
+	switch {
+	case t.max == 0:
+		return t.plan
+	case t.plan == 0:
+		return t.max
+	}
+	return min(t.max, t.plan)
+}
+
+// allows says whether the plan lets s's tier launch. Callers must hold t.mu.
+func (t *Tenant) allows(s *Scheduler) bool {
+	return t.tiers == nil || t.tiers[s.opts.Tier]
+}
+
+// raised says whether a bound changed from was to now lets more launch.
+func raised(was, now int) bool {
+	return now != was && (now == 0 || (was != 0 && now > was))
 }
 
 // release returns one launch taken earlier, and wakes the tenant's
@@ -120,7 +162,7 @@ func (t *Tenant) release() {
 	t.mu.Lock()
 	t.running--
 	var wake []*Scheduler
-	if t.max > 0 && t.heldWhy == "" {
+	if t.limit() > 0 && t.heldWhy == "" {
 		wake = slices.Clone(t.scheds)
 	}
 	t.mu.Unlock()
@@ -129,34 +171,92 @@ func (t *Tenant) release() {
 	}
 }
 
-// SetMax changes the bound to at most max runners at once, 0 for none. A
-// lower bound stops no runner: launches wait until enough have ended. A
-// higher one wakes the tenant's schedulers to launch for the jobs that
-// waited. It reports whether the bound changed.
+// SetMax changes the tenant's bound to at most max runners at once, 0 for
+// none; its plan's, when narrower, still holds. A lower bound stops no
+// runner: launches wait until enough have ended. A higher one wakes the
+// tenant's schedulers to launch for the jobs that waited. It reports whether
+// the bound changed.
 func (t *Tenant) SetMax(max int) bool {
 	t.mu.Lock()
 	if t.max == max {
 		t.mu.Unlock()
 		return false
 	}
-	raised := max == 0 || (t.max != 0 && max > t.max)
+	was := t.limit()
 	t.max = max
+	t.wakeIf(raised(was, t.limit()))
+	return true
+}
+
+// Plan is what a tenant's plan lets it run, beyond its own bound.
+type Plan struct {
+	// Runners, when positive, bounds its runners at once; the narrower of
+	// this and the tenant's own bound holds.
+	Runners int
+	// Tiers, when not nil, is the only tiers that launch; a job on another
+	// waits, with the reason.
+	Tiers []string
+}
+
+// SetPlan sets what the tenant's plan lets it run. Like SetMax, it stops no
+// runner: a tier left out keeps its runners, and launches nothing more. A
+// plan that lets more launch wakes the tenant's schedulers. It reports
+// whether anything changed.
+func (t *Tenant) SetPlan(p Plan) bool {
+	var tiers map[string]bool
+	if p.Tiers != nil {
+		tiers = make(map[string]bool, len(p.Tiers))
+		for _, n := range p.Tiers {
+			tiers[n] = true
+		}
+	}
+	runners := max(0, p.Runners)
+	t.mu.Lock()
+	if t.plan == runners && (t.tiers == nil) == (tiers == nil) && maps.Equal(t.tiers, tiers) {
+		t.mu.Unlock()
+		return false
+	}
+	was := t.limit()
+	added := tiers == nil && t.tiers != nil
+	for n := range tiers {
+		added = added || (t.tiers != nil && !t.tiers[n])
+	}
+	t.plan, t.tiers = runners, tiers
+	t.wakeIf(added || raised(was, t.limit()))
+	return true
+}
+
+// wakeIf unlocks t.mu, which the caller holds, and wakes the tenant's
+// schedulers when more may launch and the tenant is not held.
+func (t *Tenant) wakeIf(more bool) {
 	var wake []*Scheduler
-	if raised && t.heldWhy == "" {
+	if more && t.heldWhy == "" {
 		wake = slices.Clone(t.scheds)
 	}
 	t.mu.Unlock()
 	for _, s := range wake {
 		go s.retry()
 	}
-	return true
 }
 
-// Max is the bound: at most this many runners at once, 0 for none.
+// Plan is the plan last set, its tiers sorted.
+func (t *Tenant) Plan() Plan {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p := Plan{Runners: t.plan}
+	if t.tiers != nil {
+		p.Tiers = slices.AppendSeq(make([]string, 0, len(t.tiers)), maps.Keys(t.tiers))
+		slices.Sort(p.Tiers)
+	}
+	return p
+}
+
+// Max is the bound in force: at most this many runners at once, the
+// narrower of the tenant's own and its plan's, 0 for none.
 func (t *Tenant) Max() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.max
+	return t.limit()
 }
 
 // Suspend refuses every launch of the tenant's tiers and stops every runner

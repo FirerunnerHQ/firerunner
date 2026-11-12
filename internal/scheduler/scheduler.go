@@ -65,6 +65,9 @@ type Options struct {
 	// Tenant, when set, bounds this tier's runners together with the other
 	// tiers of its tenant (see Tenant).
 	Tenant *Tenant
+	// Tier names this tier to its Tenant, whose plan may leave it out (see
+	// Tenant.SetPlan).
+	Tier string
 	// MaxJob, when positive, ends a runner whose job has run this long: the
 	// job fails, and the runner's machine goes. The job's start is the first
 	// MarkBusy: the guest's own report, or GitHub's JobStarted.
