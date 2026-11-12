@@ -8,6 +8,25 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-11-12
+
+### Added
+
+- An entitlement record can carry its plan's limits: `max_runners`, at most
+  that many runners at once across an installation's tiers (the narrower of
+  this and the tenants list's holds), and `tiers`, the only tiers it launches
+  on. A change applies within 30 seconds while the installation runs, and
+  stops no runner. `firerunner entitlement set` takes `--max-runners` and
+  `--tiers`; `firerunner status` shows the plan's limits and the limit in
+  force.
+- `firerunner status` counts, per tier, the jobs held since the daemon
+  started, by what held them: the installation's own runner limit, its
+  plan's, a tier its plan leaves out, a hold or a suspension (`held_jobs` in
+  `--json`). Each entitlement record shows when the store last saw it
+  written, and an installation launching on an expired record shows since
+  when and how many times it has begun to (`fail_open_since`, `fail_opens`);
+  the daemon logs a warning each time one begins.
+
 ## [0.1.19] - 2026-11-12
 
 ### Added
@@ -596,7 +615,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.20
 [0.1.19]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.19
 [0.1.18]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.18
 [0.1.17]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.17
