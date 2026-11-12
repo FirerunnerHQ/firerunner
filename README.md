@@ -294,6 +294,34 @@ finding name another installation, which costs a review, never a suspension.
 Suppression rules archive findings, which then flag nothing. Without an EC2
 tier, GuardDuty is not read.
 
+**Entitlements: what billing lets each installation run.** With
+`--entitlements` (`FR_ENTITLEMENTS`), a JSON file or `ssm:` and an SSM path
+with one parameter per installation, the daemon reads, at start and every 30
+seconds, what billing last said each installation in the tenants file may
+run: its account state (`trial`, `active`, `past_due`, `suspended`), its
+budget state (`ok`, `warning`, `capped`) and until when the record holds.
+Billing writes the records and knows the prices; firerunner never does. An
+installation with no record, a suspended account or a capped budget is held:
+its jobs wait at GitHub, recorded as `held` with the reason, and run once a
+record lets them; running jobs go on (suspend it to end them). A record past
+its valid-until is judged by the account it last named, because billing may
+be down while the operator pays for the compute: an active account goes on
+launching (fail open), unless its spend cap was reached, and `firerunner
+doctor` warns; a trial or past-due one is held until billing renews it, so an
+outage never hands out free compute. The install's own tiers are never held.
+`firerunner status` shows each record and what it allows, and `doctor` warns
+while reads fail, while an installation launches on an expired record, or has
+none. Operators and tests write records as billing would:
+
+```bash
+firerunner entitlement set acme --account active --budget capped --reason "November's cap" --store /etc/firerunner/entitlements.json
+firerunner entitlement list --store /etc/firerunner/entitlements.json
+firerunner entitlement clear acme --store /etc/firerunner/entitlements.json
+```
+
+Entitlements are off unless set: turning them on holds every installation
+that has no record yet, so write the records first.
+
 What it does not separate: the daemon itself, which holds every installation's
 App access and signs for them all, and the account's API limits and quotas.
 For a boundary between those too, run each installation's runners in its own

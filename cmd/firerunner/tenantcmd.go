@@ -42,7 +42,7 @@ own tiers. SPEC is where the daemon reads tenant states, as its
 shell's AWS credentials and region, FR_AWS_REGION or AWS_REGION) or an
 absolute file path. Default FR_TENANT_STATE; with no FR_* variable set, the
 daemon's settings file is read for it, as status and doctor do (--env-file
-FILE reads another, --env-file none none). Flags are kept beside it, under
+FILE reads another, --env-file none reads none). Flags are kept beside it, under
 its name with -flags added.
 
 A running daemon reads the states every 15 seconds: within that, a suspended
@@ -406,18 +406,22 @@ func writeJSON(w io.Writer, v any) {
 	_ = enc.Encode(v)
 }
 
+// cliSSM is an SSM client from this shell's AWS configuration, for the
+// subcommands that read or write a store in SSM.
+func cliSSM() (tenantstate.SSMAPI, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	awsCfg, err := loadAWSConfig(ctx, &config.Config{AWSRegion: os.Getenv("FR_AWS_REGION")})
+	if err != nil {
+		return nil, errors.New("AWS configuration: " + err.Error())
+	}
+	return awsssm.NewFromConfig(awsCfg), nil
+}
+
 // openTenant opens what the tenant subcommand uses, with clients from this
 // shell's AWS configuration where a spec names SSM, or for findings.
 func openTenant() tenantOpeners {
-	newSSM := func() (tenantstate.SSMAPI, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		awsCfg, err := loadAWSConfig(ctx, &config.Config{AWSRegion: os.Getenv("FR_AWS_REGION")})
-		if err != nil {
-			return nil, errors.New("tenant state: " + err.Error())
-		}
-		return awsssm.NewFromConfig(awsCfg), nil
-	}
+	newSSM := cliSSM
 	return tenantOpeners{
 		states: func(spec string) (tenantstate.Store, error) { return tenantstate.Open(spec, newSSM) },
 		flags:  func(spec string) (tenantstate.FlagStore, error) { return tenantstate.OpenFlags(spec, newSSM) },

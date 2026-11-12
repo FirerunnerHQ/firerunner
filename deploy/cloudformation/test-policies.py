@@ -208,12 +208,14 @@ print("ok   network.yaml: the runner subnets deny outbound SMTP")
 # The control VM reads the tenant states and never writes them: only an
 # operator suspends. It writes the flags beside them (GuardDuty, --guardduty)
 # and deletes none, so it can neither suspend a tenant nor clear a flag. It
-# writes no other parameter under the prefix, where its GitHub credentials
-# live. GuardDuty it only reads, and only this account's detectors here.
+# reads the entitlements billing writes, and cannot write them, so it can
+# never lift a cap. It writes no other parameter under the prefix, where its
+# GitHub credentials live. GuardDuty it only reads, and only this account's
+# detectors here.
 prefix = 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/control/'
 by_path = re.findall(r"Action: ssm:GetParametersByPath\n\s+Resource: !Sub \"(.*)\"", control_policy)
-if by_path != [prefix + "tenant-state", prefix + "tenant-state-flags"]:
-    sys.exit(f"FAIL control.yaml: the control role reads by path {by_path}; want the tenant states and flags")
+if by_path != [prefix + "tenant-state", prefix + "tenant-state-flags", prefix + "entitlements"]:
+    sys.exit(f"FAIL control.yaml: the control role reads by path {by_path}; want the tenant states, flags and entitlements")
 ssm_writes = re.findall(r"ssm:(?:Put|Delete|Label|Add|Remove|\*)[A-Za-z*]*", control_role)
 put = control_policy.split("Action: ssm:PutParameter", 1)[1].split("- Effect", 1)[0] if ssm_writes else ""
 if ssm_writes != ["ssm:PutParameter"] or put.strip().splitlines()[0] != f'Resource: !Sub "{prefix}tenant-state-flags/*"':

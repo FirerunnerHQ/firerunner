@@ -588,6 +588,9 @@ func renderTenants(w io.Writer, tenants []health.Tenant) {
 				name, fl.Type, fl.Severity, or(fl.Tier, "?"), or(fl.Instance, "?"), fl.Count,
 				fl.First.UTC().Format(time.RFC3339), fl.Last.UTC().Format(time.RFC3339), or(fl.Finding, "?"))
 		}
+		if e := t.Entitlement; e != nil {
+			fmt.Fprintf(w, "  %s entitlement: %s\n", name, entitlementLine(e))
+		}
 		if t.NotServed != "" {
 			fmt.Fprintf(w, "  %s NOT SERVED: %s\n", name, t.NotServed)
 		}
@@ -809,6 +812,9 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 	if c := guardDutyCheck(li.File, now); c != nil {
 		checks = append(checks, *c)
 	}
+	if c := entitlementsCheck(li.File, now); c != nil {
+		checks = append(checks, *c)
+	}
 	if c := reaperUnprovenCheck(li.File); c != nil {
 		checks = append(checks, *c)
 	}
@@ -829,6 +835,83 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 		}
 	}
 	return checks
+}
+
+// entitlementLine says what a tenant's entitlement record holds, and what it
+// allows now.
+func entitlementLine(e *health.Entitlement) string {
+	if e.None {
+		return "no record: held"
+	}
+	if e.Invalid != "" {
+		return "UNREADABLE record (" + e.Invalid + "): held"
+	}
+	s := fmt.Sprintf("account %s, budget %s", e.Account, e.Budget)
+	if e.Plan != "" {
+		s = "plan " + e.Plan + ", " + s
+	}
+	if !e.ValidUntil.IsZero() {
+		s += ", valid until " + e.ValidUntil.UTC().Format(time.RFC3339)
+	}
+	switch {
+	case e.Held:
+		s += "; HELD: " + e.Why
+	case e.FailOpen:
+		s += "; EXPIRED, launching on it: " + e.Why
+	case e.Warning:
+		s += "; near its spend cap"
+	}
+	return s
+}
+
+// entitlementsCheck judges the daemon's reading of entitlements, nil when it
+// reads none: WARN while reads fail, while a tenant launches on an expired
+// record (billing has not renewed it), or while one has no record, or one
+// that cannot be read (it is held for want of one); else PASS, naming the
+// tenants held by their entitlement and those near their cap, as billing
+// decided.
+func entitlementsCheck(f health.File, now time.Time) *Check {
+	es := f.Entitlements
+	if es == nil {
+		return nil
+	}
+	var none, open, held, near []string
+	for _, t := range f.Tenants {
+		e := t.Entitlement
+		switch {
+		case e == nil:
+		case e.None:
+			none = append(none, t.ID)
+		case e.Invalid != "":
+			none = append(none, fmt.Sprintf("%s (unreadable: %s)", t.ID, e.Invalid))
+		case e.FailOpen:
+			open = append(open, fmt.Sprintf("%s (expired %s)", t.ID, e.ValidUntil.UTC().Format(time.RFC3339)))
+		case e.Held:
+			held = append(held, fmt.Sprintf("%s (%s)", t.ID, e.Why))
+		case e.Warning:
+			near = append(near, t.ID)
+		}
+	}
+	var c Check
+	switch {
+	case es.Failing():
+		c = warn("entitlements", "reading %s fails (%s ago): %s; the last records hold until they expire", es.Store,
+			humanDuration(now.Sub(es.LastErrorAt).Truncate(time.Second)), truncate(es.LastError, 200))
+	case len(open) > 0:
+		c = warn("entitlements", "launching on expired records, as their accounts were active: %s; billing has not renewed them in %s", strings.Join(open, ", "), es.Store)
+	case len(none) > 0:
+		c = warn("entitlements", "no readable record in %s, so held: %s; billing writes one per tenant", es.Store, strings.Join(none, ", "))
+	default:
+		detail := "every tenant may launch"
+		if len(held) > 0 {
+			detail = "held by billing: " + strings.Join(held, "; ")
+		}
+		if len(near) > 0 {
+			detail += "; near their spend cap: " + strings.Join(near, ", ")
+		}
+		c = pass("entitlements", "read from %s; %s", es.Store, detail)
+	}
+	return &c
 }
 
 // tenantStatesCheck judges the daemon's reading of tenant states, nil when it

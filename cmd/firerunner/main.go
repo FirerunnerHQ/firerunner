@@ -55,6 +55,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/schedule"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
 	"github.com/firerunnerhq/firerunner/internal/tenantstate"
+	"github.com/firerunnerhq/firerunner/proprietary/entitlement"
 	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
@@ -91,6 +92,8 @@ func main() {
 			os.Exit(migrateCmd(args[1:], os.Stdout, os.Stderr))
 		case "tenant":
 			os.Exit(tenantCmd(args[1:], os.Stdout, os.Stderr, openTenant()))
+		case "entitlement":
+			os.Exit(entitlementCmd(args[1:], os.Stdout, os.Stderr, openEntitlements))
 		case "cache-server":
 			if err := cacheServe(args[1:]); err != nil {
 				slog.Error("cache-server failed", "err", err)
@@ -399,6 +402,10 @@ Usage:
   firerunner git-proxy    run an EC2 instance's git checkout cache proxy
   firerunner migrate      open a pull request that moves a repository's jobs onto
                           firerunner (runs-on labels); see "firerunner migrate -h"
+  firerunner tenant       suspend, resume or list tenants, and review GuardDuty
+                          flags; see "firerunner tenant -h"
+  firerunner entitlement  set, clear or list what each tenant may run, as billing
+                          would; see "firerunner entitlement -h"
   firerunner version      print the version
   firerunner help         show this help
 
@@ -677,11 +684,42 @@ func (s *shard) watchStates(ctx context.Context, cfg *config.Config, live *liveT
 		}
 	}
 	s.states = w
-	live.mu.Lock()
-	live.onAdd = func(st *servedTenant) { s.applyState(st.t.ID, st.bound, wlog) }
-	live.mu.Unlock()
+	s.applyOnAdd(live)
 	if err := w.Read(ctx); err != nil {
 		wlog.Error("tenant states not read; the catalog's tenants are held until they are", "store", store.String(), "err", err)
+	}
+	go w.Run(ctx)
+	return nil
+}
+
+// watchEntitlements reads what each tenant may run now and then every
+// entitlement.DefaultInterval until ctx ends, judging every tenant served
+// again after each read: a record expires with the clock. A first read that
+// fails is logged; with no record, the catalog's tenants are held until one
+// succeeds. Like watchStates, it sets s.entitlements before the first read,
+// and judges each tenant as it is served.
+func (s *shard) watchEntitlements(ctx context.Context, cfg *config.Config, live *liveTenants, log *slog.Logger) error {
+	store, err := entitlement.Open(cfg.Entitlements, func() (tenantstate.SSMAPI, error) {
+		awsCfg, err := loadAWSConfig(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return awsssm.NewFromConfig(awsCfg), nil
+	})
+	if err != nil {
+		return fmt.Errorf("--entitlements: %w", err)
+	}
+	elog := log.With("component", "entitlements")
+	w := &entitlement.Watcher{Store: store, Interval: entitlement.DefaultInterval, Log: elog}
+	w.OnRead = func() {
+		for id, bound := range live.bounds() {
+			s.applyState(id, bound, elog)
+		}
+	}
+	s.entitlements = w
+	s.applyOnAdd(live)
+	if err := w.Read(ctx); err != nil {
+		elog.Error("entitlements not read; the catalog's tenants are held until they are", "store", store.String(), "err", err)
 	}
 	go w.Run(ctx)
 	return nil
@@ -1190,6 +1228,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			return err
 		}
 	}
+	if cfg.Entitlements != "" {
+		if err := s.watchEntitlements(ctx, cfg, live, log); err != nil {
+			return err
+		}
+	}
 	if cfg.GuardDuty && !readsFindings(cfg) {
 		log.Warn("--guardduty: no EC2 tier, whose machines GuardDuty's findings would name; findings are not read")
 	}
@@ -1239,7 +1282,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		f.JITRefused = healthRefusals(jitListener)
 		var states tenantstate.States
 		var flags tenantstate.Flags
-		f.TenantStates, f.GuardDuty = nil, nil
+		f.TenantStates, f.GuardDuty, f.Entitlements = nil, nil, nil
 		if s.states != nil {
 			states, _ = s.states.States()
 			f.TenantStates = healthTenantStates(s.states.Status())
@@ -1249,6 +1292,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			f.GuardDuty = healthGuardDuty(s.findings.Status())
 		}
 		f.Tenants = live.tenants(states, flags)
+		s.entitlementHealth(f)
 	}, log)
 
 	// Drive every tier's listener concurrently. A listener reconnects its own
