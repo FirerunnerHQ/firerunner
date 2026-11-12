@@ -246,6 +246,12 @@ Resources:
               - Effect: Allow
                 Action: ssm:PutParameter
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/control/tenant-state-flags/*"
+              # What each tenant may run (--entitlements): one parameter per
+              # tenant, written by billing, read every 30 s. The VM only
+              # reads them: it can never lift a cap.
+              - Effect: Allow
+                Action: ssm:GetParametersByPath
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/control/entitlements"
               # GuardDuty's findings, read only. Listing detectors names no
               # resource; the findings are read only from this account's
               # detectors in this region.

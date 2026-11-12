@@ -135,6 +135,18 @@ firerunner tenant findings --owner <owner>
 firerunner tenant clear-flag acme --state ssm:<prefix>/control/tenant-state
 ```
 
+**Entitlements.** Billing writes what each tenant may run under
+`<prefix>/control/entitlements/<id>` (see the main README's *Entitlements*);
+the VM's role may only read them, so it can never lift a cap. They are off
+until you set `FR_ENTITLEMENTS=ssm:<prefix>/control/entitlements` in the
+`env` parameter: write a record for every tenant first, as turning them on
+holds every tenant without one.
+
+```sh
+firerunner entitlement set acme --account active --budget ok --valid-for 720h --store ssm:<prefix>/control/entitlements
+firerunner entitlement list --store ssm:<prefix>/control/entitlements
+```
+
 The role reads GuardDuty only: `ListDetectors`, which names no resource, and
 `ListFindings` and `GetFindings` on the account's detectors in the region. A
 stack made before that grant, or a region without a detector, leaves the
