@@ -153,8 +153,10 @@ func TestPoolMAC_ForgedInstancesAreNeverStartedOrRegistered(t *testing.T) {
 	}
 	h.f.mu.Unlock()
 
+	before := len(h.f.launched())
 	h.runPool(t)
-	eventually(t, "the genuine instance ready", func() bool { r, _ := h.p.pool.Ready(); return r == 1 })
+	// The pool fills only once rediscovery has judged every instance.
+	eventually(t, "the pool filling", func() bool { return len(h.f.launched()) > before })
 	if r, _ := h.p.pool.Ready(); r != 1 {
 		t.Fatalf("ready = %d, want only the genuine instance", r)
 	}

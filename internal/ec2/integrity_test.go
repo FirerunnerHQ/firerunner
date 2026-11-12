@@ -48,7 +48,7 @@ func TestDiskMAC_BindsTheRootDevice(t *testing.T) {
 func TestMAC_DomainsAreDistinct(t *testing.T) {
 	// Each domain is written raw before the fields: one that prefixes
 	// another could let a MAC of one kind pass as the other.
-	domains := []string{poolMACDomain, diskMACDomain, runnerMACDomain, requestMACDomain}
+	domains := []string{poolMACDomain, diskMACDomain, runnerMACDomain, requestMACDomain, launchMACDomain}
 	for _, a := range domains {
 		for _, b := range domains {
 			if a != b && strings.HasPrefix(a, b) {

@@ -240,8 +240,10 @@ func (pl *Pool) verify(i types.Instance) error {
 // never registered for a JIT config nor started. It is terminated only when
 // it carries this install's owner tag and a pool state, as the control role
 // may end only those, and anything else is not the pool's to end; and only
-// when its pool MAC holds (its disks' failed), since the owner tag alone
-// proves nothing: anyone who may tag an instance can write it. One whose
+// when a MAC proves this install launched it (launchedHere: its disks' MAC
+// failed, say, or a crash came before its pool MAC was tagged), since the
+// owner tag alone proves nothing: anyone who may tag an instance can write
+// it. One whose
 // spot request will not cancel is left, still unused, for the reaper.
 func (pl *Pool) reject(ctx context.Context, i types.Instance, why error) {
 	id := aws.ToString(i.InstanceId)
@@ -251,7 +253,7 @@ func (pl *Pool) reject(ctx context.Context, i types.Instance, why error) {
 		pl.log.Warn("pool instance failed its MAC check; not using it", "instance", id, "why", why, "owner", owner, "pool", state)
 		return
 	}
-	if !pl.p.c.poolKeyEphemeral && pl.verify(i) != nil {
+	if pl.p.c.launchedHere(i, pl.p.o.Owner, nil) != nil {
 		pl.log.Warn("pool instance failed its MAC check; not using it, and not ending it: nothing proves this install launched it", "instance", id, "why", why)
 		return
 	}

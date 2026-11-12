@@ -19,6 +19,16 @@ func (f *fakeEC2) signRequest(c *Client, id string) {
 	i.spotTags[TagRequestMAC] = c.requestMAC(i.spotTags[TagOwner], i.spotTags[TagTier], i.spotReq)
 }
 
+// signLaunch gives an instance the ClientToken a launch would have, and the
+// launch MAC c's RunInstances would have tagged with it.
+func (f *fakeEC2) signLaunch(c *Client, id, token string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i := f.instances[id]
+	i.clientToken = token
+	i.tags[TagLaunchMAC] = c.launchMAC(i.tags[TagOwner], i.tags[TagTier], token)
+}
+
 // keyedReaper is reaperFor with the install's pool key set, so that the
 // reaper ends only what it can prove this install launched.
 func keyedReaper(t *testing.T, f *fakeEC2, g *githubRunners) (*Reaper, *Client) {
@@ -60,6 +70,17 @@ func TestReaper_EndsNothingByItsOwnerTagAlone(t *testing.T) {
 	f.instances[copied].tags[TagRunnerMAC] = f.instances[genuine].tags[TagRunnerMAC]
 	f.mu.Unlock()
 	forged[copied] = "runner MAC copied from another instance"
+	movedLaunch := f.put(job("r6"), types.InstanceStateNameRunning, long, false)
+	f.signLaunch(c, movedLaunch, "token-of-ours")
+	f.mu.Lock()
+	f.instances[movedLaunch].clientToken = "token-of-its-own-launch"
+	f.mu.Unlock()
+	forged[movedLaunch] = "launch MAC from another launch"
+	tokenless := f.put(job("r7"), types.InstanceStateNameRunning, long, false)
+	f.mu.Lock()
+	f.instances[tokenless].tags[TagLaunchMAC] = c.launchMAC("test-owner", "cloud", "")
+	f.mu.Unlock()
+	forged[tokenless] = "launch MAC over no token"
 
 	// An orphan persistent request: its instance is gone.
 	orphan := f.put(job("r5"), types.InstanceStateNameTerminated, old, true)
@@ -121,12 +142,15 @@ func TestReaper_EndsWhatItsMACsProve(t *testing.T) {
 	f.mu.Unlock()
 	orphan := f.put(job("r3"), types.InstanceStateNameTerminated, old, true)
 	f.signRequest(c, orphan)
+	// Its process died between RunInstances and tagging the runner MAC.
+	crashed := f.put(job("r4"), types.InstanceStateNameRunning, long, false)
+	f.signLaunch(c, crashed, "token-1")
 
 	rep, err := r.Sweep(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{used, cold, relaunched} {
+	for _, id := range []string{used, cold, relaunched, crashed} {
 		if f.state(id) != types.InstanceStateNameShuttingDown || !slices.Contains(rep.Instances, id) {
 			t.Errorf("%s is %s; terminated %v", id, f.state(id), rep.Instances)
 		}
@@ -147,6 +171,26 @@ func TestReaper_EndsWhatItsMACsProve(t *testing.T) {
 // The pool signs each spot request it launches, and, when it takes in an
 // instance an earlier process launched, that instance's request, so that a
 // reaper can prove the requests launched before request MACs too.
+// A pool instance whose process died before tagging its pool MAC still has
+// the launch MAC RunInstances tagged it with: a restarted pool never uses it,
+// and ends it.
+func TestPool_EndsAnInstanceItLaunchedButNeverSigned(t *testing.T) {
+	h, id := keyedPool(t, testKey)
+	h.f.mu.Lock()
+	launchMAC := h.f.instances[id].tags[TagLaunchMAC]
+	delete(h.f.instances[id].tags, TagPoolMAC)
+	delete(h.f.instances[id].tags, TagPoolDiskMAC)
+	h.f.mu.Unlock()
+	if launchMAC == "" {
+		t.Fatal("RunInstances tagged no launch MAC")
+	}
+	p := h.restart(t, testKey)
+	eventually(t, "the unsigned instance ended", func() bool { return h.f.state(id) == types.InstanceStateNameShuttingDown })
+	if r, _ := p.pool.Ready(); r != 0 {
+		t.Fatalf("ready = %d: the unsigned instance joined the pool", r)
+	}
+}
+
 func TestPool_SignsItsSpotRequests(t *testing.T) {
 	h, kept := keyedPool(t, testKey)
 	h.f.mu.Lock()

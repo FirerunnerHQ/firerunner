@@ -757,7 +757,7 @@ running process tracks, and anything younger than 2 minutes.
   tags each job instance `firerunner:runner-mac`, an HMAC of its owner, tier,
   runner and instance ID under the `--ec2-pool-key-file` key, and
   deregisters a runner only when that MAC holds. An instance without one
-  (signed by a process without the key file, or whose signing failed) is
+  (launched by a process without the key file, or whose signing failed) is
   left to `--max-vm-lifetime`, and the reaper logs a warning naming it; with
   `--max-vm-lifetime 0`,
   nothing ends it, so keep a lifetime on EC2.
@@ -768,15 +768,20 @@ running process tracks, and anything younger than 2 minutes.
 - **Proven before ended.** The owner tag is not signed: anyone who may tag
   an instance could put it on someone else's. With `--ec2-pool-key-file`,
   the reaper ends an instance only if a MAC under the key proves this
-  install launched it: its `firerunner:pool-mac`, its
-  `firerunner:runner-mac`, or the `firerunner:request-mac` of the spot
-  request that launched it, which the pool tags on each persistent request.
-  It cancels a request only by that MAC. Whatever it cannot prove it leaves
-  alone and logs, and `firerunner status` and `firerunner doctor` list it:
-  find who launched or tagged it in CloudTrail, and end it by hand if it is
-  yours (after a key change, or a signing that failed). Without the key
-  file, nothing an earlier process signed can be checked, so the owner tag
-  is trusted.
+  install launched it. RunInstances itself tags each instance
+  `firerunner:launch-mac`, a MAC of its owner, tier and the launch's
+  `ClientToken`, which AWS keeps on the instance and nobody can change; so
+  an instance is provably this install's from its first moment, even if
+  firerunner dies before tagging anything else. Its `firerunner:pool-mac`
+  or `firerunner:runner-mac` proves it too, as does the
+  `firerunner:request-mac` of the spot request that launched it (an
+  instance AWS relaunched), which the pool tags on each persistent request.
+  The reaper cancels a request only by its MAC. Whatever it cannot prove it
+  leaves alone and logs, and `firerunner status` and `firerunner doctor`
+  list it: find who launched or tagged it in CloudTrail, and end it by hand
+  if it is yours (signed under a key since changed, or launched by a release
+  before these MACs). Without the key file, nothing an earlier process
+  signed can be checked, so the owner tag is trusted.
 
 Everything is found by the `firerunner:owner` tag, which defaults to the host
 name. **Set `--owner` (`FR_OWNER`) to a stable name when the control VM can be
