@@ -80,6 +80,12 @@ type Tier struct {
 	// Stopped counts runners ended for their tenant's limits, by kind:
 	// "job_duration" for a job that ran past its limit.
 	Stopped map[string]int `json:"stopped,omitempty"`
+	// HeldJobs counts jobs GitHub assigned while the tier's tenant held its
+	// launches back, since the daemon started, by what held them: "limit"
+	// (its own runner limit), "plan_limit" (its plan's, narrower),
+	// "plan_tier" (its plan leaves the tier out), "held" (by its state or
+	// entitlement) or "suspended".
+	HeldJobs map[string]int `json:"held_jobs,omitempty"`
 }
 
 // Held is the launches a tier's tenant holds back, and why.
@@ -125,6 +131,14 @@ type Entitlement struct {
 	Account    string    `json:"account_state,omitempty"`
 	Budget     string    `json:"budget_state,omitempty"`
 	ValidUntil time.Time `json:"valid_until,omitzero"`
+	// WrittenAt is when the store last saw its record written; zero when
+	// the store does not say.
+	WrittenAt time.Time `json:"written_at,omitzero"`
+	// FailOpenSince is when it began launching on an expired record, while
+	// it does; FailOpens counts the times it has begun to since the daemon
+	// started.
+	FailOpenSince time.Time `json:"fail_open_since,omitzero"`
+	FailOpens     int       `json:"fail_opens,omitempty"`
 	// MaxRunners and Tiers are its plan's limits, when it has any: the
 	// tenant's Limits.Runners is the narrower bound in force.
 	MaxRunners int      `json:"max_runners,omitempty"`
@@ -365,6 +379,20 @@ func (tr *Tracker) SetHeld(jobs int, reason string) {
 	tr.t.Held = &Held{Jobs: jobs, Reason: reason, Since: since}
 }
 
+// HeldJob counts a job assigned while the tier's tenant held its launches
+// back, by what held them.
+func (tr *Tracker) HeldJob(kind string) {
+	if kind == "" {
+		kind = "other"
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.t.HeldJobs == nil {
+		tr.t.HeldJobs = map[string]int{}
+	}
+	tr.t.HeldJobs[kind]++
+}
+
 // Stopped counts a runner ended for its tenant's limits.
 func (tr *Tracker) Stopped(kind string) {
 	tr.mu.Lock()
@@ -422,6 +450,7 @@ func (tr *Tracker) Snapshot() Tier {
 		t.Held = &h
 	}
 	t.Stopped = maps.Clone(t.Stopped)
+	t.HeldJobs = maps.Clone(t.HeldJobs)
 	t.Launches = maps.Clone(t.Launches)
 	t.Fallbacks = maps.Clone(t.Fallbacks)
 	t.Interruptions = maps.Clone(t.Interruptions)

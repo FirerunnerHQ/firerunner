@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -283,16 +284,24 @@ func TestTierGetsItsTenantsLimits(t *testing.T) {
 	}
 
 	held := heldBy(func() *scheduler.Scheduler { return nil })
-	if n, why := held(); n != 0 || why != "" {
-		t.Fatalf("before the scheduler: %d %q", n, why)
+	if n, kind, why := held(); n != 0 || kind != "" || why != "" {
+		t.Fatalf("before the scheduler: %d %q %q", n, kind, why)
 	}
 	sched := scheduler.New(o)
 	lc := s.listenerConfig(ten, tier, tenantHooks{}, tracker, assigned.New(nil), s.log, heldBy(func() *scheduler.Scheduler { return sched }))
 	if lc.Held == nil {
 		t.Fatal("the listener does not ask the tier's scheduler what it holds")
 	}
-	if n, _ := lc.Held(); n != 0 {
+	if n, _, _ := lc.Held(); n != 0 {
 		t.Fatalf("held %d", n)
+	}
+	// Held at its limit, the kind comes with the reason.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bound.Hold("billing says so")
+	sched.Reconcile(ctx, 1)
+	if n, kind, why := lc.Held(); n != 1 || kind != "held" || !strings.Contains(why, "billing says so") {
+		t.Fatalf("held %d %q %q, want 1 held by its tenant", n, kind, why)
 	}
 }
 

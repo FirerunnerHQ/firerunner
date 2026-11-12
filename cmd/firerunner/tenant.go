@@ -151,20 +151,21 @@ func (s *shard) schedulerOptions(t tenant, tier config.Tier, bound *scheduler.Te
 }
 
 // heldBy asks the tier's scheduler, once there is one, how many launches
-// its tenant holds back, and why.
-func heldBy(sched func() *scheduler.Scheduler) func() (int, string) {
-	return func() (int, string) {
+// its tenant holds back, of what kind, and why.
+func heldBy(sched func() *scheduler.Scheduler) func() (int, string, string) {
+	return func() (int, string, string) {
 		if s := sched(); s != nil {
-			return s.Held()
+			n, h := s.Holding()
+			return n, string(h.Kind), h.Why
 		}
-		return 0, ""
+		return 0, "", ""
 	}
 }
 
 // listenerConfig is what a tier's scale set listener gets from its tenant.
 // held says what the tier's tenant holds back, for the jobs a message
 // assigns.
-func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tracker *health.Tracker, jobs *assigned.Jobs, log *slog.Logger, held func() (int, string)) listener.Config {
+func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tracker *health.Tracker, jobs *assigned.Jobs, log *slog.Logger, held func() (int, string, string)) listener.Config {
 	return listener.Config{
 		Held:         held,
 		URL:          t.URL,
@@ -564,7 +565,10 @@ func (s *shard) entitlementHealth(f *health.File) {
 	f.Entitlements = &health.TenantStates{Store: st.Store, LastRead: st.LastRead, LastError: st.LastError, LastErrorAt: st.LastErrorAt}
 	for i := range f.Tenants {
 		if f.Tenants[i].ID != "" {
-			f.Tenants[i].Entitlement = healthEntitlement(s.entitlements.Decide(f.Tenants[i].ID))
+			e := healthEntitlement(s.entitlements.Decide(f.Tenants[i].ID))
+			fo := s.entitlements.FailOpen(f.Tenants[i].ID)
+			e.FailOpenSince, e.FailOpens = fo.Since, fo.Count
+			f.Tenants[i].Entitlement = e
 		}
 	}
 }
@@ -574,7 +578,7 @@ func (s *shard) entitlementHealth(f *health.File) {
 func healthEntitlement(r entitlement.Record, ok bool, d entitlement.Decision) *health.Entitlement {
 	l := r.PlanLimits()
 	return &health.Entitlement{None: !ok, Invalid: r.Invalid, Plan: r.Plan, Account: string(r.Account), Budget: string(r.Budget), ValidUntil: r.ValidUntil,
-		MaxRunners: l.MaxRunners, Tiers: l.Tiers,
+		WrittenAt: r.Written, MaxRunners: l.MaxRunners, Tiers: l.Tiers,
 		Held: d.Hold, FailOpen: d.FailOpen, Warning: d.Warning, Why: d.Why}
 }
 

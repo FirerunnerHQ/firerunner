@@ -9,6 +9,7 @@ import (
 
 	"github.com/actions/scaleset"
 
+	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jobevent"
 )
 
@@ -82,8 +83,9 @@ func TestJobHeldWithReason(t *testing.T) {
 	events := &eventLog{}
 	held, why := 0, `tenant "acme" is at its limit of 2 runner(s) at once`
 	var planned []int
-	a := &scaler{events: events, tier: "tier-a", log: slog.New(slog.DiscardHandler), stats: &statsRecorder{},
-		held: func() (int, string) { return held, why },
+	tracker := health.NewTracker("tier-a")
+	a := &scaler{events: events, tier: "tier-a", log: slog.New(slog.DiscardHandler), stats: &statsRecorder{}, health: tracker,
+		held: func() (int, string, string) { return held, "limit", why },
 		onDesired: func(_ context.Context, n int) int {
 			planned = append(planned, n)
 			held = 1 // the plan launches one and holds one back
@@ -102,6 +104,9 @@ func TestJobHeldWithReason(t *testing.T) {
 	}
 	if h := events.got[0]; h.Kind != jobevent.Held || h.Reason != why || h.JobID != "job-2" || h.Tier != "tier-a" || h.Repository != "owner/repo" {
 		t.Fatalf("held event = %+v", h)
+	}
+	if got := tracker.Snapshot().HeldJobs; len(got) != 1 || got["limit"] != 1 {
+		t.Fatalf("held jobs in the tier's health = %v, want 1 by its limit", got)
 	}
 
 	held, events.got = 0, nil

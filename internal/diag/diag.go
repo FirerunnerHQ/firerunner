@@ -447,6 +447,9 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			if n := t.Stopped["job_duration"]; n > 0 {
 				fmt.Fprintf(w, "  %s runners ended at the job limit: %d\n", t.Name, n)
 			}
+			if len(t.HeldJobs) > 0 {
+				fmt.Fprintf(w, "  %s jobs held since start, by what held them: %s\n", t.Name, countList(t.HeldJobs))
+			}
 			if len(t.Launches) > 0 {
 				fmt.Fprintf(w, "  %s launches: %d from the pool, %d cold, %d cold with the pool kept\n",
 					t.Name, t.Launches["pool"], t.Launches["cold"], t.Launches["kept"])
@@ -867,6 +870,9 @@ func entitlementLine(e *health.Entitlement) string {
 	if !e.ValidUntil.IsZero() {
 		s += ", valid until " + e.ValidUntil.UTC().Format(time.RFC3339)
 	}
+	if !e.WrittenAt.IsZero() {
+		s += ", written " + e.WrittenAt.UTC().Format(time.RFC3339)
+	}
 	if e.MaxRunners > 0 {
 		s += fmt.Sprintf(", plan's limit %d runner(s)", e.MaxRunners)
 	}
@@ -880,6 +886,9 @@ func entitlementLine(e *health.Entitlement) string {
 		s += "; EXPIRED, launching on it: " + e.Why
 	case e.Warning:
 		s += "; near its spend cap"
+	}
+	if e.FailOpens > 0 {
+		s += fmt.Sprintf(" (launched on an expired record %d time(s) since the daemon started)", e.FailOpens)
 	}
 	return s
 }
@@ -905,7 +914,11 @@ func entitlementsCheck(f health.File, now time.Time) *Check {
 		case e.Invalid != "":
 			none = append(none, fmt.Sprintf("%s (unreadable: %s)", t.ID, e.Invalid))
 		case e.FailOpen:
-			open = append(open, fmt.Sprintf("%s (expired %s)", t.ID, e.ValidUntil.UTC().Format(time.RFC3339)))
+			s := fmt.Sprintf("%s (expired %s", t.ID, e.ValidUntil.UTC().Format(time.RFC3339))
+			if !e.FailOpenSince.IsZero() {
+				s += fmt.Sprintf("; launching on it for %s", humanDuration(now.Sub(e.FailOpenSince).Truncate(time.Second)))
+			}
+			open = append(open, s+")")
 		case e.Held:
 			held = append(held, fmt.Sprintf("%s (%s)", t.ID, e.Why))
 		case e.Warning:

@@ -68,21 +68,49 @@ func (t *Tenant) join(s *Scheduler) {
 	t.scheds = append(t.scheds, s)
 }
 
+// HoldKind says what holds a tier's launches back.
+type HoldKind string
+
+// Hold kinds.
+const (
+	// HoldLimit: the tenant is at its own runner limit.
+	HoldLimit HoldKind = "limit"
+	// HoldPlanLimit: the tenant is at its plan's runner limit, narrower
+	// than its own.
+	HoldPlanLimit HoldKind = "plan_limit"
+	// HoldPlanTier: the tenant's plan leaves the tier out.
+	HoldPlanTier HoldKind = "plan_tier"
+	// HoldHeld: the tenant is held (Tenant.Hold).
+	HoldHeld HoldKind = "held"
+	// HoldSuspended: the tenant is suspended (Tenant.Suspend).
+	HoldSuspended HoldKind = "suspended"
+)
+
+// Hold is why a tier's launches wait: its kind, and the reason in words.
+// The zero Hold holds nothing.
+type Hold struct {
+	Kind HoldKind
+	Why  string
+}
+
 // take grants s up to n launches and returns how many it granted and, when
 // it granted fewer, why the rest wait. The places free go first to the
 // schedulers ahead of s in line; one not in line is behind them all. A
 // scheduler in line that is granted a place moves to the back.
-func (t *Tenant) take(s *Scheduler, n int) (int, string) {
+func (t *Tenant) take(s *Scheduler, n int) (int, Hold) {
 	if n <= 0 {
-		return 0, ""
+		return 0, Hold{}
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.heldWhy != "" {
-		return 0, t.heldWhy
+		if t.suspended {
+			return 0, Hold{HoldSuspended, t.heldWhy}
+		}
+		return 0, Hold{HoldHeld, t.heldWhy}
 	}
 	if !t.allows(s) {
-		return 0, fmt.Sprintf("%s's plan does not include tier %q", t.who(), s.opts.Tier)
+		return 0, Hold{HoldPlanTier, fmt.Sprintf("%s's plan does not include tier %q", t.who(), s.opts.Tier)}
 	}
 	granted := n
 	if limit := t.limit(); limit > 0 {
@@ -106,7 +134,7 @@ func (t *Tenant) take(s *Scheduler, n int) (int, string) {
 	if granted < n {
 		return granted, t.atLimit()
 	}
-	return granted, ""
+	return granted, Hold{}
 }
 
 // wait puts s in line, at the back, while it has launches held back, and
@@ -123,12 +151,12 @@ func (t *Tenant) wait(s *Scheduler, waiting bool) {
 	}
 }
 
-func (t *Tenant) atLimit() string {
+func (t *Tenant) atLimit() Hold {
 	limit := t.limit()
 	if limit == t.plan && limit != t.max {
-		return fmt.Sprintf("%s is at its plan's limit of %d runner(s) at once", t.who(), limit)
+		return Hold{HoldPlanLimit, fmt.Sprintf("%s is at its plan's limit of %d runner(s) at once", t.who(), limit)}
 	}
-	return fmt.Sprintf("%s is at its limit of %d runner(s) at once", t.who(), limit)
+	return Hold{HoldLimit, fmt.Sprintf("%s is at its limit of %d runner(s) at once", t.who(), limit)}
 }
 
 // limit is the bound in force: the narrower of the tenant's and its plan's,

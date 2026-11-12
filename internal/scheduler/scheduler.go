@@ -148,9 +148,9 @@ type Scheduler struct {
 	// cannot be extended by a launch it has to wait for in turn. Guarded by mu.
 	draining bool
 	// held is how many launches the latest plan wanted that the tenant held
-	// back, and heldWhy why. Guarded by mu.
-	held    int
-	heldWhy string
+	// back, and hold why. Guarded by mu.
+	held int
+	hold Hold
 }
 
 // vmHandle is the shutdown-relevant state of one in-flight microVM.
@@ -339,39 +339,45 @@ func (s *Scheduler) grant(want int) int {
 	if s.opts.Tenant == nil {
 		return want
 	}
-	n, why := s.opts.Tenant.take(s, want)
-	s.setHeld(want-n, why)
+	n, h := s.opts.Tenant.take(s, want)
+	s.setHeld(want-n, h)
 	return n
 }
 
 // setHeld records that the tenant holds n wanted launches back, and why, and
 // reports a change. Callers must hold s.mu.
-func (s *Scheduler) setHeld(n int, why string) {
-	if n <= 0 || why == "" {
-		n, why = 0, ""
+func (s *Scheduler) setHeld(n int, h Hold) {
+	if n <= 0 || h.Why == "" {
+		n, h = 0, Hold{}
 	}
-	if n == s.held && why == s.heldWhy {
+	if n == s.held && h == s.hold {
 		return
 	}
-	s.held, s.heldWhy = n, why
+	s.held, s.hold = n, h
 	if s.opts.Tenant != nil {
 		s.opts.Tenant.wait(s, n > 0)
 	}
 	if n > 0 {
-		s.opts.Logger.Info("launches held", "jobs", n, "reason", why)
+		s.opts.Logger.Info("launches held", "jobs", n, "kind", h.Kind, "reason", h.Why)
 	} else {
 		s.opts.Logger.Info("launches no longer held")
 	}
 	if s.opts.OnHold != nil {
-		s.opts.OnHold(n, why)
+		s.opts.OnHold(n, h.Why)
 	}
 }
 
 // Held returns how many launches the tenant holds back, and why.
 func (s *Scheduler) Held() (int, string) {
+	n, h := s.Holding()
+	return n, h.Why
+}
+
+// Holding returns how many launches the tenant holds back, and the hold.
+func (s *Scheduler) Holding() (int, Hold) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.held, s.heldWhy
+	return s.held, s.hold
 }
 
 // retry plans again with the last desired count, when a place among its
@@ -383,7 +389,7 @@ func (s *Scheduler) retry() {
 	s.mu.Lock()
 	if s.held > 0 && (s.draining || (s.hasDesired && s.lastCtx.Err() != nil)) {
 		// The tier stopped: it no longer waits in its tenant's line.
-		s.setHeld(0, "")
+		s.setHeld(0, Hold{})
 	}
 	if s.held == 0 || !s.hasDesired || s.draining || s.lastCtx.Err() != nil {
 		s.mu.Unlock()
@@ -454,12 +460,12 @@ func (s *Scheduler) replan(ctx context.Context) (int, context.Context) {
 	if s.opts.Tenant != nil {
 		// The place this exit freed is the tenant's: a tier ahead in its
 		// line gets it first (see Tenant).
-		granted, why := s.opts.Tenant.take(s, n)
+		granted, h := s.opts.Tenant.take(s, n)
 		switch {
-		case why != "":
-			s.setHeld(want-granted, why)
+		case h.Why != "":
+			s.setHeld(want-granted, h)
 		case granted == want:
-			s.setHeld(0, "")
+			s.setHeld(0, Hold{})
 		}
 		// Granted one of several: the rest wait for the next message, as
 		// without a tenant, and the hold stays as the last plan left it.
@@ -1184,7 +1190,7 @@ func (s *Scheduler) Capacity() int {
 func (s *Scheduler) Drain() {
 	s.mu.Lock()
 	s.draining = true
-	s.setHeld(0, "") // out of its tenant's line
+	s.setHeld(0, Hold{}) // out of its tenant's line
 	s.mu.Unlock()
 	s.wg.Wait()
 }
