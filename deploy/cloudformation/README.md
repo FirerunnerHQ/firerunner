@@ -94,7 +94,8 @@ of the key reaches the VM. Each signature is in CloudTrail.
 ## Tenants (optional)
 
 Store a JSON array as the String `<prefix>/control/tenants`, and the VM serves
-those installations too, on the same GitHub App and tier catalog:
+those installations too, on the same GitHub App and tier catalog. The daemon
+reads the parameter every 30 seconds and follows it without a restart:
 
 ```json
 [{"id": "acme", "url": "https://github.com/acme", "installation_id": 1234, "tiers": ["firerunner-ubuntu-24.04-2"]}]

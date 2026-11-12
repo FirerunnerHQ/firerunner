@@ -129,6 +129,36 @@ func (t *Tenant) release() {
 	}
 }
 
+// SetMax changes the bound to at most max runners at once, 0 for none. A
+// lower bound stops no runner: launches wait until enough have ended. A
+// higher one wakes the tenant's schedulers to launch for the jobs that
+// waited. It reports whether the bound changed.
+func (t *Tenant) SetMax(max int) bool {
+	t.mu.Lock()
+	if t.max == max {
+		t.mu.Unlock()
+		return false
+	}
+	raised := max == 0 || (t.max != 0 && max > t.max)
+	t.max = max
+	var wake []*Scheduler
+	if raised && t.heldWhy == "" {
+		wake = slices.Clone(t.scheds)
+	}
+	t.mu.Unlock()
+	for _, s := range wake {
+		go s.retry()
+	}
+	return true
+}
+
+// Max is the bound: at most this many runners at once, 0 for none.
+func (t *Tenant) Max() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.max
+}
+
 // Suspend refuses every launch of the tenant's tiers and stops every runner
 // they have, busy or not, so its machines end now: a job running fails. A
 // launch already on its way is stopped as it starts. The reason is the

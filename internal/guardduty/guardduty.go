@@ -193,9 +193,9 @@ func finding(f types.Finding, detector string) (Finding, bool) {
 }
 
 // Owners maps an owner tag to the tenant it names: install's own tag to
-// tenantstate.Install, and install/<id> to id, for an id in ids (any valid
-// id when ids is nil). It names no other.
-func Owners(install string, ids []string) func(owner string) (string, bool) {
+// tenantstate.Install, and install/<id> to id, for an id known reports (any
+// valid id when known is nil). It names no other.
+func Owners(install string, known func(id string) bool) func(owner string) (string, bool) {
 	return func(owner string) (string, bool) {
 		if owner == install {
 			return tenantstate.Install, true
@@ -204,7 +204,7 @@ func Owners(install string, ids []string) func(owner string) (string, bool) {
 		if !ok || id == tenantstate.Install || !tenantstate.ValidID(id) {
 			return "", false
 		}
-		if ids != nil && !slices.Contains(ids, id) {
+		if known != nil && !known(id) {
 			return "", false
 		}
 		return id, true

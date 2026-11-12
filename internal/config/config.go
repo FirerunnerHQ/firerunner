@@ -419,7 +419,7 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.IntVar(&c.VCPU, "vcpu", er.int("FR_VCPU", 4), "vCPUs per microVM")
 	fs.IntVar(&c.MemMiB, "mem-mib", er.int("FR_MEM_MIB", 8192), "guest memory (MiB) per microVM")
 
-	fs.StringVar(&c.TenantsPath, "tenants", env("FR_TENANTS", ""), "path to a JSON array of tenants served beside this install, each {id,url,installation_id,tiers,limits}, using its GitHub App and tier catalog. Their tiers run with caches off and no hot runners or pool. A tenant's limits default to 2 runners, tiers of at most 2 vCPU and 30 minutes per job")
+	fs.StringVar(&c.TenantsPath, "tenants", env("FR_TENANTS", ""), "a JSON array of tenants served beside this install, each {id,url,installation_id,tiers,limits}, using its GitHub App and tier catalog: a file path, or ssm: and an SSM parameter holding it. The daemon reads it again every 30s and starts, changes and stops tenants to match. Their tiers run with caches off and no hot runners or pool. A tenant's limits default to 2 runners, tiers of at most 2 vCPU and 30 minutes per job")
 	fs.IntVar(&c.Limits.Runners, "limit-runners", er.int("FR_LIMIT_RUNNERS", 0), "most runners the install's own tiers have at once, together (0 = no limit). A tenant sets its own in the --tenants catalog")
 	fs.IntVar(&c.Limits.VCPU, "limit-vcpu", er.int("FR_LIMIT_VCPU", 0), "serve the install only the tiers of at most this many vCPUs, leaving the others out with a warning (0 = no limit). A tenant sets its own in the --tenants catalog")
 	fs.DurationVar(&c.Limits.JobDuration, "limit-job-duration", er.duration("FR_LIMIT_JOB_DURATION", 0), "end the runner of an install's job that has run this long, failing the job (0 = no limit; at least 1m). A tenant sets its own in the --tenants catalog")
@@ -535,7 +535,7 @@ func Parse(args []string) (*Config, error) {
 		}
 		c.Tiers = tiers
 	}
-	if c.TenantsPath != "" {
+	if _, ssm := TenantsParameter(c.TenantsPath); c.TenantsPath != "" && !ssm {
 		tenants, err := loadTenants(c.TenantsPath)
 		if err != nil {
 			return nil, err

@@ -243,3 +243,48 @@ func TestTenantWithoutLimitHoldsNothing(t *testing.T) {
 	}
 	s[0].Drain()
 }
+
+// A raised bound launches for the jobs held at the old one at once, without
+// waiting for a runner to end or another message; a lowered one stops
+// nothing, and holds launches until enough runners have ended.
+func TestTenantSetMax(t *testing.T) {
+	ctx, ten, prov, s, hs := tenantLab(t, 1)
+	s[0].Reconcile(ctx, 3)
+	a := prov.next(t)
+	if jobs, _, _ := hs[0].get(); jobs != 2 {
+		t.Fatalf("held %d, want 2", jobs)
+	}
+	if ten.SetMax(1) {
+		t.Fatal("SetMax to the same bound reported a change")
+	}
+
+	if !ten.SetMax(3) || ten.Max() != 3 {
+		t.Fatalf("SetMax(3): max %d", ten.Max())
+	}
+	b, c := prov.next(t), prov.next(t)
+	waitUntil(t, "nothing held", func() bool { j, _, _ := hs[0].get(); return j == 0 })
+
+	// Lowered below what runs: every runner keeps going, and the next job
+	// waits until two have ended.
+	ten.SetMax(1)
+	if got := s[0].Running(); got != 3 {
+		t.Fatalf("running %d after lowering the bound, want 3: it stops nothing", got)
+	}
+	message(ctx, s[0], 3, a)
+	prov.finish(a)
+	waitUntil(t, "a gone", func() bool { return ten.Running() == 2 })
+	s[0].Reconcile(ctx, 3)
+	prov.noMore(t)
+	if jobs, why, _ := hs[0].get(); jobs != 1 || !strings.Contains(why, "limit of 1 runner(s)") {
+		t.Fatalf("held %d (%q), want 1 at the new limit", jobs, why)
+	}
+
+	// No bound: everything held launches.
+	ten.SetMax(0)
+	d := prov.next(t)
+	for _, n := range []string{b, c, d} {
+		prov.finish(n)
+	}
+	s[0].Drain()
+	s[1].Drain()
+}

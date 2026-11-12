@@ -207,11 +207,10 @@ if [ -n "$dsn" ]; then
 	printf '%s\n' "$dsn" > "$etc/job-events-dsn"
 	setenv FR_JOB_EVENTS_DSN_FILE "$etc/job-events-dsn"
 fi
-tenants=$(param tenants)
-if [ -n "$tenants" ]; then
-	printf '%s\n' "$tenants" > "$etc/tenants.json"
-	setenv FR_TENANTS "$etc/tenants.json"
-fi
+# The daemon reads its tenants from this parameter every 30 s, and starts,
+# changes and stops them to match: a tenant needs no new VM. Until the
+# parameter exists, there are none; once read, removing them all takes [].
+setenv FR_TENANTS "ssm:$FR_PREFIX/control/tenants"
 # Suspensions live under this path; the daemon reads it every 15 s. A stack
 # made before the VM's role could read it leaves suspension off, rather than
 # a daemon that cannot read whether its tenants are suspended. Any other

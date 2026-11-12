@@ -32,25 +32,66 @@ type Tenant struct {
 
 var tenantID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 
+// TenantsSSM is the prefix of a --tenants that names an SSM parameter
+// holding the list, rather than a file.
+const TenantsSSM = "ssm:"
+
+// TenantsParameter returns the SSM parameter spec names, and whether it
+// names one.
+func TenantsParameter(spec string) (string, bool) {
+	return strings.CutPrefix(spec, TenantsSSM)
+}
+
 func loadTenants(path string) ([]Tenant, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("--tenants: %w", err)
 	}
-	dec := json.NewDecoder(strings.NewReader(string(b)))
-	dec.DisallowUnknownFields()
-	var tenants []Tenant
-	if err := dec.Decode(&tenants); err != nil {
+	tenants, err := ParseTenants(b)
+	if err != nil {
 		return nil, fmt.Errorf("--tenants %s: %w", path, err)
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("--tenants %s: content after the list", path)
 	}
 	return tenants, nil
 }
 
+// ParseTenants reads a tenants list: a JSON array, nothing after it, and no
+// field this version does not know.
+func ParseTenants(b []byte) ([]Tenant, error) {
+	dec := json.NewDecoder(strings.NewReader(string(b)))
+	dec.DisallowUnknownFields()
+	var tenants []Tenant
+	if err := dec.Decode(&tenants); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("content after the list")
+	}
+	return tenants, nil
+}
+
+func (c *Config) checkTenantsSpec() error {
+	name, ok := TenantsParameter(c.TenantsPath)
+	if !ok {
+		return nil
+	}
+	if !strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") || strings.Contains(name, "//") {
+		return fmt.Errorf("--tenants %q: an SSM parameter name is absolute, e.g. ssm:/firerunner/control/tenants", c.TenantsPath)
+	}
+	return nil
+}
+
 func (c *Config) validateTenants() error {
-	if len(c.Tenants) == 0 {
+	if err := c.checkTenantsSpec(); err != nil {
+		return err
+	}
+	return c.CheckTenants(c.Tenants)
+}
+
+// CheckTenants reports what is wrong with a tenants list for this install:
+// the list from a file is checked at start, and every list the daemon reads
+// again before it serves any of it.
+func (c *Config) CheckTenants(tenants []Tenant) error {
+	if len(tenants) == 0 {
 		return nil
 	}
 	if c.AppClientID == "" || (c.AppPrivateKey == "" && c.AppKMSKey == "") {
@@ -64,7 +105,7 @@ func (c *Config) validateTenants() error {
 		catalog[t.Name] = t
 	}
 	ids, urls := map[string]bool{}, map[string]bool{accountOf(c.URL): true}
-	for _, t := range c.Tenants {
+	for _, t := range tenants {
 		if !tenantID.MatchString(t.ID) {
 			return fmt.Errorf("tenant %q: an id is lowercase letters, digits and hyphens, at most 32", t.ID)
 		}
@@ -104,6 +145,10 @@ func (c *Config) validateTenants() error {
 	}
 	return nil
 }
+
+// AccountOf returns the account a runner URL registers runners in, as
+// accountOf: two tenants on one account would share scale sets.
+func AccountOf(raw string) string { return accountOf(raw) }
 
 // accountOf returns the host and organization of a runner URL, or "" if it is
 // not an https URL naming one. A repository in an organization counts as that

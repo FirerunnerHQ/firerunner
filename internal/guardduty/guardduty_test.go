@@ -59,7 +59,7 @@ func newRig(t *testing.T) *rig {
 // poller is a fresh poller on the rig's store, as after a restart.
 func (r *rig) poller() *Poller {
 	return &Poller{
-		API: r.gd, Store: r.store, Tenant: Owners("inst", []string{"acme"}),
+		API: r.gd, Store: r.store, Tenant: Owners("inst", func(id string) bool { return id == "acme" }),
 		MinSeverity: DefaultMinSeverity, now: r.clock.now,
 		Account: func(context.Context) (string, error) { return ownAccount, nil },
 		OnFlag:  func(f Flagged) { r.flagged = append(r.flagged, f) },
@@ -436,7 +436,7 @@ func TestAdvance(t *testing.T) {
 }
 
 func TestOwners(t *testing.T) {
-	served := Owners("inst", []string{"acme"})
+	served := Owners("inst", func(id string) bool { return id == "acme" })
 	anyID := Owners("inst", nil)
 	for _, c := range []struct {
 		owner string
