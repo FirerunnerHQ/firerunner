@@ -115,6 +115,9 @@ type Tenant struct {
 	// Flag is set while GuardDuty findings have flagged it for review
 	// (--guardduty). It does not suspend.
 	Flag *Flag `json:"flag,omitempty"`
+	// Restarts is how often its loop has stopped it and tried again since
+	// the daemon started; nil when never.
+	Restarts *Restarts `json:"restarts,omitempty"`
 	// Entitlement is what billing last said it may run, and what that
 	// allows now (--entitlements); nil for the install, or when off.
 	Entitlement *Entitlement `json:"entitlement,omitempty"`
@@ -151,6 +154,15 @@ type Entitlement struct {
 	// Warning: its budget is near its cap.
 	Warning bool   `json:"warning,omitempty"`
 	Why     string `json:"why,omitempty"`
+}
+
+// Restarts is how a tenant's loop has stopped it and started it again: how
+// many times, how many of them for a panic (a bug), and the last error.
+type Restarts struct {
+	Count     int       `json:"count"`
+	Panics    int       `json:"panics,omitempty"`
+	LastError string    `json:"last_error,omitempty"`
+	LastAt    time.Time `json:"last_at,omitzero"`
 }
 
 // Flag is a tenant's flag for review: what the latest GuardDuty finding on

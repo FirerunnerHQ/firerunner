@@ -298,9 +298,10 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 			}
 			return st, err
 		},
-		serve: func(ctx context.Context, cancel context.CancelFunc, st *servedTenant) error {
-			return serveTiers(ctx, cancel, st.names(), st.runs(s.cfg), st.log)
+		serve: func(ctx context.Context, cancel context.CancelFunc, st *servedTenant, onPanic func()) error {
+			return serveTiers(ctx, cancel, st.names(), st.runs(s.cfg), onPanic, st.log)
 		},
+		stopLimit: panicStopLimit(get().Limits.JobDuration),
 		stop: func(ctx context.Context, st *servedTenant) {
 			st.drain()
 			if removedTenant(ctx) {
@@ -366,12 +367,19 @@ func (t tenant) tierKey(tier string) string {
 
 // start registers a tenant's scale sets and builds what serves them. A failure
 // leaves none of its scale sets open.
-func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (*servedTenant, error) {
+func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (_ *servedTenant, err error) {
 	cfg, log := s.cfg, s.log
 	if t.ID != "" {
 		log = log.With("tenant", t.ID)
 	}
 	st := &servedTenant{t: t, tiers: t.Tiers, log: log, bound: s.newBound(t, log)}
+	// A panic part way leaves no session open either: it is an error here.
+	defer func() {
+		if p := recover(); p != nil {
+			st.close(context.WithoutCancel(ctx))
+			err = recovered(p, fmt.Sprintf("tenant %q start", t.ID), log)
+		}
+	}()
 
 	// The REST runner list behind --runner-sweep, shared by the tenant's tiers.
 	if cfg.RunnerSweep != "off" {
@@ -654,6 +662,8 @@ type liveTenants struct {
 	mu      sync.Mutex
 	served  []*servedTenant
 	waiting map[string]*health.Tracker
+	// restarts is how each tenant's loop has stopped it and tried again.
+	restarts map[string]*health.Restarts
 	// skipped are tenants never started: no tier is within their limits.
 	skipped []health.Tenant
 	// onAdd, when set, is called with each tenant once it is served: the
@@ -682,6 +692,22 @@ func (l *liveTenants) tenants(states tenantstate.States, flags tenantstate.Flags
 		out = append(out, st.health(states))
 	}
 	out = append(out, l.skipped...)
+	served := map[string]bool{}
+	for _, h := range out {
+		served[h.ID] = true
+	}
+	// A tenant between tries is listed too, so its restarts show.
+	for _, id := range slices.Sorted(maps.Keys(l.waiting)) {
+		if !served[id] {
+			out = append(out, health.Tenant{ID: id, NotServed: "starting again after it stopped"})
+		}
+	}
+	for i := range out {
+		if r, ok := l.restarts[out[i].ID]; ok {
+			c := *r
+			out[i].Restarts = &c
+		}
+	}
 	healthFlag := func(fl tenantstate.Flag) *health.Flag {
 		return &health.Flag{Type: fl.Type, Severity: fl.Severity, Tier: fl.Tier, Instance: fl.Instance,
 			Finding: fl.Finding, Count: fl.Count, First: fl.First, Last: fl.Last}
@@ -745,13 +771,27 @@ func (l *liveTenants) forget(id string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.waiting, id)
+	delete(l.restarts, id)
 	l.skipped = slices.DeleteFunc(l.skipped, func(h health.Tenant) bool { return h.ID == id })
 }
 
-// wait records that a tenant is down until its next try.
+// wait records that a tenant is down until its next try, and counts it.
 func (l *liveTenants) wait(id string, err error, backoff time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.restarts == nil {
+		l.restarts = map[string]*health.Restarts{}
+	}
+	r := l.restarts[id]
+	if r == nil {
+		r = &health.Restarts{}
+		l.restarts[id] = r
+	}
+	r.Count++
+	if errors.Is(err, errPanicked) {
+		r.Panics++
+	}
+	r.LastError, r.LastAt = fmt.Sprint(err), time.Now()
 	if l.waiting == nil {
 		l.waiting = map[string]*health.Tracker{}
 	}
@@ -826,7 +866,9 @@ const (
 type tenantLoop struct {
 	id    string
 	start func(ctx context.Context) (*servedTenant, error)
-	serve func(ctx context.Context, cancel context.CancelFunc, st *servedTenant) error
+	serve func(ctx context.Context, cancel context.CancelFunc, st *servedTenant, onPanic func()) error
+	// stopLimit bounds its stop after a recovered panic (guardAfterPanic).
+	stopLimit time.Duration
 	// stop is given the loop's context, whose cause says why it ended.
 	stop func(ctx context.Context, st *servedTenant)
 	// served, when set, is called with each start once it is served.
@@ -855,23 +897,50 @@ func (l *tenantLoop) run(ctx context.Context) {
 }
 
 // try serves the tenant until it stops, and resets the wait if it served for
-// longer than the longest one.
-func (l *tenantLoop) try(ctx context.Context, wait *time.Duration) error {
+// longer than the longest one. A panic in its start, serve or stop ends the
+// try as an error, as any other failure does, and stop still runs: one
+// tenant's bug starts that tenant again, not the daemon. From the panic on,
+// the tenant is out of the health file, which must not wait on a lock the
+// panic may have left held, and its stop has stopLimit to end before the
+// daemon exits for a restart (guardAfterPanic).
+func (l *tenantLoop) try(ctx context.Context, wait *time.Duration) (err error) {
+	settled := make(chan struct{})
+	defer close(settled)
+	var st *servedTenant
+	onPanic := sync.OnceFunc(func() {
+		if st != nil {
+			l.live.remove(st)
+		}
+		_ = guardAfterPanic(settled, l.stopLimit, fmt.Sprintf("tenant %q", l.id), l.log)
+	})
+	protect := func(what string, f func() error) (err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = recovered(p, fmt.Sprintf("tenant %q %s", l.id, what), l.log)
+				onPanic()
+			}
+		}()
+		return f()
+	}
 	tctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	st, err := l.start(tctx)
-	if err != nil {
+	if err := protect("start", func() (err error) { st, err = l.start(tctx); return err }); err != nil {
 		return err
 	}
 	began := time.Now()
-	l.live.add(st)
+	// Removed whatever happens from here: adding it may panic (onAdd).
 	defer l.live.remove(st)
-	if l.served != nil {
-		l.served(st)
-	}
-	err = l.serve(tctx, cancel, st)
+	err = protect("serve", func() error {
+		l.live.add(st)
+		if l.served != nil {
+			l.served(st)
+		}
+		return l.serve(tctx, cancel, st, onPanic)
+	})
 	cancel()
-	l.stop(ctx, st)
+	if perr := protect("stop", func() error { l.stop(ctx, st); return nil }); err == nil {
+		err = perr
+	}
 	if time.Since(began) > l.max {
 		*wait = l.min
 	}
@@ -879,6 +948,14 @@ func (l *tenantLoop) try(ctx context.Context, wait *time.Duration) error {
 		err = errors.New("its tiers stopped")
 	}
 	return err
+}
+
+// panicStopLimit is how long a tenant's stop may take after a recovered
+// panic: a drain waits for jobs no longer than their limit and its slack.
+// With no job limit, the slack alone: a drain that waits longer may be
+// waiting on a lock the panic left held.
+func panicStopLimit(job time.Duration) time.Duration {
+	return max(job, 0) + jobLifetimeSlack
 }
 
 // close closes the tenant's scale set sessions.

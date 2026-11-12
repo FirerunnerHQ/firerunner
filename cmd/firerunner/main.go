@@ -474,8 +474,13 @@ func tierProvisioner(t config.Tier, fc provisioner.Provisioner, newEC2 func(conf
 // every tier has stopped there is nothing left to serve, so it cancels ctx and
 // returns the first error. A tier that needs a fresh process
 // (listener.ErrRestart: its scale set was deleted) stops every tier at once,
-// so the daemon exits for its supervisor to restart and re-register it.
-func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, runs []func(context.Context) error, log *slog.Logger) error {
+// so the daemon exits for its supervisor to restart and re-register it. So
+// does a tier whose run panics (errPanicked): for a tenant of the list its
+// loop starts it again, and the install restarts, while other tenants'
+// tiers, served by their own loops, never see it. onPanic, when set, is
+// called at once on such a panic, before the other tiers have stopped. A
+// panic in a goroutine a tier's run starts in turn is not recovered here.
+func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, runs []func(context.Context) error, onPanic func(), log *slog.Logger) error {
 	var (
 		wg      sync.WaitGroup
 		mu      sync.Mutex
@@ -489,7 +494,17 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 			defer wg.Done()
 			tierCtx, tierCancel := context.WithCancel(ctx)
 			defer tierCancel()
-			err := run(tierCtx)
+			err := func() (err error) {
+				defer func() {
+					if p := recover(); p != nil {
+						err = recovered(p, fmt.Sprintf("tier %q", names[i]), log)
+						if onPanic != nil {
+							onPanic()
+						}
+					}
+				}()
+				return run(tierCtx)
+			}()
 			tierCancel()
 			if ctx.Err() != nil {
 				return
@@ -500,10 +515,14 @@ func serveTiers(ctx context.Context, cancel context.CancelFunc, names []string, 
 			mu.Lock()
 			defer mu.Unlock()
 			stopped++
-			if first == nil || errors.Is(err, listener.ErrRestart) {
+			if first == nil || errors.Is(err, listener.ErrRestart) || errors.Is(err, errPanicked) {
 				first = fmt.Errorf("tier %q: %w", names[i], err)
 			}
 			switch {
+			case errors.Is(err, errPanicked):
+				log.Error("a tier panicked; stopping every tier to start them again", "tier", names[i], "err", err)
+				restart = true
+				cancel()
 			case errors.Is(err, listener.ErrRestart):
 				log.Error("restarting to register the scale set again; stopping every tier", "tier", names[i], "err", err)
 				restart = true
@@ -1347,7 +1366,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 	}, log)
 
-	runErr := serveTiers(runCtx, cancel, served.names(), served.runs(cfg), log)
+	// A panic in one of the install's own tiers restarts the daemon, after
+	// a drain no longer than its runners' lifetime.
+	installPanic := sync.OnceFunc(func() { _ = guardAfterPanic(nil, panicStopLimit(served.t.Limits.JobDuration), "the install", log) })
+	runErr := serveTiers(runCtx, cancel, served.names(), served.runs(cfg), installPanic, log)
 	cancel()
 	// No tier is listening any more. Stop refreshing the health file before
 	// the drain, which can wait out long jobs: a file that keeps its last

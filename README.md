@@ -260,6 +260,20 @@ deleted and written again stops nobody. To remove every installation, write
 `[]`. A new run of an installation, or of another on the same account (a
 rename), starts only once the last has finished.
 
+**When one installation fails.** Each installation of the list runs in a loop
+of its own. A failure there (a start GitHub refuses, a scale set deleted, a
+panic in its start, its tiers' listeners or its stop) stops that installation
+alone: it drains, and starts again by itself after 30 seconds, doubling up to
+5 minutes. The other installations keep serving. `firerunner status` counts
+each installation's restarts and the last error, and `firerunner doctor` warns
+while one has panicked (`tenant-panics`), a bug to report with the stack the
+daemon logs. A panic may leave a lock held, so after one the installation
+has its job limit and 15 minutes to stop; if it has not, the daemon exits
+for systemd to restart it, as the panic would have before. A panic in the
+install's own tiers restarts the daemon after its drain, and one in a
+goroutine a tier starts in turn (a launch, a runner's watcher) still ends
+the process.
+
 **Suspending an installation.** An operator suspends one, for example on an
 abuse report, and resumes it later:
 

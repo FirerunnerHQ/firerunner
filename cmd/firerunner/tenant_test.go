@@ -358,7 +358,7 @@ func TestTenantLoopRetriesAFailedStart(t *testing.T) {
 			})
 			return &servedTenant{t: tenant{ID: "t1"}, trackers: []*health.Tracker{health.NewTracker("t1/a")}}, nil
 		},
-		serve: func(ctx context.Context, _ context.CancelFunc, st *servedTenant) error {
+		serve: func(ctx context.Context, _ context.CancelFunc, st *servedTenant, _ func()) error {
 			serving <- st
 			<-ctx.Done()
 			return nil
@@ -403,7 +403,7 @@ func TestTenantLoopEndsATriesContext(t *testing.T) {
 			cancel()
 			return nil, errors.New("done")
 		},
-		serve: func(context.Context, context.CancelFunc, *servedTenant) error { return errors.New("restart") },
+		serve: func(context.Context, context.CancelFunc, *servedTenant, func()) error { return errors.New("restart") },
 		stop:  func(context.Context, *servedTenant) { <-ended },
 	}
 	l.run(ctx)
