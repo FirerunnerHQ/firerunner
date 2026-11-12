@@ -248,8 +248,11 @@ and every 30 seconds, and follows it without a restart:
 
 A list that cannot be read, or that `config check` would reject, changes
 nothing: the installations are served as they were, `firerunner status` shows
-why, and `firerunner doctor` warns. An SSM parameter that does not exist lists
-no installations, so deleting it removes them all.
+why, and `firerunner doctor` warns. A list that does not exist is none until a
+list has been read; after that, it is a failed read too, so a parameter
+deleted and written again stops nobody. To remove every installation, write
+`[]`. A new run of an installation, or of another on the same account (a
+rename), starts only once the last has finished.
 
 **Suspending an installation.** An operator suspends one, for example on an
 abuse report, and resumes it later:

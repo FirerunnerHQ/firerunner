@@ -732,11 +732,14 @@ func (s *shard) watchEntitlements(ctx context.Context, cfg *config.Config, live 
 // too. It never suspends a tenant: it is given no tenant state to write.
 func (s *shard) watchFindings(ctx context.Context, cfg *config.Config, owner string, api guardduty.API, store tenantstate.FlagStore, account func(context.Context) (string, error), log *slog.Logger) {
 	glog := log.With("component", "guardduty")
-	// Any tenant under the install's owner tag: the tenants list changes
-	// while the daemon runs, and a tenant just removed may still have
-	// machines finishing their jobs.
+	// A tenant listed now, or one stopped that may still have machines
+	// finishing their jobs: the tenants list changes while the daemon runs.
+	known := func(id string) bool {
+		ts := s.tenants.Load()
+		return ts == nil || ts.known(id)
+	}
 	s.findings = &guardduty.Poller{
-		API: api, Store: store, Account: account, Tenant: guardduty.Owners(owner),
+		API: api, Store: store, Account: account, Tenant: guardduty.Owners(owner, known),
 		MinSeverity: cfg.GuardDutyMinSeverity, Interval: guardduty.DefaultInterval, Log: glog,
 		OnFlag: func(f guardduty.Flagged) {
 			jobevent.Record(s.events, jobevent.Event{Kind: jobevent.Flagged, Tier: f.Tier, Instance: f.Instance,
@@ -1293,6 +1296,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			}
 		},
 	}
+	s.tenants.Store(tenants)
 	var catalog *tenantCatalog
 	if cfg.TenantsPath != "" {
 		src, err := openTenants(cfg.TenantsPath, func() (ssmGetAPI, error) {

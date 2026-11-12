@@ -25,8 +25,14 @@ import (
 // added there is served within this long.
 const tenantsInterval = 30 * time.Second
 
+// tenantRemoveTimeout bounds deleting a removed tenant's scale sets.
+const tenantRemoveTimeout = 30 * time.Second
+
 // tenantsReadTimeout bounds one read, so a hung store delays the next only.
 const tenantsReadTimeout = 10 * time.Second
+
+// errTenantsMissing is a source whose list does not exist (yet).
+var errTenantsMissing = errors.New("the tenants list does not exist")
 
 // Why a tenant's loop ends while the daemon runs: the cause of its context.
 var (
@@ -51,8 +57,14 @@ type tenantSource interface {
 // fileTenants is a tenants list in a file.
 type fileTenants string
 
-func (f fileTenants) Load(context.Context) ([]byte, error) { return os.ReadFile(string(f)) }
-func (f fileTenants) String() string                       { return string(f) }
+func (f fileTenants) Load(context.Context) ([]byte, error) {
+	b, err := os.ReadFile(string(f))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w: %w", errTenantsMissing, err)
+	}
+	return b, err
+}
+func (f fileTenants) String() string { return string(f) }
 
 // ssmGetAPI is the part of the SSM client a tenants list in a parameter uses.
 type ssmGetAPI interface {
@@ -60,8 +72,7 @@ type ssmGetAPI interface {
 }
 
 // ssmTenants is a tenants list in one SSM parameter. A parameter that does
-// not exist lists no tenants: deleting it is how an operator removes the
-// last one. Any other failure is a failed read.
+// not exist is errTenantsMissing.
 type ssmTenants struct {
 	name string
 	api  ssmGetAPI
@@ -71,7 +82,7 @@ func (s ssmTenants) Load(ctx context.Context) ([]byte, error) {
 	out, err := s.api.GetParameter(ctx, &awsssm.GetParameterInput{Name: aws.String(s.name), WithDecryption: aws.Bool(true)})
 	var missing *ssmtypes.ParameterNotFound
 	if errors.As(err, &missing) {
-		return []byte("[]"), nil
+		return nil, fmt.Errorf("parameter %s: %w", s.name, errTenantsMissing)
 	}
 	if err != nil {
 		return nil, err
@@ -120,17 +131,25 @@ type tenantSet struct {
 
 	mu      sync.Mutex
 	running map[string]*tenantRun
-	// removed are the runs of tenants removed, which may still drain: a
-	// tenant listed again starts after its last run has ended, or that
-	// run would delete the scale sets the new one serves.
-	removed map[string]*tenantRun
-	wg      sync.WaitGroup
+	// ending are the runs stopped, removed or changed, that may still be
+	// draining. A run starts only after every one of them on its id or its
+	// account has ended: else one removed would delete the scale sets the
+	// new one serves (scale sets are found by name, in the account), and
+	// two would contend for one session.
+	ending []*tenantRun
+	// closed is set once wait is called: nothing starts after.
+	closed bool
+	// listed is set once a list has been applied.
+	listed bool
+	wg     sync.WaitGroup
 }
 
 // tenantRun is one tenant's loop in a tenantSet.
 type tenantRun struct {
-	cur    atomic.Pointer[config.Tenant]
-	cancel context.CancelCauseFunc
+	// id and account are the tenant's, as listed when the run began.
+	id, account string
+	cur         atomic.Pointer[config.Tenant]
+	cancel      context.CancelCauseFunc
 	// done closes once the loop has ended, its runners finished.
 	done chan struct{}
 }
@@ -139,9 +158,21 @@ type tenantRun struct {
 func (ts *tenantSet) apply(list []config.Tenant) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	if ts.running == nil {
-		ts.running, ts.removed = map[string]*tenantRun{}, map[string]*tenantRun{}
+	if ts.closed || ts.ctx.Err() != nil {
+		return
 	}
+	if ts.running == nil {
+		ts.running = map[string]*tenantRun{}
+	}
+	ts.listed = true
+	ts.ending = slices.DeleteFunc(ts.ending, func(r *tenantRun) bool {
+		select {
+		case <-r.done:
+			return true
+		default:
+			return false
+		}
+	})
 	want := map[string]bool{}
 	for _, c := range list {
 		want[c.ID] = true
@@ -149,14 +180,13 @@ func (ts *tenantSet) apply(list []config.Tenant) {
 	for _, id := range slices.Sorted(maps.Keys(ts.running)) {
 		if !want[id] {
 			ts.running[id].cancel(errTenantRemoved)
-			ts.removed[id] = ts.running[id]
+			ts.ending = append(ts.ending, ts.running[id])
 			delete(ts.running, id)
 			ts.log.Info("tenant removed from the list: it takes no more jobs, and its scale sets are deleted once its runners finish", "tenant", id)
 		}
 	}
 	for _, c := range list {
 		old, ok := ts.running[c.ID]
-		var prev <-chan struct{}
 		if ok {
 			was := *old.cur.Load()
 			switch {
@@ -170,16 +200,18 @@ func (ts *tenantSet) apply(list []config.Tenant) {
 				continue
 			}
 			old.cancel(errTenantChanged)
-			prev = old.done
+			ts.ending = append(ts.ending, old)
 			ts.log.Info("tenant changed in the list: it starts again as listed once its runners finish", "tenant", c.ID)
 		} else {
-			if gone, ok := ts.removed[c.ID]; ok {
-				prev = gone.done
-				delete(ts.removed, c.ID)
-			}
 			ts.log.Info("tenant added to the list", "tenant", c.ID)
 		}
-		r := &tenantRun{done: make(chan struct{})}
+		r := &tenantRun{id: c.ID, account: config.AccountOf(c.URL), done: make(chan struct{})}
+		var prev []<-chan struct{}
+		for _, e := range ts.ending {
+			if e.id == r.id || e.account == r.account {
+				prev = append(prev, e.done)
+			}
+		}
 		r.cur.Store(&c)
 		ctx, cancel := context.WithCancelCause(ts.ctx)
 		r.cancel = cancel
@@ -187,10 +219,10 @@ func (ts *tenantSet) apply(list []config.Tenant) {
 		ts.wg.Go(func() {
 			defer close(r.done)
 			defer cancel(nil)
-			if prev != nil {
-				// Whatever happens to this run, its done waits on the one
-				// before: a run after it must not start beside that one.
-				<-prev
+			// Whatever happens to this run, its done waits on the ones
+			// before: a run after it must not start beside them.
+			for _, p := range prev {
+				<-p
 			}
 			if ctx.Err() != nil {
 				return
@@ -205,8 +237,30 @@ func (ts *tenantSet) apply(list []config.Tenant) {
 	}
 }
 
-// wait returns once every tenant's loop has ended.
-func (ts *tenantSet) wait() { ts.wg.Wait() }
+// wait returns once every tenant's loop has ended. Nothing starts after it
+// is called, whatever is applied.
+func (ts *tenantSet) wait() {
+	ts.mu.Lock()
+	ts.closed = true
+	ts.mu.Unlock()
+	ts.wg.Wait()
+}
+
+// known reports whether id is a tenant listed now, or one stopped that may
+// still have machines: GuardDuty findings on its machines flag it. Before
+// any list is applied, every id is: a tenant's machines from before a
+// restart may be running, and a finding passed over is not read again.
+func (ts *tenantSet) known(id string) bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if !ts.listed {
+		return true
+	}
+	if _, ok := ts.running[id]; ok {
+		return true
+	}
+	return slices.ContainsFunc(ts.ending, func(r *tenantRun) bool { return r.id == id })
+}
 
 // onlyRunnersDiffer reports whether two entries of one tenant differ in
 // their runner limit alone, which changes in place.
@@ -222,6 +276,12 @@ func onlyRunnersDiffer(a, b config.Tenant) bool {
 // tenantCatalog reads the tenants list now and every tenantsInterval, and
 // applies each list that reads and checks. A list that does not leaves the
 // tenants as they were, and says why in health.
+//
+// A list that does not exist is no tenants until one has been applied, as
+// on a new deployment. After that it is a failed read: a parameter deleted
+// and written again, or a VM pointed at the wrong one, would otherwise stop
+// every tenant and delete their scale sets. Removing them all takes an
+// explicit [].
 type tenantCatalog struct {
 	src   tenantSource
 	check func([]config.Tenant) error
@@ -231,6 +291,7 @@ type tenantCatalog struct {
 	tick <-chan time.Time
 
 	mu        sync.Mutex
+	applied   bool
 	lastRead  time.Time
 	lastErr   string
 	lastErrAt time.Time
@@ -241,6 +302,13 @@ func (c *tenantCatalog) read(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, tenantsReadTimeout)
 	defer cancel()
 	b, err := c.src.Load(ctx)
+	c.mu.Lock()
+	if errors.Is(err, errTenantsMissing) && !c.applied {
+		b, err = []byte("[]"), nil
+	} else if errors.Is(err, errTenantsMissing) {
+		err = fmt.Errorf("%w: the tenants served stay; write [] to remove them all", err)
+	}
+	c.mu.Unlock()
 	var list []config.Tenant
 	if err == nil {
 		if list, err = config.ParseTenants(b); err == nil {
@@ -260,6 +328,9 @@ func (c *tenantCatalog) read(ctx context.Context) error {
 		return err
 	}
 	c.set.apply(list)
+	c.mu.Lock()
+	c.applied = true
+	c.mu.Unlock()
 	return nil
 }
 

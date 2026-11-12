@@ -146,6 +146,10 @@ func (c *Config) CheckTenants(tenants []Tenant) error {
 	return nil
 }
 
+// AccountOf returns the account a runner URL registers runners in, as
+// accountOf: two tenants on one account would share scale sets.
+func AccountOf(raw string) string { return accountOf(raw) }
+
 // accountOf returns the host and organization of a runner URL, or "" if it is
 // not an https URL naming one. A repository in an organization counts as that
 // organization, whose runners its jobs could also reach.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,10 @@ type setLab struct {
 	// over is set once the test ends: every gate is open from then on.
 	over  bool
 	maxes []string
+	// active counts the runs serving each account; overlaps records a run
+	// that started while another on its account had not returned.
+	active   map[string]int
+	overlaps []string
 }
 
 type tenantStart struct {
@@ -44,11 +49,22 @@ type tenantEnd struct {
 
 func newSetLab(t *testing.T) *setLab {
 	ctx, cancel := context.WithCancel(context.Background())
-	l := &setLab{t: t, starts: make(chan tenantStart, 16), ends: make(chan tenantEnd, 16), gates: map[string]chan struct{}{}}
+	l := &setLab{t: t, starts: make(chan tenantStart, 16), ends: make(chan tenantEnd, 16), gates: map[string]chan struct{}{}, active: map[string]int{}}
 	l.set = &tenantSet{
 		ctx: ctx, log: slog.New(slog.DiscardHandler),
 		run: func(ctx context.Context, cur func() config.Tenant, _ func(*servedTenant)) {
-			id := cur().ID
+			id, account := cur().ID, config.AccountOf(cur().URL)
+			l.mu.Lock()
+			if l.active[account] > 0 {
+				l.overlaps = append(l.overlaps, id+" on "+account)
+			}
+			l.active[account]++
+			l.mu.Unlock()
+			defer func() {
+				l.mu.Lock()
+				l.active[account]--
+				l.mu.Unlock()
+			}()
 			l.starts <- tenantStart{id, cur}
 			<-ctx.Done()
 			l.ends <- tenantEnd{id, context.Cause(ctx)}
@@ -151,16 +167,29 @@ func (l *setLab) ended(want string, cause error) {
 	}
 }
 
-// nothing checks that no tenant starts or ends: a start would have been sent
-// before apply returned, as the runs need nothing else to start.
-func (l *setLab) nothing() {
+// runs is the set's run of each tenant, to compare across an apply: a run
+// that is the same one was neither restarted nor stopped.
+func (l *setLab) runs() map[string]*tenantRun {
+	l.set.mu.Lock()
+	defer l.set.mu.Unlock()
+	return maps.Clone(l.set.running)
+}
+
+// unchanged fails if the runs differ from before.
+func (l *setLab) unchanged(before map[string]*tenantRun) {
 	l.t.Helper()
-	select {
-	case s := <-l.starts:
-		l.t.Fatalf("%s started", s.id)
-	case e := <-l.ends:
-		l.t.Fatalf("%s ended (%v)", e.id, e.cause)
-	case <-time.After(50 * time.Millisecond):
+	if after := l.runs(); !maps.Equal(before, after) {
+		l.t.Fatalf("runs changed: %v -> %v", before, after)
+	}
+}
+
+// noOverlap fails if a run started beside another on its account.
+func (l *setLab) noOverlap() {
+	l.t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.overlaps) > 0 {
+		l.t.Fatalf("started beside a run not yet ended: %v", l.overlaps)
 	}
 }
 
@@ -178,27 +207,32 @@ func TestTenantSetFollowsTheList(t *testing.T) {
 	l.set.apply([]config.Tenant{listed("a", 2, "x"), listed("b", 2, "x")})
 	l.startedAll("a", "b")
 
+	before := l.runs()
 	l.set.apply([]config.Tenant{listed("a", 2, "x"), listed("b", 2, "x")})
-	l.nothing()
+	l.unchanged(before)
 
 	l.set.apply([]config.Tenant{listed("a", 2, "x")})
 	l.ended("b", errTenantRemoved)
 	l.finish("b")
 
+	before = l.runs()
 	l.set.apply([]config.Tenant{listed("a", 5, "x")})
-	l.nothing()
+	l.unchanged(before)
+	if got := before["a"].cur.Load().EffectiveLimits().Runners; got != 5 {
+		t.Fatalf("entry has %d runners, want 5: a restart after a failure would lose the change", got)
+	}
 	if got := strings.Join(l.maxes, ","); got != "a=5" {
 		t.Fatalf("set max %s, want a=5", got)
 	}
 
 	l.set.apply([]config.Tenant{listed("a", 5, "x", "y")})
 	l.ended("a", errTenantChanged)
-	l.nothing() // its runners have not finished
 	l.finish("a")
 	s := l.started("a")
 	if got := s.cur().Tiers; len(got) != 2 {
 		t.Fatalf("restarted with tiers %v, want the new list's", got)
 	}
+	l.noOverlap()
 }
 
 // A tenant removed, then listed again while its runners finish, starts only
@@ -211,9 +245,61 @@ func TestTenantSetWaitsForARemovedTenant(t *testing.T) {
 	l.set.apply(nil)
 	l.ended("a", errTenantRemoved)
 	l.set.apply([]config.Tenant{listed("a", 2, "x")})
-	l.nothing()
 	l.finish("a")
 	l.started("a")
+	l.noOverlap()
+}
+
+// A tenant renamed, or an account moved to another tenant, starts only once
+// the run it replaces has ended: that run, removed, deletes the scale sets
+// it finds by name in the account, which the new one would serve.
+func TestTenantSetWaitsForTheAccountsLastRun(t *testing.T) {
+	l := newSetLab(t)
+	a := listed("a", 2, "x")
+	l.set.apply([]config.Tenant{a})
+	l.started("a")
+	b := listed("b", 2, "x")
+	b.URL = a.URL
+	l.set.apply([]config.Tenant{b})
+	l.ended("a", errTenantRemoved)
+	l.finish("a")
+	l.started("b")
+	l.noOverlap()
+}
+
+// Once the set waits, nothing applied starts: a list read as the daemon
+// stops must not add to what it waits for.
+func TestTenantSetStartsNothingOnceItWaits(t *testing.T) {
+	l := newSetLab(t)
+	l.set.apply([]config.Tenant{listed("a", 2, "x")})
+	l.started("a")
+	l.finish("a")
+	l.set.mu.Lock()
+	l.set.closed = true // as wait sets it
+	l.set.mu.Unlock()
+	before := l.runs()
+	l.set.apply([]config.Tenant{listed("b", 2, "x")})
+	l.unchanged(before)
+}
+
+// GuardDuty's findings name a tenant listed now or still stopping, and any
+// before the first list.
+func TestTenantSetKnown(t *testing.T) {
+	l := newSetLab(t)
+	if !l.set.known("anyone") {
+		t.Fatal("before any list, an id is unknown: its findings would be passed over")
+	}
+	l.set.apply([]config.Tenant{listed("a", 2, "x")})
+	l.started("a")
+	if !l.set.known("a") || l.set.known("anyone") {
+		t.Fatal("known does not follow the list")
+	}
+	l.set.apply(nil)
+	l.ended("a", errTenantRemoved)
+	if !l.set.known("a") {
+		t.Fatal("a tenant still stopping is unknown")
+	}
+	l.finish("a")
 }
 
 // A change that comes while the last is still waiting for runners to finish
@@ -225,13 +311,12 @@ func TestTenantSetChangesInTurn(t *testing.T) {
 	l.set.apply([]config.Tenant{listed("a", 2, "y")})
 	l.ended("a", errTenantChanged)
 	l.set.apply([]config.Tenant{listed("a", 2, "z")})
-	l.nothing()
 	l.finish("a")
 	s := l.started("a")
 	if got := s.cur().Tiers[0]; got != "z" {
 		t.Fatalf("started with tier %s, want the latest, z", got)
 	}
-	l.nothing()
+	l.noOverlap()
 }
 
 func TestOnlyRunnersDiffer(t *testing.T) {
@@ -293,12 +378,16 @@ func TestTenantCatalogKeepsTheTenantsOnABadList(t *testing.T) {
 	if st := c.status(); st.Failing() || st.LastRead.IsZero() || st.Store != "fake" {
 		t.Fatalf("status %+v", st)
 	}
+	before := l.runs()
 
 	for name, s := range map[string]fakeSource{
 		"unreadable":    {err: errors.New("AccessDenied")},
 		"not JSON":      {b: []byte(`[{"id":`)},
 		"unknown field": {b: []byte(`[{"id":"a","colour":"red"}]`)},
 		"rejected":      {b: []byte(`[{"id":"rejected"}]`)},
+		// Once a list has applied, one that is gone is a failed read:
+		// it takes an explicit [] to remove every tenant.
+		"missing": {err: errTenantsMissing},
 	} {
 		*src = s
 		if err := c.read(context.Background()); err == nil {
@@ -308,7 +397,7 @@ func TestTenantCatalogKeepsTheTenantsOnABadList(t *testing.T) {
 			t.Fatalf("%s: status %+v, want failing", name, st)
 		}
 	}
-	l.nothing()
+	l.unchanged(before)
 
 	*src = fakeSource{b: []byte(`[]`)}
 	if err := c.read(context.Background()); err != nil {
@@ -318,6 +407,20 @@ func TestTenantCatalogKeepsTheTenantsOnABadList(t *testing.T) {
 	l.finish("a")
 	if st := c.status(); st.Failing() {
 		t.Fatalf("status %+v after a good read", st)
+	}
+}
+
+// Before any list has applied, one that does not exist lists no tenants: a
+// new deployment has none yet.
+func TestTenantCatalogStartsWithoutAList(t *testing.T) {
+	l := newSetLab(t)
+	c := &tenantCatalog{src: &fakeSource{err: errTenantsMissing}, set: l.set, log: slog.New(slog.DiscardHandler),
+		check: func([]config.Tenant) error { return nil }}
+	if err := c.read(context.Background()); err != nil {
+		t.Fatalf("no list yet: %v", err)
+	}
+	if st := c.status(); st.Failing() || st.LastRead.IsZero() {
+		t.Fatalf("status %+v", st)
 	}
 }
 
@@ -346,11 +449,11 @@ func TestSSMTenants(t *testing.T) {
 		t.Fatalf("load: %q, %v", b, err)
 	}
 	gone := ssmTenants{name: "/x", api: fakeGet{err: &ssmtypes.ParameterNotFound{}}}
-	if b, err := gone.Load(context.Background()); err != nil || string(b) != "[]" {
-		t.Fatalf("missing parameter: %q, %v; want no tenants", b, err)
+	if _, err := gone.Load(context.Background()); !errors.Is(err, errTenantsMissing) {
+		t.Fatalf("missing parameter: %v", err)
 	}
 	denied := ssmTenants{name: "/x", api: fakeGet{err: errors.New("AccessDeniedException")}}
-	if _, err := denied.Load(context.Background()); err == nil {
+	if _, err := denied.Load(context.Background()); err == nil || errors.Is(err, errTenantsMissing) {
 		t.Fatal("a denied read listed no tenants: it would remove them all")
 	}
 	if src, _ := openTenants("/etc/firerunner/tenants.json", nil); src.String() != "/etc/firerunner/tenants.json" {
@@ -400,5 +503,56 @@ func TestLiveTenantsForget(t *testing.T) {
 	}
 	if n := len(live.trackers()); n != 0 {
 		t.Fatalf("%d trackers left", n)
+	}
+}
+
+// A tenant's loop hands stop the context whose cause says why it ended: a
+// removal deletes its scale sets, anything else keeps them.
+func TestTenantLoopStopSeesWhyItEnded(t *testing.T) {
+	for cause, want := range map[error]bool{errTenantRemoved: true, errTenantChanged: false} {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		removed := make(chan bool, 1)
+		l := &tenantLoop{
+			id: "t1", live: &liveTenants{}, log: slog.New(slog.DiscardHandler), min: time.Millisecond, max: time.Millisecond,
+			start: func(context.Context) (*servedTenant, error) { return &servedTenant{t: tenant{ID: "t1"}}, nil },
+			serve: func(ctx context.Context, _ context.CancelFunc, _ *servedTenant) error {
+				cancel(cause)
+				<-ctx.Done()
+				return nil
+			},
+			stop: func(ctx context.Context, _ *servedTenant) { removed <- removedTenant(ctx) },
+		}
+		l.run(ctx)
+		if got := <-removed; got != want {
+			t.Errorf("%v: stop saw removed %v, want %v", cause, got, want)
+		}
+	}
+}
+
+// A runner limit changed while the tenant starts, when apply finds no
+// tenant served to set it on, reaches the tenant once it serves.
+func TestTenantSetLimitChangedWhileStarting(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	starting, release := make(chan struct{}), make(chan struct{})
+	got := make(chan int, 1)
+	set := &tenantSet{ctx: ctx, log: slog.New(slog.DiscardHandler),
+		setMax: func(string, int) {}, // nothing served yet
+		run: func(ctx context.Context, cur func() config.Tenant, served func(*servedTenant)) {
+			st := &servedTenant{bound: scheduler.NewTenant("a", cur().EffectiveLimits().Runners)}
+			close(starting)
+			<-release
+			served(st)
+			got <- st.bound.Max()
+			<-ctx.Done()
+		}}
+	defer set.wait()
+	defer cancel()
+	set.apply([]config.Tenant{listed("a", 2, "x")})
+	<-starting
+	set.apply([]config.Tenant{listed("a", 6, "x")})
+	close(release)
+	if n := <-got; n != 6 {
+		t.Fatalf("served with a limit of %d, want 6", n)
 	}
 }

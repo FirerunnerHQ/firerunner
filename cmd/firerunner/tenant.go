@@ -73,6 +73,8 @@ type shard struct {
 	// entitlements reads what each tenant may run (--entitlements); nil when
 	// off. It holds a tenant's launches, and never stops a runner.
 	entitlements *entitlement.Watcher
+	// tenants are the tenants of the list, once the list is read.
+	tenants atomic.Pointer[tenantSet]
 	// applyMu makes each applyState decide and apply as one step: the
 	// watchers and the tenant loops call it at once, and a decision taken
 	// on older inputs must not land after one taken on newer.
@@ -297,7 +299,10 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 		stop: func(ctx context.Context, st *servedTenant) {
 			st.drain()
 			if removedTenant(ctx) {
-				st.remove(context.WithoutCancel(ctx))
+				// Bounded: a GitHub that hangs must not hold up shutdown.
+				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
+				defer cancel()
+				st.remove(rctx)
 				return
 			}
 			st.close(context.WithoutCancel(ctx))
