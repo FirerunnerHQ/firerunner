@@ -127,7 +127,11 @@ type tenantSet struct {
 	// setMax sets the runner limit of the tenant served by that id, if one
 	// is.
 	setMax func(id string, max int)
-	log    *slog.Logger
+	// removed, when set, is called with a removed tenant's last entry once
+	// its run has ended, whether that run served it or still waited on the
+	// runs before it: it deletes what the tenant's tiers registered.
+	removed func(config.Tenant)
+	log     *slog.Logger
 
 	mu      sync.Mutex
 	running map[string]*tenantRun
@@ -219,6 +223,13 @@ func (ts *tenantSet) apply(list []config.Tenant) {
 		ts.wg.Go(func() {
 			defer close(r.done)
 			defer cancel(nil)
+			// Before done: a run after it on the account must not register
+			// what this deletes.
+			defer func() {
+				if removedTenant(ctx) && ts.removed != nil {
+					ts.removed(*r.cur.Load())
+				}
+			}()
 			// Whatever happens to this run, its done waits on the ones
 			// before: a run after it must not start beside them.
 			for _, p := range prev {

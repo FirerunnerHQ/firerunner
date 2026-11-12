@@ -75,6 +75,9 @@ type shard struct {
 	entitlements *entitlement.Watcher
 	// tenants are the tenants of the list, once the list is read.
 	tenants atomic.Pointer[tenantSet]
+	// removeByName deletes a scale set by name; nil is
+	// listener.RemoveByName. Tests replace it.
+	removeByName func(context.Context, listener.Config) (bool, error)
 	// applyMu makes each applyState decide and apply as one step: the
 	// watchers and the tenant loops call it at once, and a decision taken
 	// on older inputs must not land after one taken on newer.
@@ -310,6 +313,35 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 			st.close(context.WithoutCancel(ctx))
 		},
 		live: live, log: s.log, min: tenantRetryMin, max: tenantRetryMax,
+	}
+}
+
+// removeLeftovers deletes, by name, the scale sets a removed tenant's tiers
+// registered in its runner group, each tier its last entry lists, served or
+// not. A run that served it when it was removed has deleted its own, and
+// finds none; this covers the rest: a tenant in retry backoff, skipped, or
+// waiting on a run before it when removed, and one whose scale sets an
+// earlier run kept (KeepOnClose). Not covered: a tier or runner group an
+// earlier entry named, and a tenant removed while no daemon ran, or before
+// one crashed mid-drain.
+func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) {
+	remove := s.removeByName
+	if remove == nil {
+		remove = listener.RemoveByName
+	}
+	for _, name := range names {
+		cfg := s.listenerConfig(t, config.Tier{Name: name}, tenantHooks{}, nil, nil, s.log, nil)
+		// Bounded per tier: a GitHub that hangs must not hold up shutdown,
+		// and a slow first tier must not use up the rest's time.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
+		removed, err := remove(rctx, cfg)
+		cancel()
+		switch {
+		case err != nil:
+			s.log.Warn("scale set of a removed tenant left registered", "tenant", t.ID, "tier", name, "err", err)
+		case removed:
+			s.log.Info("deregistered runner scale set left by a removed tenant", "tenant", t.ID, "tier", name)
+		}
 	}
 }
 

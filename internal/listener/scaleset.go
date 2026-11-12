@@ -648,6 +648,35 @@ func (s *ScaleSet) Remove(ctx context.Context) error {
 	return nil
 }
 
+// RemoveByName deletes the scale set cfg names (URL, credentials, runner
+// group and Name) if one is registered, with no session of its own: for a
+// tenant removed while nothing served it, whose scale set a run before
+// registered. It reports whether there was one to delete.
+func RemoveByName(ctx context.Context, cfg Config) (bool, error) {
+	if cfg.RunnerGroup == "" {
+		cfg.RunnerGroup = scaleset.DefaultRunnerGroup
+	}
+	client, err := newClient(cfg)
+	if err != nil {
+		return false, err
+	}
+	groupID, err := runnerGroupID(ctx, client, cfg.RunnerGroup)
+	if err != nil {
+		return false, err
+	}
+	existing, err := client.GetRunnerScaleSet(ctx, groupID, cfg.Name)
+	if err != nil {
+		return false, fmt.Errorf("look up runner scale set: %w", err)
+	}
+	if existing == nil {
+		return false, nil
+	}
+	if err := client.DeleteRunnerScaleSet(ctx, existing.ID); err != nil {
+		return false, fmt.Errorf("delete runner scale set: %w", err)
+	}
+	return true, nil
+}
+
 // scaler adapts GitHub's scale-set callbacks onto firerunner's DesiredFunc.
 // Because every microVM is ephemeral and self-terminating, job start marks the
 // VM busy for shutdown drain and dispatches trusted identity resolution, and

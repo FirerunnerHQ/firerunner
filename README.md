@@ -238,7 +238,13 @@ and every 30 seconds, and follows it without a restart:
 
 - An installation **added** starts serving.
 - One **removed** takes no more jobs. Its runners finish the jobs they have,
-  within its job limit, and its scale sets are then deleted.
+  within its job limit, and its scale sets are then deleted: every tier its
+  last entry listed, by name in its runner group, whether it was being
+  served or waiting to start. Delete in the runner group's settings what
+  they leave: a tier or group an earlier entry named, and scale sets of an
+  installation removed while no daemon ran. To move an installation to
+  another daemon, remove it from this one's list first, and add it to the
+  other's once this one has deleted its scale sets.
 - One whose `max_runners` alone **changed** gets the new limit at once. A
   lower limit ends no runner; launches wait until enough have ended.
 - One **changed** otherwise (tiers, installation, URL, group, vCPU or job
