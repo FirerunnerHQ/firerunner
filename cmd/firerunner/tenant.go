@@ -145,7 +145,7 @@ func (s *shard) schedulerOptions(t tenant, tier config.Tier, bound *scheduler.Te
 		Tier:        tier.Name,
 		MaxJob:      t.Limits.JobDuration,
 		OnHold:      tracker.SetHeld,
-		OnStop:      s.stopRecorder(tier.Name, tracker),
+		OnStop:      s.stopRecorder(t, tier.Name, tracker),
 	}
 	if jit != nil {
 		o.JIT, o.Remover = jit, jit
@@ -175,7 +175,7 @@ func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tr
 		OnJobStarted: hooks.onJobStarted,
 		OnJobOffered: hooks.onJobOffered,
 		OnRunnerID:   hooks.onRunnerID,
-		Events:       s.events,
+		Events:       s.eventsFor(t),
 		Health:       tracker,
 		Pending:      jobs,
 		Name:         tier.Name,
@@ -208,7 +208,7 @@ func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracke
 		MaxLifetime: tierLifetime(s.cfg.Firecracker.MaxVMLifetime, t.Limits.JobDuration, tier),
 		UsePool:     jobs.ClaimPool,
 		Cache:       s.ec2Cache,
-		Events:      s.events,
+		Events:      s.eventsFor(t),
 		OnRunnerJob: hooks.onRunnerJob,
 		Launched:    tracker.Launched,
 		FellBack:    tracker.FellBack,
@@ -246,11 +246,18 @@ func tierLifetime(install, job time.Duration, tier config.Tier) time.Duration {
 
 // stopRecorder reports a runner a tier's scheduler ended for its tenant's
 // limits: in the tier's health and the job events.
-func (s *shard) stopRecorder(tier string, tracker *health.Tracker) func(scheduler.Stop) {
+func (s *shard) stopRecorder(t tenant, tier string, tracker *health.Tracker) func(scheduler.Stop) {
+	events := s.eventsFor(t)
 	return func(st scheduler.Stop) {
 		tracker.Stopped(st.Kind)
-		jobevent.Record(s.events, jobevent.Event{Kind: jobevent.Stopped, Tier: tier, Runner: st.Runner, Reason: st.Reason})
+		jobevent.Record(events, jobevent.Event{Kind: jobevent.Stopped, Tier: tier, Runner: st.Runner, Reason: st.Reason})
 	}
+}
+
+// eventsFor is where t's job events go: the shard's sink, naming t on each
+// event, as tiers and runners are named only within a tenant.
+func (s *shard) eventsFor(t tenant) jobevent.Sink {
+	return jobevent.ForTenant(s.events, t.ID)
 }
 
 // extraTenant is a tenant from the --tenants file, on the install's App.

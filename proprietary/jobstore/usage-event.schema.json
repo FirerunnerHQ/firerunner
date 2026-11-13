@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/FirerunnerHQ/firerunner/proprietary/jobstore/usage-event.schema.json",
+  "title": "firerunner usage event, schema 1",
+  "description": "One job a runner ran, written once when the job completed. Read with `firerunner usage`; count each event_id once, as delivery is at least once. An event is never changed: a correction will be an event of its own. Adding a field keeps the schema number; changing or removing one makes a new number.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema", "event_id", "kind", "tenant",
+    "repository", "workflow", "job_name", "job_id", "run_id", "event_name", "result",
+    "tier", "runner", "instance_type", "market", "zone", "supply",
+    "started_at", "start_source", "completed_at", "duration_ms"
+  ],
+  "properties": {
+    "schema": { "const": 1 },
+    "event_id": { "type": "string", "description": "Stable across redelivery and replay: \"job/\" and GitHub's job id. Dedupe on it." },
+    "kind": { "const": "job" },
+    "tenant": { "type": "string", "description": "The tenants list's id of the tenant; empty for the install the daemon's flags name." },
+    "repository": { "type": "string", "description": "owner/name." },
+    "workflow": { "type": "string", "description": "The job's workflow ref, e.g. owner/name/.github/workflows/ci.yml@refs/heads/main." },
+    "job_name": { "type": "string" },
+    "job_id": { "type": "string", "description": "GitHub's job id. A re-run attempt is a job of its own." },
+    "run_id": { "type": "integer" },
+    "event_name": { "type": "string", "description": "What triggered the run: push, pull_request, ..." },
+    "result": { "type": "string", "description": "As GitHub reported it: succeeded, failed, canceled, ..." },
+    "tier": { "type": "string", "description": "The tier, which is the runs-on label the job asked for." },
+    "runner": { "type": "string" },
+    "instance_type": { "type": "string", "description": "Empty when no launch was recorded, as for a Firecracker tier." },
+    "market": { "type": "string", "description": "spot or on-demand; empty as instance_type." },
+    "zone": { "type": "string" },
+    "supply": { "type": "string", "description": "How the machine was supplied: cold, pool or kept; empty as instance_type." },
+    "started_at": { "type": ["string", "null"], "format": "date-time", "description": "UTC. GitHub's start of the job, or else the runner's report of taking it; null when neither was recorded." },
+    "start_source": { "enum": ["github", "runner", "none"] },
+    "completed_at": { "type": "string", "format": "date-time", "description": "UTC. GitHub's end of the job." },
+    "duration_ms": { "type": "integer", "minimum": 0, "description": "completed_at less started_at, in whole milliseconds; 0 when started_at is null. Rounding to a billing unit is billing's." }
+  }
+}

@@ -81,7 +81,20 @@ runners.
 Store a Postgres URL as the SecureString `<prefix>/control/job-events-dsn`, and
 firerunner keeps each job's stages, machine and result there. The code is under
 [`proprietary/`](../../proprietary/LICENSE). A database that is down costs that
-record, never a job.
+record, never a job. Each record names its tenant (the `id` in the tenants
+list, empty for the install).
+
+The same database keeps the usage events that billing or your own
+chargeback reads. Each event is one job a runner ran: its tenant,
+repository, workflow, tier, machine and run time. It is written once, in the
+same transaction that records the job's completion. On the VM, `firerunner
+usage --after CURSOR` prints them in order, one JSON object a line, with
+the cursor to read on from; [`usage-event.schema.json`](../../proprietary/jobstore/usage-event.schema.json)
+describes an event. Delivery is at least once: count each `event_id` once.
+
+Only jobs the daemon saw complete get an event. A job whose completion it
+never received, because the daemon was down or its queue full, has none
+yet.
 
 ## Keeping the App key in KMS (optional)
 
