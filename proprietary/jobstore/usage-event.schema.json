@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/FirerunnerHQ/firerunner/proprietary/jobstore/usage-event.schema.json",
   "title": "firerunner usage event, schema 1",
-  "description": "One job a runner ran, written once when the job completed. Read with `firerunner usage`; count each event_id once, as delivery is at least once. An event is never changed: a correction will be an event of its own. Adding a field keeps the schema number; changing or removing one makes a new number.",
+  "description": "One job a runner ran, written once after the job completed, when its start is known or after a grace. Read with `firerunner usage`; count each event_id once, as delivery is at least once. An event is never changed: a correction will be an event of its own. Adding a field keeps the schema number; changing or removing one makes a new number.",
   "type": "object",
   "additionalProperties": true,
   "required": [

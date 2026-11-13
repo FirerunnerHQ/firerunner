@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/firerunnerhq/firerunner/internal/jobevent"
 )
@@ -32,6 +33,18 @@ func story(tenant, jobID, typ string, t0 time.Time, run time.Duration) []jobeven
 		assigned, r(jobevent.Launched, t0.Add(time.Second)), r(jobevent.Served, t0.Add(5*time.Second)),
 		r(jobevent.Running, t0.Add(9*time.Second)), j(jobevent.Started, t0.Add(10*time.Second)), completed,
 		r(jobevent.InstanceGone, t0.Add(15*time.Second+run)),
+	}
+}
+
+// write records events as the writer does, then sweeps usage as of now.
+func write(t *testing.T, s *Store, now time.Time, events ...jobevent.Event) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.writeEvents(ctx, events); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.sweep(ctx, now); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -74,9 +87,7 @@ func TestUsageAtCompletion(t *testing.T) {
 	ctx := context.Background()
 	t0 := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
 	events := append(story("acme", "101", "c8a.large", t0, 90500*time.Millisecond), story("", "202", "m8a.xlarge", t0, 30*time.Second)...)
-	if err := s.writeEvents(ctx, events); err != nil {
-		t.Fatal(err)
-	}
+	write(t, s, t0.Add(5*time.Minute), events...)
 	got := usageRows(t, s)
 	if len(got) != 2 {
 		t.Fatalf("%d usage events, want 2: %v", len(got), got)
@@ -106,21 +117,15 @@ func TestUsageAtCompletion(t *testing.T) {
 // and change none: an event is written once, under the job's id.
 func TestUsageIsWrittenOnce(t *testing.T) {
 	s := open(t)
-	ctx := context.Background()
 	t0 := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
 	events := story("acme", "101", "c8a.large", t0, time.Minute)
-	if err := s.writeEvents(ctx, events); err != nil {
-		t.Fatal(err)
-	}
+	now := t0.Add(5 * time.Minute)
+	write(t, s, now, events...)
 	first := readAll(t, s, 10)
 	late := events[5] // the completion, delivered again later
 	late.At = t0.Add(time.Hour)
-	if err := s.writeEvents(ctx, []jobevent.Event{late}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.writeEvents(ctx, events); err != nil { // a replay
-		t.Fatal(err)
-	}
+	write(t, s, now, late)
+	write(t, s, t0.Add(time.Hour), events...) // a replay
 	again := readAll(t, s, 10)
 	if len(first) != 1 || len(again) != 1 || string(first[0].Event) != string(again[0].Event) || first[0].Cursor != again[0].Cursor {
 		t.Fatalf("before %s, after %s", first, again)
@@ -137,9 +142,7 @@ func TestUsageConsumerTotalsOnce(t *testing.T) {
 	for i, id := range []string{"1", "2", "3", "4", "5"} {
 		run := time.Duration(i+1) * time.Minute
 		want += run.Milliseconds()
-		if err := s.writeEvents(ctx, story("acme", id, "c8a.large", t0, run)); err != nil {
-			t.Fatal(err)
-		}
+		write(t, s, t0.Add(time.Hour), story("acme", id, "c8a.large", t0, run)...)
 	}
 	// Pages of two, with the second page read again as if its
 	// acknowledgement were lost.
@@ -208,10 +211,8 @@ func TestUsageReadWaitsForAnOpenTransaction(t *testing.T) {
 	}
 	// Another tenant's, as the same runner's row would wait on the open
 	// transaction's lock.
-	if err := s.writeEvents(ctx, story("beta", "late", "c8a.large", t0, time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := slow.Exec(ctx, insertUsage, "early"); err != nil {
+	write(t, s, t0.Add(time.Hour), story("beta", "late", "c8a.large", t0, time.Minute)...)
+	if _, err := slow.Exec(ctx, sweepUsage, t0.Add(time.Hour), usageGrace, usageWindow); err != nil {
 		t.Fatal(err)
 	}
 	if got := readAll(t, s, 10); len(got) != 0 {
@@ -240,42 +241,60 @@ func usageIDs(t *testing.T, entries []UsageEntry) []string {
 	return ids
 }
 
-// A job nothing ran (cancelled while queued) uses nothing; one whose start
-// from GitHub was lost bills from its runner's report of taking it.
-func TestUsageWithoutARunnerOrAStart(t *testing.T) {
+// A job nothing ran (cancelled while queued) uses nothing. One whose start
+// from GitHub was lost waits for its runner's report of taking it, which
+// comes once the runner exits, after the job's end; one with neither is
+// written once its grace has passed, as a job with no known start; one
+// older than the sweep's window is not.
+func TestUsageWaitsForAStart(t *testing.T) {
 	s := open(t)
-	ctx := context.Background()
 	t0 := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
 	cancelled := []jobevent.Event{
 		{Kind: jobevent.Assigned, At: t0, Tenant: "acme", JobID: "queued"},
 		{Kind: jobevent.Completed, At: t0.Add(time.Minute), Tenant: "acme", JobID: "queued", Result: "canceled"},
 	}
-	var lost []jobevent.Event
+	var lost, running []jobevent.Event
 	for _, e := range story("acme", "lost", "c8a.large", t0, time.Minute) {
-		if e.Kind != jobevent.Started {
+		switch e.Kind {
+		case jobevent.Started:
+		case jobevent.Running:
+			running = append(running, e)
+		default:
 			lost = append(lost, e)
 		}
 	}
-	if err := s.writeEvents(ctx, append(cancelled, lost...)); err != nil {
-		t.Fatal(err)
+	var never []jobevent.Event
+	for _, e := range story("beta", "never", "c8a.large", t0, time.Minute) {
+		if e.Kind != jobevent.Started && e.Kind != jobevent.Running {
+			never = append(never, e)
+		}
 	}
+	old := story("gamma", "old", "c8a.large", t0.Add(-8*24*time.Hour), time.Minute)
+
+	write(t, s, t0.Add(2*time.Minute), append(append(append(cancelled, lost...), never...), old...)...)
+	if got := usageRows(t, s); len(got) != 0 {
+		t.Fatalf("usage before any start or grace: %v", got)
+	}
+	write(t, s, t0.Add(3*time.Minute), running...) // a later batch
 	got := usageRows(t, s)
-	u, ok := got["job/lost"]
-	if len(got) != 1 || !ok {
-		t.Fatalf("usage %v: want the lost start's job alone", got)
+	if u, ok := got["job/lost"]; len(got) != 1 || !ok || u.StartSource != "runner" || u.DurationMS != 61000 {
+		t.Fatalf("usage %+v: want the lost start's job alone, from its runner's 9 s to 70 s", got)
 	}
-	if u.StartSource != "runner" || u.DurationMS != 61000 {
-		t.Fatalf("start %q, %d ms: want the runner's, from 9 s to 70 s", u.StartSource, u.DurationMS)
+	write(t, s, t0.Add(70*time.Second+usageGrace-time.Second)) // its end was at 70 s
+	if got := usageRows(t, s); len(got) != 1 {
+		t.Fatalf("usage %+v: the job with no start was written within its grace", got)
+	}
+	write(t, s, t0.Add(70*time.Second+usageGrace+time.Second))
+	got = usageRows(t, s)
+	if u, ok := got["job/never"]; len(got) != 2 || !ok || u.StartSource != "none" || u.DurationMS != 0 || u.StartedAt != nil {
+		t.Fatalf("usage %+v: want the job with no start as well, after its grace", got)
 	}
 }
 
 // A store set up before tenants keeps its rows: they become the install's.
 func TestTenantMigrationKeepsRows(t *testing.T) {
-	s := open(t)
+	s := bare(t)
 	ctx := context.Background()
-	if _, err := s.pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
-		t.Fatal(err)
-	}
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `CREATE TABLE schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 			return err
@@ -305,9 +324,8 @@ func TestTenantMigrationKeepsRows(t *testing.T) {
 // requires each, and Usage reads them all.
 func TestUsageMatchesItsSchema(t *testing.T) {
 	s := open(t)
-	if err := s.writeEvents(context.Background(), story("acme", "1", "c8a.large", time.Now(), time.Minute)); err != nil {
-		t.Fatal(err)
-	}
+	t0 := time.Now()
+	write(t, s, t0.Add(5*time.Minute), story("acme", "1", "c8a.large", t0, time.Minute)...)
 	got := readAll(t, s, 10)
 	if len(got) != 1 {
 		t.Fatalf("%d events", len(got))
@@ -351,13 +369,33 @@ func TestUsageMatchesItsSchema(t *testing.T) {
 	}
 }
 
-// Before any daemon set the store up, a read says so.
-func TestUsageReaderBeforeSetUp(t *testing.T) {
-	s := open(t)
+// bare is an empty database, and a store on it with no writer: open's
+// writer sets the schema up in the background, which would race a test
+// that builds its own.
+func bare(t *testing.T) *Store {
+	t.Helper()
+	dsn := os.Getenv("FR_TEST_POSTGRES_URL")
+	if dsn == "" {
+		t.Skip("FR_TEST_POSTGRES_URL is not set")
+	}
 	ctx := context.Background()
-	if _, err := s.pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(pool.Close)
+	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
+		t.Fatal(err)
+	}
+	s := newStore(nil)
+	s.pool = pool
+	return s
+}
+
+// Before any daemon set the store up, a read says so.
+func TestUsageReaderBeforeSetUp(t *testing.T) {
+	bare(t)
+	ctx := context.Background()
 	r, err := OpenUsage(os.Getenv("FR_TEST_POSTGRES_URL"))
 	if err != nil {
 		t.Fatal(err)
@@ -365,6 +403,58 @@ func TestUsageReaderBeforeSetUp(t *testing.T) {
 	defer r.Close()
 	if _, err := r.Read(ctx, Cursor{}, 10); err == nil || !strings.Contains(err.Error(), "no usage events table") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// The running writer writes a job's usage by itself, once its events are
+// in.
+func TestWriterWritesUsage(t *testing.T) {
+	old := usageEvery
+	usageEvery = 20 * time.Millisecond
+	t.Cleanup(func() { usageEvery = old })
+	s := open(t)
+	for _, e := range story("acme", "1", "c8a.large", time.Now().Add(-time.Minute), 30*time.Second) {
+		s.Record(e)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for len(readAll(t, s, 10)) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the writer never wrote the job's usage")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A closing writer writes the usage its last events settle, rather than
+// leave it to the next daemon's sweep.
+func TestCloseWritesUsage(t *testing.T) {
+	old := usageEvery
+	usageEvery = time.Hour
+	t.Cleanup(func() { usageEvery = old })
+	s := open(t)
+	for _, e := range story("acme", "1", "c8a.large", time.Now().Add(-time.Minute), 30*time.Second) {
+		s.Record(e)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s.Close(ctx)
+	r, err := OpenUsage(os.Getenv("FR_TEST_POSTGRES_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	got, err := r.Read(ctx, Cursor{}, 10)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("after close: %d events, %v", len(got), err)
+	}
+}
+
+// A cursor from another database, or from before a restore, fails rather
+// than read nothing for ever.
+func TestUsageCursorAhead(t *testing.T) {
+	s := open(t)
+	if _, err := readUsageFrom(context.Background(), s.pool, Cursor{Xact: 1 << 40, Seq: 1}, 10); err != ErrCursorAhead {
+		t.Fatalf("err = %v, want ErrCursorAhead", err)
 	}
 }
 

@@ -85,16 +85,29 @@ record, never a job. Each record names its tenant (the `id` in the tenants
 list, empty for the install).
 
 The same database keeps the usage events that billing or your own
-chargeback reads. Each event is one job a runner ran: its tenant,
-repository, workflow, tier, machine and run time. It is written once, in the
-same transaction that records the job's completion. On the VM, `firerunner
-usage --after CURSOR` prints them in order, one JSON object a line, with
-the cursor to read on from; [`usage-event.schema.json`](../../proprietary/jobstore/usage-event.schema.json)
-describes an event. Delivery is at least once: count each `event_id` once.
+chargeback reads.
 
-Only jobs the daemon saw complete get an event. A job whose completion it
-never received, because the daemon was down or its queue full, has none
-yet.
+- **What an event is:** one job a runner ran, with its tenant, repository,
+  workflow, tier, machine and run time.
+- **When it is written:** once, within about 15 seconds of the job
+  completing. A job whose start has not arrived yet waits up to 10 minutes
+  for it.
+- **Reading them:** on the VM, `firerunner usage --after CURSOR` prints the
+  events in order, one JSON object a line, each with the cursor to read on
+  from. [`usage-event.schema.json`](../../proprietary/jobstore/usage-event.schema.json)
+  describes an event.
+- **Delivery is at least once:** count each `event_id` once.
+- **One install per database:** the install's own events have an empty
+  tenant, so two daemons sharing a database could not be told apart.
+
+A job gets no event when the daemon never learned that it completed, or
+which runner ran it: for example, the daemon was down, or its event queue
+was full. Comparing EC2 instances against the jobs recorded will close
+that gap; it is not built yet.
+
+Upgrading to this version migrates the database in a way an older version
+cannot write to. After the upgrade, do not roll back while keeping the job
+store.
 
 ## Keeping the App key in KMS (optional)
 

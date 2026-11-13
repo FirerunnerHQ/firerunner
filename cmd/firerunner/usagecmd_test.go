@@ -62,7 +62,7 @@ func TestUsageCmdPrintsEventsAfterACursor(t *testing.T) {
 }
 
 // The store's URL may come from a file, as the daemon's does; with none,
-// it is a usage error, and nothing is opened.
+// nothing is opened, and it fails as the settings' fault.
 func TestUsageCmdStoreURL(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "dsn")
 	if err := os.WriteFile(file, []byte("postgres://from-file\n"), 0o600); err != nil {
@@ -76,7 +76,7 @@ func TestUsageCmdStoreURL(t *testing.T) {
 	}
 	t.Setenv("FR_JOB_EVENTS_DSN_FILE", "")
 	f = &fakeUsage{}
-	if code, _, errOut := runUsage(t, f, "--env-file", "none"); code != 2 || f.dsn != "" || !strings.Contains(errOut, "no job store") {
+	if code, _, errOut := runUsage(t, f, "--env-file", "none"); code != 1 || f.dsn != "" || !strings.Contains(errOut, "no job store") {
 		t.Fatalf("exit %d, opened %q: %s", code, f.dsn, errOut)
 	}
 }

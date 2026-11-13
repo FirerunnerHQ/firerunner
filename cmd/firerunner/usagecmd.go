@@ -18,13 +18,18 @@ const usageUsage = `usage:
       print the usage events after CURSOR, oldest first
 
 One JSON object a line: {"cursor": "...", "event": {...}}. An event is one
-job a runner ran, written when the job completed: its tenant, repository,
+job a runner ran, written within about 15 seconds of the job completing
+(up to 10 minutes when its start is not known yet): its tenant, repository,
 workflow, tier, machine, and its run time in duration_ms. Its fields are
 described by proprietary/jobstore/usage-event.schema.json.
 
-To read them all, pass the last line's cursor as the next --after until a
-read prints fewer than --limit (default 1000, at most 10000) lines. An event
-may be read again, after a lost cursor, say: count each event_id once.
+Pass the last line's cursor as the next --after. A read that prints fewer
+than --limit (default 1000, at most 10000) lines means there is no more to
+read yet, not that there will be none: keep polling. A transaction left
+open on the database's server holds the feed back until it ends. An event
+may be read again, after a lost cursor, say: count each event_id once. A
+cursor from another database, or from before a restore, fails: read again
+from the start.
 
 The events are in the daemon's job store, FR_JOB_EVENTS_DSN or the file
 FR_JOB_EVENTS_DSN_FILE names; with no FR_* variable set, the daemon's
@@ -94,7 +99,9 @@ func usageCmd(args []string, stdout, stderr io.Writer, open func(dsn string) (us
 		dsn = strings.TrimSpace(string(raw))
 	}
 	if dsn == "" {
-		return usageErr("firerunner usage: no job store: set FR_JOB_EVENTS_DSN or FR_JOB_EVENTS_DSN_FILE as the daemon's")
+		// Not a usage error: the arguments were fine, the settings lack it.
+		fmt.Fprintln(stderr, "firerunner usage: no job store: set FR_JOB_EVENTS_DSN or FR_JOB_EVENTS_DSN_FILE as the daemon's")
+		return 1
 	}
 	r, err := open(dsn)
 	if err != nil {

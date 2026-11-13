@@ -57,6 +57,8 @@ type Store struct {
 	// write and prepare are the database's side, replaced in tests.
 	write   func(context.Context, []jobevent.Event) error
 	prepare func(context.Context) error
+	// usage writes the usage events settled by now; nil writes none.
+	usage func(ctx context.Context, now time.Time) error
 }
 
 // New starts the writer and returns at once: the database may be down, so the
@@ -72,7 +74,7 @@ func New(dsn string, log *slog.Logger) (*Store, error) {
 		return nil, errors.New("job store: the database URL is not valid")
 	}
 	s := newStore(log)
-	s.pool, s.write, s.prepare = pool, s.writeEvents, s.setUp
+	s.pool, s.write, s.prepare, s.usage = pool, s.writeEvents, s.setUp, s.sweep
 	go s.run()
 	return s, nil
 }
@@ -205,6 +207,14 @@ func (s *Store) run() {
 	defer flush.Stop()
 	partitions := time.NewTicker(partitionTick)
 	defer partitions.Stop()
+	usage := time.NewTicker(usageEvery)
+	defer usage.Stop()
+	sweep := func(ctx context.Context) error {
+		if s.usage == nil {
+			return nil
+		}
+		return s.usage(ctx, time.Now())
+	}
 	var batch []jobevent.Event
 	for {
 		select {
@@ -219,8 +229,14 @@ func (s *Store) run() {
 			batch = nil
 		case <-partitions.C:
 			s.attempt(s.prepare, "add partitions")
+		case <-usage.C:
+			// The batch first, so what it completes is swept now.
+			s.flush(batch)
+			batch = nil
+			s.attempt(sweep, "write usage")
 		case <-s.stop:
 			s.drain(batch)
+			s.attempt(sweep, "write usage")
 			return
 		}
 	}
@@ -303,7 +319,9 @@ func (s *Store) flush(batch []jobevent.Event) {
 	}
 	if len(batch) == 1 {
 		s.dropped.Add(1)
-		s.log.Warn("job store: dropped an event the database rejected", "kind", batch[0].Kind, "err", describe(err))
+		// The job names which: a dropped completion is a job never billed.
+		s.log.Warn("job store: dropped an event the database rejected", "kind", batch[0].Kind,
+			"tenant", batch[0].Tenant, "jobId", batch[0].JobID, "runner", batch[0].Runner, "err", describe(err))
 		return
 	}
 	mid := len(batch) / 2
@@ -360,13 +378,6 @@ func (s *Store) writeEvents(ctx context.Context, events []jobevent.Event) error 
 	b := &pgx.Batch{}
 	for _, e := range events {
 		queue(b, clean(e))
-	}
-	// After every upsert, so a job's usage reads its runner and its start
-	// however the batch ordered them.
-	for _, e := range events {
-		if e.Kind == jobevent.Completed && e.JobID != "" {
-			b.Queue(insertUsage, clean(e).JobID)
-		}
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		return tx.SendBatch(ctx, b).Close()

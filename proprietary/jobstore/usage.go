@@ -51,10 +51,27 @@ type Usage struct {
 	DurationMS  int64      `json:"duration_ms"`
 }
 
-// insertUsage writes the usage event of a completed job a runner ran, from
-// its rows as they stand, once: event_id is the job's, so a redelivered
-// completion, or a replay of the events, adds nothing.
-const insertUsage = `INSERT INTO usage_events (event_id, tenant, job_id, payload)
+// Usage timing, as variables for tests.
+var (
+	// usageEvery is how often the writer looks for jobs to write usage for.
+	usageEvery = 15 * time.Second
+	// usageGrace is how long a completed job whose start is not known yet
+	// waits for one (its runner reports taking it once the runner exits,
+	// after GitHub reports the end) before its usage is written without.
+	usageGrace = 10 * time.Minute
+	// usageWindow is how far back the sweep looks: a job completed longer
+	// ago than this without usage stays without.
+	usageWindow = 7 * 24 * time.Hour
+)
+
+// sweepUsage writes the usage event of each completed job a runner ran that
+// has none, once the job is settled: its start known, from GitHub or its
+// runner, or its grace ($2) passed since its end. It reads the rows as they
+// stand, so the order events arrived in, and the batch each came in, do
+// not matter. event_id is the job's, so a job is written once, however
+// often its events arrive or are replayed, and however many shards sweep.
+// $1 is now.
+const sweepUsage = `INSERT INTO usage_events (event_id, tenant, job_id, payload)
 SELECT 'job/' || j.job_id, j.tenant, j.job_id, jsonb_build_object(
     'schema', 1,
     'event_id', 'job/' || j.job_id,
@@ -81,8 +98,18 @@ FROM jobs j
 LEFT JOIN runners r ON r.tenant = j.tenant AND r.runner = j.runner
 CROSS JOIN LATERAL (SELECT COALESCE(j.started_at, r.running_at) AS at,
     CASE WHEN j.started_at IS NOT NULL THEN 'github' WHEN r.running_at IS NOT NULL THEN 'runner' ELSE 'none' END AS source) s
-WHERE j.job_id = $1 AND j.completed_at IS NOT NULL AND j.runner <> ''
+WHERE j.completed_at IS NOT NULL AND j.runner <> ''
+    AND j.completed_at > $1::timestamptz - $3::interval
+    AND (s.source <> 'none' OR j.completed_at < $1::timestamptz - $2::interval)
+    AND NOT EXISTS (SELECT 1 FROM usage_events u WHERE u.event_id = 'job/' || j.job_id)
+ORDER BY j.completed_at, j.job_id
 ON CONFLICT (event_id) DO NOTHING`
+
+// sweep writes the usage of the jobs settled by now.
+func (s *Store) sweep(ctx context.Context, now time.Time) error {
+	_, err := s.pool.Exec(ctx, sweepUsage, now, usageGrace, usageWindow)
+	return err
+}
 
 // UsageEntry is one usage event as read, with the cursor that reads on
 // from it.
@@ -149,19 +176,41 @@ func OpenUsage(dsn string) (*UsageReader, error) {
 func (r *UsageReader) Close() { r.pool.Close() }
 
 // Read returns up to limit events after cursor, oldest first. Fewer than
-// limit means none committed after them yet. An event can be read again
-// (after a consumer loses its cursor, say): consumers dedupe on event_id.
+// limit means no more can be read yet: none committed after them, or a
+// transaction older than them, anywhere on the database's server, is still
+// open (an idle one holds the feed back until it ends; a role's
+// idle_in_transaction_session_timeout bounds that). Keep polling. An event
+// can be read again (after a consumer loses its cursor, say): consumers
+// dedupe on event_id. A cursor past every transaction this database has
+// started fails: it came from another database, or from this one before a
+// restore or a move to a new server, and reading on from it would skip
+// every new event.
 func (r *UsageReader) Read(ctx context.Context, after Cursor, limit int) ([]UsageEntry, error) {
 	return readUsageFrom(ctx, r.pool, after, limit)
 }
 
 type querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
+
+// ErrCursorAhead is a cursor from another database, or from before a
+// restore: start again from the beginning, deduping on event_id.
+var ErrCursorAhead = errors.New("job store: the cursor is past every transaction this database has started: it is from another database, or from before a restore or a move to a new server; read again from the start (--after none given) and count each event_id once")
 
 func readUsageFrom(ctx context.Context, q querier, after Cursor, limit int) ([]UsageEntry, error) {
 	if limit <= 0 {
 		return nil, nil
+	}
+	if after.Xact > 0 {
+		var ahead bool
+		err := q.QueryRow(ctx, `SELECT $1::text::xid8 >= pg_snapshot_xmax(pg_current_snapshot())`, strconv.FormatUint(after.Xact, 10)).Scan(&ahead)
+		if err != nil {
+			return nil, usageErr(err)
+		}
+		if ahead {
+			return nil, ErrCursorAhead
+		}
 	}
 	rows, err := q.Query(ctx, readUsage, strconv.FormatUint(after.Xact, 10), after.Seq, limit)
 	if err != nil {
