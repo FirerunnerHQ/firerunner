@@ -24,3 +24,18 @@ func TestRecord(t *testing.T) {
 		t.Fatalf("an event's own time stands: %v", s.got[1].At)
 	}
 }
+
+func TestForTenant(t *testing.T) {
+	if ForTenant(nil, "acme") != nil {
+		t.Fatal("a nil sink stays nil")
+	}
+	s := &sink{}
+	if ForTenant(s, "") != Sink(s) {
+		t.Fatal("the install's events go to the sink as they are")
+	}
+	Record(ForTenant(s, "acme"), Event{Kind: Assigned})
+	Record(ForTenant(s, "acme"), Event{Kind: Flagged, Tenant: "other"})
+	if s.got[0].Tenant != "acme" || s.got[1].Tenant != "other" {
+		t.Fatalf("tenants %q, %q: want acme, and the event's own", s.got[0].Tenant, s.got[1].Tenant)
+	}
+}

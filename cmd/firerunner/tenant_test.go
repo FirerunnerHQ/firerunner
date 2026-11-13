@@ -17,6 +17,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/ghauth"
 	"github.com/firerunnerhq/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/internal/jobevent"
 	"github.com/firerunnerhq/firerunner/internal/jobidentity"
 	"github.com/firerunnerhq/firerunner/internal/provisioner"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
@@ -153,6 +154,31 @@ func TestLiveTenantsReportLimits(t *testing.T) {
 	got = l.tenants(nil, tenantstate.Flags{"gone": {Type: "x", Count: 1}, "acme": {Type: "y", Count: 1}})
 	if len(got) != 4 || got[3].ID != "gone" || got[3].Flag == nil || got[3].NotServed == "" || got[2].Flag == nil || got[2].Flag.Type != "y" {
 		t.Fatalf("tenants with flags = %+v", got)
+	}
+}
+
+// A tenant's listener, provisioner and scheduler name it on every job event,
+// as its tiers and runners are named only within it; the install's name
+// none.
+func TestJobEventsNameTheirTenant(t *testing.T) {
+	events := &eventLog{}
+	s := &shard{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler), events: events}
+	tier := config.Tier{Name: "t", EC2: &config.EC2Tier{InstanceTypes: []string{"c8a.large"}}}
+	for _, id := range []string{"acme", ""} {
+		ten := tenant{ID: id, Owner: "o/" + id}
+		lc := s.listenerConfig(ten, tier, tenantHooks{}, health.NewTracker("t"), assigned.New(nil), s.log, nil)
+		lc.Events.Record(jobevent.Event{Kind: jobevent.Assigned})
+		s.ec2Options(ten, tier, tenantHooks{}, health.NewTracker("t"), assigned.New(nil)).Events.Record(jobevent.Event{Kind: jobevent.Launched})
+		s.stopRecorder(ten, "t", health.NewTracker("t"))(scheduler.Stop{Runner: "r"})
+	}
+	ev := events.all()
+	if len(ev) != 6 {
+		t.Fatalf("%d events, want 6", len(ev))
+	}
+	for i, e := range ev {
+		if want := map[bool]string{true: "acme", false: ""}[i < 3]; e.Tenant != want {
+			t.Errorf("event %d (%s): tenant %q, want %q", i, e.Kind, e.Tenant, want)
+		}
 	}
 }
 

@@ -57,6 +57,8 @@ type Store struct {
 	// write and prepare are the database's side, replaced in tests.
 	write   func(context.Context, []jobevent.Event) error
 	prepare func(context.Context) error
+	// usage writes the usage events settled by now; nil writes none.
+	usage func(ctx context.Context, now time.Time) error
 }
 
 // New starts the writer and returns at once: the database may be down, so the
@@ -72,7 +74,7 @@ func New(dsn string, log *slog.Logger) (*Store, error) {
 		return nil, errors.New("job store: the database URL is not valid")
 	}
 	s := newStore(log)
-	s.pool, s.write, s.prepare = pool, s.writeEvents, s.setUp
+	s.pool, s.write, s.prepare, s.usage = pool, s.writeEvents, s.setUp, s.sweep
 	go s.run()
 	return s, nil
 }
@@ -205,6 +207,14 @@ func (s *Store) run() {
 	defer flush.Stop()
 	partitions := time.NewTicker(partitionTick)
 	defer partitions.Stop()
+	usage := time.NewTicker(usageEvery)
+	defer usage.Stop()
+	sweep := func(ctx context.Context) error {
+		if s.usage == nil {
+			return nil
+		}
+		return s.usage(ctx, time.Now())
+	}
 	var batch []jobevent.Event
 	for {
 		select {
@@ -219,8 +229,14 @@ func (s *Store) run() {
 			batch = nil
 		case <-partitions.C:
 			s.attempt(s.prepare, "add partitions")
+		case <-usage.C:
+			// The batch first, so what it completes is swept now.
+			s.flush(batch)
+			batch = nil
+			s.attempt(sweep, "write usage")
 		case <-s.stop:
 			s.drain(batch)
+			s.attempt(sweep, "write usage")
 			return
 		}
 	}
@@ -303,7 +319,9 @@ func (s *Store) flush(batch []jobevent.Event) {
 	}
 	if len(batch) == 1 {
 		s.dropped.Add(1)
-		s.log.Warn("job store: dropped an event the database rejected", "kind", batch[0].Kind, "err", describe(err))
+		// The job names which: a dropped completion is a job never billed.
+		s.log.Warn("job store: dropped an event the database rejected", "kind", batch[0].Kind,
+			"tenant", batch[0].Tenant, "jobId", batch[0].JobID, "runner", batch[0].Runner, "err", describe(err))
 		return
 	}
 	mid := len(batch) / 2
@@ -369,7 +387,7 @@ func (s *Store) writeEvents(ctx context.Context, events []jobevent.Event) error 
 // clean removes NUL, which Postgres text cannot hold. Job names come from users.
 func clean(e jobevent.Event) jobevent.Event {
 	strip := func(v string) string { return strings.ReplaceAll(v, "\x00", "") }
-	e.Tier, e.Runner, e.JobID, e.Repository = strip(e.Tier), strip(e.Runner), strip(e.JobID), strip(e.Repository)
+	e.Tenant, e.Tier, e.Runner, e.JobID, e.Repository = strip(e.Tenant), strip(e.Tier), strip(e.Runner), strip(e.JobID), strip(e.Repository)
 	e.Workflow, e.JobName, e.EventName, e.Result, e.Reason = strip(e.Workflow), strip(e.JobName), strip(e.EventName), strip(e.Result), strip(e.Reason)
 	labels := make([]string, len(e.Labels))
 	for i, l := range e.Labels {
@@ -379,16 +397,17 @@ func clean(e jobevent.Event) jobevent.Event {
 	return e
 }
 
-const insertEvent = `INSERT INTO job_events (at, kind, tier, runner, job_id, repository, run_id, detail)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+const insertEvent = `INSERT INTO job_events (at, kind, tier, runner, job_id, repository, run_id, detail, tenant)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 
 // A column set by any event stays set: COALESCE and NULLIF let events arrive in
 // any order, and more than once. A job's stage keeps its first time: a message
 // GitHub delivers again is recorded again, and one without GitHub's own time
 // is stamped when it arrives, which would otherwise move the stage later.
-const upsertJob = `INSERT INTO jobs (job_id, repository, workflow, job_name, event_name, run_id, tier, runner, queued_at, assigned_at, started_at, completed_at, result)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+const upsertJob = `INSERT INTO jobs (job_id, repository, workflow, job_name, event_name, run_id, tier, runner, queued_at, assigned_at, started_at, completed_at, result, tenant)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 ON CONFLICT (job_id) DO UPDATE SET
+    tenant = COALESCE(NULLIF(EXCLUDED.tenant, ''), jobs.tenant),
     repository = COALESCE(NULLIF(EXCLUDED.repository, ''), jobs.repository),
     workflow = COALESCE(NULLIF(EXCLUDED.workflow, ''), jobs.workflow),
     job_name = COALESCE(NULLIF(EXCLUDED.job_name, ''), jobs.job_name),
@@ -402,9 +421,9 @@ ON CONFLICT (job_id) DO UPDATE SET
     completed_at = LEAST(EXCLUDED.completed_at, jobs.completed_at),
     result = COALESCE(NULLIF(EXCLUDED.result, ''), jobs.result)`
 
-const upsertRunner = `INSERT INTO runners (runner, tier, instance, instance_type, market, subnet, zone, path, launched_at, served_at, listening_at, running_at, exited_at, exit_code, gone_at, gone_reason)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-ON CONFLICT (runner) DO UPDATE SET
+const upsertRunner = `INSERT INTO runners (runner, tier, instance, instance_type, market, subnet, zone, path, launched_at, served_at, listening_at, running_at, exited_at, exit_code, gone_at, gone_reason, tenant)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+ON CONFLICT (tenant, runner) DO UPDATE SET
     tier = COALESCE(NULLIF(EXCLUDED.tier, ''), runners.tier),
     instance = COALESCE(NULLIF(EXCLUDED.instance, ''), runners.instance),
     instance_type = COALESCE(NULLIF(EXCLUDED.instance_type, ''), runners.instance_type),
@@ -423,11 +442,11 @@ ON CONFLICT (runner) DO UPDATE SET
 
 func queue(b *pgx.Batch, e jobevent.Event) {
 	detail, _ := json.Marshal(e)
-	b.Queue(insertEvent, e.At, string(e.Kind), e.Tier, e.Runner, e.JobID, e.Repository, e.RunID, detail)
+	b.Queue(insertEvent, e.At, string(e.Kind), e.Tier, e.Runner, e.JobID, e.Repository, e.RunID, detail, e.Tenant)
 	if e.JobID != "" {
 		b.Queue(upsertJob, e.JobID, e.Repository, e.Workflow, e.JobName, e.EventName, e.RunID, e.Tier, e.Runner,
 			when(e.QueuedAt, !e.QueuedAt.IsZero()), when(e.At, e.Kind == jobevent.Assigned),
-			when(e.At, e.Kind == jobevent.Started), when(e.At, e.Kind == jobevent.Completed), e.Result)
+			when(e.At, e.Kind == jobevent.Started), when(e.At, e.Kind == jobevent.Completed), e.Result, e.Tenant)
 	}
 	if e.JobID == "" && e.Runner != "" {
 		var code *int32
@@ -438,7 +457,7 @@ func queue(b *pgx.Batch, e jobevent.Event) {
 		b.Queue(upsertRunner, e.Runner, e.Tier, e.Instance, e.InstanceType, e.Market, e.Subnet, e.Zone, e.Path,
 			when(e.At, e.Kind == jobevent.Launched), when(e.At, e.Kind == jobevent.Served),
 			when(e.At, e.Kind == jobevent.Listening), when(e.At, e.Kind == jobevent.Running),
-			when(e.At, e.Kind == jobevent.Exited), code, when(e.At, e.Kind == jobevent.InstanceGone), e.Reason)
+			when(e.At, e.Kind == jobevent.Exited), code, when(e.At, e.Kind == jobevent.InstanceGone), e.Reason, e.Tenant)
 	}
 }
 

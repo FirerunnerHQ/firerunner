@@ -135,7 +135,7 @@ func TestWatchFindingsFlagsWithoutSuspending(t *testing.T) {
 		t.Fatalf("a flag wrote a tenant state: %v, %v", st, err)
 	}
 	ev := events.all()
-	if len(ev) != 1 || ev[0].Kind != jobevent.Flagged || ev[0].Instance != "i-f1" || ev[0].Tier != "small" ||
+	if len(ev) != 1 || ev[0].Kind != jobevent.Flagged || ev[0].Instance != "i-f1" || ev[0].Tier != "small" || ev[0].Tenant != "acme" ||
 		!strings.Contains(ev[0].Reason, "tenant acme flagged for review") || ev[0].Runner != "" {
 		t.Fatalf("events = %+v", ev)
 	}

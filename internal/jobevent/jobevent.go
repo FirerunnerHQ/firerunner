@@ -40,7 +40,11 @@ const (
 type Event struct {
 	Kind Kind
 	At   time.Time
-	Tier string
+	// Tenant is the tenants list's id of the tenant the job and machine
+	// belong to; empty for the install the flags name. Tier and Runner
+	// names are unique only within a tenant.
+	Tenant string
+	Tier   string
 
 	Runner string
 
@@ -82,4 +86,27 @@ func Record(s Sink, e Event) {
 		e.At = time.Now()
 	}
 	s.Record(e)
+}
+
+// ForTenant returns a Sink that names tenant on each event s takes, for
+// the listeners, provisioners and schedulers that serve one tenant and do
+// not know its id. An event that names a tenant already keeps it. A nil s
+// stays nil, so it still records nothing.
+func ForTenant(s Sink, tenant string) Sink {
+	if s == nil || tenant == "" {
+		return s
+	}
+	return tenantSink{s, tenant}
+}
+
+type tenantSink struct {
+	s      Sink
+	tenant string
+}
+
+func (t tenantSink) Record(e Event) {
+	if e.Tenant == "" {
+		e.Tenant = t.tenant
+	}
+	t.s.Record(e)
 }

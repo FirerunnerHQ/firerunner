@@ -94,6 +94,8 @@ func main() {
 			os.Exit(tenantCmd(args[1:], os.Stdout, os.Stderr, openTenant()))
 		case "entitlement":
 			os.Exit(entitlementCmd(args[1:], os.Stdout, os.Stderr, openEntitlements))
+		case "usage":
+			os.Exit(usageCmd(args[1:], os.Stdout, os.Stderr, openUsage))
 		case "cache-server":
 			if err := cacheServe(args[1:]); err != nil {
 				slog.Error("cache-server failed", "err", err)
@@ -406,6 +408,8 @@ Usage:
                           flags; see "firerunner tenant -h"
   firerunner entitlement  set, clear or list what each tenant may run, as billing
                           would; see "firerunner entitlement -h"
+  firerunner usage        print the usage events billing reads: one per job a
+                          runner ran; see "firerunner usage -h"
   firerunner version      print the version
   firerunner help         show this help
 
@@ -761,7 +765,11 @@ func (s *shard) watchFindings(ctx context.Context, cfg *config.Config, owner str
 		API: api, Store: store, Account: account, Tenant: guardduty.Owners(owner, known),
 		MinSeverity: cfg.GuardDutyMinSeverity, Interval: guardduty.DefaultInterval, Log: glog,
 		OnFlag: func(f guardduty.Flagged) {
-			jobevent.Record(s.events, jobevent.Event{Kind: jobevent.Flagged, Tier: f.Tier, Instance: f.Instance,
+			tenant := f.Tenant
+			if tenant == tenantstate.Install {
+				tenant = "" // as the install's other events name it
+			}
+			jobevent.Record(s.events, jobevent.Event{Kind: jobevent.Flagged, Tenant: tenant, Tier: f.Tier, Instance: f.Instance,
 				Reason: fmt.Sprintf("tenant %s flagged for review: GuardDuty %s, severity %g", f.Tenant, f.Type, f.Severity)})
 		},
 	}
