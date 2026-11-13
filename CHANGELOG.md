@@ -8,6 +8,24 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-11-13
+
+### Changed
+
+- A panic in one installation's start, stop or tiers' listeners no longer
+  ends the daemon: that installation stops, drains and starts again by
+  itself, as after any other failure, while the others keep serving.
+  `firerunner status` counts each installation's restarts, panics and last
+  error, and `firerunner doctor` warns while one has panicked
+  (`tenant-panics`).
+
+### Fixed
+
+- An installation removed from the tenants list while it was not being
+  served (waiting to start again after a failure, or not served as none of
+  its tiers is within its limits) now has its scale sets deleted too, by
+  name, as one removed while serving does.
+
 ## [0.1.20] - 2026-11-12
 
 ### Added
@@ -615,7 +633,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.21
 [0.1.20]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.20
 [0.1.19]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.19
 [0.1.18]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.18
