@@ -2110,3 +2110,63 @@ func waitFailures(t *testing.T, s *Scheduler, want int) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// At shutdown, HandOff ends a busy runner's launch with core.ErrHandedOff,
+// so the drain need not wait for its job; an idle one is cancelled as ever.
+func TestHandOffLeavesBusyRunners(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	causes := map[string]error{}
+	entered := make(chan string, 3)
+	prov := provFunc(func(vmCtx context.Context, name, _ string, _ core.RunnerSpec, _ func()) error {
+		entered <- name
+		<-vmCtx.Done()
+		mu.Lock()
+		causes[name] = context.Cause(vmCtx)
+		mu.Unlock()
+		return nil
+	})
+	s := New(Options{Max: 3, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+	s.Reconcile(ctx, 3)
+	var names []string
+	for range 3 {
+		select {
+		case n := <-entered:
+			names = append(names, n)
+		case <-time.After(2 * time.Second):
+			t.Fatal("launch never started")
+		}
+	}
+	busy, idle, unstarted := names[0], names[1], names[2]
+	s.MarkBusy(busy)
+	// A job cancelled before it started: its completion marks the runner
+	// busy, but the runner is idle at GitHub.
+	s.MarkCompleted(unstarted)
+
+	cancel()
+	if got := s.HandOff(); got != 1 {
+		t.Fatalf("HandOff = %d, want the one busy runner", got)
+	}
+	done := make(chan struct{})
+	go func() { s.Drain(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain waited for the busy runner's job")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !errors.Is(causes[busy], core.ErrHandedOff) {
+		t.Fatalf("busy runner's cause = %v, want ErrHandedOff", causes[busy])
+	}
+	if errors.Is(causes[idle], core.ErrHandedOff) {
+		t.Fatalf("idle runner's cause = %v; it is ended, not handed off", causes[idle])
+	}
+	if causes[unstarted] != context.Canceled {
+		t.Fatalf("cause of a runner whose job never started = %v; it is ended as idle", causes[unstarted])
+	}
+	if got := s.HandOff(); got != 0 {
+		t.Fatalf("HandOff again = %d, want 0", got)
+	}
+}

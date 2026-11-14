@@ -15,6 +15,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/core"
+	"github.com/firerunnerhq/firerunner/internal/ec2"
 	"github.com/firerunnerhq/firerunner/internal/ghauth"
 	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/jobevent"
@@ -461,5 +462,109 @@ func TestKMSClientUsesTheKeysRegion(t *testing.T) {
 	cfg.AppKMSKey = "alias/github-app"
 	if c, _ := kmsClient(context.Background(), cfg); c.Options().Region != "us-east-1" {
 		t.Fatalf("an alias left the VM's region: %s", c.Options().Region)
+	}
+}
+
+// causeProv's runner runs until its context ends, or release closes, and
+// sends the context's cause.
+type causeProv struct {
+	launched chan<- string
+	release  <-chan struct{}
+	cause    chan<- error
+}
+
+func (p causeProv) Launch(ctx context.Context, name, _ string, _ core.RunnerSpec, _ func()) error {
+	p.launched <- name
+	select {
+	case <-ctx.Done():
+	case <-p.release:
+	}
+	p.cause <- context.Cause(ctx)
+	return nil
+}
+
+func (causeProv) Name() string { return "fake" }
+
+// A process exiting leaves its EC2 tiers' busy runners to the next one, and
+// waits for a microVM's job, which ends with it.
+func TestDrainHandsOffOnlyEC2Tiers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	launched := make(chan string, 2)
+	release := make(chan struct{})
+	fcCause, ec2Cause := make(chan error, 1), make(chan error, 1)
+	st := &servedTenant{log: slog.New(slog.DiscardHandler), tiers: []config.Tier{
+		{Name: "vm"}, {Name: "cloud", Provisioner: config.ProvisionerEC2},
+	}}
+	for _, p := range []causeProv{{launched, release, fcCause}, {launched, release, ec2Cause}} {
+		sched := scheduler.New(scheduler.Options{Max: 1, Provisioner: p, JIT: oneJIT{}, Logger: slog.New(slog.DiscardHandler)})
+		st.scheds = append(st.scheds, sched)
+		sched.Reconcile(ctx, 1)
+		<-launched
+		sched.MarkBusy("runner-2")
+	}
+	cancel()
+	drained := make(chan struct{})
+	go func() { st.drain(true); close(drained) }()
+	select {
+	case err := <-ec2Cause:
+		if !errors.Is(err, core.ErrHandedOff) {
+			t.Fatalf("EC2 runner's cause = %v, want ErrHandedOff", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the EC2 tier's busy runner was not handed off")
+	}
+	select {
+	case err := <-fcCause:
+		t.Fatalf("the microVM's busy runner ended (%v); its job is waited for", err)
+	case <-drained:
+		t.Fatal("drain did not wait for the microVM's job")
+	default:
+	}
+	close(release)
+	if err := <-fcCause; err != nil {
+		t.Fatalf("microVM runner's cause = %v, want none", err)
+	}
+	<-drained
+}
+
+// Only a process told to exit hands off, and only what its next one will
+// find and end: not a tenant removed, nor without the reaper on and an
+// --owner that outlives the host.
+func TestHandsOff(t *testing.T) {
+	exiting, exit := context.WithCancel(context.Background())
+	exit()
+	removed, drop := context.WithCancelCause(context.Background())
+	drop(errTenantRemoved)
+	stopped, stop := context.WithCancel(context.Background())
+	stop()
+	for _, c := range []struct {
+		name    string
+		exiting context.Context
+		ec2     bool
+		reaper  string
+		tenant  context.Context
+		want    bool
+	}{
+		{"exiting", exiting, true, "on", stopped, true},
+		{"not exiting", context.Background(), true, "on", stopped, false},
+		{"in a test", nil, true, "on", stopped, false},
+		{"tenant removed", exiting, true, "on", removed, false},
+		{"no EC2", exiting, false, "on", stopped, false},
+		{"reaper dry-run", exiting, true, "dry-run", stopped, false},
+		{"reaper off", exiting, true, "off", stopped, false},
+		{"no --owner", exiting, true, "on", stopped, false},
+	} {
+		owner := "dogfood"
+		if c.name == "no --owner" {
+			owner = ""
+		}
+		s := &shard{cfg: &config.Config{EC2Reaper: c.reaper, Owner: owner}, exiting: c.exiting}
+		if c.ec2 {
+			s.ec2Client = &ec2.Client{}
+		}
+		if got := s.handsOff(c.tenant); got != c.want {
+			t.Errorf("%s: handsOff = %v, want %v", c.name, got, c.want)
+		}
 	}
 }

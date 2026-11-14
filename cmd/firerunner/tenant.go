@@ -82,6 +82,9 @@ type shard struct {
 	// watchers and the tenant loops call it at once, and a decision taken
 	// on older inputs must not land after one taken on newer.
 	applyMu sync.Mutex
+	// exiting ends when the process is told to exit; nil in tests, where
+	// it never does.
+	exiting context.Context
 }
 
 // tenantHooks are the callbacks that give a tenant's jobs a cache identity.
@@ -310,7 +313,7 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 		},
 		stopLimit: panicStopLimit(get().Limits.JobDuration),
 		stop: func(ctx context.Context, st *servedTenant) {
-			st.drain()
+			st.drain(s.handsOff(ctx))
 			if removedTenant(ctx) {
 				// Bounded: a GitHub that hangs must not hold up shutdown.
 				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
@@ -1039,8 +1042,34 @@ func (st *servedTenant) runs(cfg *config.Config) []func(context.Context) error {
 	return runs
 }
 
-// drain waits for the tenant's runners to finish.
-func (st *servedTenant) drain() {
+// handsOff says whether a tenant stopping now leaves its busy EC2 runners
+// to the next process instead of waiting for their jobs: only when the
+// process is exiting, the tenant is not being removed (nothing would serve
+// it next), and the next process's reaper ends what it finds. That takes
+// --owner: without it, the close after the drain deletes the scale set, and
+// its runners with it, so the next reaper would end a handed-off job as an
+// idle orphan; and the owner tag is the host name, which the next host's
+// reaper does not look for.
+func (s *shard) handsOff(tenantCtx context.Context) bool {
+	return s.exiting != nil && s.exiting.Err() != nil && !removedTenant(tenantCtx) &&
+		s.ec2Client != nil && s.cfg.EC2Reaper == "on" && s.cfg.Owner != ""
+}
+
+// drain waits for the tenant's runners to finish. With handOff, its EC2
+// tiers' busy runners are left to run on instead: their instances outlive
+// the process, and the next one's reaper ends each once its job is done.
+// A Firecracker microVM ends with the process, so its job is waited for.
+func (st *servedTenant) drain(handOff bool) {
+	if handOff {
+		for i, sched := range st.scheds {
+			if !st.tiers[i].IsEC2() {
+				continue
+			}
+			if n := sched.HandOff(); n > 0 {
+				st.log.Info("leaving busy runners to the next firerunner", "tier", st.tiers[i].Name, "runners", n)
+			}
+		}
+	}
 	for _, sched := range st.scheds {
 		sched.Drain()
 	}

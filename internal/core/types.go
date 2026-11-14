@@ -14,6 +14,13 @@ var ErrRunnerBusy = errors.New("runner has a job assigned")
 // VM must not be treated as able to take a job until that is settled.
 var ErrRemovalUnknown = errors.New("runner removal outcome unknown")
 
+// ErrHandedOff is the cause of a busy runner's cancelled launch when the
+// process exits and leaves the runner's machine to the next one: the
+// provisioner returns without ending the machine. Only a provisioner whose
+// machines outlive the process, and that a later process finds again, may be
+// given it.
+var ErrHandedOff = errors.New("runner left to the next firerunner")
+
 // RunnerSpec describes the shape of the ephemeral microVM that will host a
 // single GitHub Actions job. One spec maps to one scale-set tier (e.g. the
 // runs-on label "firerunner-4c8g" -> 4 vCPU / 8192 MiB / a Docker-less golden

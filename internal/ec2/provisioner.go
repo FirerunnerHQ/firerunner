@@ -328,7 +328,9 @@ func (p *Provisioner) Name() string { return "ec2" }
 //
 // Cancelling ctx means the scheduler is removing the runner, so the instance
 // is terminated: an idle runner, or one its tenant's limits end, whose
-// context's cause then says why. Busy detection does not come from here: the listener
+// context's cause then says why. A cause of core.ErrHandedOff instead leaves
+// the instance running, for the next process's reaper (see waiter.handOff).
+// Busy detection does not come from here: the listener
 // marks the runner busy from GitHub's JobStarted message, so onBusy is unused.
 func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.RunnerSpec, _ func()) error {
 	path := PathCold
@@ -633,6 +635,10 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 	for {
 		select {
 		case <-done:
+			if errors.Is(context.Cause(ctx), core.ErrHandedOff) {
+				w.handOff(ip)
+				return nil
+			}
 			done = nil // terminate once; keep waiting for it to take effect
 			w.terminate(context.WithoutCancel(ctx), endReason(ctx))
 		case s := <-w.states:
@@ -686,6 +692,19 @@ func (w *waiter) run(ctx context.Context, ip netip.Addr) error {
 			}
 		}
 	}
+}
+
+// handOff leaves the instance to run its job on after this process exits:
+// the next one's reaper finds it, leaves it while its runner is busy, and
+// ends it once the job is done. It records the phases the runner reported
+// so far, which the next process cannot: the runner's start among them.
+func (w *waiter) handOff(ip netip.Addr) {
+	if ip.IsValid() {
+		if r := w.p.o.JIT.Report(ip); !r.Served.IsZero() {
+			w.recordPhases(r)
+		}
+	}
+	w.log.Info("leaving the instance to the next firerunner, which ends it once its job is done", "terminating", w.terminating)
 }
 
 // runnerResult logs the phases the instance reported for its runner and

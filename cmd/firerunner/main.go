@@ -1198,7 +1198,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if appJWT != nil {
 		t.Auth = ghauth.App{InstallationID: cfg.AppInstallID, JWT: appJWT}
 	}
-	s := &shard{cfg: cfg, log: log, events: events}
+	s := &shard{cfg: cfg, log: log, events: events, exiting: ctx}
 
 	// Each tier is its own GitHub scale set; developers pick one with
 	// runs-on: <tier name>. One Firecracker provisioner backs every Firecracker
@@ -1385,7 +1385,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	stopHealth()
 
 	log.Info("shutdown signalled, draining in-flight microVMs")
-	served.drain()
+	served.drain(s.handsOff(ctx))
 	tenants.wait()
 	log.Info("firerunner stopped")
 
