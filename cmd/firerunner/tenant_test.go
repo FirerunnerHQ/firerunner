@@ -529,7 +529,8 @@ func TestDrainHandsOffOnlyEC2Tiers(t *testing.T) {
 }
 
 // Only a process told to exit hands off, and only what its next one will
-// find and end: not a tenant removed, nor without the reaper on.
+// find and end: not a tenant removed, nor without the reaper on and an
+// --owner that outlives the host.
 func TestHandsOff(t *testing.T) {
 	exiting, exit := context.WithCancel(context.Background())
 	exit()
@@ -552,8 +553,13 @@ func TestHandsOff(t *testing.T) {
 		{"no EC2", exiting, false, "on", stopped, false},
 		{"reaper dry-run", exiting, true, "dry-run", stopped, false},
 		{"reaper off", exiting, true, "off", stopped, false},
+		{"no --owner", exiting, true, "on", stopped, false},
 	} {
-		s := &shard{cfg: &config.Config{EC2Reaper: c.reaper}, exiting: c.exiting}
+		owner := "dogfood"
+		if c.name == "no --owner" {
+			owner = ""
+		}
+		s := &shard{cfg: &config.Config{EC2Reaper: c.reaper, Owner: owner}, exiting: c.exiting}
 		if c.ec2 {
 			s.ec2Client = &ec2.Client{}
 		}

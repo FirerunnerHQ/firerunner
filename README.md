@@ -1690,8 +1690,10 @@ sudo systemctl enable --now firerunner
 Stopping the service sends `SIGTERM`; firerunner stops taking new work and
 drains in-flight microVMs before exiting (`TimeoutStopSec` bounds the wait).
 An EC2 tier's busy runners are not waited for: their instances run on, and
-the next start's reaper ends each once its job is done (with
-`--ec2-reaper on`, the default; otherwise their jobs are waited for too).
+the next start's reaper ends each once its job is done. That needs
+`--ec2-reaper on` (the default) and `--owner`, so the next start looks for
+the same owner tag and the stop keeps the scale set; otherwise their jobs
+are waited for too.
 Restarts are safe: registration is idempotent and a session left behind by an
 unclean exit is retried until GitHub expires it.
 

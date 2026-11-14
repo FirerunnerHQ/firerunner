@@ -1045,10 +1045,14 @@ func (st *servedTenant) runs(cfg *config.Config) []func(context.Context) error {
 // handsOff says whether a tenant stopping now leaves its busy EC2 runners
 // to the next process instead of waiting for their jobs: only when the
 // process is exiting, the tenant is not being removed (nothing would serve
-// it next), and the next process's reaper ends what it finds.
+// it next), and the next process's reaper ends what it finds. That takes
+// --owner: without it, the close after the drain deletes the scale set, and
+// its runners with it, so the next reaper would end a handed-off job as an
+// idle orphan; and the owner tag is the host name, which the next host's
+// reaper does not look for.
 func (s *shard) handsOff(tenantCtx context.Context) bool {
 	return s.exiting != nil && s.exiting.Err() != nil && !removedTenant(tenantCtx) &&
-		s.ec2Client != nil && s.cfg.EC2Reaper == "on"
+		s.ec2Client != nil && s.cfg.EC2Reaper == "on" && s.cfg.Owner != ""
 }
 
 // drain waits for the tenant's runners to finish. With handOff, its EC2

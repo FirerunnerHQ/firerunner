@@ -2118,7 +2118,7 @@ func TestHandOffLeavesBusyRunners(t *testing.T) {
 	defer cancel()
 	var mu sync.Mutex
 	causes := map[string]error{}
-	entered := make(chan string, 2)
+	entered := make(chan string, 3)
 	prov := provFunc(func(vmCtx context.Context, name, _ string, _ core.RunnerSpec, _ func()) error {
 		entered <- name
 		<-vmCtx.Done()
@@ -2127,10 +2127,10 @@ func TestHandOffLeavesBusyRunners(t *testing.T) {
 		mu.Unlock()
 		return nil
 	})
-	s := New(Options{Max: 2, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
-	s.Reconcile(ctx, 2)
+	s := New(Options{Max: 3, Provisioner: prov, JIT: &jitSeq{}, Logger: testLogger()})
+	s.Reconcile(ctx, 3)
 	var names []string
-	for range 2 {
+	for range 3 {
 		select {
 		case n := <-entered:
 			names = append(names, n)
@@ -2138,8 +2138,11 @@ func TestHandOffLeavesBusyRunners(t *testing.T) {
 			t.Fatal("launch never started")
 		}
 	}
-	busy, idle := names[0], names[1]
+	busy, idle, unstarted := names[0], names[1], names[2]
 	s.MarkBusy(busy)
+	// A job cancelled before it started: its completion marks the runner
+	// busy, but the runner is idle at GitHub.
+	s.MarkCompleted(unstarted)
 
 	cancel()
 	if got := s.HandOff(); got != 1 {
@@ -2159,6 +2162,9 @@ func TestHandOffLeavesBusyRunners(t *testing.T) {
 	}
 	if errors.Is(causes[idle], core.ErrHandedOff) {
 		t.Fatalf("idle runner's cause = %v; it is ended, not handed off", causes[idle])
+	}
+	if causes[unstarted] != context.Canceled {
+		t.Fatalf("cause of a runner whose job never started = %v; it is ended as idle", causes[unstarted])
 	}
 	if got := s.HandOff(); got != 0 {
 		t.Fatalf("HandOff again = %d, want 0", got)
