@@ -136,22 +136,36 @@ func (r *Reaper) Run(ctx context.Context) {
 	}
 }
 
+// endAllSweep bounds each of EndAll's sweeps. A variable for tests.
+var endAllSweep = 30 * time.Second
+
 // EndAll ends what the owner's tenant left once it is removed from the
 // tenants list: its scale sets, and its runners with them, are gone, so
 // nothing of it is kept. A pool instance is reaped as of a tier without a
 // pool (o.PooledTiers is ignored), and a running instance busy or not, for
 // why (o.Suspended is ignored). What it cannot prove this install launched
-// it leaves, as Sweep does. An instance too young to judge, a launch the
-// tenant's pool had in flight as it stopped, is judged again once its grace
-// has passed, and a sweep that failed is tried again then. It returns the
-// last sweep's report, with every instance and request either one ended.
+// it leaves, as Sweep does.
+//
+// It sweeps twice: now, and once the grace has passed, for what a sweep
+// must leave until then (a launch the tenant's pool had in flight as it
+// stopped, and its spot request) and for a sweep that failed. The first
+// sweep runs even when ctx has ended, as the daemon stops, since nothing
+// would sweep for the tenant after; each is bounded by endAllSweep. ctx
+// ends the wait for the second, and then EndAll returns ctx's error. A dry
+// run sweeps once. It returns the last sweep's report, with every
+// instance and request either sweep ended.
 func (c *Client) EndAll(ctx context.Context, o ReaperOptions, why string) (ReapReport, error) {
 	o.PooledTiers = nil
 	o.Suspended = func() string { return why }
 	r := c.NewReaper(o)
-	rep, err := r.Sweep(ctx)
-	if err == nil && len(rep.Young) == 0 {
-		return rep, nil
+	sweep := func() (ReapReport, error) {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), endAllSweep)
+		defer cancel()
+		return r.Sweep(sctx)
+	}
+	rep, err := sweep()
+	if o.DryRun {
+		return rep, err
 	}
 	t := time.NewTimer(r.o.Grace)
 	defer t.Stop()
@@ -160,7 +174,7 @@ func (c *Client) EndAll(ctx context.Context, o ReaperOptions, why string) (ReapR
 		return rep, errors.Join(err, ctx.Err())
 	case <-t.C:
 	}
-	again, err := r.Sweep(ctx)
+	again, err := sweep()
 	again.Instances = append(rep.Instances, again.Instances...)
 	again.SpotRequests = append(rep.SpotRequests, again.SpotRequests...)
 	return again, err

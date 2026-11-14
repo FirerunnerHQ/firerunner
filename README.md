@@ -245,11 +245,16 @@ and every 30 seconds, and follows it without a restart:
   no daemon tracks, busy or not (runners a stop left to this start), unless
   `--ec2-reaper` is `off` (`dry-run` only logs them). Delete in the runner
   group's settings what they leave: a tier or group an earlier entry named,
-  and scale sets of an installation removed while no daemon ran; end that
-  installation's instances, found by its `firerunner:owner` tag
-  (`OWNER/ID`), by hand too. To move an installation to
-  another daemon, remove it from this one's list first, and add it to the
-  other's once this one has deleted its scale sets.
+  and scale sets of an installation removed while no daemon ran, or while
+  this one stopped; end that installation's instances, found by its
+  `firerunner:owner` tag (`OWNER/ID`), by hand too. EC2 is swept twice,
+  the second time 2 minutes on for a launch still in flight, so the
+  installation, or another on its account, listed again starts only after
+  that. To move an installation to another daemon, remove it from this
+  one's list first, and add it to the other's once this one logs `ended
+  what a removed tenant left on EC2` (or warns that some may be left).
+  Two daemons never share an `--owner`: each would end the other's
+  machines.
 - One whose `max_runners` alone **changed** gets the new limit at once. A
   lower limit ends no runner; launches wait until enough have ended.
 - One **changed** otherwise (tiers, installation, URL, group, vCPU or job

@@ -491,19 +491,37 @@ func TestEndAll_LeavesNothingOfARemovedTenant(t *testing.T) {
 	}
 }
 
-// A stop cuts the wait for a young instance short, and says so.
+// A daemon stopping still sweeps once, as nothing would sweep for the
+// tenant after, then skips the wait for what is too young, and says so.
 func TestEndAll_StopsWithItsContext(t *testing.T) {
 	f := newFakeEC2(t)
+	ready := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameStopped, old, true)
 	young := f.put(job("", TagPool, PoolWarming, TagTier, "pooled"), types.InstanceStateNameRunning, time.Now(), true)
 	_, c := reaperFor(f, &githubRunners{}, nil)
+	f.signPool(c, ready)
 	f.signPool(c, young)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	rep, err := c.EndAll(ctx, ReaperOptions{Owner: "test-owner", Logger: quietLog()}, "removed")
+	rep, err := c.EndAll(ctx, ReaperOptions{Owner: "test-owner", Grace: 5 * time.Minute, Logger: quietLog()}, "removed")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want the context's", err)
 	}
-	if f.state(young) != types.InstanceStateNameRunning || len(rep.Instances) != 0 {
-		t.Fatalf("state %q, ended %v", f.state(young), rep.Instances)
+	if !slices.Equal(rep.Instances, []string{ready}) || f.state(young) != types.InstanceStateNameRunning {
+		t.Fatalf("ended %v, young %q: want the first sweep only", rep.Instances, f.state(young))
+	}
+}
+
+// A dry run changes nothing, so it sweeps once and does not wait.
+func TestEndAll_DryRunSweepsOnce(t *testing.T) {
+	f := newFakeEC2(t)
+	ready := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameStopped, old, true)
+	_, c := reaperFor(f, &githubRunners{}, nil)
+	f.signPool(c, ready)
+	rep, err := c.EndAll(context.Background(), ReaperOptions{Owner: "test-owner", Grace: 5 * time.Minute, DryRun: true, Logger: quietLog()}, "removed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(rep.Instances, []string{ready}) || f.state(ready) != types.InstanceStateNameStopped {
+		t.Fatalf("would end %v, state %q", rep.Instances, f.state(ready))
 	}
 }
