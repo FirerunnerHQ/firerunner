@@ -1184,6 +1184,25 @@ func (s *Scheduler) Capacity() int {
 	return committed + willBoot + headroom
 }
 
+// HandOff cancels each busy runner's launch with core.ErrHandedOff, so a
+// Drain after it need not wait for their jobs: the provisioner leaves their
+// machines running for the next process to find. Call it only once shutdown
+// has begun (idle runners are cancelled then), and only for a provisioner
+// that honours the cause. It returns how many it handed off.
+func (s *Scheduler) HandOff() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, h := range s.active {
+		if h.busy && !h.cancelled {
+			h.cancelled = true
+			h.cancel(core.ErrHandedOff)
+			n++
+		}
+	}
+	return n
+}
+
 // Drain blocks until all in-flight microVMs have exited. Nothing launches once
 // it has begun: not Reconcile, not the warm-pool top-up, not a re-plan after
 // an exit.

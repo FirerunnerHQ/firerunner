@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
 	"github.com/firerunnerhq/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/core"
 	"github.com/firerunnerhq/firerunner/internal/jobevent"
 )
 
@@ -184,4 +185,41 @@ func TestPoolLaunch_RecordsEvents(t *testing.T) {
 	inst := h.instance(t)
 	h.f.setState(inst.id, types.InstanceStateNameTerminated)
 	waitErr(t, errc)
+}
+
+// A busy runner left to the next process at shutdown keeps its instance, and
+// records its runner's start, which the next process cannot.
+func TestLaunch_HandOffLeavesTheInstance(t *testing.T) {
+	events := &eventLog{}
+	h := newHarness(t, func(o *Options) { o.Events = events })
+	ctx, cancel := context.WithCancelCause(context.Background())
+	errc := h.launch(ctx)
+	inst := h.instance(t)
+	if code, _ := h.fetch(inst.ip); code != http.StatusOK {
+		t.Fatalf("fetch = %d", code)
+	}
+	h.f.setState(inst.id, types.InstanceStateNameRunning)
+	h.report(t, inst.ip, "phase=job")
+	cancel(core.ErrHandedOff)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatalf("Launch = %v, want nil", err)
+	}
+	if ids := h.f.terminatedIDs(); len(ids) != 0 {
+		t.Fatalf("terminated %v; a handed-off instance runs its job on", ids)
+	}
+	if s := h.f.state(inst.id); s != types.InstanceStateNameRunning {
+		t.Fatalf("instance state %q, want running", s)
+	}
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	var running bool
+	for _, e := range events.got {
+		running = running || e.Kind == jobevent.Running
+		if e.Kind == jobevent.InstanceGone {
+			t.Fatalf("recorded the instance gone: %+v", e)
+		}
+	}
+	if !running {
+		t.Fatalf("the runner's start is not recorded: %+v", events.got)
+	}
 }

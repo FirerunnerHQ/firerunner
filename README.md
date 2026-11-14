@@ -835,8 +835,9 @@ running process tracks, and anything younger than 2 minutes.
 - **A job instance still running:** firerunner asks GitHub to deregister its
   runner. If GitHub agrees, the runner had no job and the instance is
   terminated. If the runner is busy, its job is left to finish; it powers off,
-  and the next sweep ends it. Past `--max-vm-lifetime`, it is terminated
-  regardless. The runner's name comes from the instance's `firerunner:runner`
+  and the next sweep ends it. This is also how a stop or restart leaves a
+  busy runner: the next start finds its instance here. Past
+  `--max-vm-lifetime`, it is terminated regardless. The runner's name comes from the instance's `firerunner:runner`
   tag, which anyone who may tag instances could write; so firerunner also
   tags each job instance `firerunner:runner-mac`, an HMAC of its owner, tier,
   runner and instance ID under the `--ec2-pool-key-file` key, and
@@ -1688,6 +1689,9 @@ sudo systemctl enable --now firerunner
 
 Stopping the service sends `SIGTERM`; firerunner stops taking new work and
 drains in-flight microVMs before exiting (`TimeoutStopSec` bounds the wait).
+An EC2 tier's busy runners are not waited for: their instances run on, and
+the next start's reaper ends each once its job is done (with
+`--ec2-reaper on`, the default; otherwise their jobs are waited for too).
 Restarts are safe: registration is idempotent and a session left behind by an
 unclean exit is retried until GitHub expires it.
 
