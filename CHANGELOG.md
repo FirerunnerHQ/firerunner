@@ -8,6 +8,16 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-11-14
+
+### Fixed
+
+- An installation removed from the tenants list no longer leaves EC2
+  resources behind. Once its scale sets are deleted, the daemon ends what it
+  left under its owner tag: its stopped pool, the pool's spot requests, and
+  job instances no daemon tracks, such as runners a stop left running.
+  Before, nothing ever ended them.
+
 ## [0.1.23] - 2026-11-14
 
 ### Fixed
@@ -667,7 +677,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.23...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.24...HEAD
+[0.1.24]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.24
 [0.1.23]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.23
 [0.1.22]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.22
 [0.1.21]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.21
