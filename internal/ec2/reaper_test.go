@@ -2,6 +2,7 @@ package ec2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -443,5 +444,66 @@ func TestReaper_ReadsEveryPage(t *testing.T) {
 	}
 	if !slices.Contains(rep.SpotRequests, "sir-"+gone) {
 		t.Fatalf("missed the orphan request on a later page: %v", rep.SpotRequests)
+	}
+}
+
+// A tenant removed from the tenants list keeps nothing: its pool, a busy
+// runner left by a stop, and a pool launch its pool had in flight, once
+// that is old enough to judge. Another owner's instance stays.
+func TestEndAll_LeavesNothingOfARemovedTenant(t *testing.T) {
+	f := newFakeEC2(t)
+	ready := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameStopped, old, true)
+	busy := f.put(job("busy-runner"), types.InstanceStateNameRunning, old, true)
+	warming := f.put(job("", TagPool, PoolWarming, TagTier, "pooled"), types.InstanceStateNameRunning, time.Now(), true)
+	foreign := f.put(map[string]string{TagOwner: "someone-else", TagTier: "cloud", TagRunner: "x"}, types.InstanceStateNameStopped, old, false)
+	g := &githubRunners{busy: map[string]bool{"busy-runner": true}}
+	_, c := reaperFor(f, g, nil)
+	f.signPool(c, ready)
+	f.signPool(c, warming)
+	f.signRunner(c, busy)
+	o := ReaperOptions{Owner: "test-owner", Remove: g.remove, PooledTiers: map[string]bool{"pooled": true}, Grace: 50 * time.Millisecond, Logger: quietLog()}
+
+	rep, err := c.EndAll(context.Background(), o, "removed from the tenants list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(rep.Instances)
+	if want := []string{ready, busy, warming}; !slices.Equal(rep.Instances, want) {
+		t.Fatalf("ended %v, want %v", rep.Instances, want)
+	}
+	for _, id := range []string{ready, busy, warming} {
+		if s := f.state(id); s != types.InstanceStateNameShuttingDown {
+			t.Errorf("%s: state %q, want terminated", id, s)
+		}
+	}
+	for _, id := range []string{foreign} {
+		if s := f.state(id); s != types.InstanceStateNameStopped {
+			t.Errorf("%s: state %q, want left alone", id, s)
+		}
+	}
+	if open := f.openSpotRequests(); len(open) != 0 {
+		t.Fatalf("spot requests left open: %v", open)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.termWithOpenRequest) != 0 {
+		t.Fatalf("terminated with its request open: %v", f.termWithOpenRequest)
+	}
+}
+
+// A stop cuts the wait for a young instance short, and says so.
+func TestEndAll_StopsWithItsContext(t *testing.T) {
+	f := newFakeEC2(t)
+	young := f.put(job("", TagPool, PoolWarming, TagTier, "pooled"), types.InstanceStateNameRunning, time.Now(), true)
+	_, c := reaperFor(f, &githubRunners{}, nil)
+	f.signPool(c, young)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rep, err := c.EndAll(ctx, ReaperOptions{Owner: "test-owner", Logger: quietLog()}, "removed")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want the context's", err)
+	}
+	if f.state(young) != types.InstanceStateNameRunning || len(rep.Instances) != 0 {
+		t.Fatalf("state %q, ended %v", f.state(young), rep.Instances)
 	}
 }

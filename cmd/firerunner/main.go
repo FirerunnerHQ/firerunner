@@ -1323,7 +1323,9 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			}
 		},
 		removed: func(c config.Tenant) {
-			s.removeLeftovers(runCtx, extraTenant(cfg, c, owner, appJWT), c.Tiers)
+			t := extraTenant(cfg, c, owner, appJWT)
+			s.removeLeftovers(runCtx, t, c.Tiers)
+			s.endRemoved(runCtx, t)
 		},
 	}
 	s.tenants.Store(tenants)
