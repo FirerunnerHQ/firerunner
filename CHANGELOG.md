@@ -8,6 +8,18 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-11-14
+
+### Fixed
+
+- Stopping or restarting firerunner no longer waits for EC2 runners that are
+  running a job. Their instances keep running the job, and the next start's
+  reaper ends each one once its job is done. This needs `--owner` and
+  `--ec2-reaper on`; without them, a stop still waits. Before, a stop waited for those
+  jobs. On the CloudFormation control VM, a stop that ran past the unit's
+  60-second limit failed the unit, and the VM replaced itself. A runner's
+  start, if it reported one, is now recorded before it is left.
+
 ## [0.1.22] - 2026-11-13
 
 ### Added
@@ -655,7 +667,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.22...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.23...HEAD
+[0.1.23]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.23
 [0.1.22]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.22
 [0.1.21]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.21
 [0.1.20]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.20
