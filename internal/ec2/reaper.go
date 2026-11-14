@@ -33,9 +33,10 @@ type ReaperOptions struct {
 	// MaxLifetime reaps a running instance this old even if its runner is
 	// busy; 0 disables.
 	MaxLifetime time.Duration
-	// Suspended, when set, says why the owner's tenant is suspended, or "".
-	// While it is, a running orphan is reaped busy or not: a suspended
-	// tenant's machines end, after a restart too.
+	// Suspended, when set, says why the owner's tenant may run nothing (it
+	// is suspended, or removed: see EndAll), or "". While it says so, a
+	// running orphan is reaped busy or not: such a tenant's machines end,
+	// after a restart too.
 	Suspended func() string
 	// Grace leaves alone instances younger than this, so a launch between
 	// RunInstances and its registration is never mistaken for an orphan
@@ -133,6 +134,50 @@ func (r *Reaper) Run(ctx context.Context) {
 		case <-t.C:
 		}
 	}
+}
+
+// endAllSweep bounds each of EndAll's sweeps. A variable for tests.
+var endAllSweep = 30 * time.Second
+
+// EndAll ends what the owner's tenant left once it is removed from the
+// tenants list: its scale sets, and its runners with them, are gone, so
+// nothing of it is kept. A pool instance is reaped as of a tier without a
+// pool (o.PooledTiers is ignored), and a running instance busy or not, for
+// why (o.Suspended is ignored). What it cannot prove this install launched
+// it leaves, as Sweep does.
+//
+// It sweeps twice: now, and once the grace has passed, for what a sweep
+// must leave until then (a launch the tenant's pool had in flight as it
+// stopped, and its spot request) and for a sweep that failed. The first
+// sweep runs even when ctx has ended, as the daemon stops, since nothing
+// would sweep for the tenant after; each is bounded by endAllSweep. ctx
+// ends the wait for the second, and then EndAll returns ctx's error. A dry
+// run sweeps once. It returns the last sweep's report, with every
+// instance and request either sweep ended.
+func (c *Client) EndAll(ctx context.Context, o ReaperOptions, why string) (ReapReport, error) {
+	o.PooledTiers = nil
+	o.Suspended = func() string { return why }
+	r := c.NewReaper(o)
+	sweep := func() (ReapReport, error) {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), endAllSweep)
+		defer cancel()
+		return r.Sweep(sctx)
+	}
+	rep, err := sweep()
+	if o.DryRun {
+		return rep, err
+	}
+	t := time.NewTimer(r.o.Grace)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return rep, errors.Join(err, ctx.Err())
+	case <-t.C:
+	}
+	again, err := sweep()
+	again.Instances = append(rep.Instances, again.Instances...)
+	again.SpotRequests = append(rep.SpotRequests, again.SpotRequests...)
+	return again, err
 }
 
 // Sweep reaps once.
@@ -281,7 +326,7 @@ func (r *Reaper) judge(ctx context.Context, i types.Instance, now time.Time, sig
 		}
 		if r.o.Suspended != nil {
 			if why := r.o.Suspended(); why != "" {
-				if r.reap(ctx, log, "orphan of a suspended tenant: "+why, id, spotReq) {
+				if r.reap(ctx, log, "orphan of a tenant that may run nothing: "+why, id, spotReq) {
 					rep.Instances = append(rep.Instances, id)
 				}
 				return

@@ -356,6 +356,27 @@ func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) {
 	}
 }
 
+// endRemoved ends what a removed tenant left on EC2, by its owner tag: its
+// stopped pool, the pool's spot requests, and job instances no process
+// tracks, busy or not, such as runners a stop left to this start (see
+// ec2.Client.EndAll). Its runners went with its scale sets. It runs before
+// a later run on the tenant's id or account may start, so it never ends
+// what a run of a tenant listed again launched. A daemon stopping meanwhile
+// still sweeps once, skips the second, and warns.
+func (s *shard) endRemoved(ctx context.Context, t tenant) {
+	if s.ec2Client == nil || s.cfg.EC2Reaper == "off" {
+		return
+	}
+	log := s.log.With("tenant", t.ID)
+	rep, err := s.ec2Client.EndAll(ctx, reaperOptions(s.cfg, t.Owner, nil, nil, log), "removed from the tenants list")
+	if err != nil {
+		log.Warn("a removed tenant's instances or spot requests may be left; end those with its owner tag by hand", "owner", t.Owner, "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "err", err)
+		return
+	}
+	// Logged even when there was nothing: moving the tenant waits for it.
+	log.Info("ended what a removed tenant left on EC2", "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "unproven", len(rep.Unproven), "dryRun", rep.DryRun)
+}
+
 // warnRefused logs each tier the tenant lists but is not served, and why.
 func (t tenant) warnRefused(log *slog.Logger) {
 	for _, why := range t.Refused {
