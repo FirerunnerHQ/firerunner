@@ -403,6 +403,9 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			note = "  STALE: the daemon may not be running"
 		}
 		fmt.Fprintf(w, "\nlisteners: (pid %d, updated %s ago)%s\n", l.PID, age, note)
+		if p := l.Process; p != nil {
+			fmt.Fprintf(w, "  process: %s\n", processText(*p, l.WrittenAt))
+		}
 		ltw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 		fmt.Fprintln(ltw, "  TIER\tSTATE\tRECONNECTS\tLAST MESSAGE\tLAST ERROR")
 		for _, t := range l.Tiers {
@@ -1787,4 +1790,15 @@ func countList(m map[string]int) string {
 		parts = append(parts, fmt.Sprintf("%s %d", name, m[k]))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// processText is the daemon's own use of its machine, as of at.
+func processText(p health.Process, at time.Time) string {
+	s := fmt.Sprintf("%d goroutines, %.1f MiB heap (%.1f MiB from the OS)",
+		p.Goroutines, float64(p.HeapBytes)/(1<<20), float64(p.GoBytes)/(1<<20))
+	if p.OpenFiles > 0 {
+		s += fmt.Sprintf(", %d open files", p.OpenFiles)
+	}
+	s += fmt.Sprintf(", %.1fs CPU in %s up", p.CPUSeconds, humanDuration(at.Sub(p.StartedAt)))
+	return s
 }

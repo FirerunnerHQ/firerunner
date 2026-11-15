@@ -850,12 +850,16 @@ func healthCacheCredentials(r *awscreds.Refresher) *health.CacheCredentials {
 // healthInterval is how often the listener health file is rewritten.
 const healthInterval = 10 * time.Second
 
+// processStart is when this process started, as the health file reports it.
+var processStart = time.Now()
+
 // publishHealth writes the trackers' state, with whatever fill adds (the
 // reaper's, the EC2 breakers) when fill is non-nil, to path now and every
 // healthInterval until the returned func is called, which writes it once more.
 func publishHealth(path string, trackers func() []*health.Tracker, fill func(*health.File), log *slog.Logger) func() {
 	write := func() {
-		f := health.File{PID: os.Getpid(), WrittenAt: time.Now().UTC()}
+		p := health.ReadProcess(processStart)
+		f := health.File{PID: os.Getpid(), WrittenAt: time.Now().UTC(), Process: &p}
 		for _, tr := range trackers() {
 			f.Tiers = append(f.Tiers, tr.Snapshot())
 		}

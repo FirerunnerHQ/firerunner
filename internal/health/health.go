@@ -480,7 +480,10 @@ func errString(err error) string {
 type File struct {
 	PID       int       `json:"pid"`
 	WrittenAt time.Time `json:"written_at"`
-	Tiers     []Tier    `json:"tiers"`
+	// Process is the daemon's goroutines, memory, CPU and open files at
+	// WrittenAt; absent from a daemon older than v0.1.25.
+	Process *Process `json:"process,omitempty"`
+	Tiers   []Tier   `json:"tiers"`
 	// Reaper is the EC2 reaper's latest sweep, when one runs.
 	Reaper *Reaper `json:"reaper,omitempty"`
 	// EC2Breakers are the EC2 launch options backing off after a refusal,
