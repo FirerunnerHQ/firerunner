@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-11-15
+
+### Added
+
+- `firerunner status` shows the daemon's own goroutines, Go heap and the
+  memory Go has mapped, open files and CPU time since its start, and
+  `status --json` has them under `listeners.process`. They are what sizing
+  how many installations and tiers one daemon serves is measured from.
+
 ## [0.1.24] - 2026-11-14
 
 ### Fixed
@@ -677,7 +686,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.24...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.25...HEAD
+[0.1.25]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.25
 [0.1.24]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.24
 [0.1.23]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.23
 [0.1.22]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.22
