@@ -411,6 +411,9 @@ func TestPublishHealth(t *testing.T) {
 	if err != nil || len(f.Tiers) != 2 || f.PID != os.Getpid() {
 		t.Fatalf("initial file = %+v, %v", f, err)
 	}
+	if p := f.Process; p == nil || p.Goroutines == 0 || p.HeapBytes == 0 || !p.StartedAt.Equal(processStart.UTC().Truncate(0)) {
+		t.Fatalf("process = %+v, want this process's goroutines, heap and start", p)
+	}
 	b.Failed(errors.New("401 Unauthorized"))
 	stop() // writes the final state
 	f, err = health.Read(path)

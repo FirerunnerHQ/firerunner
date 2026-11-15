@@ -1156,6 +1156,10 @@ error. `status` shows it, and marks it stale if the daemon stopped updating it.
 firerunner status --json | jq '.listeners.tiers[] | {name, state, reconnects, last_message}'
 ```
 
+The file also holds the daemon's own goroutines, Go heap and the memory Go has
+mapped, open files and CPU seconds since its start (`.listeners.process`), for
+sizing how many installations and tiers one daemon serves.
+
 ### Warm pool (`--min-runners`)
 
 Every job runs in a fresh microVM, so by default a runner is cold-booted only
