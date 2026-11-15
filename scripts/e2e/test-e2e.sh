@@ -59,7 +59,11 @@ case "$1 $2" in
 "ssm get-parameter")
 	f="$STATE/ssm$(arg --name "$@")"
 	[ -f "$f" ] || { echo "An error occurred (ParameterNotFound) when calling the GetParameter operation" >&2; exit 254; }
-	cat "$f"
+	if [ "$(arg --query "$@")" = Parameter.Type ]; then # the type it was put with, else String
+		awk -v n="$(arg --name "$@")" '$1 == n {t = $2} END {print (t == "" ? "String" : t)}' "$STATE/ssm-types" 2>/dev/null || echo String
+	else
+		cat "$f"
+	fi
 	;;
 "ssm put-parameter")
 	j="$(arg --cli-input-json "$@")"
@@ -958,6 +962,27 @@ expect "up with a KMS key: passes AppKMSKeyArn to the session" "$(cat "$STATE/cr
 	jqe --arg k "$KMS_ARN" 'map({key: .ParameterKey, value: .ParameterValue}) | from_entries | .AppKMSKeyArn == $k' "$STATE/create-params.json"
 expect "up with a KMS key: writes no key or token" "" \
 	test ! -e "$STATE/ssm/fr/e2e/sessions/e2e-test/control/app-private-key" -a ! -e "$STATE/ssm/fr/e2e/sessions/e2e-test/control/token"
+
+# A setting naming parameters under the shared prefix moves under the
+# session's, which is all its role reads, and what it names is copied.
+vm_fresh vm-up-ssm-settings
+ssm_seed /fr/e2e/control/env $'FR_URL=https://example.invalid/org\nFR_ENTITLEMENTS=ssm:/fr/e2e/control/entitlements\nFR_OTHER=ssm:/elsewhere/x'
+ssm_seed /fr/e2e/control/entitlements/acme '{"account_state":"active"}'
+ssm_seed /fr/e2e/control/entitlements/beta '{"account_state":"trial"}'
+echo "/fr/e2e/control/entitlements/beta SecureString" >>"$STATE/ssm-types"
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack CREATE_COMPLETE)"
+answer invocation 1 "$(inv Success 0 $'active\nfirerunner v1.2.0\n' '')"
+run control-vm.sh up
+expect "up with ssm settings: exit 0" "$(dump)" rc_is 0
+expect "up with ssm settings: points them under the session's prefix" "$(ssm_val $S/control/env)" \
+	grep -qx "FR_ENTITLEMENTS=ssm:$S/control/entitlements" "$STATE/ssm$S/control/env"
+expect "up with ssm settings: leaves a path outside the shared prefix" "" \
+	grep -qx "FR_OTHER=ssm:/elsewhere/x" "$STATE/ssm$S/control/env"
+expect "up with ssm settings: copies what they name" "" \
+	[ "$(ssm_val $S/control/entitlements/acme)/$(ssm_val $S/control/entitlements/beta)" = '{"account_state":"active"}/{"account_state":"trial"}' ]
+expect "up with ssm settings: each with its own type" "" grep -qx "$S/control/entitlements/beta SecureString" "$STATE/ssm-types"
+expect "up with ssm settings: keeps the shared ones" "" [ -e "$STATE/ssm/fr/e2e/control/entitlements/acme" ]
 
 vm_fresh vm-up-no-credential
 rm "$STATE/ssm/fr/e2e/control/app-private-key"

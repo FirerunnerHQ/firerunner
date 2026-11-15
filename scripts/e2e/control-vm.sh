@@ -138,6 +138,21 @@ ssm_put() {
 	rm -f "$work/put.json"
 }
 
+# copy_params FROM TO: the parameter FROM, or every parameter under the path
+# FROM, to the same names under TO, each with its own type.
+copy_params() {
+	local names n t v
+	names="$(aws ssm get-parameters-by-path --path "$1" --recursive \
+		--query 'Parameters[].Name' --output json)" || e2e_die 1 "get-parameters-by-path $1 failed"
+	[ -n "$(ssm_get "$1")" ] && names="$(jq -c --arg n "$1" '. + [$n]' <<<"$names")"
+	while IFS= read -r n; do
+		[ -n "$n" ] || continue
+		t="$(aws ssm get-parameter --name "$n" --query Parameter.Type --output text)" || e2e_die 1 "get-parameter $n failed"
+		v="$(ssm_get "$n")"
+		ssm_put "$2${n#"$1"}" "$t" "$v"
+	done < <(jq -r '.[]' <<<"$names")
+}
+
 # instance: the group's in-service VM, or nothing.
 instance() {
 	local i
@@ -266,6 +281,17 @@ seed_and_create() {
 		.name += $sfx
 		| if .labels then .labels |= map(. + $sfx) else . end
 		| if ((.ec2.ami // "") | startswith($p)) then .ec2.ami = $s + (.ec2.ami | ltrimstr($p)) else . end)' <<<"$tiers")"
+
+	# Settings that name parameters under the shared prefix, such as
+	# FR_ENTITLEMENTS=ssm:<prefix>/control/entitlements: the session's role
+	# reads only its own prefix, so they move under it, with a copy of what
+	# they hold. Left pointing at the shared path, the daemon cannot read
+	# them, and holds every tenant for want of an entitlement.
+	while IFS= read -r a; do
+		[ -n "$a" ] || continue
+		copy_params "$a" "$prefix/${a#"$base_prefix"/}"
+	done < <(grep -oE "=ssm:$base_prefix/[^[:space:]\"']+" <<<"$env" | sed 's/^=ssm://' | sort -u)
+	env="${env//=ssm:$base_prefix\//=ssm:$prefix/}"
 
 	ssm_put "$prefix/control/env" String "$env"
 	ssm_put "$prefix/control/tiers" String "$tiers"
