@@ -495,7 +495,7 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			}
 			fmt.Fprintf(w, "  shard %s holds the leases of %d of %d tenant(s) listed, renewed %s\n", tl.Shard, tl.Tenants, tl.Listed, last)
 			if tl.Failing() {
-				fmt.Fprintf(w, "  last renewal failed %s ago; each tenant is handed off 20s after the last renewal that succeeded: %s\n",
+				fmt.Fprintf(w, "  last renewal failed %s ago; each tenant is handed off 20s after the last successful renewal was sent: %s\n",
 					humanDuration(time.Since(tl.LastErrorAt).Truncate(time.Second)), truncate(tl.LastError, 200))
 			}
 		}
@@ -1028,7 +1028,7 @@ func tenantLeasesCheck(f health.File, now time.Time) *Check {
 		return nil
 	}
 	if tl.Failing() {
-		c := warn("tenant-leases", "shard %s cannot renew its tenant leases (%s ago): %s; its tenants are handed off 20s after the last renewal that succeeded", tl.Shard,
+		c := warn("tenant-leases", "shard %s cannot renew its tenant leases (%s ago): %s; its tenants are handed off 20s after the last successful renewal was sent", tl.Shard,
 			humanDuration(now.Sub(tl.LastErrorAt).Truncate(time.Second)), truncate(tl.LastError, 200))
 		return &c
 	}

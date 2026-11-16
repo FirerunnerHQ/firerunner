@@ -1378,17 +1378,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		catalog = &tenantCatalog{src: src, check: cfg.CheckTenants, set: tenants, log: log.With("component", "tenants")}
 		if cfg.TenantLeases { // validated: --tenants db:, so db is open
-			leaser = &tenantLeaser{store: db, shard: jobstore.Shard{ID: shardID(), Owner: owner, TenantOwner: tenantOwner}, set: tenants, log: log.With("component", "tenant-leases")}
-			if err := leaser.join(runCtx); err != nil {
-				return fmt.Errorf("--tenant-leases: %w", err)
-			}
+			leaser = &tenantLeaser{store: db, shard: newShard(owner, tenantOwner), set: tenants, log: log.With("component", "tenant-leases")}
 			catalog.leaser = leaser
 		}
 		if err := catalog.read(runCtx); err != nil {
 			log.Error("tenants list not read; serving the install alone until it is", "source", src.String(), "err", err)
 		}
 		if leaser != nil {
-			_ = leaser.renew(runCtx)
 			go leaser.run(runCtx)
 		}
 		go catalog.run(runCtx)

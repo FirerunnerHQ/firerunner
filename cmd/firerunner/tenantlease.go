@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -30,6 +31,10 @@ const (
 	// leaseRenewTimeout bounds one renewal: one that ends after its
 	// deadline would serve nothing.
 	leaseRenewTimeout = 5 * time.Second
+	// leaseRetry is how soon a renewal that failed is tried again: a
+	// deadline is 20s after the last success was sent, so one blip must
+	// not wait out the next interval and hand every tenant off.
+	leaseRetry = 2 * time.Second
 	// leaseReleaseTimeout bounds releasing them all on the way out.
 	leaseReleaseTimeout = 10 * time.Second
 )
@@ -42,19 +47,20 @@ type leaseStore interface {
 	Release(ctx context.Context, sh jobstore.Shard) error
 }
 
-// shardID is an id for this process among the shards: its host name and a
+// newShard is this process among the shards. Its id is its host name and a
 // random part, so that no two processes share one, even on one host. A
-// process started again is a new shard: its leases from before are taken
-// again only once they expire, which GitHub's hold on the old sessions
-// outlasts after a crash anyway.
-func shardID() string {
+// process started again is a new shard, which replaces the one before it
+// on its host: its leases from before are taken again only once they
+// expire, which GitHub's hold on the old sessions outlasts after a crash
+// anyway.
+func newShard(owner, tenantOwner string) jobstore.Shard {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "firerunner"
 	}
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)
-	return host + "-" + hex.EncodeToString(b)
+	return jobstore.Shard{ID: host + "-" + hex.EncodeToString(b), Host: host, Owner: owner, TenantOwner: tenantOwner}
 }
 
 // tenantLeaser serves the tenants list read by a tenantCatalog under
@@ -73,9 +79,14 @@ type tenantLeaser struct {
 	shard jobstore.Shard
 	set   *tenantSet
 	log   *slog.Logger
-	// now and tick replace the clock and the interval's ticker in tests.
-	now  func() time.Time
-	tick <-chan time.Time
+	// now and tick replace the clock and the interval's ticker in tests,
+	// and after the wait before a retry.
+	now   func() time.Time
+	tick  <-chan time.Time
+	after func(time.Duration) <-chan time.Time
+
+	// joined is run's: whether the shard is registered.
+	joined bool
 
 	mu     sync.Mutex
 	list   []config.Tenant
@@ -95,15 +106,36 @@ func (l *tenantLeaser) clock() time.Time {
 	return time.Now()
 }
 
-// join registers the shard. It fails while a live shard has another owner.
+// join registers the shard. It fails while a live shard's owners do not
+// fit this one's.
 func (l *tenantLeaser) join(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, tenantsReadTimeout)
 	defer cancel()
 	if err := l.store.Join(ctx, l.shard); err != nil {
-		return fmt.Errorf("join the shards as %s: %w", l.shard.ID, err)
+		err = fmt.Errorf("join the shards as %s: %w", l.shard.ID, err)
+		l.mu.Lock()
+		l.lastErr, l.lastErrAt = err.Error(), time.Now()
+		l.mu.Unlock()
+		l.log.Error("not serving any tenant until this shard may join", "err", err)
+		return err
 	}
 	l.log.Info("joined the shards: serving tenants under leases", "shard", l.shard.ID)
 	return nil
+}
+
+// step joins, if the shard has not, and renews.
+func (l *tenantLeaser) step(ctx context.Context) error {
+	if !l.joined {
+		if err := l.join(ctx); err != nil {
+			return err
+		}
+		l.joined = true
+	}
+	err := l.renew(ctx)
+	if errors.Is(err, jobstore.ErrNotJoined) {
+		l.joined = false
+	}
+	return err
 }
 
 // apply is the catalog's: it applies a list read and checked, under the
@@ -156,14 +188,17 @@ func (l *tenantLeaser) renew(ctx context.Context) error {
 	for _, a := range got {
 		l.held[a] = deadline
 	}
+	l.set.renewRemoving(l.held)
 	if l.listed {
 		l.applyLocked()
 	}
 	return nil
 }
 
-// run renews the leases every leaseInterval until ctx ends. It does not
-// renew at once: call renew first.
+// run joins the shards and renews the leases at once, then every
+// leaseInterval until ctx ends. A join or renewal that fails is tried again
+// after leaseRetry, and a shard the database lost joins again. Until it has
+// joined, it serves no tenant; the install's own tiers serve meanwhile.
 func (l *tenantLeaser) run(ctx context.Context) {
 	tick := l.tick
 	if tick == nil {
@@ -171,12 +206,22 @@ func (l *tenantLeaser) run(ctx context.Context) {
 		defer t.Stop()
 		tick = t.C
 	}
+	after := l.after
+	if after == nil {
+		after = time.After
+	}
 	for {
+		for l.step(ctx) != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-after(leaseRetry):
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick:
-			_ = l.renew(ctx)
 		}
 	}
 }

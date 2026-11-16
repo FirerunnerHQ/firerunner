@@ -100,6 +100,11 @@ func (c *Config) checkTenantsSpec() error {
 		// tiers and pool are its alone, by its --owner.
 		return errors.New("--tenant-leases needs --tenant-owner, the same on every shard, by which a tenant's busy runners are handed to the next one; and --owner, a different one on each")
 	}
+	if c.TenantLeases && c.UsesEC2() && c.EC2PoolKeyFile == "" {
+		// A process's own random key proves nothing to the next shard,
+		// which would leave the runners handed to it to their max lifetime.
+		return errors.New("--tenant-leases with EC2 tiers needs --ec2-pool-key-file, the same on every shard: the next shard proves by it that the runners handed to it are its to end")
+	}
 	name, ok := TenantsParameter(c.TenantsPath)
 	if !ok {
 		return nil

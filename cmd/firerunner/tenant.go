@@ -1095,12 +1095,14 @@ type tenantStop struct{ sessionsFirst, handOff, remove bool }
 // ended. A tenant handed off to another shard closes its sessions first, so
 // that shard opens them at once rather than after GitHub's hold, and never
 // deletes a scale set: the next shard may be serving it already. A removed
-// one deletes them once its runners have finished.
+// one deletes them once its runners have finished, unless its lease has
+// lapsed meanwhile: another shard may be serving its account, under the
+// same scale set names.
 func (s *shard) stopPlan(tenantCtx context.Context) tenantStop {
 	return tenantStop{
 		sessionsFirst: handedOffTenant(tenantCtx),
 		handOff:       s.handsOff(tenantCtx),
-		remove:        removedTenant(tenantCtx),
+		remove:        removedTenant(tenantCtx) && !leaseLapsed(tenantCtx),
 	}
 }
 

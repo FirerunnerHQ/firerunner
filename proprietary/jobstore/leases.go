@@ -10,14 +10,20 @@ import (
 )
 
 // Shard is one daemon that serves the tenants of the tenants table under
-// leases: an id no other process has, the owner its own instances are
-// tagged with, and the tenants' owner, which their instances are tagged
-// under (<TenantOwner>/<id>).
+// leases: an id no other process has, the host it runs on, the owner its
+// own instances are tagged with, and the tenants' owner, which their
+// instances are tagged under (<TenantOwner>/<id>).
 type Shard struct {
 	ID          string
+	Host        string
 	Owner       string
 	TenantOwner string
 }
+
+// ErrNotJoined is a renewal by a shard the database does not have: it was
+// forgotten, or replaced by a later process of its host and owner. It must
+// join again.
+var ErrNotJoined = errors.New("this shard is not registered: join again")
 
 // ErrOwnerDiffers is a shard joining beside a live one whose tenants' owner
 // differs, or whose own owner is the same. A shard hands a tenant's busy
@@ -37,7 +43,9 @@ const shardForgotten = 24 * time.Hour
 
 // Join registers sh as a shard. It sets the database up first, and fails
 // with ErrOwnerDiffers while a live shard has another tenants' owner, or
-// sh's own owner. It also deletes shards and leases gone for a day.
+// sh's own owner. A shard of sh's host and owner is taken for an earlier
+// process of it, as after a crash, and replaced; its leases expire as they
+// are. Join also deletes shards and leases gone for a day.
 func (s *TenantStore) Join(ctx context.Context, sh Shard) error {
 	if err := prepare(ctx, s.pool); err != nil {
 		return fmt.Errorf("set up the job store: %w", err)
@@ -46,6 +54,9 @@ func (s *TenantStore) Join(ctx context.Context, sh Shard) error {
 		// One join at a time: two of different owners must not both pass.
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7231906)`); err != nil {
 			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM shards WHERE host = $1 AND owner = $2 AND id <> $3`, sh.Host, sh.Owner, sh.ID); err != nil {
+			return fmt.Errorf("replace this host's earlier shard: %w", err)
 		}
 		var tenantOwners, same string
 		if err := tx.QueryRow(ctx, `SELECT
@@ -68,9 +79,9 @@ func (s *TenantStore) Join(ctx context.Context, sh Shard) error {
 		if _, err := tx.Exec(ctx, `DELETE FROM leases WHERE expires_at < now() - make_interval(secs => $1)`, forgotten); err != nil {
 			return fmt.Errorf("delete the leases gone: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO shards (id, owner, tenant_owner) VALUES ($1, $2, $3)
-			ON CONFLICT (id) DO UPDATE SET owner = excluded.owner, tenant_owner = excluded.tenant_owner, heartbeat_at = now()`,
-			sh.ID, sh.Owner, sh.TenantOwner); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO shards (id, host, owner, tenant_owner) VALUES ($1, $2, $3, $4)
+			ON CONFLICT (id) DO UPDATE SET host = excluded.host, owner = excluded.owner, tenant_owner = excluded.tenant_owner, heartbeat_at = now()`,
+			sh.ID, sh.Host, sh.Owner, sh.TenantOwner); err != nil {
 			return fmt.Errorf("register the shard: %w", err)
 		}
 		return nil
@@ -87,19 +98,29 @@ func (s *TenantStore) Join(ctx context.Context, sh Shard) error {
 // a deadline it sets before calling, shorter than ttl, on its own monotonic
 // clock, never serves it once another shard may hold the lease: the
 // transaction, and so its now(), begins after that.
+//
+// Renewals run one at a time: two shards whose lists disagree would lock
+// each other's leases in turn, the one releasing what the other takes, and
+// deadlock. One takes milliseconds, every few seconds a shard.
+//
+// A shard the database does not have is ErrNotJoined, and renews nothing.
 func (s *TenantStore) Renew(ctx context.Context, sh Shard, accounts []string, ttl time.Duration) ([]string, error) {
 	var held []string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO shards (id, owner, tenant_owner) VALUES ($1, $2, $3)
-			ON CONFLICT (id) DO UPDATE SET heartbeat_at = now()`, sh.ID, sh.Owner, sh.TenantOwner); err != nil {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7231907)`); err != nil {
+			return fmt.Errorf("wait for the other renewals: %w", err)
+		}
+		tag, err := tx.Exec(ctx, `UPDATE shards SET heartbeat_at = now() WHERE id = $1`, sh.ID)
+		if err != nil {
 			return fmt.Errorf("beat the heartbeat: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotJoined
 		}
 		if _, err := tx.Exec(ctx, `UPDATE leases SET expires_at = now()
 			WHERE shard = $1 AND expires_at > now() AND account <> ALL(coalesce($2::text[], '{}'))`, sh.ID, accounts); err != nil {
 			return fmt.Errorf("release the leases no longer wanted: %w", err)
 		}
-		// In account order, so that two shards renewing at once lock rows
-		// in one order.
 		rows, err := tx.Query(ctx, `INSERT INTO leases (account, shard, expires_at)
 			SELECT a, $1, now() + make_interval(secs => $3) FROM (SELECT DISTINCT unnest($2::text[]) AS a) wanted ORDER BY a
 			ON CONFLICT (account) DO UPDATE SET shard = excluded.shard,

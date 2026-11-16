@@ -5,6 +5,7 @@
 -- owner is the shard's own (--owner), tenant_owner the tenants' (shared).
 CREATE TABLE shards (
     id           text PRIMARY KEY,
+    host         text NOT NULL,
     owner        text NOT NULL,
     tenant_owner text NOT NULL,
     started_at   timestamptz NOT NULL DEFAULT now(),

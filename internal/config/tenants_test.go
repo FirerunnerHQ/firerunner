@@ -202,8 +202,15 @@ func TestTenantLeasesNeedDBAndOwner(t *testing.T) {
 		t.Fatalf("leases on a parameter: %v", err)
 	}
 	c.TenantsPath = "db:"
+	if !c.UsesEC2() {
+		t.Fatal("the fixture has no EC2 tier")
+	}
+	if err := c.validateTenants(); err == nil || !strings.Contains(err.Error(), "--ec2-pool-key-file") {
+		t.Fatalf("leases with EC2 and no pool key: %v", err)
+	}
+	c.EC2PoolKeyFile = "/etc/firerunner/pool-key"
 	if err := c.validateTenants(); err != nil {
-		t.Fatalf("leases on db: with an owner: %v", err)
+		t.Fatalf("leases on db: with owners and a pool key: %v", err)
 	}
 	c.Owner = ""
 	if err := c.validateTenants(); err == nil || !strings.Contains(err.Error(), "--owner") {

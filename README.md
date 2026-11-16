@@ -292,17 +292,25 @@ stops renewing:
   EC2 runners finish their jobs, its scale sets stay registered, and nothing
   is deleted. The next shard's reaper ends those runners once their jobs are
   done.
-- A shard that stops releases its leases once its sessions are closed, so
-  another takes them at its next renewal. One that crashes leaves them to
+- A shard that stops releases its leases once every installation it
+  served has stopped: its sessions closed, and its runners finished or
+  handed on. Another shard takes them at its next renewal. One that crashes leaves them to
   expire, and GitHub holds its sessions for about 50 seconds.
 - An installation removed keeps its lease until its scale sets are deleted.
+  If the lease lapses first, nothing is deleted, as another shard may serve
+  its account by then: delete what it left by hand, as the log says.
+- A renewal that fails is tried again every 2 seconds. A shard that cannot
+  join (its database down, or owners that do not fit) serves its own tiers
+  and no installation, and keeps trying.
 
 Every shard needs the same `--tenant-owner` (`FR_TENANT_OWNER`): an
 installation's instances are tagged `<tenant-owner>/<id>`, which is how the
 next shard finds the runners handed to it. Each needs an `--owner` of its
-own, for its own tiers and pool, and the same pool key
-(`FR_EC2_POOL_KEY_FILE`), without which the next shard cannot prove those
-runners are its to end. A shard refuses to start beside a live one whose
+own, for its own tiers and pool, and with EC2 tiers the same pool key
+(`FR_EC2_POOL_KEY_FILE`), by which the next shard proves those runners are
+its to end. The CloudFormation templates scope the control VM's role and the
+reaper to `<Owner>` and `<Owner>/*`; a shard's role also needs
+`<tenant-owner>/*`, which no template parameter grants yet. A shard refuses to start beside a live one whose
 `--tenant-owner` differs or whose `--owner` is the same. `firerunner status`
 shows the shard and how many installations it holds; `firerunner doctor`
 warns while renewals fail (`tenant-leases`). Each shard holds every lease it

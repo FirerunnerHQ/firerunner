@@ -23,6 +23,8 @@ type fakeLeases struct {
 	// when set, fails them.
 	grant []string
 	err   error
+	// errs fail the next renewals, one each, before err.
+	errs []error
 	// during runs inside each renewal, as a slow database would.
 	during   func()
 	asked    [][]string
@@ -41,6 +43,9 @@ func (f *fakeLeases) Join(_ context.Context, sh jobstore.Shard) error {
 func (f *fakeLeases) Renew(_ context.Context, _ jobstore.Shard, accounts []string, ttl time.Duration) ([]string, error) {
 	f.mu.Lock()
 	during, err := f.during, f.err
+	if len(f.errs) > 0 {
+		err, f.errs = f.errs[0], f.errs[1:]
+	}
 	f.asked = append(f.asked, slices.Clone(accounts))
 	var held []string
 	for _, a := range accounts {
@@ -78,6 +83,13 @@ func (f *fakeLeases) fail(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.err = err
+}
+
+// counts is how many joins and renewals there have been.
+func (f *fakeLeases) counts() (joins, renewals int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.joined), len(f.asked)
 }
 
 // lastAsked is the accounts the last renewal asked for.
@@ -209,6 +221,41 @@ func TestLeaserKeepsTheLeaseOfARemovedTenantDraining(t *testing.T) {
 	}
 }
 
+// A removed tenant deletes what it registered only while its lease holds:
+// renewals that keep its account move its deadline on; once they fail past
+// it, another shard may serve the account under the same scale set names,
+// and it deletes nothing.
+func TestLeaserRemovedTenantDeletesOnlyUnderItsLease(t *testing.T) {
+	for _, renewed := range []bool{true, false} {
+		l, c, store, lr := leaserLab(t)
+		lr.apply([]config.Tenant{listed("a", 2, "x")})
+		store.set(acct("a"))
+		mustRenew(t, lr)
+		l.started("a")
+
+		lr.apply(nil)
+		l.ended("a", errTenantRemoved)
+		if !renewed {
+			store.fail(errors.New("connection refused"))
+		}
+		for range 3 { // 30s of draining, renewed every 10s or not at all
+			c.advance(10 * time.Second)
+			_ = lr.renew(context.Background())
+		}
+		l.finish("a")
+		l.set.wg.Wait()
+		l.mu.Lock()
+		removed := slices.Clone(l.removed)
+		l.mu.Unlock()
+		if renewed && len(removed) != 1 {
+			t.Fatalf("renewed throughout: deleted %v, want a's", removed)
+		}
+		if !renewed && len(removed) != 0 {
+			t.Fatalf("lease lapsed: deleted %v, want nothing", removed)
+		}
+	}
+}
+
 // The catalog applies each list it reads through the leaser.
 func TestTenantCatalogAppliesUnderLeases(t *testing.T) {
 	l, _, store, lr := leaserLab(t)
@@ -226,7 +273,7 @@ func TestTenantCatalogAppliesUnderLeases(t *testing.T) {
 	l.started("a")
 }
 
-// join registers the shard, and says which when it may not.
+// join registers the shard, and says which when it may not, in status too.
 func TestLeaserJoin(t *testing.T) {
 	_, _, store, lr := leaserLab(t)
 	if err := lr.join(context.Background()); err != nil {
@@ -237,6 +284,9 @@ func TestLeaserJoin(t *testing.T) {
 	if !errors.Is(err, jobstore.ErrOwnerDiffers) || !strings.Contains(err.Error(), "s1") {
 		t.Fatalf("join = %v", err)
 	}
+	if st := lr.status(); !st.Failing() || !strings.Contains(st.LastError, "owner") {
+		t.Fatalf("status %+v, want the join's error", st)
+	}
 	lr.release(context.Background())
 	if len(store.released) != 1 || store.released[0].ID != "s1" {
 		t.Fatalf("released %v", store.released)
@@ -246,8 +296,60 @@ func TestLeaserJoin(t *testing.T) {
 // Two processes never share a shard id, even on one host.
 func TestShardIDIsUnique(t *testing.T) {
 	host, _ := os.Hostname()
-	a, b := shardID(), shardID()
-	if a == b || !strings.HasPrefix(a, host+"-") || !strings.HasPrefix(b, host+"-") {
-		t.Fatalf("shard ids %q and %q, want two of host %q", a, b, host)
+	a, b := newShard("vm-1", "fr"), newShard("vm-1", "fr")
+	if a.ID == b.ID || !strings.HasPrefix(a.ID, host+"-") || a.Host != host || a.Owner != "vm-1" || a.TenantOwner != "fr" {
+		t.Fatalf("shards %+v and %+v, want two of host %q", a, b, host)
+	}
+}
+
+// run joins and renews at once, and every tick after. A failure, of the
+// join or a renewal, is tried again after leaseRetry rather than at the
+// next tick: one blip must not let every tenant's deadline pass. A shard
+// the database lost joins again.
+func TestLeaserRunRetries(t *testing.T) {
+	_, _, store, lr := leaserLab(t)
+	tick, retry := make(chan time.Time), make(chan time.Time)
+	lr.tick = tick
+	waits := make(chan time.Duration)
+	lr.after = func(d time.Duration) <-chan time.Time {
+		waits <- d
+		return retry
+	}
+	store.joinErr = errors.New("connection refused")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); lr.run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	retried := func(what string, wantJoins, wantRenewals int) {
+		t.Helper()
+		select {
+		case d := <-waits:
+			if d != leaseRetry {
+				t.Fatalf("%s: waits %s, want %s", what, d, leaseRetry)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: no retry", what)
+		}
+		if j, r := store.counts(); j != wantJoins || r != wantRenewals {
+			t.Fatalf("%s: %d joins and %d renewals, want %d and %d", what, j, r, wantJoins, wantRenewals)
+		}
+	}
+	retried("join refused", 1, 0)
+
+	store.mu.Lock()
+	store.joinErr = nil
+	store.errs = []error{errors.New("timeout"), jobstore.ErrNotJoined}
+	store.mu.Unlock()
+	retry <- time.Time{}
+	retried("renewal failed", 2, 1)
+	retry <- time.Time{}
+	retried("shard lost", 2, 2)
+	retry <- time.Time{} // joins again, and renews
+	waitFor(t, "a join and a renewal", func() bool { j, r := store.counts(); return j == 3 && r == 3 })
+	tick <- time.Time{}
+	waitFor(t, "the tick's renewal", func() bool { _, r := store.counts(); return r == 4 })
+	if st := lr.status(); st.Failing() {
+		t.Fatalf("status %+v after a renewal", st)
 	}
 }

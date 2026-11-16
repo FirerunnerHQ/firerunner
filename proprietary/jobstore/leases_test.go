@@ -23,7 +23,7 @@ func joined(t *testing.T, ids ...string) (*TenantStore, string, []Shard) {
 	s, dsn := openTenantStore(t)
 	var shards []Shard
 	for _, id := range ids {
-		sh := Shard{ID: id, Owner: "vm-" + id, TenantOwner: "fr"}
+		sh := Shard{ID: id, Host: "h-" + id, Owner: "vm-" + id, TenantOwner: "fr"}
 		if err := s.Join(context.Background(), sh); err != nil {
 			t.Fatal(err)
 		}
@@ -144,7 +144,7 @@ func TestLeasesRelease(t *testing.T) {
 func TestJoinRefusesOwnersThatDoNotFit(t *testing.T) {
 	s, dsn, sh := joined(t, "a")
 	ctx := context.Background()
-	if err := s.Join(ctx, Shard{ID: "b", Owner: "vm-b", TenantOwner: "fr"}); err != nil {
+	if err := s.Join(ctx, Shard{ID: "b", Host: "h-b", Owner: "vm-b", TenantOwner: "fr"}); err != nil {
 		t.Fatalf("a shard of its own owner and the tenants' owner: %v", err)
 	}
 	if err := s.Join(ctx, sh[0]); err != nil {
@@ -154,8 +154,8 @@ func TestJoinRefusesOwnersThatDoNotFit(t *testing.T) {
 		sh   Shard
 		want string
 	}{
-		{Shard{ID: "c", Owner: "vm-c", TenantOwner: "other"}, "--tenant-owner fr, not other"},
-		{Shard{ID: "c", Owner: "vm-a", TenantOwner: "fr"}, "live shard a has --owner vm-a too"},
+		{Shard{ID: "c", Host: "h-c", Owner: "vm-c", TenantOwner: "other"}, "--tenant-owner fr, not other"},
+		{Shard{ID: "c", Host: "h-c", Owner: "vm-a", TenantOwner: "fr"}, "live shard a has --owner vm-a too"},
 	} {
 		err := s.Join(ctx, c.sh)
 		if !errors.Is(err, ErrOwnerDiffers) || !strings.Contains(err.Error(), c.want) {
@@ -166,9 +166,31 @@ func TestJoinRefusesOwnersThatDoNotFit(t *testing.T) {
 		t.Fatal("a refused shard was registered")
 	}
 	exec(t, dsn, `UPDATE shards SET heartbeat_at = now() - interval '2 minutes'`)
-	if err := s.Join(ctx, Shard{ID: "c", Owner: "vm-a", TenantOwner: "other"}); err != nil {
+	if err := s.Join(ctx, Shard{ID: "c", Host: "h-c", Owner: "vm-a", TenantOwner: "other"}); err != nil {
 		t.Fatalf("Join once the others stopped beating: %v", err)
 	}
+}
+
+// A process started again on its host, with its owner, replaces the shard
+// it was before, as after a crash: it is not refused as a second shard of
+// that owner. The earlier one's leases are not handed on: they expire as
+// they are, and it renews nothing more.
+func TestJoinReplacesThisHostsEarlierShard(t *testing.T) {
+	s, dsn, sh := joined(t, "a")
+	held(t, s, sh[0], []string{"x"}, "x")
+	again := Shard{ID: "a2", Host: sh[0].Host, Owner: sh[0].Owner, TenantOwner: "fr"}
+	if err := s.Join(context.Background(), again); err != nil {
+		t.Fatalf("joining again after a crash: %v", err)
+	}
+	if n := query[int64](t, dsn, `SELECT count(*) FROM shards WHERE id = 'a'`); n != 0 {
+		t.Fatal("the earlier shard is still registered")
+	}
+	if _, err := s.Renew(context.Background(), sh[0], []string{"x"}, testTTL); !errors.Is(err, ErrNotJoined) {
+		t.Fatalf("the earlier shard's renewal = %v, want ErrNotJoined", err)
+	}
+	held(t, s, again, nil, "x")
+	exec(t, dsn, `UPDATE leases SET expires_at = now() - interval '1 second'`)
+	held(t, s, again, []string{"x"}, "x")
 }
 
 // Join forgets the shards and leases gone for a day.
@@ -177,7 +199,7 @@ func TestJoinForgetsTheLongGone(t *testing.T) {
 	held(t, s, sh[0], []string{"x", "y"}, "x", "y")
 	exec(t, dsn, `UPDATE leases SET expires_at = now() - interval '25 hours' WHERE account = 'x'`)
 	exec(t, dsn, `UPDATE shards SET heartbeat_at = now() - interval '25 hours'`)
-	if err := s.Join(context.Background(), Shard{ID: "b", Owner: "vm-b", TenantOwner: "fr"}); err != nil {
+	if err := s.Join(context.Background(), Shard{ID: "b", Host: "h-b", Owner: "vm-b", TenantOwner: "fr"}); err != nil {
 		t.Fatal(err)
 	}
 	if n := query[int64](t, dsn, `SELECT count(*) FROM shards`); n != 1 {
@@ -189,7 +211,9 @@ func TestJoinForgetsTheLongGone(t *testing.T) {
 }
 
 // Shards renewing the same accounts at once, each in its own order, never
-// share one, and none of them fails.
+// share one, and none of them fails: not even when their lists disagree, so
+// that each releases leases the others want, which deadlocks a transaction
+// now and then.
 func TestLeasesUnderContention(t *testing.T) {
 	ids := []string{"a", "b", "c", "d", "e", "f"}
 	s, _, sh := joined(t, ids...)
@@ -197,7 +221,7 @@ func TestLeasesUnderContention(t *testing.T) {
 	for i := range 20 {
 		accounts = append(accounts, fmt.Sprintf("acct%02d", i))
 	}
-	for round := range 5 {
+	for round := range 30 {
 		holders := map[string][]string{}
 		var mu sync.Mutex
 		var wg sync.WaitGroup
@@ -205,6 +229,9 @@ func TestLeasesUnderContention(t *testing.T) {
 		for _, x := range sh {
 			mine := slices.Clone(accounts)
 			rand.Shuffle(len(mine), func(i, j int) { mine[i], mine[j] = mine[j], mine[i] })
+			if round >= 5 {
+				mine = mine[:len(mine)/2] // the rest released, if held
+			}
 			wg.Go(func() {
 				got, err := s.Renew(context.Background(), x, mine, testTTL)
 				if err != nil {
@@ -224,7 +251,7 @@ func TestLeasesUnderContention(t *testing.T) {
 			t.Fatalf("round %d: %v", round, err)
 		}
 		for _, a := range accounts {
-			if len(holders[a]) != 1 {
+			if len(holders[a]) > 1 || (round < 5 && len(holders[a]) != 1) {
 				t.Fatalf("round %d: %s held by %v, want one shard", round, a, holders[a])
 			}
 		}

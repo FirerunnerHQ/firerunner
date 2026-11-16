@@ -59,6 +59,18 @@ func handedOffTenant(ctx context.Context) bool {
 	return errors.Is(context.Cause(ctx), errTenantHandedOff)
 }
 
+// leaseKey carries a run's lapsed check in its context.
+type leaseKey struct{}
+
+// leaseLapsed reports whether the tenant's run serves past its lease's
+// deadline: another shard may serve its account now, and register scale
+// sets there under the names this run's would delete. False for a run with
+// no lease.
+func leaseLapsed(ctx context.Context) bool {
+	lapsed, _ := ctx.Value(leaseKey{}).(func() bool)
+	return lapsed != nil && lapsed()
+}
+
 // tenantSource is where the tenants list is kept.
 type tenantSource interface {
 	// Load returns the list as written.
@@ -394,7 +406,7 @@ func (ts *tenantSet) applyLeases(list []config.Tenant, leases map[string]time.Ti
 			}
 		}
 		r.cur.Store(&c)
-		ctx, cancel := context.WithCancelCause(ts.ctx)
+		ctx, cancel := context.WithCancelCause(context.WithValue(ts.ctx, leaseKey{}, func() bool { return r.expired(ts.clock()) }))
 		r.cancel = cancel
 		ts.running[c.ID] = r
 		ts.renewLocked(r, deadline)
@@ -405,9 +417,14 @@ func (ts *tenantSet) applyLeases(list []config.Tenant, leases map[string]time.Ti
 			// Before done: a run after it on the account must not register
 			// what this deletes.
 			defer func() {
-				if removedTenant(ctx) && ts.removed != nil {
-					ts.removed(*r.cur.Load())
+				if !removedTenant(ctx) || ts.removed == nil {
+					return
 				}
+				if leaseLapsed(ctx) {
+					ts.log.Warn("removed tenant's lease lapsed before its scale sets and machines were deleted: leaving them, as another shard may serve its account; delete them by hand", "tenant", r.id)
+					return
+				}
+				ts.removed(*r.cur.Load())
 			}()
 			// Whatever happens to this run, its done waits on the ones
 			// before: a run after it must not start beside them.
@@ -426,6 +443,20 @@ func (ts *tenantSet) applyLeases(list []config.Tenant, leases map[string]time.Ti
 				st.bound.SetFence(fence)
 			})
 		})
+	}
+}
+
+// renewRemoving moves the deadline of each run removed that has not ended
+// to its account's in held, the leases just renewed: it deletes its scale
+// sets only while its lease holds. One whose account is not in held keeps
+// its deadline, which lapses.
+func (ts *tenantSet) renewRemoving(held map[string]time.Time) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	for _, r := range ts.ending {
+		if d, ok := held[r.account]; ok && r.removing && r.deadline.Load() != nil {
+			r.deadline.Store(&d)
+		}
 	}
 }
 
