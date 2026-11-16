@@ -712,6 +712,11 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 	if ctx.Err() != nil {
 		return
 	}
+	// A fence closed since the plan granted this launch: it must not even
+	// register a runner.
+	if s.fencedLaunch("") {
+		return
+	}
 
 	jitStart := time.Now()
 	name, jit, err := s.opts.JIT.Generate(context.WithoutCancel(ctx), s.opts.Spec)
@@ -876,7 +881,31 @@ func (s *Scheduler) track(name string, cancel context.CancelCauseFunc) {
 	}
 	if why := s.opts.Tenant.suspension(); why != "" {
 		s.stopLocked(name, h, Stop{Kind: StopSuspended, Reason: why})
+		return
 	}
+	// The last check before the provisioner asks for the runner's machine,
+	// under the lock (see Tenant.SetFence).
+	if s.fencedLaunch(name) {
+		h.cancelled = true
+		h.cancel(errFenced)
+	}
+}
+
+// errFenced is the cause of a launch stopped by its tenant's fence.
+var errFenced = errors.New("the tenant's lease has ended")
+
+// fencedLaunch reports whether the tenant's fence stops a launch, and logs
+// it. name is the runner's, "" before it has one.
+func (s *Scheduler) fencedLaunch(name string) bool {
+	if s.opts.Tenant == nil {
+		return false
+	}
+	why := s.opts.Tenant.fenced()
+	if why == "" {
+		return false
+	}
+	s.opts.Logger.Info("launch stopped: the tenant's lease has ended", "runner", name, "why", why)
+	return true
 }
 
 // stopAll stops every runner the scheduler has, busy or not, for stop: its
