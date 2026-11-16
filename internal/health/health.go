@@ -210,6 +210,11 @@ type TenantLeases struct {
 	// Listed how many the list has.
 	Tenants int `json:"tenants"`
 	Listed  int `json:"listed"`
+	// Assigner is set while this shard assigns the tenants to the shards,
+	// and Unplaced says, for each tenant it could not place, why
+	// ("<id>: <why>"): it is served by no shard.
+	Assigner bool     `json:"assigner,omitempty"`
+	Unplaced []string `json:"unplaced,omitempty"`
 	// LastRenewed is the last successful renewal; zero before the first.
 	LastRenewed time.Time `json:"last_renewed,omitzero"`
 	LastError   string    `json:"last_error,omitempty"`

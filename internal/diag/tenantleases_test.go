@@ -50,6 +50,17 @@ func TestStatusAndDoctorShowTheTenantLeases(t *testing.T) {
 		t.Fatalf("doctor = %+v", c)
 	}
 
+	f.TenantLeases.Assigner = true
+	f.TenantLeases.Unplaced = []string{"big: it lists 41 tiers, over the 40 a tenant may have"}
+	write()
+	if s := status(); !strings.Contains(s, "this shard assigns the tenants") || !strings.Contains(s, "not served: big: it lists 41 tiers") {
+		t.Fatalf("status of the assigner:\n%s", s)
+	}
+	if c := check(); c == nil || c.Level != levelWarn || !strings.Contains(c.Detail, "big: it lists 41 tiers") {
+		t.Fatalf("doctor with a tenant unplaced = %+v", c)
+	}
+	f.TenantLeases.Unplaced = nil
+
 	f.TenantLeases.LastError, f.TenantLeases.LastErrorAt = "renew the leases: connection refused", now
 	write()
 	if s := status(); !strings.Contains(s, "last renewal failed") || !strings.Contains(s, "connection refused") {

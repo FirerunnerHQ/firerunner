@@ -494,6 +494,12 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				last = humanDuration(time.Since(tl.LastRenewed).Truncate(time.Second)) + " ago"
 			}
 			fmt.Fprintf(w, "  shard %s holds the leases of %d of %d tenant(s) listed, renewed %s\n", tl.Shard, tl.Tenants, tl.Listed, last)
+			if tl.Assigner {
+				fmt.Fprintf(w, "  this shard assigns the tenants to the shards; %d placed on none\n", len(tl.Unplaced))
+				for _, u := range tl.Unplaced {
+					fmt.Fprintf(w, "    not served: %s\n", truncate(u, 200))
+				}
+			}
 			if tl.Failing() {
 				fmt.Fprintf(w, "  last renewal failed %s ago; each tenant is handed off 20s after the last successful renewal was sent: %s\n",
 					humanDuration(time.Since(tl.LastErrorAt).Truncate(time.Second)), truncate(tl.LastError, 200))
@@ -1034,6 +1040,10 @@ func tenantLeasesCheck(f health.File, now time.Time) *Check {
 	}
 	if tl.LastRenewed.IsZero() {
 		c := warn("tenant-leases", "shard %s has not renewed its tenant leases yet", tl.Shard)
+		return &c
+	}
+	if len(tl.Unplaced) > 0 {
+		c := warn("tenant-leases", "%d tenant(s) placed on no shard, so not served: %s", len(tl.Unplaced), truncate(strings.Join(tl.Unplaced, "; "), 300))
 		return &c
 	}
 	c := pass("tenant-leases", "shard %s holds the leases of %d of %d tenant(s) listed, renewed %s ago", tl.Shard, tl.Tenants, tl.Listed,

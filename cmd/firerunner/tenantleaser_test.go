@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -19,10 +20,18 @@ import (
 // what it was asked.
 type fakeLeases struct {
 	mu sync.Mutex
-	// grant is the accounts the next renewals hold, of those asked; err,
-	// when set, fails them.
+	// grant is the accounts the next renewals hold: those assigned to the
+	// shard, the assigner's lease among them when it is; err, when set,
+	// fails them.
 	grant []string
 	err   error
+	// shards and assignments are what Placement reads; Assign writes
+	// assignments, and counts in assigns.
+	shards      []jobstore.ShardState
+	assignments map[string]jobstore.Assignment
+	assigns     int
+	assignErr   error
+	drained     []string
 	// errs fail the next renewals, one each, before err.
 	errs []error
 	// during runs inside each renewal, as a slow database would.
@@ -47,12 +56,7 @@ func (f *fakeLeases) Renew(_ context.Context, _ jobstore.Shard, accounts []strin
 		err, f.errs = f.errs[0], f.errs[1:]
 	}
 	f.asked = append(f.asked, slices.Clone(accounts))
-	var held []string
-	for _, a := range accounts {
-		if slices.Contains(f.grant, a) {
-			held = append(held, a)
-		}
-	}
+	held := slices.Clone(f.grant)
 	f.mu.Unlock()
 	if ttl != leaseTTL {
 		return nil, errors.New("asked for another ttl")
@@ -70,6 +74,30 @@ func (f *fakeLeases) Release(_ context.Context, sh jobstore.Shard) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.released = append(f.released, sh)
+	return nil
+}
+
+func (f *fakeLeases) Placement(context.Context) ([]jobstore.ShardState, map[string]jobstore.Assignment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.shards), maps.Clone(f.assignments), nil
+}
+
+func (f *fakeLeases) Assign(_ context.Context, _ jobstore.Shard, next map[string]jobstore.Assignment) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.assignErr != nil {
+		return f.assignErr
+	}
+	f.assignments = maps.Clone(next)
+	f.assigns++
+	return nil
+}
+
+func (f *fakeLeases) Drain(_ context.Context, sh jobstore.Shard) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drained = append(f.drained, sh.ID)
 	return nil
 }
 
@@ -92,14 +120,19 @@ func (f *fakeLeases) counts() (joins, renewals int) {
 	return len(f.joined), len(f.asked)
 }
 
-// lastAsked is the accounts the last renewal asked for.
+// lastAsked is the accounts the last renewal asked for beyond those
+// assigned to it, but for the assigner's lease, which every one asks for.
 func (f *fakeLeases) lastAsked() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.asked) == 0 {
 		return nil
 	}
-	return f.asked[len(f.asked)-1]
+	last := f.asked[len(f.asked)-1]
+	if !slices.Contains(last, jobstore.AssignerLease) {
+		return []string{"(not the assigner's lease)"}
+	}
+	return slices.DeleteFunc(slices.Clone(last), func(a string) bool { return a == jobstore.AssignerLease })
 }
 
 func acct(id string) string { return config.AccountOf(listed(id, 1, "x").URL) }
@@ -119,15 +152,14 @@ func mustRenew(t *testing.T, lr *tenantLeaser) {
 	}
 }
 
-// A shard serves the tenants whose accounts it holds the lease of, asks for
-// the account of each tenant listed, and hands a tenant off once another
-// shard holds its lease.
+// A shard serves the tenants whose accounts it holds the lease of, and
+// hands a tenant off once another shard holds its lease. It asks for no
+// listed account itself: those assigned to it are renewed as such.
 func TestLeaserServesWhatItLeases(t *testing.T) {
 	l, _, store, lr := leaserLab(t)
-	// Before a list, a renewal only beats the heartbeat.
 	mustRenew(t, lr)
 	if got := store.lastAsked(); len(got) != 0 {
-		t.Fatalf("asked for %v before a list", got)
+		t.Fatalf("asked for %v", got)
 	}
 
 	list := []config.Tenant{listed("a", 2, "x"), listed("b", 2, "x")}
@@ -137,8 +169,8 @@ func TestLeaserServesWhatItLeases(t *testing.T) {
 	}
 	store.set(acct("a"))
 	mustRenew(t, lr)
-	if got, want := store.lastAsked(), []string{acct("a"), acct("b")}; !slices.Equal(got, want) {
-		t.Fatalf("asked for %v, want %v", got, want)
+	if got := store.lastAsked(); len(got) != 0 {
+		t.Fatalf("asked for %v, want the assigned alone", got)
 	}
 	l.started("a")
 	if _, ok := l.runs()["b"]; ok {

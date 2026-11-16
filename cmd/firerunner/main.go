@@ -1426,6 +1426,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	installPanic := sync.OnceFunc(func() { _ = guardAfterPanic(nil, panicStopLimit(served.t.Limits.JobDuration), "the install", log) })
 	runErr := serveTiers(runCtx, cancel, served.names(), served.runs(cfg), installPanic, log)
 	cancel()
+	if leaser != nil {
+		// The assigner moves this shard's tenants to the others now.
+		leaser.drain(ctx)
+	}
 	// No tier is listening any more. Stop refreshing the health file before
 	// the drain, which can wait out long jobs: a file that keeps its last
 	// write time ages into "stale" instead of claiming live listeners.
