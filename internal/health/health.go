@@ -201,6 +201,27 @@ func (s TenantStates) Failing() bool {
 	return s.LastError != "" && !s.LastErrorAt.Before(s.LastRead)
 }
 
+// TenantLeases is how renewing this shard's tenant leases goes
+// (--tenant-leases).
+type TenantLeases struct {
+	// Shard is this process's id among the shards.
+	Shard string `json:"shard"`
+	// Tenants is how many tenants of the list it holds the lease of, and
+	// Listed how many the list has.
+	Tenants int `json:"tenants"`
+	Listed  int `json:"listed"`
+	// LastRenewed is the last successful renewal; zero before the first.
+	LastRenewed time.Time `json:"last_renewed,omitzero"`
+	LastError   string    `json:"last_error,omitempty"`
+	LastErrorAt time.Time `json:"last_error_at,omitzero"`
+}
+
+// Failing reports whether the latest renewal failed: the tenants are handed
+// off once their leases' deadlines pass.
+func (l TenantLeases) Failing() bool {
+	return l.LastError != "" && !l.LastErrorAt.Before(l.LastRenewed)
+}
+
 // GuardDuty is how the daemon's reading of GuardDuty findings goes
 // (--guardduty).
 type GuardDuty struct {
@@ -533,6 +554,9 @@ type File struct {
 	// the daemon has one. A list read but rejected counts as a failed read:
 	// the tenants served stay as they were.
 	TenantCatalog *TenantStates `json:"tenant_catalog,omitempty"`
+	// TenantLeases is how renewing the tenants' leases goes, when the
+	// daemon serves them under leases (--tenant-leases).
+	TenantLeases *TenantLeases `json:"tenant_leases,omitempty"`
 }
 
 // ConnRefusals is a listener's connections refused at its connection caps.

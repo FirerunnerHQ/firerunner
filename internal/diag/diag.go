@@ -488,6 +488,17 @@ func renderStatusText(r StatusReport, w io.Writer) {
 					humanDuration(time.Since(tc.LastErrorAt).Truncate(time.Second)), truncate(tc.LastError, 200))
 			}
 		}
+		if tl := l.TenantLeases; tl != nil {
+			last := "never"
+			if !tl.LastRenewed.IsZero() {
+				last = humanDuration(time.Since(tl.LastRenewed).Truncate(time.Second)) + " ago"
+			}
+			fmt.Fprintf(w, "  shard %s holds the leases of %d of %d tenant(s) listed, renewed %s\n", tl.Shard, tl.Tenants, tl.Listed, last)
+			if tl.Failing() {
+				fmt.Fprintf(w, "  last renewal failed %s ago; each tenant is handed off 20s after the last successful renewal was sent: %s\n",
+					humanDuration(time.Since(tl.LastErrorAt).Truncate(time.Second)), truncate(tl.LastError, 200))
+			}
+		}
 		if ts := l.TenantStates; ts != nil {
 			last := "never"
 			if !ts.LastRead.IsZero() {
@@ -835,6 +846,9 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 		return []Check{warn("listeners", "listener state last updated %s ago; is the daemon running?", humanDuration(now.Sub(li.WrittenAt).Truncate(time.Second)))}
 	}
 	var checks []Check
+	if c := tenantLeasesCheck(li.File, now); c != nil {
+		checks = append(checks, *c)
+	}
 	if c := tenantCatalogCheck(li.File, now); c != nil {
 		checks = append(checks, *c)
 	}
@@ -1001,6 +1015,29 @@ func tenantCatalogCheck(f health.File, now time.Time) *Check {
 		return &c
 	}
 	c := pass("tenant-catalog", "read from %s %s ago", tc.Store, humanDuration(now.Sub(tc.LastRead).Truncate(time.Second)))
+	return &c
+}
+
+// tenantLeasesCheck judges the renewal of this shard's tenant leases, nil
+// when it serves none under leases: WARN while renewals fail (each tenant is
+// handed off at its deadline, so another shard may serve it) or before the
+// first, else PASS.
+func tenantLeasesCheck(f health.File, now time.Time) *Check {
+	tl := f.TenantLeases
+	if tl == nil {
+		return nil
+	}
+	if tl.Failing() {
+		c := warn("tenant-leases", "shard %s cannot renew its tenant leases (%s ago): %s; its tenants are handed off 20s after the last successful renewal was sent", tl.Shard,
+			humanDuration(now.Sub(tl.LastErrorAt).Truncate(time.Second)), truncate(tl.LastError, 200))
+		return &c
+	}
+	if tl.LastRenewed.IsZero() {
+		c := warn("tenant-leases", "shard %s has not renewed its tenant leases yet", tl.Shard)
+		return &c
+	}
+	c := pass("tenant-leases", "shard %s holds the leases of %d of %d tenant(s) listed, renewed %s ago", tl.Shard, tl.Tenants, tl.Listed,
+		humanDuration(now.Sub(tl.LastRenewed).Truncate(time.Second)))
 	return &c
 }
 

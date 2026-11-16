@@ -264,6 +264,15 @@ func (s *shard) eventsFor(t tenant) jobevent.Sink {
 }
 
 // extraTenant is a tenant from the --tenants file, on the install's App.
+// tenantOwnerOf is the owner tag the tenants' instances are tagged under,
+// <it>/<id>: --tenant-owner, or else the install's owner.
+func tenantOwnerOf(cfg *config.Config, owner string) string {
+	if cfg.TenantOwner != "" {
+		return cfg.TenantOwner
+	}
+	return owner
+}
+
 func extraTenant(cfg *config.Config, c config.Tenant, owner string, jwt *ghauth.JWT) tenant {
 	group := c.RunnerGroup
 	if group == "" {
@@ -1086,12 +1095,14 @@ type tenantStop struct{ sessionsFirst, handOff, remove bool }
 // ended. A tenant handed off to another shard closes its sessions first, so
 // that shard opens them at once rather than after GitHub's hold, and never
 // deletes a scale set: the next shard may be serving it already. A removed
-// one deletes them once its runners have finished.
+// one deletes them once its runners have finished, unless its lease has
+// lapsed meanwhile: another shard may be serving its account, under the
+// same scale set names.
 func (s *shard) stopPlan(tenantCtx context.Context) tenantStop {
 	return tenantStop{
 		sessionsFirst: handedOffTenant(tenantCtx),
 		handOff:       s.handsOff(tenantCtx),
-		remove:        removedTenant(tenantCtx),
+		remove:        removedTenant(tenantCtx) && !leaseLapsed(tenantCtx),
 	}
 }
 

@@ -311,6 +311,13 @@ func TestTenantSetKnown(t *testing.T) {
 		t.Fatal("a tenant still stopping is unknown")
 	}
 	l.finish("a")
+
+	// On a leased shard, a tenant listed but served by another shard is
+	// known too: the findings on its machines must not be passed over.
+	l.set.applyLeases([]config.Tenant{listed("b", 2, "x")}, map[string]time.Time{})
+	if !l.set.known("b") {
+		t.Fatal("a tenant listed and served elsewhere is unknown")
+	}
 }
 
 // A change that comes while the last is still waiting for runners to finish

@@ -190,6 +190,50 @@ func TestTenantsInDB(t *testing.T) {
 	}
 }
 
+// --tenant-leases keeps its leases beside the tenants table, and hands a
+// tenant's runners on by --owner: it needs both.
+func TestTenantLeasesNeedDBAndOwner(t *testing.T) {
+	c := tenantConfig()
+	c.JobEventsDSNFile = "/etc/firerunner/job-events-dsn"
+	c.TenantLeases = true
+	c.Owner, c.TenantOwner = "vm-1", "fr"
+	c.TenantsPath = "ssm:/fr/control/tenants"
+	if err := c.validateTenants(); err == nil || !strings.Contains(err.Error(), "--tenants db:") {
+		t.Fatalf("leases on a parameter: %v", err)
+	}
+	c.TenantsPath = "db:"
+	if !c.UsesEC2() {
+		t.Fatal("the fixture has no EC2 tier")
+	}
+	if err := c.validateTenants(); err == nil || !strings.Contains(err.Error(), "--ec2-pool-key-file") {
+		t.Fatalf("leases with EC2 and no pool key: %v", err)
+	}
+	c.EC2PoolKeyFile = "/etc/firerunner/pool-key"
+	if err := c.validateTenants(); err != nil {
+		t.Fatalf("leases on db: with owners and a pool key: %v", err)
+	}
+	c.Owner = ""
+	if err := c.validateTenants(); err == nil || !strings.Contains(err.Error(), "--owner") {
+		t.Fatalf("leases with no owner: %v", err)
+	}
+	c.Owner, c.TenantOwner = "vm-1", ""
+	if err := c.validateTenants(); err == nil || !strings.Contains(err.Error(), "--tenant-owner") {
+		t.Fatalf("leases with no tenant owner: %v", err)
+	}
+	t.Setenv("FR_JOB_EVENTS_DSN", "postgres://u@h/db")
+	t.Setenv("FR_TENANT_LEASES", "true")
+	p, err := Parse([]string{"--url", "https://github.com/o", "--token", "t", "--tenants", "db:", "--owner", "vm-1", "--tenant-owner", "fr"})
+	if err != nil || !p.TenantLeases || p.TenantOwner != "fr" {
+		t.Fatalf("Parse: %v, leases %v, tenant owner %q", err, p.TenantLeases, p.TenantOwner)
+	}
+	for _, bad := range []string{"fr/x", " fr", "aws:fr", strings.Repeat("f", 65)} {
+		p.TenantOwner = bad
+		if err := p.validateTenants(); err == nil || !strings.Contains(err.Error(), "--tenant-owner") {
+			t.Fatalf("tenant owner %q: %v", bad, err)
+		}
+	}
+}
+
 // A parameter is not a file: Parse reads nothing for it.
 func TestParseLeavesAParameterToTheDaemon(t *testing.T) {
 	c, err := Parse([]string{"--url", "https://github.com/o", "--token", "t", "--tenants", "ssm:/fr/control/tenants"})

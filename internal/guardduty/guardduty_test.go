@@ -59,7 +59,7 @@ func newRig(t *testing.T) *rig {
 // poller is a fresh poller on the rig's store, as after a restart.
 func (r *rig) poller() *Poller {
 	return &Poller{
-		API: r.gd, Store: r.store, Tenant: Owners("inst", func(id string) bool { return id == "acme" }),
+		API: r.gd, Store: r.store, Tenant: Owners("inst", "inst", func(id string) bool { return id == "acme" }),
 		MinSeverity: DefaultMinSeverity, now: r.clock.now,
 		Account: func(context.Context) (string, error) { return ownAccount, nil },
 		OnFlag:  func(f Flagged) { r.flagged = append(r.flagged, f) },
@@ -436,8 +436,10 @@ func TestAdvance(t *testing.T) {
 }
 
 func TestOwners(t *testing.T) {
-	served := Owners("inst", func(id string) bool { return id == "acme" })
-	anyID := Owners("inst", nil)
+	served := Owners("inst", "inst", func(id string) bool { return id == "acme" })
+	anyID := Owners("inst", "inst", nil)
+	// A shard's own tag, and the tenants' that shards share.
+	shard := Owners("vm-1", "fr", nil)
 	for _, c := range []struct {
 		owner string
 		f     func(string) (string, bool)
@@ -452,6 +454,10 @@ func TestOwners(t *testing.T) {
 		{"inst2/acme", served, ""},
 		{"insta", anyID, ""},
 		{"", anyID, ""},
+		{"vm-1", shard, tenantstate.Install},
+		{"fr/acme", shard, "acme"},
+		{"vm-1/acme", shard, ""},
+		{"vm-2", shard, ""},
 	} {
 		got, ok := c.f(c.owner)
 		if got != c.want || ok != (c.want != "") {

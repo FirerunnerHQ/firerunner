@@ -260,7 +260,8 @@ seconds, and follows it without a restart:
   one's list first, and add it to the other's once this one logs `ended
   what a removed tenant left on EC2` (or warns that some may be left).
   Two daemons never share an `--owner`: each would end the other's
-  machines.
+  machines. Daemons that share one list under leases (below) share
+  `--tenant-owner` instead.
 - One whose `max_runners` alone **changed** gets the new limit at once. A
   lower limit ends no runner; launches wait until enough have ended.
 - One **changed** otherwise (tiers, installation, URL, group, vCPU or job
@@ -275,6 +276,45 @@ list has been read; after that, it is a failed read too, so a parameter
 deleted and written again stops nobody. To remove every installation, write
 `[]`. A new run of an installation, or of another on the same account (a
 rename), starts only once the last has finished.
+
+**Several daemons on one list.** With `--tenants db:` and `--tenant-leases`
+(`FR_TENANT_LEASES`), each daemon (a shard) serves an installation only
+while it holds the lease on its GitHub account in the job store's database.
+A shard renews its leases every 10 seconds, for 30 seconds of the database's
+time; it takes any lease that is free or has expired. So each installation
+is served by one shard at a time, and another takes it over once its shard
+stops renewing:
+
+- A shard that cannot renew, as when the database does not answer, stops
+  launching for an installation 20 seconds after the last renewal that
+  succeeded was sent, on its own clock: before any other shard may take it.
+  It then hands the installation off. Its sessions close at once, its busy
+  EC2 runners finish their jobs, its scale sets stay registered, and nothing
+  is deleted. The next shard's reaper ends those runners once their jobs are
+  done.
+- A shard that stops releases its leases once every installation it
+  served has stopped: its sessions closed, and its runners finished or
+  handed on. Another shard takes them at its next renewal. One that crashes leaves them to
+  expire, and GitHub holds its sessions for about 50 seconds.
+- An installation removed keeps its lease until its scale sets are deleted.
+  If the lease lapses first, nothing is deleted, as another shard may serve
+  its account by then: delete what it left by hand, as the log says.
+- A renewal that fails is tried again every 2 seconds. A shard that cannot
+  join (its database down, or owners that do not fit) serves its own tiers
+  and no installation, and keeps trying.
+
+Every shard needs the same `--tenant-owner` (`FR_TENANT_OWNER`): an
+installation's instances are tagged `<tenant-owner>/<id>`, which is how the
+next shard finds the runners handed to it. Each needs an `--owner` of its
+own, for its own tiers and pool, and with EC2 tiers the same pool key
+(`FR_EC2_POOL_KEY_FILE`), by which the next shard proves those runners are
+its to end. The CloudFormation templates scope the control VM's role and the
+reaper to `<Owner>` and `<Owner>/*`; a shard's role also needs
+`<tenant-owner>/*`, which no template parameter grants yet. A shard refuses to start beside a live one whose
+`--tenant-owner` differs or whose `--owner` is the same. `firerunner status`
+shows the shard and how many installations it holds; `firerunner doctor`
+warns while renewals fail (`tenant-leases`). Each shard holds every lease it
+can for now; spreading installations across shards comes next (#166).
 
 **When one installation fails.** Each installation of the list runs in a loop
 of its own. A failure there (a start GitHub refuses, a scale set deleted, a

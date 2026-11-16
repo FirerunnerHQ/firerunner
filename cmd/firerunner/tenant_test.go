@@ -578,4 +578,21 @@ func TestHandsOff(t *testing.T) {
 			t.Errorf("%s: stopPlan = %+v, want %+v", c.name, p, want)
 		}
 	}
+
+	// A removed tenant whose lease has lapsed deletes nothing: another
+	// shard may serve its account under the same scale set names.
+	held, lapsed := context.WithValue(context.Background(), leaseKey{}, func() bool { return false }),
+		context.WithValue(context.Background(), leaseKey{}, func() bool { return true })
+	s := &shard{cfg: &config.Config{EC2Reaper: "on", Owner: "dogfood"}}
+	for _, c := range []struct {
+		name   string
+		parent context.Context
+		want   bool
+	}{{"lease held", held, true}, {"lease lapsed", lapsed, false}} {
+		ctx, drop := context.WithCancelCause(c.parent)
+		drop(errTenantRemoved)
+		if p := s.stopPlan(ctx); p.remove != c.want {
+			t.Errorf("removed, %s: stopPlan = %+v, want remove %v", c.name, p, c.want)
+		}
+	}
 }
