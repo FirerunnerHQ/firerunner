@@ -50,7 +50,7 @@ type leaseStore interface {
 	Assign(ctx context.Context, sh jobstore.Shard, next map[string]jobstore.Assignment) error
 	Drain(ctx context.Context, sh jobstore.Shard) error
 	RemovedTenants(ctx context.Context) ([]jobstore.Removed, error)
-	ForgetRemoved(ctx context.Context, id string, removedAt time.Time) error
+	ForgetRemoved(ctx context.Context, id string, upTo time.Time, url string) error
 }
 
 // newShard is this process among the shards. Its id is its host name and a
@@ -121,6 +121,9 @@ type tenantLeaser struct {
 	// sweeps are the sweeps planned, by account: tenants removed while no
 	// shard served them, whose account's lease this shard asks for.
 	sweeps map[string]*plannedSweep
+	// sweepFailures are the removals whose sweeps failed, until one
+	// succeeds or the removal is gone.
+	sweepFailures map[sweepKey]*sweepFailure
 }
 
 func (l *tenantLeaser) clock() time.Time {
@@ -164,6 +167,7 @@ func (l *tenantLeaser) step(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	l.sweepHeld(ctx)
 	moved, err := l.assign(ctx)
 	if err != nil || !moved {
 		return err
@@ -187,6 +191,7 @@ func (l *tenantLeaser) assign(ctx context.Context) (bool, error) {
 		// Before a list, every tenant would read as removed.
 		return false, nil
 	}
+	outer := ctx
 	ctx, cancel := context.WithTimeout(ctx, leaseRenewTimeout)
 	defer cancel()
 	shards, current, holders, err := l.store.Placement(ctx)
@@ -195,7 +200,7 @@ func (l *tenantLeaser) assign(ctx context.Context) (bool, error) {
 		l.mu.Lock()
 		l.unplaced, l.assignErr = unplaced, ""
 		l.mu.Unlock()
-		l.planSweeps(ctx, holders)
+		l.planSweeps(outer, holders, next)
 		if maps.Equal(next, current) {
 			return false, nil
 		}
@@ -282,7 +287,6 @@ func (l *tenantLeaser) renew(ctx context.Context) error {
 	}
 	l.assignerID, l.unlisted = r.Assigner, r.Unlisted
 	l.set.renewRemoving(l.held)
-	l.startSweepsLocked()
 	if l.listed {
 		l.applyLocked()
 	}
@@ -360,8 +364,10 @@ func (l *tenantLeaser) status() *health.TenantLeases {
 		AssignerShard: l.assignerID, Unlisted: slices.Clone(l.unlisted)}
 	st.Sweeping = l.set.sweeping()
 	st.SweepsPlanned = l.plannedLocked()
+	st.SweepsFailing, st.SweepsStuck = l.failingLocked()
 	slices.Sort(st.Sweeping)
 	slices.Sort(st.SweepsPlanned)
+	slices.Sort(st.SweepsFailing)
 	if l.assigningLocked() {
 		st.Assigner = true
 		for _, id := range slices.Sorted(maps.Keys(l.unplaced)) {

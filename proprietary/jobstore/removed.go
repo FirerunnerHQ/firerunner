@@ -48,10 +48,10 @@ func (s *TenantStore) RemovedTenants(ctx context.Context) ([]Removed, error) {
 }
 
 // ForgetRemoved records that tenant id's leftovers are deleted, for its
-// removal recorded at or before upTo: a tenant listed and removed again
-// since is a new removal, still to do.
-func (s *TenantStore) ForgetRemoved(ctx context.Context, id string, upTo time.Time) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM removed_tenants WHERE id = $1 AND removed_at <= $2`, id, upTo)
+// removal on url recorded at or before upTo: a tenant listed and removed
+// again since, or on another URL, is a removal still to do.
+func (s *TenantStore) ForgetRemoved(ctx context.Context, id string, upTo time.Time, url string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM removed_tenants WHERE id = $1 AND removed_at <= $2 AND entry->>'url' = $3`, id, upTo, url)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
 		return nil
@@ -60,4 +60,14 @@ func (s *TenantStore) ForgetRemoved(ctx context.Context, id string, upTo time.Ti
 		return fmt.Errorf("forget the removal of tenant %q: %w", id, err)
 	}
 	return nil
+}
+
+// TenantListed reports whether the tenants table lists id now.
+func (s *TenantStore) TenantListed(ctx context.Context, id string) (bool, error) {
+	var listed bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1)`, id).Scan(&listed)
+	if err != nil {
+		return false, fmt.Errorf("read whether tenant %q is listed: %w", id, err)
+	}
+	return listed, nil
 }

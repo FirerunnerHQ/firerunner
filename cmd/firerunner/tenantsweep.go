@@ -3,76 +3,165 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
-// forgetRemovedTimeout bounds forgetting a tenant's removal once what it
-// left is deleted.
-const forgetRemovedTimeout = 5 * time.Second
+const (
+	// forgetRemovedTimeout bounds forgetting a tenant's removal once what
+	// it left is deleted.
+	forgetRemovedTimeout = 5 * time.Second
+	// sweepRetryMin and sweepRetryMax bound the wait before a sweep that
+	// failed is tried again, doubling between.
+	sweepRetryMin = time.Minute
+	sweepRetryMax = time.Hour
+	// sweepStuck is how many failures in a row doctor warns at.
+	sweepStuck = 3
+)
+
+// sweepKey is one removal: a tenant id, and when its removal was recorded.
+type sweepKey struct {
+	id string
+	at time.Time
+}
+
+// sweepFailure is how sweeping one removal has gone wrong so far.
+type sweepFailure struct {
+	attempts int
+	next     time.Time
+	err      string
+}
 
 // plannedSweep is a tenant removed while no shard served it, whose
-// account's lease this shard asks for: once it holds it, the tenant set
-// deletes what the tenant left, as a removing run (tenantSet.sweep).
+// account's lease the assigner asks for, so that it may sweep it.
 type plannedSweep struct {
 	removed jobstore.Removed
 	tenant  config.Tenant
 }
 
-// planSweeps is the assigner's. It reads the tenants removed whose
-// leftovers are not deleted yet, and plans to sweep each whose account no
-// shard holds the lease of: a shard that holds it is removing the tenant,
-// sweeping it, or serving the account, and a later run there waits on the
-// removal. holders are the leases' holders, as just read with the
-// assignments. Plans it no longer holds true of are dropped: the removal
-// forgotten (done elsewhere, or the id listed again), or the account held.
-//
-// It decides from the database alone, never from this shard's list,
-// which may be older: a tenant listed again under its id is no longer
-// removed there, and one listed again on its account waits, here or on
-// the shard that holds the account, for a sweep to end.
-func (l *tenantLeaser) planSweeps(ctx context.Context, holders map[string]string) {
+// removedTenants reads the removals not yet done, with each one's entry.
+// One whose entry does not read is forgotten, with an error to delete what
+// it left by hand: nothing can sweep it.
+func (l *tenantLeaser) removedTenants(ctx context.Context) ([]plannedSweep, error) {
+	ctx, cancel := context.WithTimeout(ctx, leaseRenewTimeout)
+	defer cancel()
 	removed, err := l.store.RemovedTenants(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []plannedSweep
+	for _, r := range removed {
+		var c config.Tenant
+		if err := json.Unmarshal(r.Entry, &c); err != nil || config.AccountOf(c.URL) == "" || c.ID != r.ID {
+			l.log.Error("removed tenant's entry does not read: delete what it left by hand", "tenant", r.ID, "removed_at", r.RemovedAt)
+			if err := l.store.ForgetRemoved(ctx, r.ID, r.RemovedAt, c.URL); err != nil {
+				l.log.Warn("removed tenant not forgotten", "tenant", r.ID, "err", err)
+			}
+			continue
+		}
+		out = append(out, plannedSweep{removed: r, tenant: c})
+	}
+	return out, nil
+}
+
+// due reports whether a removal may be swept now: one that failed waits.
+// The caller holds mu.
+func (l *tenantLeaser) dueLocked(k sweepKey) bool {
+	f, ok := l.sweepFailures[k]
+	return !ok || !l.clock().Before(f.next)
+}
+
+// sweepHeld is every shard's, after each renewal: it sweeps each removal
+// due on an account it holds the lease of, beside whatever it runs there
+// (tenantSet.sweep), so that one whose removal failed, or lost its lease,
+// here or elsewhere, is swept again even while its account is served.
+func (l *tenantLeaser) sweepHeld(ctx context.Context) {
+	removed, err := l.removedTenants(ctx)
 	if err != nil {
 		l.log.Warn("removed tenants not read; their leftovers are swept later", "err", err)
 		return
 	}
-	type key struct {
-		id string
-		at time.Time
-	}
-	current := map[key]bool{}
-	var unreadable []jobstore.Removed
 	l.mu.Lock()
-	for _, r := range removed {
-		current[key{r.ID, r.RemovedAt}] = true
-		var c config.Tenant
-		if err := json.Unmarshal(r.Entry, &c); err != nil || config.AccountOf(c.URL) == "" || c.ID != r.ID {
-			unreadable = append(unreadable, r)
+	defer l.mu.Unlock()
+	for _, p := range removed {
+		account := config.AccountOf(p.tenant.URL)
+		d, held := l.held[account]
+		k := sweepKey{p.removed.ID, p.removed.RemovedAt}
+		if !held || !l.dueLocked(k) {
 			continue
 		}
-		account := config.AccountOf(c.URL)
-		if l.sweeps[account] != nil || holders[account] != "" {
+		if l.sweeps[account] != nil && l.sweeps[account].removed.ID == p.removed.ID {
+			delete(l.sweeps, account) // planned for this: done here now
+		}
+		l.set.sweep(p.tenant, p.removed.RemovedAt, d, func(err error) { l.swept(k, err) })
+	}
+}
+
+// swept records how a sweep ended: one that failed waits before the next,
+// longer each time.
+func (l *tenantLeaser) swept(k sweepKey, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err == nil {
+		delete(l.sweepFailures, k)
+		return
+	}
+	if l.sweepFailures == nil {
+		l.sweepFailures = map[sweepKey]*sweepFailure{}
+	}
+	f := l.sweepFailures[k]
+	if f == nil {
+		f = &sweepFailure{}
+		l.sweepFailures[k] = f
+	}
+	f.attempts++
+	wait := sweepRetryMin << min(f.attempts-1, 6)
+	f.next, f.err = l.clock().Add(min(wait, sweepRetryMax)), err.Error()
+}
+
+// planSweeps is the assigner's. It plans to sweep each removal due whose
+// account no shard holds the lease of, nor is being assigned (next): it
+// asks for that account's lease, and once it holds it sweeps it
+// (sweepHeld). An account held, or assigned, is swept by its holder.
+// Plans it no longer holds true of are dropped: the removal done or the
+// id listed again, or the account held elsewhere.
+//
+// It decides from the database alone, never from this shard's list, which
+// may be older.
+func (l *tenantLeaser) planSweeps(ctx context.Context, holders map[string]string, next map[string]jobstore.Assignment) {
+	removed, err := l.removedTenants(ctx)
+	if err != nil {
+		l.log.Warn("removed tenants not read; their leftovers are swept later", "err", err)
+		return
+	}
+	current := map[sweepKey]bool{}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, p := range removed {
+		k := sweepKey{p.removed.ID, p.removed.RemovedAt}
+		current[k] = true
+		account := config.AccountOf(p.tenant.URL)
+		if _, assigned := next[account]; l.sweeps[account] != nil || holders[account] != "" || assigned || !l.dueLocked(k) {
 			continue
 		}
 		if l.sweeps == nil {
 			l.sweeps = map[string]*plannedSweep{}
 		}
-		l.sweeps[account] = &plannedSweep{removed: r, tenant: c}
-		l.log.Info("tenant removed while no shard served it: deleting what it left once this shard holds its account's lease", "tenant", r.ID, "account", account)
+		l.sweeps[account] = &p
+		l.log.Info("tenant removed while no shard served it: deleting what it left once this shard holds its account's lease", "tenant", p.removed.ID, "account", account)
 	}
 	for account, p := range l.sweeps {
-		if !current[key{p.removed.ID, p.removed.RemovedAt}] || (holders[account] != "" && holders[account] != l.shard.ID) {
+		_, assigned := next[account]
+		if !current[sweepKey{p.removed.ID, p.removed.RemovedAt}] || assigned || (holders[account] != "" && holders[account] != l.shard.ID) {
 			delete(l.sweeps, account)
 		}
 	}
-	l.mu.Unlock()
-	for _, r := range unreadable {
-		l.log.Error("removed tenant's entry does not read: delete what it left by hand, then forget it", "tenant", r.ID, "removed_at", r.RemovedAt)
-		if err := l.store.ForgetRemoved(ctx, r.ID, r.RemovedAt); err != nil {
-			l.log.Warn("removed tenant not forgotten", "tenant", r.ID, "err", err)
+	for k := range l.sweepFailures {
+		if !current[k] {
+			delete(l.sweepFailures, k)
 		}
 	}
 }
@@ -87,22 +176,6 @@ func (l *tenantLeaser) sweepAccountsLocked() []string {
 	return accounts
 }
 
-// startSweepsLocked hands each sweep planned whose account's lease this
-// shard now holds to the tenant set, which deletes what the tenant left
-// under that lease. One the set refuses, as when a run serves the account
-// here now, is dropped and planned again if still due. The caller holds
-// mu.
-func (l *tenantLeaser) startSweepsLocked() {
-	for account, p := range l.sweeps {
-		d, held := l.held[account]
-		if !held {
-			continue
-		}
-		delete(l.sweeps, account)
-		l.set.sweep(p.tenant, p.removed.RemovedAt, d)
-	}
-}
-
 // plannedLocked returns the ids of the sweeps planned. The caller holds mu.
 func (l *tenantLeaser) plannedLocked() []string {
 	var ids []string
@@ -110,4 +183,15 @@ func (l *tenantLeaser) plannedLocked() []string {
 		ids = append(ids, p.removed.ID)
 	}
 	return ids
+}
+
+// failingLocked describes each removal whose sweeps keep failing, and
+// reports whether any has failed sweepStuck times. The caller holds mu.
+func (l *tenantLeaser) failingLocked() (failing []string, stuck bool) {
+	for k, f := range l.sweepFailures {
+		failing = append(failing, fmt.Sprintf("%s: %d attempt(s), next in %s: %s", k.id, f.attempts,
+			max(0, f.next.Sub(l.clock())).Truncate(time.Second), f.err))
+		stuck = stuck || f.attempts >= sweepStuck
+	}
+	return failing, stuck
 }

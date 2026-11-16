@@ -48,6 +48,8 @@ type setLab struct {
 	removing  func(ctx context.Context) error
 	// removeCtx is the context the last gated removal was given.
 	removeCtx context.Context
+	// stop ends the set's context, as the daemon stopping does.
+	stop context.CancelFunc
 }
 
 type tenantStart struct {
@@ -62,7 +64,7 @@ type tenantEnd struct {
 
 func newSetLab(t *testing.T) *setLab {
 	ctx, cancel := context.WithCancel(context.Background())
-	l := &setLab{t: t, starts: make(chan tenantStart, 16), ends: make(chan tenantEnd, 16), gates: map[string]chan struct{}{}, active: map[string]int{}}
+	l := &setLab{t: t, starts: make(chan tenantStart, 16), ends: make(chan tenantEnd, 16), gates: map[string]chan struct{}{}, active: map[string]int{}, stop: cancel}
 	l.set = &tenantSet{
 		ctx: ctx, log: slog.New(slog.DiscardHandler),
 		run: func(ctx context.Context, cur func() config.Tenant, _ func(*servedTenant)) {
@@ -106,7 +108,7 @@ func newSetLab(t *testing.T) *setLab {
 			}
 			return err
 		},
-		forget: func(id string, upTo time.Time) {
+		forget: func(id string, upTo time.Time, _ string) {
 			l.mu.Lock()
 			defer l.mu.Unlock()
 			if upTo.IsZero() {
@@ -695,8 +697,13 @@ func TestRemoveLeftoversStopsWhenItsLeaseLapses(t *testing.T) {
 			return true, nil
 		}}
 	c := config.Tenant{ID: "acme", URL: "https://github.com/acme", InstallationID: 7, Tiers: []string{"ok", "broken", "slow", "after"}}
-	ctx, cancel := context.WithCancelCause(context.Background())
-	go func() { <-inCall; cancel(errLeaseLapsed) }()
+	// The removal's own context has ended too, as the daemon stops: the
+	// lapse stops it all the same.
+	stopping, stop := context.WithCancel(context.Background())
+	stop()
+	lapse, lapsed := context.WithCancelCause(context.Background())
+	ctx := context.WithValue(stopping, lapseKey{}, context.Context(lapse))
+	go func() { <-inCall; lapsed(errLeaseLapsed) }()
 	start := time.Now()
 	err := s.removeLeftovers(ctx, extraTenant(s.cfg, c, "inst", nil), c.Tiers)
 	if took := time.Since(start); took > tenantRemoveTimeout/2 {

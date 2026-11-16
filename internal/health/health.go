@@ -229,6 +229,10 @@ type TenantLeases struct {
 	// will once it holds their account's lease.
 	Sweeping      []string `json:"sweeping,omitempty"`
 	SweepsPlanned []string `json:"sweeps_planned,omitempty"`
+	// SweepsFailing describes each removal whose sweeps keep failing here,
+	// tried again later; SweepsStuck is set once one has failed 3 times.
+	SweepsFailing []string `json:"sweeps_failing,omitempty"`
+	SweepsStuck   bool     `json:"sweeps_stuck,omitempty"`
 	// LastRenewed is the last successful renewal; zero before the first.
 	LastRenewed time.Time `json:"last_renewed,omitzero"`
 	LastError   string    `json:"last_error,omitempty"`

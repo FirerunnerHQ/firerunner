@@ -150,11 +150,11 @@ func (f *fakeLeases) RemovedTenants(context.Context) ([]jobstore.Removed, error)
 	return slices.Clone(f.removed), nil
 }
 
-func (f *fakeLeases) ForgetRemoved(_ context.Context, id string, removedAt time.Time) error {
+func (f *fakeLeases) ForgetRemoved(_ context.Context, id string, upTo time.Time, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.removed = slices.DeleteFunc(f.removed, func(r jobstore.Removed) bool {
-		return r.ID == id && (removedAt.IsZero() || r.RemovedAt.Equal(removedAt))
+		return r.ID == id && !r.RemovedAt.After(upTo)
 	})
 	f.forgotten = append(f.forgotten, id)
 	return nil

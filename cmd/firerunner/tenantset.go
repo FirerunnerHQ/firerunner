@@ -190,9 +190,10 @@ type tenantSet struct {
 	// lease (cause errLeaseLapsed); an error means it did not all go.
 	removed func(ctx context.Context, c config.Tenant) error
 	// forget, when set, is called once removed has deleted all a tenant
-	// left, with the time its removal was seen: the job store forgets the
-	// removal recorded by then, so that no shard sweeps it again.
-	forget func(id string, upTo time.Time)
+	// left, with the time its removal was seen and its URL: the job store
+	// forgets its removal on that URL recorded by then, so that no shard
+	// sweeps it again.
+	forget func(id string, upTo time.Time, url string)
 	log    *slog.Logger
 	// now and afterFunc replace the clock and its timers in tests.
 	now       func() time.Time
@@ -432,7 +433,7 @@ func (ts *tenantSet) applyLeases(list []config.Tenant, leases map[string]time.Ti
 			// what this deletes.
 			defer func() {
 				if removedTenant(ctx) {
-					ts.remove(r)
+					_ = ts.remove(r)
 				}
 			}()
 			// Whatever happens to this run, its done waits on the ones
@@ -482,37 +483,61 @@ func (ts *tenantSet) renewRemoving(held map[string]time.Time) {
 	}
 }
 
-// errLeaseLapsed ends a removal whose lease has lapsed.
-var errLeaseLapsed = errors.New("the lease on the account lapsed")
+// errLeaseLapsed ends a removal whose lease has lapsed, and
+// errListedAgain one of a tenant id listed again.
+var (
+	errLeaseLapsed = errors.New("the lease on the account lapsed")
+	errListedAgain = errors.New("the tenant is listed again")
+)
+
+// lapseKey carries a removal's lapse context in its context.
+type lapseKey struct{}
+
+// leaseLapse returns the context that ends once a removal's lease lapses,
+// or nil for one under no lease. It is apart from the removal's own
+// context, which ends as the daemon stops: a lapse must stop a removal
+// then too, when nothing renews its lease any more.
+func leaseLapse(ctx context.Context) context.Context {
+	l, _ := ctx.Value(lapseKey{}).(context.Context)
+	return l
+}
 
 // remove deletes what removed run r's tenant left, while r's lease holds,
 // and forgets its removal once all of it is gone. A removal whose lease
 // lapses first, or that fails, deletes no more and is not forgotten: with
-// the tenants in the job store, a shard sweeps it again later.
-func (ts *tenantSet) remove(r *tenantRun) {
+// the tenants in the job store, a shard sweeps it again later. It returns
+// why it did not all go.
+func (ts *tenantSet) remove(r *tenantRun) error {
 	if ts.removed == nil {
-		return
+		return nil
 	}
 	if r.expired(ts.clock()) {
 		ts.log.Warn("removed tenant's lease lapsed before what it left was deleted: leaving it, as another shard may serve its account; it is swept again under a lease", "tenant", r.id)
-		return
+		return errLeaseLapsed
 	}
 	ctx, stop := ts.leaseBound(r)
 	defer stop()
-	if err := ts.removed(ctx, *r.cur.Load()); err != nil {
+	c := *r.cur.Load()
+	if err := ts.removed(ctx, c); err != nil {
 		ts.log.Warn("removed tenant's leftovers not all deleted: kept to sweep again", "tenant", r.id, "err", err)
-		return
+		return err
 	}
 	if ts.forget != nil {
-		ts.forget(r.id, r.removedAt)
+		ts.forget(r.id, r.removedAt, c.URL)
 	}
+	return nil
 }
 
-// leaseBound returns a context of the set's that also ends, with cause
-// errLeaseLapsed, once r's deadline passes unrenewed, and the func that
-// releases it. A run with no deadline is bound by the set's alone.
+// leaseBound returns a context of the set's whose leaseLapse ends, with
+// cause errLeaseLapsed, once r's deadline passes unrenewed, whether or not
+// the set's has ended; and the func that releases it. A run with no
+// deadline has none.
 func (ts *tenantSet) leaseBound(r *tenantRun) (context.Context, func()) {
-	ctx, cancel := context.WithCancelCause(ts.ctx)
+	if r.deadline.Load() == nil {
+		return ts.ctx, func() {}
+	}
+	lapse, cancel := context.WithCancelCause(context.WithoutCancel(ts.ctx))
+	ctx := context.WithValue(ts.ctx, lapseKey{}, context.Context(lapse))
 	after := ts.afterFunc
 	if after == nil {
 		after = func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
@@ -527,7 +552,7 @@ func (ts *tenantSet) leaseBound(r *tenantRun) (context.Context, func()) {
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		if ctx.Err() != nil {
+		if lapse.Err() != nil {
 			return
 		}
 		stopTimer = after(d.Sub(ts.clock()), func() {
@@ -549,23 +574,40 @@ func (ts *tenantSet) leaseBound(r *tenantRun) (context.Context, func()) {
 	}
 }
 
-// sweep starts a run that only deletes what tenant c, removed while no
-// shard served it, left: once every run before it on its id or account has
-// ended, and while this shard's lease on its account holds, which runs to
+// sweep starts a run that only deletes what tenant c, removed and not yet
+// cleared, left: once every run before it on its id or account has ended,
+// and while this shard's lease on its account holds, which runs to
 // deadline and is renewed as a removing run's. A run of the account listed
-// again after it waits for it. removedAt is when the removal was recorded.
-// It reports false, and starts nothing, while a run on the account is
-// running here, or the set has stopped.
-func (ts *tenantSet) sweep(c config.Tenant, removedAt, deadline time.Time) bool {
+// after it waits for it. One serving the account here now goes on beside
+// it, and its tiers' scale sets, which it took over by name, are not
+// deleted. removedAt is when the removal was recorded, and done, when set,
+// is called with how the sweep ended. It reports false, and starts
+// nothing, while this id's removal is under way here, or the set has
+// stopped.
+func (ts *tenantSet) sweep(c config.Tenant, removedAt, deadline time.Time, done func(error)) bool {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	if ts.closed || ts.ctx.Err() != nil {
 		return false
 	}
 	account := config.AccountOf(c.URL)
+	for _, r := range ts.ending {
+		select {
+		case <-r.done:
+			continue
+		default:
+		}
+		if r.id == c.ID && r.removing {
+			return false
+		}
+	}
+	if r, ok := ts.running[c.ID]; ok && r.account == account {
+		return false // listed again: its removal is no more
+	}
 	for _, r := range ts.running {
 		if r.account == account {
-			return false
+			inUse := r.cur.Load().Tiers
+			c.Tiers = slices.DeleteFunc(slices.Clone(c.Tiers), func(t string) bool { return slices.Contains(inUse, t) })
 		}
 	}
 	r := &tenantRun{id: c.ID, account: account, done: make(chan struct{}), removing: true, removedAt: removedAt, swept: true}
@@ -585,7 +627,10 @@ func (ts *tenantSet) sweep(c config.Tenant, removedAt, deadline time.Time) bool 
 		for _, p := range prev {
 			<-p
 		}
-		ts.remove(r)
+		err := ts.remove(r)
+		if done != nil {
+			done(err)
+		}
 	})
 	return true
 }

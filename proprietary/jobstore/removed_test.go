@@ -46,13 +46,19 @@ func TestRemovedTenants(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec(t, dsn, `DELETE FROM tenants WHERE id = 'a'`)
-	if err := s.ForgetRemoved(ctx, "a", first); err != nil {
+	if err := s.ForgetRemoved(ctx, "a", first, "https://github.com/a"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ = s.RemovedTenants(ctx); len(got) != 1 || got[0].RemovedAt.Equal(first) {
 		t.Fatalf("removed %+v, want a's later removal kept", got)
 	}
-	if err := s.ForgetRemoved(ctx, "a", got[0].RemovedAt); err != nil {
+	if err := s.ForgetRemoved(ctx, "a", got[0].RemovedAt, "https://github.com/elsewhere"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = s.RemovedTenants(ctx); len(got) != 1 {
+		t.Fatalf("removed %+v: a removal on another URL was forgotten", got)
+	}
+	if err := s.ForgetRemoved(ctx, "a", got[0].RemovedAt, "https://github.com/a"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ = s.RemovedTenants(ctx); len(got) != 0 {
@@ -60,7 +66,13 @@ func TestRemovedTenants(t *testing.T) {
 	}
 	// A removal recorded by now, forgotten by a run that saw it then.
 	exec(t, dsn, `DELETE FROM tenants WHERE id = 'b'`)
-	if err := s.ForgetRemoved(ctx, "b", time.Now().Add(time.Minute)); err != nil {
+	if listed, err := s.TenantListed(ctx, "b"); err != nil || listed {
+		t.Fatalf("TenantListed(b) = %v, %v once deleted", listed, err)
+	}
+	if listed, err := s.TenantListed(ctx, "a"); err != nil || listed {
+		t.Fatalf("TenantListed(a) = %v, %v", listed, err)
+	}
+	if err := s.ForgetRemoved(ctx, "b", time.Now().Add(time.Minute), "https://github.com/b"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ = s.RemovedTenants(ctx); len(got) != 0 {
@@ -74,6 +86,9 @@ func TestRemovedTenants(t *testing.T) {
 	exec(t, dsn, `UPDATE tenants SET id = 'd', entry = jsonb_set(entry, '{id}', '"d"') WHERE id = 'c'`)
 	if got, _ = s.RemovedTenants(ctx); len(got) != 1 || got[0].ID != "c" {
 		t.Fatalf("removed %+v after c was renamed d, want c", got)
+	}
+	if listed, err := s.TenantListed(ctx, "d"); err != nil || !listed {
+		t.Fatalf("TenantListed(d) = %v, %v", listed, err)
 	}
 	exec(t, dsn, `UPDATE tenants SET entry = jsonb_set(entry, '{url}', '"https://github.com/e"') WHERE id = 'd'`)
 	if got, _ = s.RemovedTenants(ctx); len(got) != 1 {

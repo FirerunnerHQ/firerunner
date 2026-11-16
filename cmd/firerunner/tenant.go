@@ -78,6 +78,10 @@ type shard struct {
 	// removeByName deletes a scale set by name; nil is
 	// listener.RemoveByName. Tests replace it.
 	removeByName func(context.Context, listener.Config) (bool, error)
+	// tenantListed, with the tenants in the job store, reports whether a
+	// tenant id is listed there now: a removal ends no machine by its owner
+	// tag once it is, as they are a run's of the id listed again.
+	tenantListed func(ctx context.Context, id string) (bool, error)
 	// applyMu makes each applyState decide and apply as one step: the
 	// watchers and the tenant loops call it at once, and a decision taken
 	// on older inputs must not land after one taken on newer.
@@ -328,6 +332,11 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 			}
 			st.drain(p.handOff)
 			switch {
+			case p.remove && !p.removesNow(ctx):
+				// Its lease lapsed while it drained: another shard may
+				// serve the account under these names now. A sweep deletes
+				// them under a lease.
+				s.log.Warn("removed tenant's lease lapsed while its runners finished: leaving its scale sets to a sweep", "tenant", st.t.ID)
 			case p.remove:
 				// Bounded: a GitHub that hangs must not hold up shutdown.
 				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
@@ -351,28 +360,28 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 // covered: a tier or runner group an earlier entry named.
 //
 // It goes on as the daemon stops, each tier bounded, but stops at once,
-// mid-call too, when ctx ends with errLeaseLapsed: another shard may serve
-// the account then, under the same scale set names. It returns an error
-// unless every tier's scale set is gone.
+// mid-call too, once its lease lapses (leaseLapse): another shard may
+// serve the account then, under the same scale set names. It returns an
+// error unless every tier's scale set is gone.
 func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) error {
 	remove := s.removeByName
 	if remove == nil {
 		remove = listener.RemoveByName
 	}
+	lapse := leaseLapse(ctx)
 	var errs []error
 	for _, name := range names {
-		if errors.Is(context.Cause(ctx), errLeaseLapsed) {
+		if lapse != nil && lapse.Err() != nil {
 			return errors.Join(append(errs, errLeaseLapsed)...)
 		}
 		cfg := s.listenerConfig(t, config.Tier{Name: name}, tenantHooks{}, nil, nil, s.log, nil)
 		// Bounded per tier: a GitHub that hangs must not hold up shutdown,
 		// and a slow first tier must not use up the rest's time.
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
-		stop := context.AfterFunc(ctx, func() {
-			if errors.Is(context.Cause(ctx), errLeaseLapsed) {
-				cancel()
-			}
-		})
+		stop := func() bool { return false }
+		if lapse != nil {
+			stop = context.AfterFunc(lapse, cancel)
+		}
 		removed, err := remove(rctx, cfg)
 		stop()
 		cancel()
@@ -393,20 +402,34 @@ func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) e
 // ec2.Client.EndAll). Its runners went with its scale sets. It runs before
 // a later run on the tenant's id or account may start, so it never ends
 // what a run of a tenant listed again launched. A daemon stopping meanwhile
-// still sweeps once, skips the second, and warns. A lease that lapses
-// first ends nothing; one that lapses during the first sweep ends the
-// second: what the first can end is older than its grace (2 minutes), so
-// launched before another shard could serve the id again. It returns an
-// error unless both sweeps ran.
+// still sweeps once, skips the second, and warns.
+//
+// The owner tag is the tenant id's, on whatever account: before each sweep
+// it checks that its lease still holds and, with the tenants in the job
+// store, that the id is not listed again (on another account, say), whose
+// run's reaper ends what is left of the old one as its own. A lapse also
+// ends the wait for the second; what the first can end is older than its
+// grace (2 minutes), so launched before another shard could serve the
+// account. It returns an error unless both sweeps ran, or the id is
+// listed again.
 func (s *shard) endRemoved(ctx context.Context, t tenant) error {
 	if s.ec2Client == nil || s.cfg.EC2Reaper == "off" {
 		return nil
 	}
-	if errors.Is(context.Cause(ctx), errLeaseLapsed) {
-		return errLeaseLapsed
+	lapse := leaseLapse(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if lapse != nil {
+		defer context.AfterFunc(lapse, cancel)()
 	}
 	log := s.log.With("tenant", t.ID)
-	rep, err := s.ec2Client.EndAll(ctx, reaperOptions(s.cfg, t.Owner, nil, nil, log), "removed from the tenants list")
+	o := reaperOptions(s.cfg, t.Owner, nil, nil, log)
+	o.Proceed = s.mayEndRemoved(lapse, t.ID)
+	rep, err := s.ec2Client.EndAll(ctx, o, "removed from the tenants list")
+	if errors.Is(err, errListedAgain) {
+		log.Info("removed tenant listed again: leaving what it left on EC2 to the reaper of its new run", "instances", len(rep.Instances))
+		return nil
+	}
 	if err != nil {
 		log.Warn("a removed tenant's instances or spot requests may be left; end those with its owner tag by hand, or let a shard sweep it", "owner", t.Owner, "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "err", err)
 		return err
@@ -414,6 +437,25 @@ func (s *shard) endRemoved(ctx context.Context, t tenant) error {
 	// Logged even when there was nothing: moving the tenant waits for it.
 	log.Info("ended what a removed tenant left on EC2", "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "unproven", len(rep.Unproven), "dryRun", rep.DryRun)
 	return nil
+}
+
+// mayEndRemoved is asked before each EC2 sweep of removed tenant id's
+// owner tag: errLeaseLapsed once lapse has ended, errListedAgain once the
+// job store lists the id again, or the error reading it.
+func (s *shard) mayEndRemoved(lapse context.Context, id string) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if lapse != nil && lapse.Err() != nil {
+			return errLeaseLapsed
+		}
+		if s.tenantListed == nil {
+			return nil
+		}
+		listed, err := s.tenantListed(ctx, id)
+		if err == nil && listed {
+			err = errListedAgain
+		}
+		return err
+	}
 }
 
 // warnRefused logs each tier the tenant lists but is not served, and why.
@@ -1129,6 +1171,13 @@ func (s *shard) stopPlan(tenantCtx context.Context) tenantStop {
 		handOff:       s.handsOff(tenantCtx),
 		remove:        removedTenant(tenantCtx) && !leaseLapsed(tenantCtx),
 	}
+}
+
+// removesNow reports whether a tenant that stops as removed deletes its
+// scale sets now, once its runners have finished: not if its lease lapsed
+// meanwhile, as another shard may serve the account under those names.
+func (p tenantStop) removesNow(tenantCtx context.Context) bool {
+	return p.remove && !leaseLapsed(tenantCtx)
 }
 
 // handsOff says whether a tenant stopping now leaves its busy EC2 runners

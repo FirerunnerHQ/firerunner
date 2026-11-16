@@ -38,6 +38,11 @@ type ReaperOptions struct {
 	// running orphan is reaped busy or not: such a tenant's machines end,
 	// after a restart too.
 	Suspended func() string
+	// Proceed, when set, is asked before each of EndAll's sweeps; one that
+	// returns an error ends EndAll with it, sweeping no more: as when the
+	// owner's tenant has been listed again, and its instances are another
+	// run's now.
+	Proceed func(context.Context) error
 	// Grace leaves alone instances younger than this, so a launch between
 	// RunInstances and its registration is never mistaken for an orphan
 	// (default 2m).
@@ -161,6 +166,11 @@ func (c *Client) EndAll(ctx context.Context, o ReaperOptions, why string) (ReapR
 	sweep := func() (ReapReport, error) {
 		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), endAllSweep)
 		defer cancel()
+		if o.Proceed != nil {
+			if err := o.Proceed(sctx); err != nil {
+				return ReapReport{}, err
+			}
+		}
 		return r.Sweep(sctx)
 	}
 	rep, err := sweep()

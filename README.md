@@ -322,18 +322,24 @@ takes any free lease, ignoring the assignments.
   handed on. Another shard takes them at its next renewal. One that crashes leaves them to
   expire, and GitHub holds its sessions for about 50 seconds.
 - An installation removed keeps its lease until its scale sets are deleted.
-  If the lease lapses first, deletion stops at once, as another shard may
-  serve its account by then. The job store keeps every installation
-  deleted from its table (or whose id is changed) in `removed_tenants`
-  until all it left is gone: one whose deletion stopped or failed, or that
-  was removed while no shard served it (its shard crashed, it was placed
-  on none, or no daemon ran), is swept by the assigning shard once no
-  shard holds its account's lease: under that lease, its scale sets by
-  name, then its machines by owner tag. An installation listed again on
-  its account waits for the sweep. `firerunner status` lists the sweeps
-  under way and planned. `TRUNCATE tenants` records nothing; an
-  installation whose URL moves to another account leaves its old
-  account's scale sets, as a change does.
+  If the lease lapses first, even as the daemon stops, deletion stops at
+  once, as another shard may serve its account by then. The job store keeps
+  every installation deleted from its table (or whose id is changed) in
+  `removed_tenants` until all it left is gone. One whose deletion stopped or
+  failed, or that was removed while no shard served it (its shard crashed,
+  it was placed on none, or no daemon ran), is swept again under the lease
+  on its account: by the shard that holds that lease, beside the
+  installation it serves there, whose tiers' scale sets it keeps; or, when
+  no shard holds it, by the assigning shard. Its scale sets go by name,
+  then its machines by owner tag, unless its id is listed again by then,
+  whose new run's reaper ends what is left of the old. An installation
+  listed later on its account waits for the sweep. A sweep that fails is
+  tried again after 1 minute, doubling up to an hour; `firerunner status`
+  lists the sweeps under way, planned and failing, and `doctor` warns once
+  one has failed 3 times. Listing an id again forgets its removal, even on
+  another account; `TRUNCATE tenants` records nothing; and an installation
+  whose URL moves to another account leaves its old account's scale sets,
+  as a change does.
 - A renewal that fails is tried again every 2 seconds. A shard that cannot
   join (its database down, or owners that do not fit) serves its own tiers
   and no installation, and keeps trying.
