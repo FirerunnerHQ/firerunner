@@ -394,7 +394,12 @@ func TestHoldKinds(t *testing.T) {
 	}
 	ten.SetPlan(Plan{Runners: 1})
 	ten.SetMax(2)
-	waitUntil(t, "plan_limit", func() bool { return kind() == HoldPlanLimit })
+	// The limit in force stays 1, so SetMax wakes nothing, and the wake
+	// SetPlan sent may have run before it: plan again.
+	s[0].Reconcile(ctx, 2)
+	if k := kind(); k != HoldPlanLimit {
+		t.Fatalf("at its plan's limit: %q", k)
+	}
 	ten.SetPlan(Plan{Runners: 1, Tiers: []string{"b"}})
 	waitUntil(t, "plan_tier", func() bool { return kind() == HoldPlanTier })
 	ten.Hold("billing")
