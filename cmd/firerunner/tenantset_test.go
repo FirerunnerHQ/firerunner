@@ -19,6 +19,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/listener"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
+	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
 // setLab runs a tenantSet whose tenants record their starts and ends, and
@@ -451,7 +452,7 @@ func (f fakeGet) GetParameter(_ context.Context, in *awsssm.GetParameterInput, _
 // is a failed read, which keeps them.
 func TestSSMTenants(t *testing.T) {
 	v := `[{"id":"a"}]`
-	src, err := openTenants("ssm:/fr/control/tenants", func() (ssmGetAPI, error) { return fakeGet{value: &v}, nil })
+	src, err := openTenants("ssm:/fr/control/tenants", func() (ssmGetAPI, error) { return fakeGet{value: &v}, nil }, nil)
 	if err != nil || src.String() != "ssm:/fr/control/tenants" {
 		t.Fatalf("open: %v, %v", src, err)
 	}
@@ -466,8 +467,37 @@ func TestSSMTenants(t *testing.T) {
 	if _, err := denied.Load(context.Background()); err == nil || errors.Is(err, errTenantsMissing) {
 		t.Fatal("a denied read listed no tenants: it would remove them all")
 	}
-	if src, _ := openTenants("/etc/firerunner/tenants.json", nil); src.String() != "/etc/firerunner/tenants.json" {
+	if src, _ := openTenants("/etc/firerunner/tenants.json", nil, nil); src.String() != "/etc/firerunner/tenants.json" {
 		t.Fatalf("file source %v", src)
+	}
+}
+
+type fakeLoader struct {
+	list []byte
+	err  error
+}
+
+func (f fakeLoader) Load(context.Context) ([]byte, error) { return f.list, f.err }
+
+// db: reads the job store's tenants table. A database not set up yet lists no
+// tenants; one that cannot be read is a failed read, which keeps them.
+func TestDBTenants(t *testing.T) {
+	v := []byte(`[{"id":"a"}]`)
+	src, err := openTenants("db:", nil, func() (tenantsLoader, error) { return fakeLoader{list: v}, nil })
+	if err != nil || !strings.HasPrefix(src.String(), "db:") {
+		t.Fatalf("open: %v, %v", src, err)
+	}
+	if b, err := src.Load(context.Background()); err != nil || string(b) != string(v) {
+		t.Fatalf("load: %q, %v", b, err)
+	}
+	if _, err := (dbTenants{fakeLoader{err: jobstore.ErrNoTenants}}).Load(context.Background()); !errors.Is(err, errTenantsMissing) {
+		t.Fatalf("no table yet: %v", err)
+	}
+	if _, err := (dbTenants{fakeLoader{err: errors.New("connection refused")}}).Load(context.Background()); err == nil || errors.Is(err, errTenantsMissing) {
+		t.Fatal("a database that is down listed no tenants: it would remove them all")
+	}
+	if _, err := openTenants("db:", nil, func() (tenantsLoader, error) { return nil, errors.New("no URL") }); err == nil {
+		t.Fatal("open succeeded with no job store")
 	}
 }
 

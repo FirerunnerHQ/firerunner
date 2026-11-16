@@ -42,6 +42,17 @@ func TenantsParameter(spec string) (string, bool) {
 	return strings.CutPrefix(spec, TenantsSSM)
 }
 
+// TenantsDB is the --tenants that reads the list from the tenants table of
+// the job store's database (FR_JOB_EVENTS_DSN), one row a tenant.
+const TenantsDB = "db:"
+
+// TenantsFromFile reports whether spec names a file, read at start, rather
+// than a store the daemon reads in its own time.
+func TenantsFromFile(spec string) bool {
+	_, ssm := TenantsParameter(spec)
+	return spec != "" && !ssm && !strings.HasPrefix(spec, "db:")
+}
+
 func loadTenants(path string) ([]Tenant, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -70,6 +81,12 @@ func ParseTenants(b []byte) ([]Tenant, error) {
 }
 
 func (c *Config) checkTenantsSpec() error {
+	if strings.HasPrefix(c.TenantsPath, "db:") && c.TenantsPath != TenantsDB {
+		return fmt.Errorf("--tenants %q: the database is the job store's; write db: alone", c.TenantsPath)
+	}
+	if c.TenantsPath == TenantsDB && c.JobEventsDSN == "" && c.JobEventsDSNFile == "" {
+		return errors.New("--tenants db: reads the job store's database: set FR_JOB_EVENTS_DSN or FR_JOB_EVENTS_DSN_FILE")
+	}
 	name, ok := TenantsParameter(c.TenantsPath)
 	if !ok {
 		return nil

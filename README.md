@@ -233,8 +233,14 @@ The install's own tiers are not limited unless `--limit-runners`,
 `--limit-vcpu` and `--limit-job-duration` (`FR_LIMIT_*`) say so.
 
 **Changing the tenants list while the daemon runs.** `--tenants` names a file,
-or `ssm:` and an SSM parameter holding the list. The daemon reads it at start
-and every 30 seconds, and follows it without a restart:
+`ssm:` and an SSM parameter holding the list, or `db:`: the `tenants` table of
+the job store's database (`FR_JOB_EVENTS_DSN`), one row an installation, with
+no limit on the list's length. `firerunner tenant import FILE` writes a whole
+list there, checked first as the daemon checks one it reads, and
+`firerunner tenant export` prints it. A database that is down, like an SSM
+parameter that cannot be read, is a failed read: the daemon serves the
+installations as they were. The daemon reads the list at start and every 30
+seconds, and follows it without a restart:
 
 - An installation **added** starts serving.
 - One **removed** takes no more jobs. Its runners finish the jobs they have,

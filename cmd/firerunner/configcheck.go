@@ -202,6 +202,9 @@ func checkLimits(r *checkReport, cfg *config.Config) {
 	if name, ok := config.TenantsParameter(cfg.TenantsPath); ok {
 		r.Notes = append(r.Notes, fmt.Sprintf("the tenants list is read from the SSM parameter %s by the daemon, every 30s; it is not checked here", name))
 	}
+	if cfg.TenantsPath == config.TenantsDB {
+		r.Notes = append(r.Notes, "the tenants list is read from the job store's tenants table by the daemon, every 30s; it is not checked here (firerunner tenants put checks a list as it writes it)")
+	}
 	for _, t := range cfg.Tenants {
 		tiers, refused := cfg.TenantTiers(t)
 		ct := checkTenant{ID: t.ID, URL: t.URL, Tiers: []string{}, Limits: t.EffectiveLimits()}

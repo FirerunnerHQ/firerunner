@@ -1084,18 +1084,27 @@ func setPoolKey(c *ec2.Client, key []byte, tiers []config.Tier, log *slog.Logger
 // without --ec2-pool-key-file.
 const noPoolKeyWarning = "no --ec2-pool-key-file: this process signs pool instances and runner tags with a key of its own, so after a restart the warm pool is rebuilt, and the reaper deregisters no runner an earlier process launched (their instances end at --max-vm-lifetime)"
 
+// jobStoreDSN is the job store's database URL: FR_JOB_EVENTS_DSN, else the
+// file FR_JOB_EVENTS_DSN_FILE names, else "". The error never holds the URL.
+func jobStoreDSN(cfg *config.Config) (string, error) {
+	if cfg.JobEventsDSN != "" || cfg.JobEventsDSNFile == "" {
+		return cfg.JobEventsDSN, nil
+	}
+	raw, err := os.ReadFile(cfg.JobEventsDSNFile)
+	if err != nil {
+		return "", fmt.Errorf("cannot read the database URL's file %s", cfg.JobEventsDSNFile)
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
 // openJobEvents returns where job events go, and how to close it. The store
 // connects in the background, so a database that is down costs the record, never
 // a job, nor any time at start.
 func openJobEvents(cfg *config.Config, log *slog.Logger) (jobevent.Sink, func()) {
-	dsn := cfg.JobEventsDSN
-	if dsn == "" && cfg.JobEventsDSNFile != "" {
-		raw, err := os.ReadFile(cfg.JobEventsDSNFile)
-		if err != nil {
-			log.Warn("job events are off: cannot read the database URL's file", "file", cfg.JobEventsDSNFile)
-			return nil, func() {}
-		}
-		dsn = strings.TrimSpace(string(raw))
+	dsn, err := jobStoreDSN(cfg)
+	if err != nil {
+		log.Warn("job events are off: cannot read the database URL's file", "file", cfg.JobEventsDSNFile)
+		return nil, func() {}
 	}
 	if dsn == "" {
 		return nil, func() {}
@@ -1341,6 +1350,20 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				return nil, err
 			}
 			return awsssm.NewFromConfig(awsCfg), nil
+		}, func() (tenantsLoader, error) {
+			dsn, err := jobStoreDSN(cfg)
+			if err != nil {
+				return nil, err
+			}
+			if dsn == "" { // pgx would take its defaults: a local server
+				return nil, errors.New("db: the job store's database URL is empty")
+			}
+			store, err := jobstore.OpenTenants(dsn)
+			if err != nil {
+				return nil, err
+			}
+			go func() { <-ctx.Done(); store.Close() }()
+			return store, nil
 		})
 		if err != nil {
 			return fmt.Errorf("--tenants: %w", err)

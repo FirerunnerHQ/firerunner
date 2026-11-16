@@ -113,10 +113,13 @@ func (s *Store) Close(ctx context.Context) {
 	}
 }
 
-// setUp migrates and creates partitions under one lock, so shards starting
-// together on an empty database wait for each other.
-func (s *Store) setUp(ctx context.Context) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+func (s *Store) setUp(ctx context.Context) error { return prepare(ctx, s.pool) }
+
+// prepare migrates and creates partitions under one lock, so shards starting
+// together on an empty database, and an operator writing the tenants, wait
+// for each other.
+func prepare(ctx context.Context, pool *pgxpool.Pool) error {
+	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7231905)`); err != nil {
 			return err
 		}
