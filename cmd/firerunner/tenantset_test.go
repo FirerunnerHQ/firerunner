@@ -45,6 +45,7 @@ type setLab struct {
 	removed   []string
 	forgot    []string
 	removeErr error
+	forgetErr error
 	removing  func(ctx context.Context) error
 	// removeCtx is the context the last gated removal was given.
 	removeCtx context.Context
@@ -98,23 +99,26 @@ func newSetLab(t *testing.T) *setLab {
 			defer l.mu.Unlock()
 			l.maxes = append(l.maxes, id+"="+strconv.Itoa(max))
 		},
-		removed: func(ctx context.Context, c config.Tenant) error {
+		// Its scale sets go at once; what it left on EC2, as the test says.
+		removed: func(ctx context.Context, c config.Tenant, namesGone func()) error {
 			l.mu.Lock()
 			l.removed = append(l.removed, c.ID+" "+strings.Join(c.Tiers, ","))
 			err, during := l.removeErr, l.removing
 			l.mu.Unlock()
+			namesGone()
 			if during != nil {
 				return during(ctx)
 			}
 			return err
 		},
-		forget: func(id string, upTo time.Time, _ string) {
+		forget: func(id string, upTo time.Time, url string) error {
 			l.mu.Lock()
 			defer l.mu.Unlock()
-			if upTo.IsZero() {
-				l.t.Errorf("forgot %s with no time", id)
+			if upTo.IsZero() || url == "" {
+				l.t.Errorf("forgot %s with no time or URL", id)
 			}
 			l.forgot = append(l.forgot, id)
+			return l.forgetErr
 		},
 	}
 	t.Cleanup(func() {
@@ -644,7 +648,7 @@ func TestTenantSetStopHandsOnNothing(t *testing.T) {
 			close(started)
 			<-ctx.Done()
 		},
-		removed: func(context.Context, config.Tenant) error { handed.Add(1); return nil },
+		removed: func(context.Context, config.Tenant, func()) error { handed.Add(1); return nil },
 	}
 	set.apply([]config.Tenant{listed("a", 2, "x")})
 	<-started

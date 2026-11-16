@@ -1330,7 +1330,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	//
 	// forgetRemoved, with the tenants in the job store, records there that
 	// all a removed tenant left is deleted, so that no shard sweeps it.
-	var forgetRemoved func(id string, upTo time.Time, url string)
+	var forgetRemoved func(id string, upTo time.Time, url string) error
 	tenants := &tenantSet{
 		ctx: runCtx, log: log,
 		run: func(ctx context.Context, cur func() config.Tenant, served func(*servedTenant)) {
@@ -1343,14 +1343,17 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		},
 		// What a removed tenant left: its scale sets by name, then its
 		// machines by owner tag.
-		removed: func(ctx context.Context, c config.Tenant) error {
+		removed: func(ctx context.Context, c config.Tenant, namesGone func()) error {
 			t := extraTenant(cfg, c, tenantOwner, appJWT)
-			return errors.Join(s.removeLeftovers(ctx, t, c.Tiers), s.endRemoved(ctx, t))
+			err := s.removeLeftovers(ctx, t, c.Tiers)
+			namesGone()
+			return errors.Join(err, s.endRemoved(ctx, t))
 		},
-		forget: func(id string, upTo time.Time, url string) {
-			if forgetRemoved != nil {
-				forgetRemoved(id, upTo, url)
+		forget: func(id string, upTo time.Time, url string) error {
+			if forgetRemoved == nil {
+				return nil
 			}
+			return forgetRemoved(id, upTo, url)
 		},
 	}
 	s.tenants.Store(tenants)
@@ -1384,12 +1387,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			defer db.Close()
 			// A removal done here is done: no sweep repeats it.
 			s.tenantListed = db.TenantListed
-			forgetRemoved = func(id string, upTo time.Time, url string) {
+			forgetRemoved = func(id string, upTo time.Time, url string) error {
 				fctx, cancel := context.WithTimeout(context.WithoutCancel(runCtx), forgetRemovedTimeout)
 				defer cancel()
-				if err := db.ForgetRemoved(fctx, id, upTo, url); err != nil {
-					log.Warn("removed tenant not forgotten: a shard may delete what it left again", "tenant", id, "err", err)
-				}
+				return db.ForgetRemoved(fctx, id, upTo, url)
 			}
 		}
 		if err != nil {

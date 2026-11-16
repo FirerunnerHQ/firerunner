@@ -185,15 +185,16 @@ type tenantSet struct {
 	setMax func(id string, max int)
 	// removed, when set, is called with a removed tenant's last entry once
 	// its run has ended, whether that run served it or still waited on the
-	// runs before it: it deletes what the tenant's tiers registered, and
-	// what it left on EC2. ctx ends with the set's, and with the run's
-	// lease (cause errLeaseLapsed); an error means it did not all go.
-	removed func(ctx context.Context, c config.Tenant) error
+	// runs before it: it deletes what the tenant's tiers registered, calls
+	// namesGone, then ends what it left on EC2. ctx ends with the set's;
+	// its leaseLapse, with the run's lease. An error means it did not all
+	// go.
+	removed func(ctx context.Context, c config.Tenant, namesGone func()) error
 	// forget, when set, is called once removed has deleted all a tenant
 	// left, with the time its removal was seen and its URL: the job store
 	// forgets its removal on that URL recorded by then, so that no shard
-	// sweeps it again.
-	forget func(id string, upTo time.Time, url string)
+	// sweeps it again. An error leaves the removal to sweep again.
+	forget func(id string, upTo time.Time, url string) error
 	log    *slog.Logger
 	// now and afterFunc replace the clock and its timers in tests.
 	now       func() time.Time
@@ -238,6 +239,25 @@ type tenantRun struct {
 	// swept is set on a run that only deletes what a tenant removed while
 	// no shard served it left.
 	swept bool
+	// named, on a removing run, closes once its scale sets are deleted
+	// (or their deletion gave up): a run of another id on the account
+	// waits for that alone, not for its EC2 sweep, which goes by this id's
+	// owner tag. Set before the run is cancelled; guarded by the set's mu.
+	named chan struct{}
+}
+
+// waitsOn is what a run of id on account must wait for, of run e: all of
+// it on the same id, its scale sets' deletion on the same account.
+func (e *tenantRun) waitsOn(id, account string) <-chan struct{} {
+	switch {
+	case e.id == id:
+		return e.done
+	case e.account != account:
+		return nil
+	case e.named != nil:
+		return e.named
+	}
+	return e.done
 }
 
 // fence returns why the run may launch nothing more, or "" while it may:
@@ -277,6 +297,7 @@ func (ts *tenantSet) endLocked(r *tenantRun, cause error) {
 	r.removing = errors.Is(cause, errTenantRemoved)
 	if r.removing {
 		r.removedAt = time.Now()
+		r.named = make(chan struct{})
 	}
 	r.cancel(cause)
 	if r.stopTimer != nil {
@@ -416,12 +437,14 @@ func (ts *tenantSet) applyLeases(list []config.Tenant, leases map[string]time.Ti
 		r := &tenantRun{id: c.ID, account: config.AccountOf(c.URL), done: make(chan struct{})}
 		var prev []<-chan struct{}
 		for _, e := range ts.ending {
-			if e.id == r.id || e.account == r.account {
-				prev = append(prev, e.done)
+			if ch := e.waitsOn(r.id, r.account); ch != nil {
+				prev = append(prev, ch)
 			}
 		}
 		r.cur.Store(&c)
-		ctx, cancel := context.WithCancelCause(context.WithValue(ts.ctx, leaseKey{}, func() bool { return r.expired(ts.clock()) }))
+		ctx, cancel := context.WithCancelCause(context.WithValue(context.WithValue(ts.ctx,
+			leaseKey{}, func() bool { return r.expired(ts.clock()) }),
+			boundKey{}, func() (context.Context, func()) { return ts.leaseBound(r) }))
 		r.cancel = cancel
 		ts.running[c.ID] = r
 		ts.renewLocked(r, deadline)
@@ -518,14 +541,44 @@ func (ts *tenantSet) remove(r *tenantRun) error {
 	ctx, stop := ts.leaseBound(r)
 	defer stop()
 	c := *r.cur.Load()
-	if err := ts.removed(ctx, c); err != nil {
+	namesGone := sync.OnceFunc(func() {
+		if r.named != nil {
+			close(r.named)
+		}
+	})
+	defer namesGone()
+	if err := ts.removed(ctx, c, namesGone); err != nil {
 		ts.log.Warn("removed tenant's leftovers not all deleted: kept to sweep again", "tenant", r.id, "err", err)
 		return err
 	}
 	if ts.forget != nil {
-		ts.forget(r.id, r.removedAt, c.URL)
+		if err := ts.forget(r.id, r.removedAt, c.URL); err != nil {
+			ts.log.Warn("removed tenant's leftovers deleted, but its removal not forgotten: swept again later", "tenant", r.id, "err", err)
+			return err
+		}
 	}
 	return nil
+}
+
+// boundKey carries a run's leaseBound in its context: a removal of what
+// it serves, at its stop, is bound by its lease too.
+type boundKey struct{}
+
+// boundRemoval returns a context of ctx's for a removal of what a run
+// served, bounded by tenantRemoveTimeout, and ended at once if the run's
+// lease lapses, the daemon stopping or not; and its release.
+func boundRemoval(ctx context.Context) (context.Context, func()) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
+	bound, ok := ctx.Value(boundKey{}).(func() (context.Context, func()))
+	if !ok {
+		return rctx, cancel
+	}
+	lctx, stop := bound()
+	unhook := func() bool { return false }
+	if lapse := leaseLapse(lctx); lapse != nil {
+		unhook = context.AfterFunc(lapse, cancel)
+	}
+	return rctx, func() { unhook(); stop(); cancel() }
 }
 
 // leaseBound returns a context of the set's whose leaseLapse ends, with
@@ -605,19 +658,20 @@ func (ts *tenantSet) sweep(c config.Tenant, removedAt, deadline time.Time, done 
 		return false // listed again: its removal is no more
 	}
 	for _, r := range ts.running {
-		if r.account == account {
-			inUse := r.cur.Load().Tiers
-			c.Tiers = slices.DeleteFunc(slices.Clone(c.Tiers), func(t string) bool { return slices.Contains(inUse, t) })
+		// Scale sets are found by name in a runner group: only the same
+		// group's names are that run's.
+		if cur := r.cur.Load(); r.account == account && cur.RunnerGroup == c.RunnerGroup {
+			c.Tiers = slices.DeleteFunc(slices.Clone(c.Tiers), func(t string) bool { return slices.Contains(cur.Tiers, t) })
 		}
 	}
-	r := &tenantRun{id: c.ID, account: account, done: make(chan struct{}), removing: true, removedAt: removedAt, swept: true}
+	r := &tenantRun{id: c.ID, account: account, done: make(chan struct{}), removing: true, removedAt: removedAt, swept: true, named: make(chan struct{})}
 	r.cur.Store(&c)
 	r.deadline.Store(&deadline)
 	r.cancel = func(error) {}
 	var prev []<-chan struct{}
 	for _, e := range ts.ending {
-		if e.id == r.id || e.account == r.account {
-			prev = append(prev, e.done)
+		if ch := e.waitsOn(r.id, r.account); ch != nil {
+			prev = append(prev, ch)
 		}
 	}
 	ts.ending = append(ts.ending, r)

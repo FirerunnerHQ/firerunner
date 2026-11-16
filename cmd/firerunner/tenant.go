@@ -78,6 +78,9 @@ type shard struct {
 	// removeByName deletes a scale set by name; nil is
 	// listener.RemoveByName. Tests replace it.
 	removeByName func(context.Context, listener.Config) (bool, error)
+	// endAll ends what an owner left on EC2; nil is ec2Client.EndAll.
+	// Tests replace it.
+	endAll func(ctx context.Context, o ec2.ReaperOptions, why string) (ec2.ReapReport, error)
 	// tenantListed, with the tenants in the job store, reports whether a
 	// tenant id is listed there now: a removal ends no machine by its owner
 	// tag once it is, as they are a run's of the id listed again.
@@ -338,9 +341,10 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 				// them under a lease.
 				s.log.Warn("removed tenant's lease lapsed while its runners finished: leaving its scale sets to a sweep", "tenant", st.t.ID)
 			case p.remove:
-				// Bounded: a GitHub that hangs must not hold up shutdown.
-				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
-				defer cancel()
+				// Bounded: a GitHub that hangs must not hold up shutdown,
+				// and a lease that lapses meanwhile stops it at once.
+				rctx, release := boundRemoval(ctx)
+				defer release()
 				st.remove(rctx)
 			case !p.sessionsFirst:
 				st.close(context.WithoutCancel(ctx))
@@ -413,7 +417,11 @@ func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) e
 // account. It returns an error unless both sweeps ran, or the id is
 // listed again.
 func (s *shard) endRemoved(ctx context.Context, t tenant) error {
-	if s.ec2Client == nil || s.cfg.EC2Reaper == "off" {
+	endAll := s.endAll
+	if endAll == nil && s.ec2Client != nil {
+		endAll = s.ec2Client.EndAll
+	}
+	if endAll == nil || s.cfg.EC2Reaper == "off" {
 		return nil
 	}
 	lapse := leaseLapse(ctx)
@@ -425,7 +433,7 @@ func (s *shard) endRemoved(ctx context.Context, t tenant) error {
 	log := s.log.With("tenant", t.ID)
 	o := reaperOptions(s.cfg, t.Owner, nil, nil, log)
 	o.Proceed = s.mayEndRemoved(lapse, t.ID)
-	rep, err := s.ec2Client.EndAll(ctx, o, "removed from the tenants list")
+	rep, err := endAll(ctx, o, "removed from the tenants list")
 	if errors.Is(err, errListedAgain) {
 		log.Info("removed tenant listed again: leaving what it left on EC2 to the reaper of its new run", "instances", len(rep.Instances))
 		return nil

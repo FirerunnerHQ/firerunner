@@ -64,6 +64,23 @@ func TestRemovedTenants(t *testing.T) {
 	if got, _ = s.RemovedTenants(ctx); len(got) != 0 {
 		t.Fatalf("removed %+v once forgotten", got)
 	}
+	// One whose entry does not read: forgotten by its exact time alone.
+	exec(t, dsn, `INSERT INTO tenants (id, entry) VALUES ('z', '{"id": "z"}')`)
+	exec(t, dsn, `DELETE FROM tenants WHERE id = 'z'`)
+	z, _ := s.RemovedTenants(ctx)
+	if err := s.ForgetRemoved(ctx, "z", z[0].RemovedAt.Add(-time.Second), ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = s.RemovedTenants(ctx); len(got) != 1 {
+		t.Fatalf("removed %+v: forgot z at another time", got)
+	}
+	if err := s.ForgetRemoved(ctx, "z", z[0].RemovedAt, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = s.RemovedTenants(ctx); len(got) != 0 {
+		t.Fatalf("removed %+v, want z forgotten by its time", got)
+	}
+
 	// A removal recorded by now, forgotten by a run that saw it then.
 	exec(t, dsn, `DELETE FROM tenants WHERE id = 'b'`)
 	if listed, err := s.TenantListed(ctx, "b"); err != nil || listed {

@@ -49,9 +49,16 @@ func (s *TenantStore) RemovedTenants(ctx context.Context) ([]Removed, error) {
 
 // ForgetRemoved records that tenant id's leftovers are deleted, for its
 // removal on url recorded at or before upTo: a tenant listed and removed
-// again since, or on another URL, is a removal still to do.
+// again since, or on another URL, is a removal still to do. An empty url
+// forgets the removal recorded exactly at upTo, whatever its entry: one
+// whose entry does not read.
 func (s *TenantStore) ForgetRemoved(ctx context.Context, id string, upTo time.Time, url string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM removed_tenants WHERE id = $1 AND removed_at <= $2 AND entry->>'url' = $3`, id, upTo, url)
+	var err error
+	if url == "" {
+		_, err = s.pool.Exec(ctx, `DELETE FROM removed_tenants WHERE id = $1 AND removed_at = $2`, id, upTo)
+	} else {
+		_, err = s.pool.Exec(ctx, `DELETE FROM removed_tenants WHERE id = $1 AND removed_at <= $2 AND entry->>'url' = $3`, id, upTo, url)
+	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
 		return nil

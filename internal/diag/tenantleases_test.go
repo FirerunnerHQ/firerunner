@@ -98,6 +98,21 @@ func TestStatusAndDoctorShowTheTenantLeases(t *testing.T) {
 	}
 	f.TenantLeases.Sweeping = nil
 
+	f.TenantLeases.SweepsFailing = []string{"old: 3 attempt(s), next in 4m0s: 502"}
+	write()
+	if s := status(); !strings.Contains(s, "sweep failing: old: 3 attempt(s)") {
+		t.Fatalf("status with a sweep failing:\n%s", s)
+	}
+	if c := check(); c == nil || c.Level != levelPass {
+		t.Fatalf("doctor before it is stuck = %+v, want a pass", c)
+	}
+	f.TenantLeases.SweepsStuck = true
+	write()
+	if c := check(); c == nil || c.Level != levelWarn || !strings.Contains(c.Detail, "keeps failing") || !strings.Contains(c.Detail, "502") {
+		t.Fatalf("doctor with a sweep stuck = %+v", c)
+	}
+	f.TenantLeases.SweepsFailing, f.TenantLeases.SweepsStuck = nil, false
+
 	f.TenantLeases.LastError, f.TenantLeases.LastErrorAt = "renew the leases: connection refused", now
 	write()
 	if s := status(); !strings.Contains(s, "last renewal failed") || !strings.Contains(s, "connection refused") {

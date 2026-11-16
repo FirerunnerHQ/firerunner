@@ -31,6 +31,8 @@ type fakeLeases struct {
 	// and records in forgotten.
 	removed   []jobstore.Removed
 	forgotten []string
+	// forgotByTime are the removals forgotten whatever their entry.
+	forgotByTime []string
 	// mine are the leases s1 holds as of its last renewal: Placement reads
 	// them as held, as the store does.
 	mine []string
@@ -150,12 +152,15 @@ func (f *fakeLeases) RemovedTenants(context.Context) ([]jobstore.Removed, error)
 	return slices.Clone(f.removed), nil
 }
 
-func (f *fakeLeases) ForgetRemoved(_ context.Context, id string, upTo time.Time, _ string) error {
+func (f *fakeLeases) ForgetRemoved(_ context.Context, id string, upTo time.Time, url string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.removed = slices.DeleteFunc(f.removed, func(r jobstore.Removed) bool {
 		return r.ID == id && !r.RemovedAt.After(upTo)
 	})
+	if url == "" {
+		f.forgotByTime = append(f.forgotByTime, id)
+	}
 	f.forgotten = append(f.forgotten, id)
 	return nil
 }

@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/firerunnerhq/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/ec2"
 	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
@@ -145,6 +147,15 @@ func TestTenantSetSweepBesideARunOnItsAccount(t *testing.T) {
 	}
 	if _, ok := l.runs()["a"]; !ok {
 		t.Fatal("a stopped for the sweep")
+	}
+
+	// In another runner group, a's names are not old's scale sets.
+	other := old
+	other.ID, other.RunnerGroup = "other", "elsewhere"
+	out = mustSweep(t, l, other, c.now().Add(20*time.Second))
+	waitErr(t, out, nil)
+	if r, _ := l.removals(); !slices.Contains(r, "other x,y") {
+		t.Fatalf("removed %v, want all of other's", r)
 	}
 }
 
@@ -437,4 +448,131 @@ func TestLeaserSweepsWhatItHoldsAndBacksOff(t *testing.T) {
 	pass(leaseInterval)
 	waitFor(t, "the sweep that succeeds", func() bool { _, f := l.removals(); return len(f) == 1 })
 	waitFor(t, "the failure cleared", func() bool { return len(lr.status().SweepsFailing) == 0 })
+}
+
+// A run of another id on the account waits only for a sweep's scale sets
+// to go, not for its EC2 sweep, which goes by the removed id's owner tag.
+func TestTenantSetRunWaitsOnlyForASweepsScaleSets(t *testing.T) {
+	l, c := leaseLab(t)
+	release, ended := gated(l) // after its scale sets, in its EC2 sweep
+	defer release()
+	old := listed("a", 2, "y")
+	old.ID = "old"
+	out := mustSweep(t, l, old, c.now().Add(20*time.Second))
+	waitFor(t, "the sweep's removal", func() bool { r, _ := l.removals(); return len(r) == 1 })
+	l.set.applyLeases([]config.Tenant{listed("a", 2, "x")}, map[string]time.Time{"a": c.now().Add(20 * time.Second)})
+	l.started("a")
+	if got := l.set.sweeping(); !slices.Equal(got, []string{"old"}) {
+		t.Fatalf("sweeping %v, want old still in its EC2 sweep", got)
+	}
+	release()
+	waitErr(t, ended, nil)
+	waitErr(t, out, nil)
+}
+
+// A sweep whose removal is not forgotten failed: it is tried again later.
+func TestTenantSetSweepNotForgottenFails(t *testing.T) {
+	l, c := leaseLab(t)
+	l.mu.Lock()
+	l.forgetErr = errors.New("connection refused")
+	l.mu.Unlock()
+	out := mustSweep(t, l, listed("gone", 2, "x"), c.now().Add(20*time.Second))
+	if err := <-out; err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("sweep ended with %v, want the forget's error", err)
+	}
+}
+
+// A removal of what a served tenant registered, at its stop, ends at once
+// when its lease lapses, the daemon stopping or not; with no lease, it is
+// bounded by its time alone.
+func TestBoundRemoval(t *testing.T) {
+	stopping, stop := context.WithCancel(context.Background())
+	stop()
+	lapse, lapsed := context.WithCancel(context.Background())
+	released := false
+	ctx := context.WithValue(stopping, boundKey{}, func() (context.Context, func()) {
+		return context.WithValue(context.Background(), lapseKey{}, context.Context(lapse)), func() { released = true }
+	})
+	rctx, release := boundRemoval(ctx)
+	if rctx.Err() != nil {
+		t.Fatal("ended with the daemon's context")
+	}
+	if _, ok := rctx.Deadline(); !ok {
+		t.Fatal("no deadline")
+	}
+	lapsed()
+	waitFor(t, "the lapse to end it", func() bool { return rctx.Err() != nil })
+	release()
+	if !released {
+		t.Fatal("its lease bound not released")
+	}
+	rctx, release = boundRemoval(stopping)
+	defer release()
+	if _, ok := rctx.Deadline(); !ok || rctx.Err() != nil {
+		t.Fatal("with no lease: not bounded by its time alone")
+	}
+}
+
+// endRemoved asks before each EC2 sweep: a tenant listed again is no
+// failure, as its new run's reaper owns what is left; any other error is.
+func TestEndRemovedAsksBeforeEachSweep(t *testing.T) {
+	var listedAgain bool
+	sweepErr := errors.New("throttled")
+	s := &shard{log: slog.New(slog.DiscardHandler), cfg: &config.Config{EC2Reaper: "on"},
+		tenantListed: func(context.Context, string) (bool, error) { return listedAgain, nil },
+		endAll: func(ctx context.Context, o ec2.ReaperOptions, _ string) (ec2.ReapReport, error) {
+			if o.Proceed == nil {
+				t.Fatal("EndAll not asked to check before each sweep")
+			}
+			if err := o.Proceed(ctx); err != nil {
+				return ec2.ReapReport{}, err
+			}
+			return ec2.ReapReport{}, sweepErr
+		}}
+	tn := tenant{ID: "gone", Owner: "fr/gone"}
+	if err := s.endRemoved(context.Background(), tn); !errors.Is(err, sweepErr) {
+		t.Fatalf("endRemoved = %v, want the sweep's error", err)
+	}
+	listedAgain = true
+	if err := s.endRemoved(context.Background(), tn); err != nil {
+		t.Fatalf("endRemoved of a tenant listed again = %v, want none", err)
+	}
+}
+
+// Any shard forgets the failures of removals done meanwhile, assigning or
+// not; and sweeps nothing until its list has applied. An entry that does
+// not read is forgotten by its time alone.
+func TestLeaserSweepHousekeeping(t *testing.T) {
+	l, _, store, lr := leaserLab(t)
+	lr.joined = true
+	lr.apply([]config.Tenant{listed("a", 2, "x")})
+	store.set(acct("a"))
+	k := sweepKey{"old", time.Unix(1_800_000_000, 0)}
+	lr.sweepFailures = map[sweepKey]*sweepFailure{k: {attempts: 5, err: "502"}}
+	if err := lr.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	l.started("a")
+	if st := lr.status(); len(st.SweepsFailing) != 0 || st.SweepsStuck {
+		t.Fatalf("status %+v, want old's failures gone with its removal", st)
+	}
+
+	store.mu.Lock()
+	bad := removedRecord("bad")
+	bad.Entry = []byte(`{"id": "bad", "url": "not a URL"}`)
+	store.removed = []jobstore.Removed{removedRecord("old"), bad}
+	store.removed[0].Entry, _ = json.Marshal(config.Tenant{ID: "old", URL: listed("a", 1).URL, Tiers: []string{"y"}})
+	store.mu.Unlock()
+	lr.listFailed()
+	if err := lr.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := l.set.sweeping(); len(got) != 0 {
+		t.Fatalf("sweeping %v with a list that did not apply", got)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if !slices.Equal(store.forgotByTime, []string{"bad"}) {
+		t.Fatalf("forgot %v by time, want bad", store.forgotByTime)
+	}
 }

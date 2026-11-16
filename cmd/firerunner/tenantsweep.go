@@ -57,7 +57,7 @@ func (l *tenantLeaser) removedTenants(ctx context.Context) ([]plannedSweep, erro
 		var c config.Tenant
 		if err := json.Unmarshal(r.Entry, &c); err != nil || config.AccountOf(c.URL) == "" || c.ID != r.ID {
 			l.log.Error("removed tenant's entry does not read: delete what it left by hand", "tenant", r.ID, "removed_at", r.RemovedAt)
-			if err := l.store.ForgetRemoved(ctx, r.ID, r.RemovedAt, c.URL); err != nil {
+			if err := l.store.ForgetRemoved(ctx, r.ID, r.RemovedAt, ""); err != nil {
 				l.log.Warn("removed tenant not forgotten", "tenant", r.ID, "err", err)
 			}
 			continue
@@ -86,6 +86,20 @@ func (l *tenantLeaser) sweepHeld(ctx context.Context) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	current := map[sweepKey]bool{}
+	for _, p := range removed {
+		current[sweepKey{p.removed.ID, p.removed.RemovedAt}] = true
+	}
+	for k := range l.sweepFailures {
+		if !current[k] {
+			delete(l.sweepFailures, k) // done, here or elsewhere
+		}
+	}
+	if !l.listOK {
+		// Beside the tenants this shard serves on an account, a sweep keeps
+		// their scale sets: only by a list that applied.
+		return
+	}
 	for _, p := range removed {
 		account := config.AccountOf(p.tenant.URL)
 		d, held := l.held[account]
