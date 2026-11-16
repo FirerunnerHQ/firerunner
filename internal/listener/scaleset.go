@@ -620,6 +620,13 @@ func jitter(d time.Duration) time.Duration {
 	return time.Duration(float64(d) * f)
 }
 
+// CloseSession closes the message session, and keeps the scale set whoever
+// created it: its tenant is handed to another process, which serves it next.
+func (s *ScaleSet) CloseSession(ctx context.Context) {
+	_ = s.session.Close(ctx)
+	s.log.Info("closed the scale set's session: its tenant is handed off", "scaleSetID", s.scaleSetID)
+}
+
 // Close deregisters the scale set and closes the message session. It deletes the
 // scale set only when this process created it; a scale set we merely reused (it
 // existed from a prior run or belongs to another instance) is left in place so

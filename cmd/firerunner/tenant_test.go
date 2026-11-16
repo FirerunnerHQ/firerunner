@@ -528,9 +528,9 @@ func TestDrainHandsOffOnlyEC2Tiers(t *testing.T) {
 	<-drained
 }
 
-// Only a process told to exit hands off, and only what its next one will
-// find and end: not a tenant removed, nor without the reaper on and an
-// --owner that outlives the host.
+// Only a process told to exit, or a tenant handed to another shard, hands
+// off, and only what the next one will find and end: not a tenant removed,
+// nor without the reaper on and an --owner that outlives the host.
 func TestHandsOff(t *testing.T) {
 	exiting, exit := context.WithCancel(context.Background())
 	exit()
@@ -538,6 +538,8 @@ func TestHandsOff(t *testing.T) {
 	drop(errTenantRemoved)
 	stopped, stop := context.WithCancel(context.Background())
 	stop()
+	handedOff, handOff := context.WithCancelCause(context.Background())
+	handOff(errTenantHandedOff)
 	for _, c := range []struct {
 		name    string
 		exiting context.Context
@@ -554,9 +556,13 @@ func TestHandsOff(t *testing.T) {
 		{"reaper dry-run", exiting, true, "dry-run", stopped, false},
 		{"reaper off", exiting, true, "off", stopped, false},
 		{"no --owner", exiting, true, "on", stopped, false},
+		{"handed off", context.Background(), true, "on", handedOff, true},
+		{"handed off, no EC2", context.Background(), false, "on", handedOff, false},
+		{"handed off, reaper dry-run", context.Background(), true, "dry-run", handedOff, false},
+		{"no --owner, handed off", context.Background(), true, "on", handedOff, false},
 	} {
 		owner := "dogfood"
-		if c.name == "no --owner" {
+		if strings.HasPrefix(c.name, "no --owner") {
 			owner = ""
 		}
 		s := &shard{cfg: &config.Config{EC2Reaper: c.reaper, Owner: owner}, exiting: c.exiting}
@@ -565,6 +571,11 @@ func TestHandsOff(t *testing.T) {
 		}
 		if got := s.handsOff(c.tenant); got != c.want {
 			t.Errorf("%s: handsOff = %v, want %v", c.name, got, c.want)
+		}
+		p := s.stopPlan(c.tenant)
+		want := tenantStop{handOff: c.want, sessionsFirst: c.tenant == handedOff, remove: c.tenant == removed}
+		if p != want {
+			t.Errorf("%s: stopPlan = %+v, want %+v", c.name, p, want)
 		}
 	}
 }

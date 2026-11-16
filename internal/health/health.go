@@ -84,7 +84,8 @@ type Tier struct {
 	// launches back, since the daemon started, by what held them: "limit"
 	// (its own runner limit), "plan_limit" (its plan's, narrower),
 	// "plan_tier" (its plan leaves the tier out), "held" (by its state or
-	// entitlement) or "suspended".
+	// entitlement), "suspended", or "fenced" (this shard's lease on the
+	// tenant ended).
 	HeldJobs map[string]int `json:"held_jobs,omitempty"`
 	// Stranded counts jobs GitHub stopped assigning to the scale set while
 	// no session was open, since the daemon started: an outage of more than

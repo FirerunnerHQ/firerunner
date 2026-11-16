@@ -23,7 +23,8 @@ import (
 //
 // A tenant can also be held, which refuses every launch, or suspended, which
 // also stops every runner it has (see Suspend). Its plan can narrow its bound
-// and leave tiers out (see SetPlan).
+// and leave tiers out (see SetPlan). A fence stops its launches once the
+// shard's lease on it has ended (see SetFence).
 //
 // It is safe for concurrent use.
 type Tenant struct {
@@ -44,6 +45,8 @@ type Tenant struct {
 	// says whether a suspension set it.
 	heldWhy   string
 	suspended bool
+	// fence, when set, says why no launch may go on; "" while one may.
+	fence func() string
 }
 
 // NewTenant returns the bound for one tenant's tiers: at most max runners at
@@ -84,6 +87,9 @@ const (
 	HoldHeld HoldKind = "held"
 	// HoldSuspended: the tenant is suspended (Tenant.Suspend).
 	HoldSuspended HoldKind = "suspended"
+	// HoldFenced: the shard's lease on the tenant has ended
+	// (Tenant.SetFence).
+	HoldFenced HoldKind = "fenced"
 )
 
 // Hold is why a tier's launches wait: its kind, and the reason in words.
@@ -103,6 +109,9 @@ func (t *Tenant) take(s *Scheduler, n int) (int, Hold) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if why := t.fencedLocked(); why != "" {
+		return 0, Hold{HoldFenced, why}
+	}
 	if t.heldWhy != "" {
 		if t.suspended {
 			return 0, Hold{HoldSuspended, t.heldWhy}
@@ -319,6 +328,35 @@ func (t *Tenant) Hold(why string) bool {
 	}
 	t.heldWhy, t.suspended = held, false
 	return true
+}
+
+// SetFence makes every launch of the tenant's tiers ask fence first, and not
+// go on while it returns a reason: when the plan grants it, and again just
+// before the runner's machine is asked for, so a launch granted before the
+// fence closed stops there too. It is for a tenant served under a lease that
+// another shard may take once it ends: from then on, this one must launch
+// nothing. fence is called with the tenant's and a scheduler's locks held,
+// so it must be quick and must not call back into either. A fence stops no
+// runner already launched.
+func (t *Tenant) SetFence(fence func() string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.fence = fence
+}
+
+// fenced is why the fence stops launches, or "".
+func (t *Tenant) fenced() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.fencedLocked()
+}
+
+// fencedLocked is fenced for a caller that holds t.mu.
+func (t *Tenant) fencedLocked() string {
+	if t.fence == nil {
+		return ""
+	}
+	return t.fence()
 }
 
 // Resume lifts a suspension or a hold, and wakes the tenant's schedulers to
