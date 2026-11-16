@@ -39,6 +39,9 @@ var errTenantsMissing = errors.New("the tenants list does not exist")
 var (
 	errTenantRemoved = errors.New("removed from the tenants list")
 	errTenantChanged = errors.New("changed in the tenants list")
+	// errTenantHandedOff: this shard no longer holds the tenant's lease,
+	// and another may serve it.
+	errTenantHandedOff = errors.New("handed off: this shard's lease on it ended")
 )
 
 // removedTenant reports whether a tenant's loop ended because the list no
@@ -46,6 +49,14 @@ var (
 // stopping, keeps them for the next start.
 func removedTenant(ctx context.Context) bool {
 	return errors.Is(context.Cause(ctx), errTenantRemoved)
+}
+
+// handedOffTenant reports whether a tenant's loop ended because this shard
+// no longer holds its lease. It closes its sessions at once, so the next
+// shard can open them, and leaves its busy runners to that shard; its scale
+// sets stay.
+func handedOffTenant(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), errTenantHandedOff)
 }
 
 // tenantSource is where the tenants list is kept.
@@ -146,6 +157,11 @@ func openTenants(spec string, newSSM func() (ssmGetAPI, error), newDB func() (te
 //   - a tenant changed otherwise stops as a removed one does, but keeps its
 //     scale sets, and starts again as listed once its runners have finished.
 //     Its jobs queue meanwhile: one scale set takes one session at a time.
+//
+// A shard that serves a tenant only while it holds the tenant's lease
+// applies its list with applyLeases: a tenant is then served until a
+// deadline, and handed off once that passes unrenewed, or once another
+// shard holds its lease.
 type tenantSet struct {
 	ctx context.Context
 	// run serves a tenant until ctx ends. cur returns its entry as listed
@@ -159,6 +175,9 @@ type tenantSet struct {
 	// runs before it: it deletes what the tenant's tiers registered.
 	removed func(config.Tenant)
 	log     *slog.Logger
+	// now and afterFunc replace the clock and its timers in tests.
+	now       func() time.Time
+	afterFunc func(time.Duration, func()) (stop func() bool)
 
 	mu      sync.Mutex
 	running map[string]*tenantRun
@@ -183,10 +202,97 @@ type tenantRun struct {
 	cancel      context.CancelCauseFunc
 	// done closes once the loop has ended, its runners finished.
 	done chan struct{}
+	// deadline, when set, is the time the run may launch and serve until,
+	// on the monotonic clock: its lease's. stopTimer stops the timer that
+	// hands it off then; it is guarded by the set's mu.
+	deadline  atomic.Pointer[time.Time]
+	stopTimer func() bool
+}
+
+// fence returns why the run may launch nothing more, or "" while it may:
+// for the scheduler (scheduler.Tenant.SetFence).
+func (r *tenantRun) fence(now func() time.Time) func() string {
+	return func() string {
+		if d := r.deadline.Load(); d != nil && !now().Before(*d) {
+			return fmt.Sprintf("this shard's lease on tenant %q was not renewed by %s", r.id, d.UTC().Format(time.TimeOnly))
+		}
+		return ""
+	}
+}
+
+// expired reports whether the run's deadline has passed.
+func (r *tenantRun) expired(now time.Time) bool {
+	d := r.deadline.Load()
+	return d != nil && !now.Before(*d)
+}
+
+// clock is the time now.
+func (ts *tenantSet) clock() time.Time {
+	if ts.now != nil {
+		return ts.now()
+	}
+	return time.Now()
+}
+
+// endLocked stops a run, for cause, and moves it from running to those
+// ending. The caller holds ts.mu.
+func (ts *tenantSet) endLocked(r *tenantRun, cause error) {
+	r.cancel(cause)
+	if r.stopTimer != nil {
+		r.stopTimer()
+	}
+	ts.ending = append(ts.ending, r)
+	delete(ts.running, r.id)
+}
+
+// renewLocked sets the run's deadline, zero for none, and arms the timer
+// that hands it off once the deadline passes unrenewed. The caller holds
+// ts.mu.
+func (ts *tenantSet) renewLocked(r *tenantRun, deadline time.Time) {
+	if r.stopTimer != nil {
+		r.stopTimer()
+		r.stopTimer = nil
+	}
+	if deadline.IsZero() {
+		r.deadline.Store(nil)
+		return
+	}
+	r.deadline.Store(&deadline)
+	after := ts.afterFunc
+	if after == nil {
+		after = func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
+	}
+	r.stopTimer = after(deadline.Sub(ts.clock()), func() { ts.expire(r) })
+}
+
+// expire hands a run off if its deadline has passed unrenewed: from then on,
+// another shard may hold its lease. The timer acts even when whatever
+// renews leases is stuck, as on a database that does not answer.
+func (ts *tenantSet) expire(r *tenantRun) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.running[r.id] != r || !r.expired(ts.clock()) {
+		return // ended already, or renewed since
+	}
+	ts.log.Warn("tenant's lease not renewed in time: handing it off; launches stop, and its busy runners finish", "tenant", r.id)
+	ts.endLocked(r, errTenantHandedOff)
 }
 
 // apply makes the tenants served match list, which has been checked.
-func (ts *tenantSet) apply(list []config.Tenant) {
+func (ts *tenantSet) apply(list []config.Tenant) { ts.applyLeases(list, nil) }
+
+// applyLeases is apply on a shard that serves a tenant only under its lease.
+// list is every tenant, and leases the deadline of each this shard holds the
+// lease of, on the monotonic clock. A tenant of the list is served until its
+// deadline, which a later call renews; one this shard serves without a
+// lease, or past its deadline, is handed off. A tenant missing from the list
+// is removed, leased or not. A nil leases serves every tenant listed, with no
+// deadline.
+//
+// A run handed off is not revived by a lease renewed after it: another shard
+// may have served the tenant meanwhile. A new run starts instead, once the
+// old one has closed its sessions.
+func (ts *tenantSet) applyLeases(list []config.Tenant, leases map[string]time.Time) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	if ts.closed || ts.ctx.Err() != nil {
@@ -210,31 +316,47 @@ func (ts *tenantSet) apply(list []config.Tenant) {
 	}
 	for _, id := range slices.Sorted(maps.Keys(ts.running)) {
 		if !want[id] {
-			ts.running[id].cancel(errTenantRemoved)
-			ts.ending = append(ts.ending, ts.running[id])
-			delete(ts.running, id)
+			ts.endLocked(ts.running[id], errTenantRemoved)
 			ts.log.Info("tenant removed from the list: it takes no more jobs, and its scale sets are deleted once its runners finish", "tenant", id)
 		}
 	}
+	now := ts.clock()
 	for _, c := range list {
+		deadline, leased := leases[c.ID]
+		if leases == nil {
+			leased = true
+		} else if leased && !now.Before(deadline) {
+			leased = false
+		}
 		old, ok := ts.running[c.ID]
+		if ok && (!leased || old.expired(now)) {
+			ts.endLocked(old, errTenantHandedOff)
+			ok = false
+			ts.log.Info("tenant handed off: this shard no longer holds its lease; its sessions close, and its busy runners finish", "tenant", c.ID)
+		}
+		if !leased {
+			continue
+		}
 		if ok {
 			was := *old.cur.Load()
 			switch {
 			case reflect.DeepEqual(was, c):
+				ts.renewLocked(old, deadline)
 				continue
 			case onlyRunnersDiffer(was, c):
 				old.cur.Store(&c)
+				ts.renewLocked(old, deadline)
 				ts.setMax(c.ID, c.EffectiveLimits().Runners)
 				ts.log.Info("tenant's runner limit changed", "tenant", c.ID,
 					"from", was.EffectiveLimits().Runners, "to", c.EffectiveLimits().Runners)
 				continue
 			}
-			old.cancel(errTenantChanged)
-			ts.ending = append(ts.ending, old)
+			ts.endLocked(old, errTenantChanged)
 			ts.log.Info("tenant changed in the list: it starts again as listed once its runners finish", "tenant", c.ID)
-		} else {
+		} else if leases == nil {
 			ts.log.Info("tenant added to the list", "tenant", c.ID)
+		} else {
+			ts.log.Info("tenant's lease taken: serving it", "tenant", c.ID)
 		}
 		r := &tenantRun{id: c.ID, account: config.AccountOf(c.URL), done: make(chan struct{})}
 		var prev []<-chan struct{}
@@ -247,6 +369,8 @@ func (ts *tenantSet) apply(list []config.Tenant) {
 		ctx, cancel := context.WithCancelCause(ts.ctx)
 		r.cancel = cancel
 		ts.running[c.ID] = r
+		ts.renewLocked(r, deadline)
+		fence := r.fence(ts.clock)
 		ts.wg.Go(func() {
 			defer close(r.done)
 			defer cancel(nil)
@@ -270,6 +394,8 @@ func (ts *tenantSet) apply(list []config.Tenant) {
 				// A limit changed while it started reaches it here: apply
 				// stores the entry before it looks for the tenant served.
 				st.bound.SetMax(cur().EffectiveLimits().Runners)
+				// Before any tier serves: nothing launches past the lease.
+				st.bound.SetFence(fence)
 			})
 		})
 	}
@@ -280,6 +406,11 @@ func (ts *tenantSet) apply(list []config.Tenant) {
 func (ts *tenantSet) wait() {
 	ts.mu.Lock()
 	ts.closed = true
+	for _, r := range ts.running {
+		if r.stopTimer != nil {
+			r.stopTimer()
+		}
+	}
 	ts.mu.Unlock()
 	ts.wg.Wait()
 }

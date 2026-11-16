@@ -313,15 +313,20 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 		},
 		stopLimit: panicStopLimit(get().Limits.JobDuration),
 		stop: func(ctx context.Context, st *servedTenant) {
-			st.drain(s.handsOff(ctx))
-			if removedTenant(ctx) {
+			p := s.stopPlan(ctx)
+			if p.closeFirst {
+				st.close(context.WithoutCancel(ctx))
+			}
+			st.drain(p.handOff)
+			switch {
+			case p.remove:
 				// Bounded: a GitHub that hangs must not hold up shutdown.
 				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
 				defer cancel()
 				st.remove(rctx)
-				return
+			case !p.closeFirst:
+				st.close(context.WithoutCancel(ctx))
 			}
-			st.close(context.WithoutCancel(ctx))
 		},
 		live: live, log: s.log, min: tenantRetryMin, max: tenantRetryMax,
 	}
@@ -1063,17 +1068,40 @@ func (st *servedTenant) runs(cfg *config.Config) []func(context.Context) error {
 	return runs
 }
 
+// tenantStop is how a tenant's run ends: whether it closes its sessions
+// before its runners finish rather than after, leaves its busy EC2 runners
+// to the next process or shard, and deletes its scale sets.
+type tenantStop struct{ closeFirst, handOff, remove bool }
+
+// stopPlan is how a tenant whose run's context has ended stops, by why it
+// ended. A tenant handed off to another shard closes its sessions first, so
+// that shard opens them at once rather than after GitHub's hold; its scale
+// sets stay (KeepOnClose, which handsOff implies). A removed one deletes
+// them once its runners have finished.
+func (s *shard) stopPlan(tenantCtx context.Context) tenantStop {
+	handOff := s.handsOff(tenantCtx)
+	return tenantStop{
+		closeFirst: handOff && handedOffTenant(tenantCtx),
+		handOff:    handOff,
+		remove:     removedTenant(tenantCtx),
+	}
+}
+
 // handsOff says whether a tenant stopping now leaves its busy EC2 runners
-// to the next process instead of waiting for their jobs: only when the
-// process is exiting, the tenant is not being removed (nothing would serve
-// it next), and the next process's reaper ends what it finds. That takes
-// --owner: without it, the close after the drain deletes the scale set, and
-// its runners with it, so the next reaper would end a handed-off job as an
-// idle orphan; and the owner tag is the host name, which the next host's
-// reaper does not look for.
+// to the next process or shard instead of waiting for their jobs: only when
+// the process is exiting or the tenant is handed off, the tenant is not
+// being removed (nothing would serve it next), and the next one's reaper
+// ends what it finds. That takes --owner: without it, the close after the
+// drain deletes the scale set, and its runners with it, so the next reaper
+// would end a handed-off job as an idle orphan; and the owner tag is the
+// host name, which the next host's reaper does not look for. A tenant handed
+// off without these drains as one changed does, its sessions held until its
+// runners finish.
 func (s *shard) handsOff(tenantCtx context.Context) bool {
-	return s.exiting != nil && s.exiting.Err() != nil && !removedTenant(tenantCtx) &&
-		s.ec2Client != nil && s.cfg.EC2Reaper == "on" && s.cfg.Owner != ""
+	if removedTenant(tenantCtx) || s.ec2Client == nil || s.cfg.EC2Reaper != "on" || s.cfg.Owner == "" {
+		return false
+	}
+	return handedOffTenant(tenantCtx) || (s.exiting != nil && s.exiting.Err() != nil)
 }
 
 // drain waits for the tenant's runners to finish. With handOff, its EC2
