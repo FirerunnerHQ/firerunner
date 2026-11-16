@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -15,18 +16,30 @@ import (
 	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
-// fakeLeases is a lease store that grants what the test says, and records
-// what it was asked.
+// fakeLeases is a lease store for shard s1 that decides what a renewal
+// asks for as the real one does, grants what the test says of that, and
+// records what it was asked.
 type fakeLeases struct {
 	mu sync.Mutex
-	// grant is the accounts the next renewals hold, of those asked; err,
-	// when set, fails them.
+	// grant is the accounts whose lease is free for s1: of those a renewal
+	// asks for, it holds these. err, when set, fails renewals.
 	grant []string
 	err   error
+	// holders is what Placement reads as the leases' holders.
+	holders map[string]string
+	// wants are the renewals' asks.
+	// shards and assignments are what Placement reads; Assign writes
+	// assignments, and counts in assigns.
+	shards      []jobstore.ShardState
+	assignments map[string]jobstore.Assignment
+	assigns     int
+	assignErr   error
+	drained     []string
 	// errs fail the next renewals, one each, before err.
 	errs []error
 	// during runs inside each renewal, as a slow database would.
 	during   func()
+	wants    []jobstore.Want
 	asked    [][]string
 	joinErr  error
 	joined   []jobstore.Shard
@@ -40,30 +53,52 @@ func (f *fakeLeases) Join(_ context.Context, sh jobstore.Shard) error {
 	return f.joinErr
 }
 
-func (f *fakeLeases) Renew(_ context.Context, _ jobstore.Shard, accounts []string, ttl time.Duration) ([]string, error) {
+// Renew asks, as the real store does, for want.Accounts, the accounts
+// assigned to s1 that its list names, and those it runs that are assigned
+// to no other shard.
+func (f *fakeLeases) Renew(_ context.Context, sh jobstore.Shard, want jobstore.Want, ttl time.Duration) (jobstore.Renewal, error) {
 	f.mu.Lock()
 	during, err := f.during, f.err
 	if len(f.errs) > 0 {
 		err, f.errs = f.errs[0], f.errs[1:]
 	}
-	f.asked = append(f.asked, slices.Clone(accounts))
-	var held []string
-	for _, a := range accounts {
-		if slices.Contains(f.grant, a) {
-			held = append(held, a)
+	f.wants = append(f.wants, want)
+	f.asked = append(f.asked, slices.Clone(want.Accounts))
+	var r jobstore.Renewal
+	ask := slices.Clone(want.Accounts)
+	for a, to := range f.assignments {
+		switch {
+		case to.Shard != sh.ID:
+		case slices.Contains(want.Listed, a):
+			ask = append(ask, a)
+		default:
+			r.Unlisted = append(r.Unlisted, a)
 		}
+	}
+	for _, a := range want.Running {
+		if to, ok := f.assignments[a]; !ok || to.Shard == sh.ID {
+			ask = append(ask, a)
+		}
+	}
+	for _, a := range ask {
+		if slices.Contains(f.grant, a) && !slices.Contains(r.Held, a) {
+			r.Held = append(r.Held, a)
+		}
+	}
+	if slices.Contains(r.Held, jobstore.AssignerLease) {
+		r.Assigner = sh.ID
 	}
 	f.mu.Unlock()
 	if ttl != leaseTTL {
-		return nil, errors.New("asked for another ttl")
+		return jobstore.Renewal{}, errors.New("asked for another ttl")
 	}
 	if during != nil {
 		during()
 	}
 	if err != nil {
-		return nil, err
+		return jobstore.Renewal{}, err
 	}
-	return held, nil
+	return r, nil
 }
 
 func (f *fakeLeases) Release(_ context.Context, sh jobstore.Shard) error {
@@ -73,10 +108,49 @@ func (f *fakeLeases) Release(_ context.Context, sh jobstore.Shard) error {
 	return nil
 }
 
+func (f *fakeLeases) Placement(context.Context) ([]jobstore.ShardState, map[string]jobstore.Assignment, map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.shards), maps.Clone(f.assignments), maps.Clone(f.holders), nil
+}
+
+func (f *fakeLeases) Assign(_ context.Context, _ jobstore.Shard, next map[string]jobstore.Assignment) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.assignErr != nil {
+		return f.assignErr
+	}
+	f.assignments = maps.Clone(next)
+	f.assigns++
+	return nil
+}
+
+func (f *fakeLeases) Drain(_ context.Context, sh jobstore.Shard) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drained = append(f.drained, sh.ID)
+	return nil
+}
+
+// set makes grant the leases free for s1, and assigns each account of them
+// to s1, and every other account away from it.
 func (f *fakeLeases) set(grant ...string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.grant, f.err = grant, nil
+	if f.assignments == nil {
+		f.assignments = map[string]jobstore.Assignment{}
+	}
+	for a, to := range f.assignments {
+		if to.Shard == "s1" && !slices.Contains(grant, a) {
+			f.assignments[a] = jobstore.Assignment{Shard: "s2", Tiers: to.Tiers}
+		}
+	}
+	for _, a := range grant {
+		if a != jobstore.AssignerLease {
+			f.assignments[a] = jobstore.Assignment{Shard: "s1", Tiers: 1}
+		}
+	}
 }
 
 func (f *fakeLeases) fail(err error) {
@@ -92,14 +166,19 @@ func (f *fakeLeases) counts() (joins, renewals int) {
 	return len(f.joined), len(f.asked)
 }
 
-// lastAsked is the accounts the last renewal asked for.
+// lastAsked is the accounts the last renewal asked for beyond those
+// assigned to it, but for the assigner's lease, which every one asks for.
 func (f *fakeLeases) lastAsked() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.asked) == 0 {
 		return nil
 	}
-	return f.asked[len(f.asked)-1]
+	last := f.asked[len(f.asked)-1]
+	if !slices.Contains(last, jobstore.AssignerLease) {
+		return []string{"(not the assigner's lease)"}
+	}
+	return slices.DeleteFunc(slices.Clone(last), func(a string) bool { return a == jobstore.AssignerLease })
 }
 
 func acct(id string) string { return config.AccountOf(listed(id, 1, "x").URL) }
@@ -119,15 +198,14 @@ func mustRenew(t *testing.T, lr *tenantLeaser) {
 	}
 }
 
-// A shard serves the tenants whose accounts it holds the lease of, asks for
-// the account of each tenant listed, and hands a tenant off once another
-// shard holds its lease.
+// A shard serves the tenants whose accounts it holds the lease of, and
+// hands a tenant off once another shard holds its lease. It asks for no
+// listed account itself: those assigned to it are renewed as such.
 func TestLeaserServesWhatItLeases(t *testing.T) {
 	l, _, store, lr := leaserLab(t)
-	// Before a list, a renewal only beats the heartbeat.
 	mustRenew(t, lr)
 	if got := store.lastAsked(); len(got) != 0 {
-		t.Fatalf("asked for %v before a list", got)
+		t.Fatalf("asked for %v", got)
 	}
 
 	list := []config.Tenant{listed("a", 2, "x"), listed("b", 2, "x")}
@@ -137,8 +215,8 @@ func TestLeaserServesWhatItLeases(t *testing.T) {
 	}
 	store.set(acct("a"))
 	mustRenew(t, lr)
-	if got, want := store.lastAsked(), []string{acct("a"), acct("b")}; !slices.Equal(got, want) {
-		t.Fatalf("asked for %v, want %v", got, want)
+	if got := store.lastAsked(); len(got) != 0 {
+		t.Fatalf("asked for %v, want the assigned alone", got)
 	}
 	l.started("a")
 	if _, ok := l.runs()["b"]; ok {
@@ -271,6 +349,18 @@ func TestTenantCatalogAppliesUnderLeases(t *testing.T) {
 	store.set(acct("a"))
 	mustRenew(t, lr)
 	l.started("a")
+
+	// A list that does not apply tells the assigner, through the leaser,
+	// to put nothing new here; the next that does lifts it.
+	listOK := func() bool { lr.mu.Lock(); defer lr.mu.Unlock(); return lr.listOK }
+	src.b = []byte(`[{"id":`)
+	if err := c.read(context.Background()); err == nil || listOK() {
+		t.Fatalf("read = %v, list ok %v after a bad list", err, listOK())
+	}
+	src.b = []byte(`[{"id":"a","url":"https://github.com/a","installation_id":7,"tiers":["x"]}]`)
+	if err := c.read(context.Background()); err != nil || !listOK() {
+		t.Fatalf("read = %v, list ok %v after a good list", err, listOK())
+	}
 }
 
 // join registers the shard, and says which when it may not, in status too.

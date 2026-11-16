@@ -494,6 +494,23 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				last = humanDuration(time.Since(tl.LastRenewed).Truncate(time.Second)) + " ago"
 			}
 			fmt.Fprintf(w, "  shard %s holds the leases of %d of %d tenant(s) listed, renewed %s\n", tl.Shard, tl.Tenants, tl.Listed, last)
+			switch {
+			case tl.Assigner:
+				fmt.Fprintf(w, "  this shard assigns the tenants to the shards; %d placed on none\n", len(tl.Unplaced))
+				for _, u := range tl.Unplaced {
+					fmt.Fprintf(w, "    placed on no shard: %s\n", truncate(u, 200))
+				}
+				if tl.AssignError != "" {
+					fmt.Fprintf(w, "  last assignment failed %s ago: %s\n", humanDuration(time.Since(tl.AssignErrorAt).Truncate(time.Second)), truncate(tl.AssignError, 200))
+				}
+			case tl.AssignerShard != "":
+				fmt.Fprintf(w, "  shard %s assigns the tenants; its status says which are placed on no shard\n", tl.AssignerShard)
+			default:
+				fmt.Fprintln(w, "  no shard assigns the tenants yet")
+			}
+			if len(tl.Unlisted) > 0 {
+				fmt.Fprintf(w, "  assigned here but not in this shard's list, so not served: %s\n", truncate(strings.Join(tl.Unlisted, ", "), 200))
+			}
 			if tl.Failing() {
 				fmt.Fprintf(w, "  last renewal failed %s ago; each tenant is handed off 20s after the last successful renewal was sent: %s\n",
 					humanDuration(time.Since(tl.LastErrorAt).Truncate(time.Second)), truncate(tl.LastError, 200))
@@ -1034,6 +1051,20 @@ func tenantLeasesCheck(f health.File, now time.Time) *Check {
 	}
 	if tl.LastRenewed.IsZero() {
 		c := warn("tenant-leases", "shard %s has not renewed its tenant leases yet", tl.Shard)
+		return &c
+	}
+	if len(tl.Unlisted) > 0 {
+		c := warn("tenant-leases", "%d account(s) assigned to shard %s are not in its tenants list, so no shard serves them: %s; its list is older than the assigner's, or rejected here (see tenant-catalog)",
+			len(tl.Unlisted), tl.Shard, truncate(strings.Join(tl.Unlisted, ", "), 300))
+		return &c
+	}
+	if len(tl.Unplaced) > 0 {
+		c := warn("tenant-leases", "%d tenant(s) placed on no shard: %s", len(tl.Unplaced), truncate(strings.Join(tl.Unplaced, "; "), 300))
+		return &c
+	}
+	if tl.AssignError != "" {
+		c := warn("tenant-leases", "shard %s, assigning, last failed to assign the tenants (%s ago): %s; the assignments stay as they were", tl.Shard,
+			humanDuration(now.Sub(tl.AssignErrorAt).Truncate(time.Second)), truncate(tl.AssignError, 200))
 		return &c
 	}
 	c := pass("tenant-leases", "shard %s holds the leases of %d of %d tenant(s) listed, renewed %s ago", tl.Shard, tl.Tenants, tl.Listed,

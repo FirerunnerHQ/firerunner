@@ -50,6 +50,47 @@ func TestStatusAndDoctorShowTheTenantLeases(t *testing.T) {
 		t.Fatalf("doctor = %+v", c)
 	}
 
+	if s := status(); !strings.Contains(s, "no shard assigns the tenants yet") {
+		t.Fatalf("status before an assigner:\n%s", s)
+	}
+	f.TenantLeases.AssignerShard = "vm-9"
+	write()
+	if s := status(); !strings.Contains(s, "shard vm-9 assigns the tenants") {
+		t.Fatalf("status of another shard:\n%s", s)
+	}
+
+	f.TenantLeases.Assigner, f.TenantLeases.AssignerShard = true, "vm-1a2b3c4d"
+	f.TenantLeases.Unplaced = []string{"big: it lists 41 tiers, over the 40 a tenant may have"}
+	write()
+	if s := status(); !strings.Contains(s, "this shard assigns the tenants") || !strings.Contains(s, "placed on no shard: big: it lists 41 tiers") {
+		t.Fatalf("status of the assigner:\n%s", s)
+	}
+	if c := check(); c == nil || c.Level != levelWarn || !strings.Contains(c.Detail, "big: it lists 41 tiers") {
+		t.Fatalf("doctor with a tenant unplaced = %+v", c)
+	}
+	f.TenantLeases.Unplaced = nil
+
+	// A failed assignment is not a failed renewal.
+	f.TenantLeases.AssignError, f.TenantLeases.AssignErrorAt = "assign the tenants: this shard does not hold the assigner's lease", now
+	write()
+	if s := status(); !strings.Contains(s, "last assignment failed") || strings.Contains(s, "last renewal failed") {
+		t.Fatalf("status with an assignment failed:\n%s", s)
+	}
+	if c := check(); c == nil || c.Level != levelWarn || !strings.Contains(c.Detail, "failed to assign") || strings.Contains(c.Detail, "cannot renew") {
+		t.Fatalf("doctor with an assignment failed = %+v", c)
+	}
+	f.TenantLeases.AssignError = ""
+
+	f.TenantLeases.Unlisted = []string{"github.com/acme"}
+	write()
+	if s := status(); !strings.Contains(s, "not in this shard's list, so not served: github.com/acme") {
+		t.Fatalf("status with an account unlisted:\n%s", s)
+	}
+	if c := check(); c == nil || c.Level != levelWarn || !strings.Contains(c.Detail, "github.com/acme") {
+		t.Fatalf("doctor with an account unlisted = %+v", c)
+	}
+	f.TenantLeases.Unlisted = nil
+
 	f.TenantLeases.LastError, f.TenantLeases.LastErrorAt = "renew the leases: connection refused", now
 	write()
 	if s := status(); !strings.Contains(s, "last renewal failed") || !strings.Contains(s, "connection refused") {

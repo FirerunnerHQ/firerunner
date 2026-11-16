@@ -281,9 +281,33 @@ rename), starts only once the last has finished.
 (`FR_TENANT_LEASES`), each daemon (a shard) serves an installation only
 while it holds the lease on its GitHub account in the job store's database.
 A shard renews its leases every 10 seconds, for 30 seconds of the database's
-time; it takes any lease that is free or has expired. So each installation
-is served by one shard at a time, and another takes it over once its shard
-stops renewing:
+time, on the accounts assigned to it; it takes one that is free or has
+expired. So each installation is served by one shard at a time, and another
+takes it over once its shard stops renewing.
+
+One shard, whichever holds the assigner's lease, assigns the accounts every
+10 seconds:
+
+- An installation stays on its shard while that shard is live: it moves
+  only when its shard stops beating for 30 seconds, is stopping
+  (draining), or last failed to apply the tenants list. A new one, or one
+  that must move, goes to the live shard with the fewest tiers.
+- A shard takes at most 500 tiers. An installation listing more than 40
+  tiers is placed on no shard: its move after a crash would take too long.
+  `firerunner status` on the assigning shard lists each installation not
+  placed and why, and `firerunner doctor` warns (`tenant-leases`); every
+  shard's status names the assigning shard.
+- A shard serves an installation assigned to it only once its own list
+  names it, and keeps serving one it already serves until its own list
+  drops it or the installation is assigned elsewhere: shards read the list
+  at different moments. One assigned but not in its list is shown in its
+  status, and `doctor` warns.
+- A shard that stops marks itself draining at once, and lets go of
+  assigning, so its installations move to the others, which take each as
+  soon as its lease is released or expires.
+
+Upgrade every shard to a version with assignment together: an older shard
+takes any free lease, ignoring the assignments.
 
 - A shard that cannot renew, as when the database does not answer, stops
   launching for an installation 20 seconds after the last renewal that
@@ -313,8 +337,7 @@ reaper to `<Owner>` and `<Owner>/*`; a shard's role also needs
 `<tenant-owner>/*`, which no template parameter grants yet. A shard refuses to start beside a live one whose
 `--tenant-owner` differs or whose `--owner` is the same. `firerunner status`
 shows the shard and how many installations it holds; `firerunner doctor`
-warns while renewals fail (`tenant-leases`). Each shard holds every lease it
-can for now; spreading installations across shards comes next (#166).
+warns while renewals fail (`tenant-leases`).
 
 **When one installation fails.** Each installation of the list runs in a loop
 of its own. A failure there (a start GitHub refuses, a scale set deleted, a
