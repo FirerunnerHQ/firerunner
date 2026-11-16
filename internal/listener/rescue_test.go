@@ -37,6 +37,8 @@ func TestStranded(t *testing.T) {
 			[]*scaleset.JobCompleted{completed("j1", "", "canceled")}, false, "[j1]"},
 		{"assigned in this session: cancelled by its user", []*scaleset.JobAssigned{assignedAt("j1", after)},
 			[]*scaleset.JobCompleted{completed("j1", "", "canceled")}, true, "[]"},
+		{"assigned 30 s before the session: clock skew, or the last session's", []*scaleset.JobAssigned{assignedAt("j1", opened.Add(-30*time.Second))},
+			[]*scaleset.JobCompleted{completed("j1", "", "canceled")}, true, "[]"},
 		{"ran on a runner", []*scaleset.JobAssigned{assignedAt("j1", before)},
 			[]*scaleset.JobCompleted{completed("j1", "r-1", "canceled")}, true, "[]"},
 		{"failed, not cancelled", []*scaleset.JobAssigned{assignedAt("j1", before)},
@@ -102,6 +104,38 @@ func TestScaleRescuesAStrandedJob(t *testing.T) {
 	}
 	if s := tr.Snapshot(); fmt.Sprint(desired) != "[1 1 1 1]" || s.Rescuing != 0 || s.Stranded != 1 {
 		t.Fatalf("desired %v, rescuing %d, stranded %d; want [1 1 1 1], 0, 1", desired, s.Rescuing, s.Stranded)
+	}
+}
+
+// A rescue also ends when GitHub reports the job started or completed (it
+// ran on another runner, or was cancelled for good), but not on the
+// stranded job's own cancellation.
+func TestRescueEndsWhenTheJobStartsOrCompletes(t *testing.T) {
+	now := time.Date(2026, 11, 16, 4, 4, 28, 0, time.UTC)
+	strand := func(id string) *scaleset.RunnerScaleSetMessage {
+		return &scaleset.RunnerScaleSetMessage{Statistics: &scaleset.RunnerScaleSetStatistic{},
+			JobAssignedMessages:  []*scaleset.JobAssigned{assignedAt(id, now.Add(-6*time.Minute))},
+			JobCompletedMessages: []*scaleset.JobCompleted{completed(id, "", "canceled")}}
+	}
+	for _, c := range []struct {
+		name string
+		msg  *scaleset.RunnerScaleSetMessage
+	}{
+		{"started", &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{
+			{RunnerName: "r-1", JobMessageBase: scaleset.JobMessageBase{JobID: "j1"}}}}},
+		{"completed", &scaleset.RunnerScaleSetMessage{JobCompletedMessages: []*scaleset.JobCompleted{completed("j1", "r-1", "succeeded")}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := &rescues{now: func() time.Time { return now }}
+			a := &scaler{log: testLogger(), stats: &statsRecorder{}, rescue: r, opened: now,
+				onDesired: func(_ context.Context, n int) int { return n }}
+			if err := a.Scale(context.Background(), strand("j1")); err != nil || r.count() != 1 {
+				t.Fatalf("Scale = %v, rescues %d; want one", err, r.count())
+			}
+			if err := a.Scale(context.Background(), c.msg); err != nil || r.count() != 0 {
+				t.Fatalf("Scale = %v, rescues %d after the job %s; want none", err, r.count(), c.name)
+			}
+		})
 	}
 }
 

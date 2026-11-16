@@ -14,6 +14,14 @@ import (
 // idle runner until then.
 const rescueFor = 10 * time.Minute
 
+// strandMargin is how long before the session opened a stranded job must have
+// been assigned. GitHub gives up on an assignment only after about 4 minutes
+// with no session, so a real one is older than that; the margin absorbs
+// clock skew between GitHub and this host, the session opening a little
+// before the scaler records it, and a message of the previous session
+// delivered again.
+const strandMargin = 2 * time.Minute
+
 // rescues are the jobs of one tier that GitHub stopped assigning to the scale
 // set while no session was open, each with when its rescue ends.
 //
@@ -29,7 +37,9 @@ const rescueFor = 10 * time.Minute
 // it again, or rescueFor passes.
 //
 // They live on the ScaleSet, not the session: a reconnect keeps them. Safe
-// for concurrent use.
+// for concurrent use. They are in memory only: a daemon that crashes again
+// before the runner takes the job loses them, and the message is not
+// delivered again.
 type rescues struct {
 	mu   sync.Mutex
 	now  func() time.Time
@@ -89,10 +99,13 @@ func (r *rescues) pruneLocked(now time.Time) {
 
 // stranded returns the assignments of the jobs msg shows stranded: a
 // JobCompleted with result "canceled" and no runner, for a job the same
-// message assigned, and assigned before the session opened. A job assigned and cancelled within one
-// long poll of a live session is not: it was assigned after the session
-// opened. When GitHub leaves out the assignment time, only the session's
-// first message with jobs counts (first).
+// message assigned, and assigned at least strandMargin before the session
+// opened. A job assigned and cancelled within one long poll of a live
+// session is not: it was assigned after the session opened. When GitHub
+// leaves out the assignment time, only the session's first message with jobs
+// counts (first). Both halves arriving in one message is the shape measured,
+// not one GitHub documents; a stranded job split across two messages is
+// missed, as it was before.
 func stranded(msg *scaleset.RunnerScaleSetMessage, opened time.Time, first bool) []*scaleset.JobAssigned {
 	if msg == nil || len(msg.JobCompletedMessages) == 0 {
 		return nil
@@ -112,7 +125,7 @@ func stranded(msg *scaleset.RunnerScaleSetMessage, opened time.Time, first bool)
 		if a == nil || slices.Contains(out, a) {
 			continue
 		}
-		if at := a.ScaleSetAssignTime; at.IsZero() && !first || !at.IsZero() && !at.Before(opened) {
+		if at := a.ScaleSetAssignTime; at.IsZero() && !first || !at.IsZero() && !at.Before(opened.Add(-strandMargin)) {
 			continue
 		}
 		out = append(out, a)
