@@ -89,11 +89,43 @@ func (s *TenantStore) Join(ctx context.Context, sh Shard) error {
 	})
 }
 
-// Renew beats sh's heartbeat, and takes or renews for ttl the lease of each
-// account assigned to sh (Assign) and each in accounts, in one transaction.
-// It returns the accounts whose lease sh holds now: a lease another shard
-// holds and has not let expire is not taken. sh's leases on accounts it no
-// longer asks for are released at once, so another shard may take them.
+// Want is what a shard asks Renew for.
+type Want struct {
+	// Accounts are taken or renewed whatever their assignment: a removed
+	// tenant's still draining, and the assigner's lease.
+	Accounts []string
+	// Listed are the accounts the shard's own list names: of those
+	// assigned to it, it takes only these. One assigned to it that its
+	// list lacks (a list older than the assigner's, or rejected here) is
+	// returned as Unlisted, and taken by no shard.
+	Listed []string
+	// Running are the accounts the shard serves now: each is renewed
+	// until it is assigned to another shard, so that a tenant unassigned
+	// (removed from the assigner's list before this shard's, say) keeps
+	// its lease until this shard has stopped it as its own list says.
+	Running []string
+	// ListOK says whether the shard's last read of the list applied. A
+	// shard whose did not is no place for the assigner to put tenants.
+	ListOK bool
+}
+
+// Renewal is what Renew found.
+type Renewal struct {
+	// Held are the accounts whose lease the shard holds now.
+	Held []string
+	// Unlisted are the accounts assigned to the shard that its list does
+	// not name.
+	Unlisted []string
+	// Assigner is the shard that holds the assigner's lease, if any.
+	Assigner string
+}
+
+// Renew beats sh's heartbeat, and takes or renews for ttl the leases want
+// says, in one transaction: want.Accounts; each account assigned to sh
+// (Assign) that want.Listed names; and each of want.Running not assigned
+// to another shard. A lease another shard holds and has not let expire is
+// not taken. sh's leases on accounts it no longer asks for are released at
+// once, so another shard may take them.
 //
 // Every time is the database's. A caller that serves an account only until
 // a deadline it sets before calling, shorter than ttl, on its own monotonic
@@ -105,28 +137,47 @@ func (s *TenantStore) Join(ctx context.Context, sh Shard) error {
 // deadlock. One takes milliseconds, every few seconds a shard.
 //
 // A shard the database does not have is ErrNotJoined, and renews nothing.
-func (s *TenantStore) Renew(ctx context.Context, sh Shard, accounts []string, ttl time.Duration) ([]string, error) {
-	var held []string
+func (s *TenantStore) Renew(ctx context.Context, sh Shard, want Want, ttl time.Duration) (Renewal, error) {
+	var r Renewal
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7231907)`); err != nil {
 			return fmt.Errorf("wait for the other renewals: %w", err)
 		}
-		tag, err := tx.Exec(ctx, `UPDATE shards SET heartbeat_at = now() WHERE id = $1`, sh.ID)
+		tag, err := tx.Exec(ctx, `UPDATE shards SET heartbeat_at = now(), list_ok = $2 WHERE id = $1`, sh.ID, want.ListOK)
 		if err != nil {
 			return fmt.Errorf("beat the heartbeat: %w", err)
 		}
 		if tag.RowsAffected() == 0 {
 			return ErrNotJoined
 		}
-		rows, err := tx.Query(ctx, `SELECT account FROM assignments WHERE shard = $1`, sh.ID)
+		rows, err := tx.Query(ctx, `SELECT account, shard FROM assignments WHERE shard = $1 OR account = ANY(coalesce($2::text[], '{}'))`, sh.ID, want.Running)
 		if err != nil {
 			return fmt.Errorf("read the assignments: %w", err)
 		}
-		assigned, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
+		assignedTo := map[string]string{}
+		var account, shard string
+		if _, err := pgx.ForEachRow(rows, []any{&account, &shard}, func() error {
+			assignedTo[account] = shard
+			return nil
+		}); err != nil {
 			return fmt.Errorf("read the assignments: %w", err)
 		}
-		accounts := append(slices.Clone(accounts), assigned...)
+		accounts := slices.Clone(want.Accounts)
+		for a, to := range assignedTo {
+			switch {
+			case to != sh.ID:
+			case slices.Contains(want.Listed, a):
+				accounts = append(accounts, a)
+			default:
+				r.Unlisted = append(r.Unlisted, a)
+			}
+		}
+		slices.Sort(r.Unlisted)
+		for _, a := range want.Running {
+			if to, ok := assignedTo[a]; !ok || to == sh.ID && slices.Contains(want.Listed, a) {
+				accounts = append(accounts, a)
+			}
+		}
 		if _, err := tx.Exec(ctx, `UPDATE leases SET expires_at = now()
 			WHERE shard = $1 AND expires_at > now() AND account <> ALL(coalesce($2::text[], '{}'))`, sh.ID, accounts); err != nil {
 			return fmt.Errorf("release the leases no longer wanted: %w", err)
@@ -141,16 +192,19 @@ func (s *TenantStore) Renew(ctx context.Context, sh Shard, accounts []string, tt
 		if err != nil {
 			return fmt.Errorf("renew the leases: %w", err)
 		}
-		held, err = pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
+		if r.Held, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
 			return fmt.Errorf("renew the leases: %w", err)
+		}
+		if err := tx.QueryRow(ctx, `SELECT coalesce((SELECT shard FROM leases WHERE account = $1 AND expires_at > now()), '')`,
+			AssignerLease).Scan(&r.Assigner); err != nil {
+			return fmt.Errorf("read the assigner: %w", err)
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return Renewal{}, err
 	}
-	return held, nil
+	return r, nil
 }
 
 // Release lets every lease sh holds expire now, and unregisters it: another

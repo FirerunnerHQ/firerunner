@@ -446,6 +446,17 @@ func (ts *tenantSet) applyLeases(list []config.Tenant, leases map[string]time.Ti
 	}
 }
 
+// runningAccounts returns the accounts of the runs serving now.
+func (ts *tenantSet) runningAccounts() []string {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	var accounts []string
+	for _, r := range ts.running {
+		accounts = append(accounts, r.account)
+	}
+	return accounts
+}
+
 // renewRemoving moves the deadline of each run removed that has not ended
 // to its account's in held, the leases just renewed: it deletes its scale
 // sets only while its lease holds. One whose account is not in held keeps
@@ -575,6 +586,9 @@ func (c *tenantCatalog) read(ctx context.Context) error {
 	c.mu.Unlock()
 	if err != nil {
 		c.log.Warn("tenants list not applied; serving the tenants as they were", "source", c.src.String(), "err", err)
+		if c.leaser != nil {
+			c.leaser.listFailed()
+		}
 		return err
 	}
 	if c.leaser != nil {

@@ -39,7 +39,9 @@ func placesOf(list []config.Tenant) []tenantPlace {
 // place assigns each tenant's account to a shard, from the assignments now:
 //
 //   - one assigned to a live shard stays there, whatever the load: a
-//     tenant moves only for a reason;
+//     tenant moves only for a reason; so does one unassigned whose lease a
+//     live shard holds (holders), as a shard keeps serving a tenant
+//     unassigned while its list still names it;
 //   - one unassigned, or on a shard draining or gone, goes to the live
 //     shard with the fewest tiers that has room for it (shardMaxTiers), the
 //     first by id on a tie;
@@ -48,7 +50,7 @@ func placesOf(list []config.Tenant) []tenantPlace {
 //
 // An account no tenant lists is unassigned. Tenants are placed in account
 // order, so that the result depends on nothing but its inputs.
-func place(tenants []tenantPlace, shards []jobstore.ShardState, current map[string]jobstore.Assignment) (next map[string]jobstore.Assignment, unplaced map[string]string) {
+func place(tenants []tenantPlace, shards []jobstore.ShardState, current map[string]jobstore.Assignment, holders map[string]string) (next map[string]jobstore.Assignment, unplaced map[string]string) {
 	next, unplaced = map[string]jobstore.Assignment{}, map[string]string{}
 	load := map[string]int{}
 	var live []string
@@ -66,12 +68,14 @@ func place(tenants []tenantPlace, shards []jobstore.ShardState, current map[stri
 			unplaced[t.id] = fmt.Sprintf("it lists %d tiers, over the %d a tenant may have", t.tiers, tenantMaxTiers)
 			continue
 		}
-		if a, ok := current[t.account]; ok {
-			if _, isLive := load[a.Shard]; isLive {
-				next[t.account] = jobstore.Assignment{Shard: a.Shard, Tiers: t.tiers}
-				load[a.Shard] += t.tiers
-				continue
-			}
+		stay := current[t.account].Shard
+		if _, isLive := load[stay]; !isLive {
+			stay = holders[t.account]
+		}
+		if _, isLive := load[stay]; isLive {
+			next[t.account] = jobstore.Assignment{Shard: stay, Tiers: t.tiers}
+			load[stay] += t.tiers
+			continue
 		}
 		waiting = append(waiting, t)
 	}

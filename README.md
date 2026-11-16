@@ -289,16 +289,25 @@ One shard, whichever holds the assigner's lease, assigns the accounts every
 10 seconds:
 
 - An installation stays on its shard while that shard is live: it moves
-  only when its shard stops beating for 30 seconds, or is stopping
-  (draining). A new one, or one that must move, goes to the live shard with
-  the fewest tiers.
+  only when its shard stops beating for 30 seconds, is stopping
+  (draining), or last failed to apply the tenants list. A new one, or one
+  that must move, goes to the live shard with the fewest tiers.
 - A shard takes at most 500 tiers. An installation listing more than 40
   tiers is placed on no shard: its move after a crash would take too long.
   `firerunner status` on the assigning shard lists each installation not
-  placed and why, and `firerunner doctor` warns (`tenant-leases`).
-- A shard that stops marks itself draining at once, so its installations
-  move to the others, which take each as soon as its lease is released or
-  expires.
+  placed and why, and `firerunner doctor` warns (`tenant-leases`); every
+  shard's status names the assigning shard.
+- A shard serves an installation assigned to it only once its own list
+  names it, and keeps serving one it already serves until its own list
+  drops it or the installation is assigned elsewhere: shards read the list
+  at different moments. One assigned but not in its list is shown in its
+  status, and `doctor` warns.
+- A shard that stops marks itself draining at once, and lets go of
+  assigning, so its installations move to the others, which take each as
+  soon as its lease is released or expires.
+
+Upgrade every shard to a version with assignment together: an older shard
+takes any free lease, ignoring the assignments.
 
 - A shard that cannot renew, as when the database does not answer, stops
   launching for an installation 20 seconds after the last renewal that

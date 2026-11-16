@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"slices"
 	"testing"
 	"time"
 )
@@ -42,6 +43,62 @@ func TestAssignIsTheAssignersAndRenewFollowsIt(t *testing.T) {
 	}
 }
 
+// A shard keeps the lease of an account it runs until that account is
+// assigned to another shard: unassigned (dropped from the assigner's list
+// before its own), it still holds it. Of the accounts assigned to it, it
+// takes only those its list names, and says which it does not.
+func TestRenewKeepsWhatItRunsAndTakesWhatItLists(t *testing.T) {
+	s, _, sh := joined(t, "a", "b")
+	ctx := context.Background()
+	held(t, s, sh[0], []string{AssignerLease}, AssignerLease)
+	if err := s.Assign(ctx, sh[0], map[string]Assignment{"x": {Shard: "b", Tiers: 1}, "y": {Shard: "b", Tiers: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.Renew(ctx, sh[1], Want{Listed: []string{"x"}, ListOK: true}, testTTL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(r.Held, []string{"x"}) || !slices.Equal(r.Unlisted, []string{"y"}) || r.Assigner != "a" {
+		t.Fatalf("renewal %+v, want x held, y unlisted, a assigning", r)
+	}
+
+	// x unassigned: b, which runs it, keeps it.
+	held(t, s, sh[0], []string{AssignerLease}, AssignerLease)
+	if err := s.Assign(ctx, sh[0], map[string]Assignment{"y": {Shard: "b", Tiers: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if r, err = s.Renew(ctx, sh[1], Want{Listed: []string{"x", "y"}, Running: []string{"x"}, ListOK: true}, testTTL); err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(r.Held)
+	if !slices.Equal(r.Held, []string{"x", "y"}) {
+		t.Fatalf("held %v, want x kept while it runs, and y", r.Held)
+	}
+
+	// x assigned to a: b lets go of it, running or not, and a takes it.
+	if err := s.Assign(ctx, sh[0], map[string]Assignment{"x": {Shard: "a", Tiers: 1}, "y": {Shard: "b", Tiers: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if r, err = s.Renew(ctx, sh[1], Want{Listed: []string{"x", "y"}, Running: []string{"x"}, ListOK: true}, testTTL); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(r.Held, []string{"y"}) {
+		t.Fatalf("held %v, want x let go once assigned elsewhere", r.Held)
+	}
+	held(t, s, sh[0], []string{AssignerLease, "x"}, AssignerLease)
+}
+
+// A shard that drains lets go of the assigner's lease at once.
+func TestDrainReleasesTheAssignersLease(t *testing.T) {
+	s, _, sh := joined(t, "a", "b")
+	held(t, s, sh[0], []string{AssignerLease}, AssignerLease)
+	held(t, s, sh[1], nil, AssignerLease)
+	if err := s.Drain(context.Background(), sh[0]); err != nil {
+		t.Fatal(err)
+	}
+	held(t, s, sh[1], []string{AssignerLease}, AssignerLease)
+}
+
 // Assign rewrites only what changed: assigned_at says when an account last
 // moved. An account left out is unassigned.
 func TestAssignKeepsWhatDidNotMove(t *testing.T) {
@@ -61,7 +118,7 @@ func TestAssignKeepsWhatDidNotMove(t *testing.T) {
 	if n := query[int64](t, dsn, `SELECT tiers FROM assignments WHERE account = 'x'`); n != 4 {
 		t.Fatalf("x has %d tiers, want 4", n)
 	}
-	_, got, err := s.Placement(ctx)
+	_, got, _, err := s.Placement(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,17 +129,27 @@ func TestAssignKeepsWhatDidNotMove(t *testing.T) {
 
 // Placement tells live shards from those draining or no longer beating.
 func TestPlacementShards(t *testing.T) {
-	s, dsn, sh := joined(t, "a", "b", "c")
+	s, dsn, sh := joined(t, "a", "b", "c", "d")
 	ctx := context.Background()
+	for _, x := range sh {
+		renew(t, s, x)
+	}
+	if _, err := s.Renew(ctx, sh[3], Want{ListOK: false}, testTTL); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Drain(ctx, sh[1]); err != nil {
 		t.Fatal(err)
 	}
 	exec(t, dsn, `UPDATE shards SET heartbeat_at = now() - make_interval(secs => $1) WHERE id = 'c'`, (ShardStale + time.Second).Seconds())
-	shards, _, err := s.Placement(ctx)
+	held(t, s, sh[0], []string{"x"}, "x")
+	shards, _, holders, err := s.Placement(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []ShardState{{ID: "a", Live: true}, {ID: "b", Draining: true}, {ID: "c"}}
+	if !maps.Equal(holders, map[string]string{"x": "a"}) {
+		t.Fatalf("holders %v, want x on a", holders)
+	}
+	want := []ShardState{{ID: "a", ListOK: true, Live: true}, {ID: "b", Draining: true, ListOK: true}, {ID: "c", ListOK: true}, {ID: "d"}}
 	if len(shards) != len(want) {
 		t.Fatalf("shards %+v, want %+v", shards, want)
 	}

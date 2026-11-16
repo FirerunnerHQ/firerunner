@@ -24,11 +24,13 @@ const ShardStale = 30 * time.Second
 // assigner's lease (any more): another shard may be assigning.
 var ErrNotAssigner = errors.New("this shard does not hold the assigner's lease")
 
-// ShardState is a shard as the assigner sees it. Live is a shard that beats
-// and is not draining: one an account may be assigned to.
+// ShardState is a shard as the assigner sees it. Live is a shard that beats,
+// is not draining and has applied its list: one an account may be assigned
+// to.
 type ShardState struct {
 	ID       string
 	Draining bool
+	ListOK   bool
 	Live     bool
 }
 
@@ -39,21 +41,21 @@ type Assignment struct {
 	Tiers int
 }
 
-// Placement reads the shards, ordered by id, and the assignments by
-// account, at one moment.
-func (s *TenantStore) Placement(ctx context.Context) ([]ShardState, map[string]Assignment, error) {
+// Placement reads, at one moment, the shards, ordered by id, the
+// assignments by account, and the shard that holds each account's lease.
+func (s *TenantStore) Placement(ctx context.Context) ([]ShardState, map[string]Assignment, map[string]string, error) {
 	var shards []ShardState
-	current := map[string]Assignment{}
+	current, holders := map[string]Assignment{}, map[string]string{}
 	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT id, draining, heartbeat_at > now() - make_interval(secs => $1) FROM shards ORDER BY id`, ShardStale.Seconds())
+		rows, err := tx.Query(ctx, `SELECT id, draining, list_ok, heartbeat_at > now() - make_interval(secs => $1) FROM shards ORDER BY id`, ShardStale.Seconds())
 		if err != nil {
 			return fmt.Errorf("read the shards: %w", err)
 		}
 		shards, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (ShardState, error) {
 			var st ShardState
 			var beats bool
-			err := r.Scan(&st.ID, &st.Draining, &beats)
-			st.Live = beats && !st.Draining
+			err := r.Scan(&st.ID, &st.Draining, &st.ListOK, &beats)
+			st.Live = beats && !st.Draining && st.ListOK
 			return st, err
 		})
 		if err != nil {
@@ -72,12 +74,24 @@ func (s *TenantStore) Placement(ctx context.Context) ([]ShardState, map[string]A
 		if err != nil {
 			return fmt.Errorf("read the assignments: %w", err)
 		}
+		rows, err = tx.Query(ctx, `SELECT account, shard FROM leases WHERE expires_at > now() AND account <> $1`, AssignerLease)
+		if err != nil {
+			return fmt.Errorf("read the leases: %w", err)
+		}
+		var holder string
+		_, err = pgx.ForEachRow(rows, []any{&account, &holder}, func() error {
+			holders[account] = holder
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("read the leases: %w", err)
+		}
 		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return shards, current, nil
+	return shards, current, holders, nil
 }
 
 // Assign makes the assignments next, if sh holds the assigner's lease:
@@ -114,10 +128,16 @@ func (s *TenantStore) Assign(ctx context.Context, sh Shard, next map[string]Assi
 }
 
 // Drain marks sh as stopping: the assigner moves its accounts to the other
-// shards at once, rather than once its heartbeat is stale.
+// shards at once, rather than once its heartbeat is stale. sh lets go of
+// the assigner's lease, if it holds it, for another shard to assign now.
 func (s *TenantStore) Drain(ctx context.Context, sh Shard) error {
-	if _, err := s.pool.Exec(ctx, `UPDATE shards SET draining = true WHERE id = $1`, sh.ID); err != nil {
-		return fmt.Errorf("mark the shard draining: %w", err)
-	}
-	return nil
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE shards SET draining = true WHERE id = $1`, sh.ID); err != nil {
+			return fmt.Errorf("mark the shard draining: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE leases SET expires_at = now() WHERE account = $1 AND shard = $2 AND expires_at > now()`, AssignerLease, sh.ID); err != nil {
+			return fmt.Errorf("release the assigner's lease: %w", err)
+		}
+		return nil
+	})
 }

@@ -32,14 +32,18 @@ func joined(t *testing.T, ids ...string) (*TenantStore, string, []Shard) {
 	return s, dsn, shards
 }
 
+// everyList is a shard's list in these tests: it names every account they
+// use, so that each assigned to the shard is taken.
+var everyList = []string{"x", "y", "z"}
+
 func renew(t *testing.T, s *TenantStore, sh Shard, accounts ...string) []string {
 	t.Helper()
-	held, err := s.Renew(context.Background(), sh, accounts, testTTL)
+	r, err := s.Renew(context.Background(), sh, Want{Accounts: accounts, Listed: everyList, ListOK: true}, testTTL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	slices.Sort(held)
-	return held
+	slices.Sort(r.Held)
+	return r.Held
 }
 
 func held(t *testing.T, s *TenantStore, sh Shard, want []string, accounts ...string) {
@@ -185,7 +189,7 @@ func TestJoinReplacesThisHostsEarlierShard(t *testing.T) {
 	if n := query[int64](t, dsn, `SELECT count(*) FROM shards WHERE id = 'a'`); n != 0 {
 		t.Fatal("the earlier shard is still registered")
 	}
-	if _, err := s.Renew(context.Background(), sh[0], []string{"x"}, testTTL); !errors.Is(err, ErrNotJoined) {
+	if _, err := s.Renew(context.Background(), sh[0], Want{Accounts: []string{"x"}}, testTTL); !errors.Is(err, ErrNotJoined) {
 		t.Fatalf("the earlier shard's renewal = %v, want ErrNotJoined", err)
 	}
 	held(t, s, again, nil, "x")
@@ -233,7 +237,8 @@ func TestLeasesUnderContention(t *testing.T) {
 				mine = mine[:len(mine)/2] // the rest released, if held
 			}
 			wg.Go(func() {
-				got, err := s.Renew(context.Background(), x, mine, testTTL)
+				r, err := s.Renew(context.Background(), x, Want{Accounts: mine, ListOK: true}, testTTL)
+				got := r.Held
 				if err != nil {
 					errs <- err
 					return

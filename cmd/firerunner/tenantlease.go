@@ -44,9 +44,9 @@ const (
 // *jobstore.TenantStore.
 type leaseStore interface {
 	Join(ctx context.Context, sh jobstore.Shard) error
-	Renew(ctx context.Context, sh jobstore.Shard, accounts []string, ttl time.Duration) ([]string, error)
+	Renew(ctx context.Context, sh jobstore.Shard, want jobstore.Want, ttl time.Duration) (jobstore.Renewal, error)
 	Release(ctx context.Context, sh jobstore.Shard) error
-	Placement(ctx context.Context) ([]jobstore.ShardState, map[string]jobstore.Assignment, error)
+	Placement(ctx context.Context) ([]jobstore.ShardState, map[string]jobstore.Assignment, map[string]string, error)
 	Assign(ctx context.Context, sh jobstore.Shard, next map[string]jobstore.Assignment) error
 	Drain(ctx context.Context, sh jobstore.Shard) error
 }
@@ -75,11 +75,12 @@ func newShard(owner, tenantOwner string) jobstore.Shard {
 // at its deadline, by itself.
 //
 // A lease is on an account, not a tenant id: two runs on one account would
-// share its scale sets. It asks for the accounts assigned to this shard, the
-// account of each tenant removed whose run still drains, until that run has
-// deleted its scale sets, and the assigner's lease. The shard that holds
-// that one assigns every listed tenant's account to a shard (place) after
-// each renewal.
+// share its scale sets. It asks for the accounts assigned to this shard
+// that its list names; those it serves, until they are assigned to another
+// shard; the account of each tenant removed whose run still drains, until
+// that run has deleted its scale sets; and the assigner's lease. The shard
+// that holds that one assigns every listed tenant's account to a shard
+// (place) after each renewal.
 type tenantLeaser struct {
 	store leaseStore
 	shard jobstore.Shard
@@ -103,10 +104,18 @@ type tenantLeaser struct {
 	lastRenewed time.Time
 	lastErr     string
 	lastErrAt   time.Time
-	// assigner is set while this shard holds the assigner's lease, and
-	// unplaced is why each tenant it could not place was not.
-	assigner bool
-	unplaced map[string]string
+	// listOK is whether the catalog's last read of the list applied.
+	listOK bool
+	// assignerID is the shard that held the assigner's lease at the last
+	// renewal, and unlisted the accounts assigned here that this shard's
+	// list does not name.
+	assignerID string
+	unlisted   []string
+	// unplaced is why each tenant this shard, assigning, could not place
+	// was not; assignErr is its last failure to assign.
+	unplaced    map[string]string
+	assignErr   string
+	assignErrAt time.Time
 }
 
 func (l *tenantLeaser) clock() time.Time {
@@ -162,10 +171,9 @@ func (l *tenantLeaser) step(ctx context.Context) error {
 // assignment changed.
 func (l *tenantLeaser) assign(ctx context.Context) (bool, error) {
 	l.mu.Lock()
-	_, leader := l.held[jobstore.AssignerLease]
-	l.assigner = leader
+	leader := l.assigningLocked()
 	if !leader {
-		l.unplaced = nil
+		l.unplaced, l.assignErr = nil, ""
 	}
 	places, listed := placesOf(l.list), l.listed
 	l.mu.Unlock()
@@ -175,11 +183,11 @@ func (l *tenantLeaser) assign(ctx context.Context) (bool, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, leaseRenewTimeout)
 	defer cancel()
-	shards, current, err := l.store.Placement(ctx)
+	shards, current, holders, err := l.store.Placement(ctx)
 	if err == nil {
-		next, unplaced := place(places, shards, current)
+		next, unplaced := place(places, shards, current, holders)
 		l.mu.Lock()
-		l.unplaced = unplaced
+		l.unplaced, l.assignErr = unplaced, ""
 		l.mu.Unlock()
 		if maps.Equal(next, current) {
 			return false, nil
@@ -195,7 +203,7 @@ func (l *tenantLeaser) assign(ctx context.Context) (bool, error) {
 	}
 	err = fmt.Errorf("assign the tenants: %w", err)
 	l.mu.Lock()
-	l.lastErr, l.lastErrAt = err.Error(), time.Now()
+	l.assignErr, l.assignErrAt = err.Error(), time.Now()
 	l.mu.Unlock()
 	l.log.Warn("tenants not assigned; trying again", "shard", l.shard.ID, "err", err)
 	return false, err
@@ -206,8 +214,24 @@ func (l *tenantLeaser) assign(ctx context.Context) (bool, error) {
 func (l *tenantLeaser) apply(list []config.Tenant) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.list, l.listed = list, true
+	l.list, l.listed, l.listOK = list, true, true
 	l.applyLocked()
+}
+
+// listFailed is the catalog's: its last read of the list did not apply.
+// Until one does, the assigner puts no tenant on this shard, whose list may
+// be older than the one it places.
+func (l *tenantLeaser) listFailed() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.listOK = false
+}
+
+// assigningLocked reports whether this shard holds the assigner's lease,
+// renewed and not past its deadline. The caller holds mu.
+func (l *tenantLeaser) assigningLocked() bool {
+	d, ok := l.held[jobstore.AssignerLease]
+	return ok && l.clock().Before(d)
 }
 
 // applyLocked applies the list under the leases held. The caller holds mu.
@@ -223,13 +247,17 @@ func (l *tenantLeaser) applyLocked() {
 
 // renew renews the leases once and applies the list under them.
 func (l *tenantLeaser) renew(ctx context.Context) error {
-	accounts := append(l.set.removing(), jobstore.AssignerLease)
-	slices.Sort(accounts)
-	accounts = slices.Compact(accounts)
+	want := jobstore.Want{Accounts: append(l.set.removing(), jobstore.AssignerLease), Running: l.set.runningAccounts()}
+	l.mu.Lock()
+	for _, c := range l.list {
+		want.Listed = append(want.Listed, config.AccountOf(c.URL))
+	}
+	want.ListOK = l.listOK
+	l.mu.Unlock()
 
 	sent := l.clock()
 	rctx, cancel := context.WithTimeout(ctx, leaseRenewTimeout)
-	got, err := l.store.Renew(rctx, l.shard, accounts, leaseTTL)
+	r, err := l.store.Renew(rctx, l.shard, want, leaseTTL)
 	cancel()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -240,10 +268,11 @@ func (l *tenantLeaser) renew(ctx context.Context) error {
 	}
 	l.lastRenewed = time.Now()
 	deadline := sent.Add(leaseServe)
-	l.held = make(map[string]time.Time, len(got))
-	for _, a := range got {
+	l.held = make(map[string]time.Time, len(r.Held))
+	for _, a := range r.Held {
 		l.held[a] = deadline
 	}
+	l.assignerID, l.unlisted = r.Assigner, r.Unlisted
 	l.set.renewRemoving(l.held)
 	if l.listed {
 		l.applyLocked()
@@ -317,11 +346,15 @@ func (l *tenantLeaser) status() *health.TenantLeases {
 			n++
 		}
 	}
-	var unplaced []string
-	for _, id := range slices.Sorted(maps.Keys(l.unplaced)) {
-		unplaced = append(unplaced, id+": "+l.unplaced[id])
-	}
-	return &health.TenantLeases{Shard: l.shard.ID, Tenants: n, Listed: len(l.list),
+	st := &health.TenantLeases{Shard: l.shard.ID, Tenants: n, Listed: len(l.list),
 		LastRenewed: l.lastRenewed, LastError: l.lastErr, LastErrorAt: l.lastErrAt,
-		Assigner: l.assigner, Unplaced: unplaced}
+		AssignerShard: l.assignerID, Unlisted: slices.Clone(l.unlisted)}
+	if l.assigningLocked() {
+		st.Assigner = true
+		for _, id := range slices.Sorted(maps.Keys(l.unplaced)) {
+			st.Unplaced = append(st.Unplaced, id+": "+l.unplaced[id])
+		}
+		st.AssignError, st.AssignErrorAt = l.assignErr, l.assignErrAt
+	}
+	return st
 }

@@ -210,11 +210,20 @@ type TenantLeases struct {
 	// Listed how many the list has.
 	Tenants int `json:"tenants"`
 	Listed  int `json:"listed"`
-	// Assigner is set while this shard assigns the tenants to the shards,
-	// and Unplaced says, for each tenant it could not place, why
-	// ("<id>: <why>"): it is served by no shard.
-	Assigner bool     `json:"assigner,omitempty"`
-	Unplaced []string `json:"unplaced,omitempty"`
+	// AssignerShard is the shard that assigns the tenants to the shards,
+	// as of the last renewal; Assigner is set when it is this one. Unplaced
+	// says, on that shard, why each tenant it could not place was not
+	// ("<id>: <why>"): no shard takes it up, though one may still serve it
+	// from before. AssignError is its last failure to assign.
+	AssignerShard string    `json:"assigner_shard,omitempty"`
+	Assigner      bool      `json:"assigner,omitempty"`
+	Unplaced      []string  `json:"unplaced,omitempty"`
+	AssignError   string    `json:"assign_error,omitempty"`
+	AssignErrorAt time.Time `json:"assign_error_at,omitzero"`
+	// Unlisted are the accounts assigned to this shard that its own list
+	// does not name, which it does not take: its list is older than the
+	// assigner's, or rejected here.
+	Unlisted []string `json:"unlisted,omitempty"`
 	// LastRenewed is the last successful renewal; zero before the first.
 	LastRenewed time.Time `json:"last_renewed,omitzero"`
 	LastError   string    `json:"last_error,omitempty"`
