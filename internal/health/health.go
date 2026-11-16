@@ -225,8 +225,10 @@ type TenantLeases struct {
 	// assigner's, or rejected here.
 	Unlisted []string `json:"unlisted,omitempty"`
 	// Sweeping are the tenants removed while no shard served them whose
-	// leftovers this shard is deleting, by id.
-	Sweeping []string `json:"sweeping,omitempty"`
+	// leftovers this shard is deleting, by id, and SweepsPlanned those it
+	// will once it holds their account's lease.
+	Sweeping      []string `json:"sweeping,omitempty"`
+	SweepsPlanned []string `json:"sweeps_planned,omitempty"`
 	// LastRenewed is the last successful renewal; zero before the first.
 	LastRenewed time.Time `json:"last_renewed,omitzero"`
 	LastError   string    `json:"last_error,omitempty"`

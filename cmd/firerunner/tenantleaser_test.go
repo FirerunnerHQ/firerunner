@@ -31,6 +31,9 @@ type fakeLeases struct {
 	// and records in forgotten.
 	removed   []jobstore.Removed
 	forgotten []string
+	// mine are the leases s1 holds as of its last renewal: Placement reads
+	// them as held, as the store does.
+	mine []string
 	// wants are the renewals' asks.
 	// shards and assignments are what Placement reads; Assign writes
 	// assignments, and counts in assigns.
@@ -92,6 +95,9 @@ func (f *fakeLeases) Renew(_ context.Context, sh jobstore.Shard, want jobstore.W
 	if slices.Contains(r.Held, jobstore.AssignerLease) {
 		r.Assigner = sh.ID
 	}
+	if err == nil {
+		f.mine = slices.Clone(r.Held)
+	}
 	f.mu.Unlock()
 	if ttl != leaseTTL {
 		return jobstore.Renewal{}, errors.New("asked for another ttl")
@@ -115,7 +121,16 @@ func (f *fakeLeases) Release(_ context.Context, sh jobstore.Shard) error {
 func (f *fakeLeases) Placement(context.Context) ([]jobstore.ShardState, map[string]jobstore.Assignment, map[string]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return slices.Clone(f.shards), maps.Clone(f.assignments), maps.Clone(f.holders), nil
+	holders := maps.Clone(f.holders)
+	for _, a := range f.mine {
+		if holders == nil {
+			holders = map[string]string{}
+		}
+		if _, ok := holders[a]; !ok && a != jobstore.AssignerLease {
+			holders[a] = "s1"
+		}
+	}
+	return slices.Clone(f.shards), maps.Clone(f.assignments), holders, nil
 }
 
 func (f *fakeLeases) Assign(_ context.Context, _ jobstore.Shard, next map[string]jobstore.Assignment) error {
@@ -345,11 +360,12 @@ func TestLeaserRemovedTenantDeletesOnlyUnderItsLease(t *testing.T) {
 		l.mu.Lock()
 		removed := slices.Clone(l.removed)
 		l.mu.Unlock()
-		if renewed && len(removed) != 1 {
-			t.Fatalf("renewed throughout: deleted %v, want a's", removed)
+		_, forgot := l.removals()
+		if renewed && (len(removed) != 1 || !slices.Equal(forgot, []string{"a"})) {
+			t.Fatalf("renewed throughout: deleted %v, forgot %v, want a's", removed, forgot)
 		}
-		if !renewed && len(removed) != 0 {
-			t.Fatalf("lease lapsed: deleted %v, want nothing", removed)
+		if !renewed && (len(removed) != 0 || len(forgot) != 0) {
+			t.Fatalf("lease lapsed: deleted %v, forgot %v, want nothing: it is swept again", removed, forgot)
 		}
 	}
 }

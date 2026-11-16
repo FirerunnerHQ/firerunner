@@ -58,13 +58,29 @@ func TestRemovedTenants(t *testing.T) {
 	if got, _ = s.RemovedTenants(ctx); len(got) != 0 {
 		t.Fatalf("removed %+v once forgotten", got)
 	}
+	// A removal recorded by now, forgotten by a run that saw it then.
 	exec(t, dsn, `DELETE FROM tenants WHERE id = 'b'`)
-	if err := s.ForgetRemoved(ctx, "b", time.Time{}); err != nil {
+	if err := s.ForgetRemoved(ctx, "b", time.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ = s.RemovedTenants(ctx); len(got) != 0 {
-		t.Fatalf("removed %+v, want b forgotten whatever its time", got)
+		t.Fatalf("removed %+v, want b forgotten", got)
+	}
+
+	// An id changed in place: the old one is removed, the new one is not.
+	if err := s.Replace(ctx, []Entry{entry("c", "https://github.com/c")}); err != nil {
+		t.Fatal(err)
+	}
+	exec(t, dsn, `UPDATE tenants SET id = 'd', entry = jsonb_set(entry, '{id}', '"d"') WHERE id = 'c'`)
+	if got, _ = s.RemovedTenants(ctx); len(got) != 1 || got[0].ID != "c" {
+		t.Fatalf("removed %+v after c was renamed d, want c", got)
+	}
+	exec(t, dsn, `UPDATE tenants SET entry = jsonb_set(entry, '{url}', '"https://github.com/e"') WHERE id = 'd'`)
+	if got, _ = s.RemovedTenants(ctx); len(got) != 1 {
+		t.Fatalf("removed %+v after d's entry changed, want c alone", got)
 	}
 }
 
-func jsonHas(b []byte, s string) bool { return strings.Contains(strings.ReplaceAll(string(b), `":"`, `": "`), s) }
+func jsonHas(b []byte, s string) bool {
+	return strings.Contains(strings.ReplaceAll(string(b), `":"`, `": "`), s)
+}

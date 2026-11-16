@@ -346,28 +346,45 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 // not. A run that served it when it was removed has deleted its own, and
 // finds none; this covers the rest: a tenant in retry backoff, skipped, or
 // waiting on a run before it when removed, and one whose scale sets an
-// earlier run kept (KeepOnClose). Not covered: a tier or runner group an
-// earlier entry named, and a tenant removed while no daemon ran, or before
-// one crashed mid-drain.
-func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) {
+// earlier run kept (KeepOnClose); with the tenants in the job store under
+// leases, also a tenant removed while no shard served it (a sweep). Not
+// covered: a tier or runner group an earlier entry named.
+//
+// It goes on as the daemon stops, each tier bounded, but stops at once,
+// mid-call too, when ctx ends with errLeaseLapsed: another shard may serve
+// the account then, under the same scale set names. It returns an error
+// unless every tier's scale set is gone.
+func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) error {
 	remove := s.removeByName
 	if remove == nil {
 		remove = listener.RemoveByName
 	}
+	var errs []error
 	for _, name := range names {
+		if errors.Is(context.Cause(ctx), errLeaseLapsed) {
+			return errors.Join(append(errs, errLeaseLapsed)...)
+		}
 		cfg := s.listenerConfig(t, config.Tier{Name: name}, tenantHooks{}, nil, nil, s.log, nil)
 		// Bounded per tier: a GitHub that hangs must not hold up shutdown,
 		// and a slow first tier must not use up the rest's time.
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
+		stop := context.AfterFunc(ctx, func() {
+			if errors.Is(context.Cause(ctx), errLeaseLapsed) {
+				cancel()
+			}
+		})
 		removed, err := remove(rctx, cfg)
+		stop()
 		cancel()
 		switch {
 		case err != nil:
 			s.log.Warn("scale set of a removed tenant left registered", "tenant", t.ID, "tier", name, "err", err)
+			errs = append(errs, fmt.Errorf("tier %s: %w", name, err))
 		case removed:
 			s.log.Info("deregistered runner scale set left by a removed tenant", "tenant", t.ID, "tier", name)
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // endRemoved ends what a removed tenant left on EC2, by its owner tag: its
@@ -376,19 +393,27 @@ func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) {
 // ec2.Client.EndAll). Its runners went with its scale sets. It runs before
 // a later run on the tenant's id or account may start, so it never ends
 // what a run of a tenant listed again launched. A daemon stopping meanwhile
-// still sweeps once, skips the second, and warns.
-func (s *shard) endRemoved(ctx context.Context, t tenant) {
+// still sweeps once, skips the second, and warns. A lease that lapses
+// first ends nothing; one that lapses during the first sweep ends the
+// second: what the first can end is older than its grace (2 minutes), so
+// launched before another shard could serve the id again. It returns an
+// error unless both sweeps ran.
+func (s *shard) endRemoved(ctx context.Context, t tenant) error {
 	if s.ec2Client == nil || s.cfg.EC2Reaper == "off" {
-		return
+		return nil
+	}
+	if errors.Is(context.Cause(ctx), errLeaseLapsed) {
+		return errLeaseLapsed
 	}
 	log := s.log.With("tenant", t.ID)
 	rep, err := s.ec2Client.EndAll(ctx, reaperOptions(s.cfg, t.Owner, nil, nil, log), "removed from the tenants list")
 	if err != nil {
-		log.Warn("a removed tenant's instances or spot requests may be left; end those with its owner tag by hand", "owner", t.Owner, "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "err", err)
-		return
+		log.Warn("a removed tenant's instances or spot requests may be left; end those with its owner tag by hand, or let a shard sweep it", "owner", t.Owner, "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "err", err)
+		return err
 	}
 	// Logged even when there was nothing: moving the tenant waits for it.
 	log.Info("ended what a removed tenant left on EC2", "instances", len(rep.Instances), "spotRequests", len(rep.SpotRequests), "unproven", len(rep.Unproven), "dryRun", rep.DryRun)
+	return nil
 }
 
 // warnRefused logs each tier the tenant lists but is not served, and why.

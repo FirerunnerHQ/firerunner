@@ -1328,15 +1328,9 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// tenantsInterval, and tenants start, change and stop to match it. They
 	// end with runCtx, and drain themselves.
 	//
-	// sweepRemoved deletes what a removed tenant left: its scale sets by
-	// name, then its machines by owner tag. forgetRemoved, with the tenants
-	// in the job store, records it done there, so that no shard sweeps it.
-	sweepRemoved := func(ctx context.Context, c config.Tenant) {
-		t := extraTenant(cfg, c, tenantOwner, appJWT)
-		s.removeLeftovers(ctx, t, c.Tiers)
-		s.endRemoved(ctx, t)
-	}
-	var forgetRemoved func(id string)
+	// forgetRemoved, with the tenants in the job store, records there that
+	// all a removed tenant left is deleted, so that no shard sweeps it.
+	var forgetRemoved func(id string, upTo time.Time)
 	tenants := &tenantSet{
 		ctx: runCtx, log: log,
 		run: func(ctx context.Context, cur func() config.Tenant, served func(*servedTenant)) {
@@ -1347,10 +1341,15 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				b.SetMax(max)
 			}
 		},
-		removed: func(c config.Tenant) {
-			sweepRemoved(runCtx, c)
+		// What a removed tenant left: its scale sets by name, then its
+		// machines by owner tag.
+		removed: func(ctx context.Context, c config.Tenant) error {
+			t := extraTenant(cfg, c, tenantOwner, appJWT)
+			return errors.Join(s.removeLeftovers(ctx, t, c.Tiers), s.endRemoved(ctx, t))
+		},
+		forget: func(id string, upTo time.Time) {
 			if forgetRemoved != nil {
-				forgetRemoved(c.ID)
+				forgetRemoved(id, upTo)
 			}
 		},
 	}
@@ -1384,10 +1383,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			// After the leases are released, on the way out.
 			defer db.Close()
 			// A removal done here is done: no sweep repeats it.
-			forgetRemoved = func(id string) {
+			forgetRemoved = func(id string, upTo time.Time) {
 				fctx, cancel := context.WithTimeout(context.WithoutCancel(runCtx), forgetRemovedTimeout)
 				defer cancel()
-				if err := db.ForgetRemoved(fctx, id, time.Time{}); err != nil {
+				if err := db.ForgetRemoved(fctx, id, upTo); err != nil {
 					log.Warn("removed tenant not forgotten: a shard may delete what it left again", "tenant", id, "err", err)
 				}
 			}
@@ -1397,7 +1396,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		catalog = &tenantCatalog{src: src, check: cfg.CheckTenants, set: tenants, log: log.With("component", "tenants")}
 		if cfg.TenantLeases { // validated: --tenants db:, so db is open
-			leaser = &tenantLeaser{store: db, shard: newShard(owner, tenantOwner), set: tenants, sweep: sweepRemoved, log: log.With("component", "tenant-leases")}
+			leaser = &tenantLeaser{store: db, shard: newShard(owner, tenantOwner), set: tenants, log: log.With("component", "tenant-leases")}
 			catalog.leaser = leaser
 		}
 		if err := catalog.read(runCtx); err != nil {

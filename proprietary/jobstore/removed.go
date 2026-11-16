@@ -47,16 +47,11 @@ func (s *TenantStore) RemovedTenants(ctx context.Context) ([]Removed, error) {
 	return removed, nil
 }
 
-// ForgetRemoved records that tenant id's leftovers are deleted. It forgets
-// only the removal of removedAt, when that is set: a tenant listed and
-// removed again meanwhile is a new removal, still to do.
-func (s *TenantStore) ForgetRemoved(ctx context.Context, id string, removedAt time.Time) error {
-	var err error
-	if removedAt.IsZero() {
-		_, err = s.pool.Exec(ctx, `DELETE FROM removed_tenants WHERE id = $1`, id)
-	} else {
-		_, err = s.pool.Exec(ctx, `DELETE FROM removed_tenants WHERE id = $1 AND removed_at = $2`, id, removedAt)
-	}
+// ForgetRemoved records that tenant id's leftovers are deleted, for its
+// removal recorded at or before upTo: a tenant listed and removed again
+// since is a new removal, still to do.
+func (s *TenantStore) ForgetRemoved(ctx context.Context, id string, upTo time.Time) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM removed_tenants WHERE id = $1 AND removed_at <= $2`, id, upTo)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
 		return nil

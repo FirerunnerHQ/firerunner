@@ -39,8 +39,15 @@ type setLab struct {
 	// that started while another on its account had not returned.
 	active   map[string]int
 	overlaps []string
-	// removed records each removed tenant's entry the set hands on.
-	removed []string
+	// removed records each removed tenant's entry the set hands on, and
+	// forgot each removal forgotten; removeErr fails the removals, and
+	// removing, when set, runs inside each.
+	removed   []string
+	forgot    []string
+	removeErr error
+	removing  func(ctx context.Context) error
+	// removeCtx is the context the last gated removal was given.
+	removeCtx context.Context
 }
 
 type tenantStart struct {
@@ -89,10 +96,23 @@ func newSetLab(t *testing.T) *setLab {
 			defer l.mu.Unlock()
 			l.maxes = append(l.maxes, id+"="+strconv.Itoa(max))
 		},
-		removed: func(c config.Tenant) {
+		removed: func(ctx context.Context, c config.Tenant) error {
+			l.mu.Lock()
+			l.removed = append(l.removed, c.ID+" "+strings.Join(c.Tiers, ","))
+			err, during := l.removeErr, l.removing
+			l.mu.Unlock()
+			if during != nil {
+				return during(ctx)
+			}
+			return err
+		},
+		forget: func(id string, upTo time.Time) {
 			l.mu.Lock()
 			defer l.mu.Unlock()
-			l.removed = append(l.removed, c.ID+" "+strings.Join(c.Tiers, ","))
+			if upTo.IsZero() {
+				l.t.Errorf("forgot %s with no time", id)
+			}
+			l.forgot = append(l.forgot, id)
 		},
 	}
 	t.Cleanup(func() {
@@ -622,7 +642,7 @@ func TestTenantSetStopHandsOnNothing(t *testing.T) {
 			close(started)
 			<-ctx.Done()
 		},
-		removed: func(config.Tenant) { handed.Add(1) },
+		removed: func(context.Context, config.Tenant) error { handed.Add(1); return nil },
 	}
 	set.apply([]config.Tenant{listed("a", 2, "x")})
 	<-started
@@ -648,9 +668,45 @@ func TestRemoveLeftovers(t *testing.T) {
 	c := config.Tenant{ID: "acme", URL: "https://github.com/acme", InstallationID: 7, Tiers: []string{"small", "big"}}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the run's context has ended: the deletion still runs
-	s.removeLeftovers(ctx, extraTenant(s.cfg, c, "inst", nil), c.Tiers)
+	if err := s.removeLeftovers(ctx, extraTenant(s.cfg, c, "inst", nil), c.Tiers); err != nil {
+		t.Fatal(err)
+	}
 	if want := []string{"https://github.com/acme firerunner small", "https://github.com/acme firerunner big"}; !slices.Equal(asked, want) {
 		t.Fatalf("asked %v, want %v", asked, want)
+	}
+}
+
+// removeLeftovers says when a tier's scale set is not gone; and a lease
+// that lapses stops it at once, the call under way and every tier after.
+func TestRemoveLeftoversStopsWhenItsLeaseLapses(t *testing.T) {
+	inCall := make(chan struct{})
+	var asked []string
+	s := &shard{log: slog.New(slog.DiscardHandler), cfg: &config.Config{RunnerGroup: "firerunner"},
+		removeByName: func(ctx context.Context, c listener.Config) (bool, error) {
+			asked = append(asked, c.Name)
+			switch c.Name {
+			case "broken":
+				return false, errors.New("502")
+			case "slow":
+				close(inCall)
+				<-ctx.Done()
+				return false, ctx.Err()
+			}
+			return true, nil
+		}}
+	c := config.Tenant{ID: "acme", URL: "https://github.com/acme", InstallationID: 7, Tiers: []string{"ok", "broken", "slow", "after"}}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	go func() { <-inCall; cancel(errLeaseLapsed) }()
+	start := time.Now()
+	err := s.removeLeftovers(ctx, extraTenant(s.cfg, c, "inst", nil), c.Tiers)
+	if took := time.Since(start); took > tenantRemoveTimeout/2 {
+		t.Fatalf("took %s: the call under way did not stop at the lapse", took)
+	}
+	if !errors.Is(err, errLeaseLapsed) || !strings.Contains(err.Error(), "502") {
+		t.Fatalf("removeLeftovers = %v, want the failed tier's and the lapse", err)
+	}
+	if want := []string{"ok", "broken", "slow"}; !slices.Equal(asked, want) {
+		t.Fatalf("asked %v, want %v: nothing after the lapse", asked, want)
 	}
 }
 

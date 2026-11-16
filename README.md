@@ -322,12 +322,18 @@ takes any free lease, ignoring the assignments.
   handed on. Another shard takes them at its next renewal. One that crashes leaves them to
   expire, and GitHub holds its sessions for about 50 seconds.
 - An installation removed keeps its lease until its scale sets are deleted.
-  If the lease lapses first, nothing is deleted, as another shard may serve
-  its account by then. One removed while no shard served it (its shard
-  crashed, it was placed on none, or no daemon ran) is kept in the
-  `removed_tenants` table; the assigning shard takes its account's lease
-  and deletes what it left, scale sets and machines, then forgets it.
-  `firerunner status` lists those it is deleting.
+  If the lease lapses first, deletion stops at once, as another shard may
+  serve its account by then. The job store keeps every installation
+  deleted from its table (or whose id is changed) in `removed_tenants`
+  until all it left is gone: one whose deletion stopped or failed, or that
+  was removed while no shard served it (its shard crashed, it was placed
+  on none, or no daemon ran), is swept by the assigning shard once no
+  shard holds its account's lease: under that lease, its scale sets by
+  name, then its machines by owner tag. An installation listed again on
+  its account waits for the sweep. `firerunner status` lists the sweeps
+  under way and planned. `TRUNCATE tenants` records nothing; an
+  installation whose URL moves to another account leaves its old
+  account's scale sets, as a change does.
 - A renewal that fails is tried again every 2 seconds. A shard that cannot
   join (its database down, or owners that do not fit) serves its own tiers
   and no installation, and keeps trying.

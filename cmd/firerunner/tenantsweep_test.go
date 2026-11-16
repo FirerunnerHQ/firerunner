@@ -12,188 +12,249 @@ import (
 	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
-// sweepLab is a leaser that assigns, with a list of tenant a, and a sweep
-// that records each tenant it is given and returns once the test lets it,
-// or its context ends.
-type sweepLab struct {
-	*testing.T
-	l       *setLab
-	store   *fakeLeases
-	lr      *tenantLeaser
-	started chan string
-	ended   chan error
-	finish  chan struct{}
+// removedRecord is tenant id as the job store keeps it once removed.
+func removedRecord(id string) jobstore.Removed {
+	entry, _ := json.Marshal(listed(id, 2, "x", "y"))
+	return jobstore.Removed{ID: id, Entry: entry, RemovedAt: time.Unix(1_800_000_000, 0)}
 }
 
-func newSweepLab(t *testing.T) *sweepLab {
-	l, _, store, lr := leaserLab(t)
-	sl := &sweepLab{T: t, l: l, store: store, lr: lr,
-		started: make(chan string, 4), ended: make(chan error, 4), finish: make(chan struct{})}
-	lr.sweep = func(ctx context.Context, c config.Tenant) {
-		sl.started <- c.ID
+// gated makes the lab's removals wait until the returned func is called,
+// or their context ends, and report which.
+func gated(l *setLab) (release func(), ended chan error) {
+	gate, ended := make(chan struct{}), make(chan error, 4)
+	l.mu.Lock()
+	l.removing = func(ctx context.Context) error {
+		l.mu.Lock()
+		l.removeCtx = ctx
+		l.mu.Unlock()
 		select {
-		case <-sl.finish:
-			sl.ended <- nil
+		case <-gate:
+			ended <- nil
+			return nil
 		case <-ctx.Done():
-			sl.ended <- ctx.Err()
+			err := context.Cause(ctx)
+			ended <- err
+			return err
 		}
 	}
+	l.mu.Unlock()
+	return func() { close(gate) }, ended
+}
+
+func (l *setLab) removals() (removed, forgot []string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.removed), slices.Clone(l.forgot)
+}
+
+func waitErr(t *testing.T, ch chan error, want error) {
+	t.Helper()
+	select {
+	case err := <-ch:
+		if !errors.Is(err, want) {
+			t.Fatalf("removal ended with %v, want %v", err, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("removal never ended")
+	}
+}
+
+// A sweep deletes what the tenant left under the lease's deadline, and
+// forgets its removal once all of it is gone; a run on its account listed
+// again waits for it to end.
+func TestTenantSetSweep(t *testing.T) {
+	l, c := leaseLab(t)
+	release, ended := gated(l)
+	gone := listed("gone", 2, "x")
+	if !l.set.sweep(gone, time.Unix(1_800_000_000, 0), c.now().Add(20*time.Second)) {
+		t.Fatal("sweep refused")
+	}
+	waitFor(t, "the sweep's removal", func() bool { r, _ := l.removals(); return len(r) == 1 })
+	if got := l.set.sweeping(); !slices.Equal(got, []string{"gone"}) {
+		t.Fatalf("sweeping %v", got)
+	}
+	if got := l.set.removing(); !slices.Equal(got, []string{acct("gone")}) {
+		t.Fatalf("removing %v, want gone's account: its lease is kept", got)
+	}
+
+	// Listed again on its account: waits for the sweep.
+	l.set.applyLeases([]config.Tenant{gone}, map[string]time.Time{"gone": c.now().Add(20 * time.Second)})
+	select {
+	case s := <-l.starts:
+		t.Fatalf("%s started beside the sweep of its account", s.id)
+	case <-time.After(50 * time.Millisecond):
+	}
+	release()
+	waitErr(t, ended, nil)
+	l.started("gone")
+	if _, forgot := l.removals(); !slices.Equal(forgot, []string{"gone"}) {
+		t.Fatalf("forgot %v, want gone", forgot)
+	}
+	if got := l.set.sweeping(); len(got) != 0 {
+		t.Fatalf("sweeping %v once done", got)
+	}
+	// Refused while its account is served here.
+	if l.set.sweep(gone, time.Unix(1_800_000_000, 0), c.now().Add(20*time.Second)) {
+		t.Fatal("swept an account served here")
+	}
+}
+
+// A sweep waits for a removal on its account still under way here: the
+// two would delete by the same names.
+func TestTenantSetSweepWaitsForTheAccountsRemoval(t *testing.T) {
+	l, c := leaseLab(t)
+	l.set.applyLeases([]config.Tenant{listed("a", 2, "x")}, map[string]time.Time{"a": c.now().Add(20 * time.Second)})
+	l.started("a")
+	l.set.applyLeases(nil, map[string]time.Time{})
+	l.ended("a", errTenantRemoved) // draining: its runners not finished
+	old := listed("a", 2, "y")
+	old.ID = "old"
+	l.set.renewRemoving(map[string]time.Time{acct("a"): c.now().Add(20 * time.Second)})
+	if !l.set.sweep(old, time.Unix(1_800_000_000, 0), c.now().Add(20*time.Second)) {
+		t.Fatal("sweep refused")
+	}
+	for range 20 {
+		if r, _ := l.removals(); len(r) != 0 {
+			t.Fatalf("removed %v while a's run drains", r)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	l.finish("a")
+	l.set.wg.Wait()
+	if r, _ := l.removals(); !slices.Equal(r, []string{"a x", "old y"}) {
+		t.Fatalf("removed %v, want a's, then old's", r)
+	}
+}
+
+// A removal whose lease lapses stops at once, with errLeaseLapsed, and is
+// not forgotten; a renewal before the deadline lets it go on. One that
+// fails is not forgotten either.
+func TestTenantSetSweepUnderItsLease(t *testing.T) {
+	l, c := leaseLab(t)
+	release, ended := gated(l)
+	defer release()
+	l.set.sweep(listed("gone", 2, "x"), time.Unix(1_800_000_000, 0), c.now().Add(20*time.Second))
+	waitFor(t, "the sweep's removal", func() bool { r, _ := l.removals(); return len(r) == 1 })
+
+	c.advance(15 * time.Second)
+	l.set.renewRemoving(map[string]time.Time{acct("gone"): c.now().Add(20 * time.Second)})
+	c.advance(10 * time.Second) // past the first deadline, not the renewed one
+	l.mu.Lock()
+	rctx := l.removeCtx
+	l.mu.Unlock()
+	if err := context.Cause(rctx); err != nil {
+		t.Fatalf("removal ended at a deadline renewed: %v", err)
+	}
+	c.advance(10 * time.Second)
+	waitErr(t, ended, errLeaseLapsed)
+	l.set.wg.Wait()
+	if _, forgot := l.removals(); len(forgot) != 0 {
+		t.Fatalf("forgot %v after the lease lapsed", forgot)
+	}
+
+	// A renewal after the deadline revives nothing.
+	l.set.renewRemoving(map[string]time.Time{acct("gone"): c.now().Add(20 * time.Second)})
+
+	l.mu.Lock()
+	l.removing, l.removeErr = nil, errors.New("502")
+	l.mu.Unlock()
+	l.set.sweep(listed("other", 2, "x"), time.Unix(1_800_000_000, 0), c.now().Add(20*time.Second))
+	l.set.wg.Wait()
+	if _, forgot := l.removals(); len(forgot) != 0 {
+		t.Fatalf("forgot %v after a removal failed", forgot)
+	}
+}
+
+// A removing run whose deadline has passed is not revived by a renewal.
+func TestRenewRemovingRevivesNothingLapsed(t *testing.T) {
+	l, c := leaseLab(t)
+	release, _ := gated(l)
+	defer release()
+	l.set.sweep(listed("gone", 2, "x"), time.Unix(1_800_000_000, 0), c.now().Add(20*time.Second))
+	waitFor(t, "the sweep's removal", func() bool { r, _ := l.removals(); return len(r) == 1 })
+	c.mu.Lock()
+	c.t = c.t.Add(21 * time.Second) // past it, its timer not fired yet
+	c.mu.Unlock()
+	l.set.renewRemoving(map[string]time.Time{acct("gone"): c.now().Add(20 * time.Second)})
+	l.set.mu.Lock()
+	defer l.set.mu.Unlock()
+	for _, r := range l.set.ending {
+		if !r.expired(c.now()) {
+			t.Fatal("a lapsed removal was revived")
+		}
+	}
+}
+
+// The assigner plans to sweep a removed tenant whose account no shard
+// holds, asks for its lease, and hands it to the tenant set once held. It
+// plans none whose account is held, drops a plan once the removal is
+// forgotten or the account taken, and plans nothing once it no longer
+// assigns.
+func TestLeaserPlansSweeps(t *testing.T) {
+	l, _, store, lr := leaserLab(t)
 	lr.joined = true
 	store.shards = live("s1")
-	store.set(jobstore.AssignerLease, acct("a"))
-	lr.apply([]config.Tenant{listed("a", 2, "x")})
-	t.Cleanup(func() {
-		select {
-		case <-sl.finish:
-		default:
-			close(sl.finish)
+	store.set(jobstore.AssignerLease)
+	lr.apply(nil)
+	store.removed = []jobstore.Removed{removedRecord("gone"), removedRecord("held"), removedRecord("busy")}
+	store.holders = map[string]string{acct("held"): "s2"}
+	step := func() {
+		t.Helper()
+		if err := lr.step(context.Background()); err != nil {
+			t.Fatal(err)
 		}
-		lr.sweepWG.Wait()
-	})
-	return sl
-}
-
-// removed adds a tenant to those removed, as the tenants table's trigger
-// does.
-func (sl *sweepLab) removed(id string) jobstore.Removed {
-	entry, _ := json.Marshal(listed(id, 2, "x", "y"))
-	r := jobstore.Removed{ID: id, Entry: entry, RemovedAt: time.Unix(1_800_000_000, 0)}
-	sl.store.mu.Lock()
-	sl.store.removed = append(sl.store.removed, r)
-	sl.store.mu.Unlock()
-	return r
-}
-
-func (sl *sweepLab) step() {
-	sl.Helper()
-	if err := sl.lr.step(context.Background()); err != nil {
-		sl.Fatal(err)
 	}
-}
-
-func (sl *sweepLab) sweepStarted(want string) {
-	sl.Helper()
-	select {
-	case id := <-sl.started:
-		if id != want {
-			sl.Fatalf("swept %s, want %s", id, want)
-		}
-	case <-time.After(5 * time.Second):
-		sl.Fatalf("%s never swept", want)
+	step()
+	if st := lr.status(); !slices.Equal(st.SweepsPlanned, []string{"busy", "gone"}) {
+		t.Fatalf("planned %v, want busy and gone", st.SweepsPlanned)
 	}
-}
-
-func (sl *sweepLab) sweepEnded(want error) {
-	sl.Helper()
-	select {
-	case err := <-sl.ended:
-		if !errors.Is(err, want) {
-			sl.Fatalf("sweep ended with %v, want %v", err, want)
-		}
-	case <-time.After(5 * time.Second):
-		sl.Fatal("sweep never ended")
+	store.grant = append(store.grant, acct("gone")) // busy's lease is not free
+	step()
+	if got := store.lastAsked(); !slices.Contains(got, acct("gone")) || !slices.Contains(got, acct("busy")) {
+		t.Fatalf("asked for %v, want both planned accounts", got)
 	}
-}
-
-func (sl *sweepLab) forgotten() []string {
-	sl.lr.sweepWG.Wait()
-	sl.store.mu.Lock()
-	defer sl.store.mu.Unlock()
-	return slices.Clone(sl.store.forgotten)
-}
-
-// A tenant removed while no shard held its account's lease is swept by
-// the assigner, under that lease, which it asks for and holds throughout;
-// then its removal is forgotten.
-func TestLeaserSweepsATenantRemovedWhileUnserved(t *testing.T) {
-	sl := newSweepLab(t)
-	sl.removed("gone")
-	sl.store.grant = append(sl.store.grant, acct("gone"))
-	sl.step() // plans the sweep, and asks for the lease at once (moved: a)
-	sl.step()
-	sl.sweepStarted("gone")
-	if st := sl.lr.status(); !slices.Equal(st.Sweeping, []string{"gone"}) {
-		t.Fatalf("status %+v, want gone being swept", st)
+	waitFor(t, "gone's sweep", func() bool { r, _ := l.removals(); return len(r) == 1 })
+	l.set.wg.Wait()
+	if removed, forgot := l.removals(); removed[0] != "gone x,y" || !slices.Equal(forgot, []string{"gone"}) {
+		t.Fatalf("removed %v, forgot %v", removed, forgot)
 	}
-	sl.step() // a renewal while it runs keeps it and starts no other
-	if got := sl.store.lastAsked(); !slices.Contains(got, acct("gone")) {
-		t.Fatalf("asked for %v while sweeping, want gone's account", got)
-	}
-	close(sl.finish)
-	sl.sweepEnded(nil)
-	if got := sl.forgotten(); !slices.Equal(got, []string{"gone"}) {
-		t.Fatalf("forgotten %v, want gone", got)
-	}
-	sl.step()
-	if got := sl.store.lastAsked(); slices.Contains(got, acct("gone")) {
-		t.Fatalf("asked for %v once swept, want gone's account no more", got)
-	}
-}
-
-// One whose account a shard holds is left to it: that shard is removing
-// it, or serves the account. One listed again is forgotten, not swept.
-func TestLeaserSweepsNothingHeldOrListedAgain(t *testing.T) {
-	sl := newSweepLab(t)
-	sl.removed("held")
-	sl.removed("a") // listed again under its id
-	sl.store.holders = map[string]string{acct("held"): "s2"}
-	sl.store.grant = append(sl.store.grant, acct("held"))
-	sl.step()
-	sl.step()
-	select {
-	case id := <-sl.started:
-		t.Fatalf("swept %s", id)
-	default:
-	}
-	if got := sl.forgotten(); !slices.Equal(got, []string{"a"}) {
-		t.Fatalf("forgotten %v, want a alone", got)
-	}
-	if st := sl.lr.status(); len(st.Sweeping) != 0 {
-		t.Fatalf("status %+v, want nothing swept", st)
+	store.mu.Lock() // as forgetting it in the job store does
+	store.removed = slices.DeleteFunc(store.removed, func(r jobstore.Removed) bool { return r.ID == "gone" })
+	store.mu.Unlock()
+	if st := lr.status(); !slices.Equal(st.SweepsPlanned, []string{"busy"}) {
+		t.Fatalf("planned %v, want busy alone", st.SweepsPlanned)
 	}
 
-	// No holder read, but the lease not free: planned, asked for, and not
-	// started until it is held.
-	sl.removed("busy")
-	sl.step()
-	sl.step()
-	sl.lr.mu.Lock()
-	s := sl.lr.sweeps[acct("busy")]
-	sl.lr.mu.Unlock()
-	if s == nil || s.cancel != nil {
-		t.Fatalf("sweep %+v, want it planned and not started without the lease", s)
+	// busy's account taken by another shard: its plan is dropped.
+	store.holders[acct("busy")] = "s2"
+	step()
+	if st := lr.status(); len(st.SweepsPlanned) != 0 {
+		t.Fatalf("planned %v once busy's account was held elsewhere", st.SweepsPlanned)
 	}
-	if got := sl.store.lastAsked(); !slices.Contains(got, acct("busy")) {
-		t.Fatalf("asked for %v, want busy's account", got)
-	}
-}
 
-// A sweep stops once this shard no longer holds the account's lease, or
-// cannot renew to know, and its removal stays to sweep again.
-func TestLeaserSweepStopsWithItsLease(t *testing.T) {
-	for _, how := range []string{"taken", "renewal failed"} {
-		sl := newSweepLab(t)
-		sl.removed("gone")
-		sl.store.grant = append(sl.store.grant, acct("gone"))
-		sl.step()
-		sl.step()
-		sl.sweepStarted("gone")
-		if how == "taken" {
-			sl.store.mu.Lock()
-			sl.store.grant = slices.DeleteFunc(sl.store.grant, func(a string) bool { return a == acct("gone") })
-			sl.store.holders = map[string]string{acct("gone"): "s2"} // whoever took it
-			sl.store.mu.Unlock()
-			sl.step()
-		} else {
-			sl.store.fail(errors.New("connection refused"))
-			_ = sl.lr.step(context.Background())
-		}
-		sl.sweepEnded(context.Canceled)
-		if got := sl.forgotten(); len(got) != 0 {
-			t.Fatalf("%s: forgotten %v, want the removal kept", how, got)
-		}
-		if st := sl.lr.status(); len(st.Sweeping) != 0 {
-			t.Fatalf("%s: status %+v, want no sweep", how, st)
-		}
+	// A plan whose removal was forgotten meanwhile is dropped.
+	delete(store.holders, acct("busy"))
+	step()
+	store.mu.Lock()
+	store.removed = nil
+	store.mu.Unlock()
+	step()
+	if st := lr.status(); len(st.SweepsPlanned) != 0 {
+		t.Fatalf("planned %v once the removal was forgotten", st.SweepsPlanned)
+	}
+
+	// No longer assigning: what it planned is dropped, and not asked for.
+	store.mu.Lock()
+	store.removed = []jobstore.Removed{removedRecord("late")}
+	store.mu.Unlock()
+	step()
+	if st := lr.status(); !slices.Equal(st.SweepsPlanned, []string{"late"}) {
+		t.Fatalf("planned %v, want late", st.SweepsPlanned)
+	}
+	store.set()
+	step()
+	step()
+	if st := lr.status(); len(st.SweepsPlanned) != 0 || slices.Contains(store.lastAsked(), acct("late")) {
+		t.Fatalf("planned %v, asked %v, once not assigning", st.SweepsPlanned, store.lastAsked())
 	}
 }

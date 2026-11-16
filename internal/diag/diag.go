@@ -514,6 +514,9 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			if len(tl.Sweeping) > 0 {
 				fmt.Fprintf(w, "  deleting what tenants removed while no shard served them left: %s\n", truncate(strings.Join(tl.Sweeping, ", "), 200))
 			}
+			if len(tl.SweepsPlanned) > 0 {
+				fmt.Fprintf(w, "  to delete once this shard holds their account's lease: %s\n", truncate(strings.Join(tl.SweepsPlanned, ", "), 200))
+			}
 			if tl.Failing() {
 				fmt.Fprintf(w, "  last renewal failed %s ago; each tenant is handed off 20s after the last successful renewal was sent: %s\n",
 					humanDuration(time.Since(tl.LastErrorAt).Truncate(time.Second)), truncate(tl.LastError, 200))
