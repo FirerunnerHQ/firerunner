@@ -8,6 +8,17 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-11-16
+
+### Fixed
+
+- A job queued while a tier had no listener for more than about 4 minutes (a
+  replaced control VM, a crash loop) no longer waits until the installation
+  queues another job. GitHub cancels its assignment to the scale set and
+  counts it nowhere, so firerunner now launches a runner for it, which GitHub
+  hands the job to. The daemon logs `job stranded`, and `status` counts such
+  jobs per tier (`stranded`, `rescuing`).
+
 ## [0.1.25] - 2026-11-15
 
 ### Added
@@ -686,7 +697,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.25...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.26...HEAD
+[0.1.26]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.26
 [0.1.25]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.25
 [0.1.24]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.24
 [0.1.23]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.23
