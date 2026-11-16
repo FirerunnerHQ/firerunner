@@ -1327,6 +1327,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// failure there touches nobody else. The list is read again every
 	// tenantsInterval, and tenants start, change and stop to match it. They
 	// end with runCtx, and drain themselves.
+	//
+	// forgetRemoved, with the tenants in the job store, records there that
+	// all a removed tenant left is deleted, so that no shard sweeps it.
+	var forgetRemoved func(id string, upTo time.Time, url string) error
 	tenants := &tenantSet{
 		ctx: runCtx, log: log,
 		run: func(ctx context.Context, cur func() config.Tenant, served func(*servedTenant)) {
@@ -1337,10 +1341,19 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 				b.SetMax(max)
 			}
 		},
-		removed: func(c config.Tenant) {
+		// What a removed tenant left: its scale sets by name, then its
+		// machines by owner tag.
+		removed: func(ctx context.Context, c config.Tenant, namesGone func()) error {
 			t := extraTenant(cfg, c, tenantOwner, appJWT)
-			s.removeLeftovers(runCtx, t, c.Tiers)
-			s.endRemoved(runCtx, t)
+			err := s.removeLeftovers(ctx, t, c.Tiers)
+			namesGone()
+			return errors.Join(err, s.endRemoved(ctx, t))
+		},
+		forget: func(id string, upTo time.Time, url string) error {
+			if forgetRemoved == nil {
+				return nil
+			}
+			return forgetRemoved(id, upTo, url)
 		},
 	}
 	s.tenants.Store(tenants)
@@ -1372,6 +1385,13 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if db != nil {
 			// After the leases are released, on the way out.
 			defer db.Close()
+			// A removal done here is done: no sweep repeats it.
+			s.tenantListed = db.TenantListed
+			forgetRemoved = func(id string, upTo time.Time, url string) error {
+				fctx, cancel := context.WithTimeout(context.WithoutCancel(runCtx), forgetRemovedTimeout)
+				defer cancel()
+				return db.ForgetRemoved(fctx, id, upTo, url)
+			}
 		}
 		if err != nil {
 			return fmt.Errorf("--tenants: %w", err)

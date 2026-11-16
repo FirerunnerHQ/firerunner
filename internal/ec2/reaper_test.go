@@ -511,6 +511,44 @@ func TestEndAll_StopsWithItsContext(t *testing.T) {
 	}
 }
 
+// Proceed is asked before each sweep: one it refuses sweeps nothing, and
+// the second sweep is skipped once it refuses, with its error.
+func TestEndAll_AsksBeforeEachSweep(t *testing.T) {
+	f := newFakeEC2(t)
+	ready := f.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameStopped, old, true)
+	_, c := reaperFor(f, &githubRunners{}, nil)
+	f.signPool(c, ready)
+	listed := errors.New("the tenant is listed again")
+	asked := 0
+	o := ReaperOptions{Owner: "test-owner", Grace: 10 * time.Millisecond, Logger: quietLog(),
+		Proceed: func(context.Context) error {
+			asked++
+			if asked > 1 {
+				return listed
+			}
+			return nil
+		}}
+	rep, err := c.EndAll(context.Background(), o, "removed")
+	if !errors.Is(err, listed) || asked != 2 {
+		t.Fatalf("err = %v after %d asks, want the refusal at the second", err, asked)
+	}
+	if !slices.Equal(rep.Instances, []string{ready}) {
+		t.Fatalf("ended %v, want the first sweep's", rep.Instances)
+	}
+
+	f2 := newFakeEC2(t)
+	kept := f2.put(job("", TagPool, PoolReady, TagTier, "pooled"), types.InstanceStateNameStopped, old, true)
+	_, c2 := reaperFor(f2, &githubRunners{}, nil)
+	f2.signPool(c2, kept)
+	o.Proceed = func(context.Context) error { return listed }
+	if _, err := c2.EndAll(context.Background(), o, "removed"); !errors.Is(err, listed) {
+		t.Fatalf("err = %v, want the refusal", err)
+	}
+	if s := f2.state(kept); s != types.InstanceStateNameStopped {
+		t.Fatalf("state %q: swept though refused", s)
+	}
+}
+
 // A dry run changes nothing, so it sweeps once and does not wait.
 func TestEndAll_DryRunSweepsOnce(t *testing.T) {
 	f := newFakeEC2(t)

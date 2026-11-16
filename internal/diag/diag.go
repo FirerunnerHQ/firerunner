@@ -511,6 +511,15 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			if len(tl.Unlisted) > 0 {
 				fmt.Fprintf(w, "  assigned here but not in this shard's list, so not served: %s\n", truncate(strings.Join(tl.Unlisted, ", "), 200))
 			}
+			if len(tl.Sweeping) > 0 {
+				fmt.Fprintf(w, "  deleting what tenants removed while no shard served them left: %s\n", truncate(strings.Join(tl.Sweeping, ", "), 200))
+			}
+			for _, f := range tl.SweepsFailing {
+				fmt.Fprintf(w, "  sweep failing: %s\n", truncate(f, 200))
+			}
+			if len(tl.SweepsPlanned) > 0 {
+				fmt.Fprintf(w, "  to delete once this shard holds their account's lease: %s\n", truncate(strings.Join(tl.SweepsPlanned, ", "), 200))
+			}
 			if tl.Failing() {
 				fmt.Fprintf(w, "  last renewal failed %s ago; each tenant is handed off 20s after the last successful renewal was sent: %s\n",
 					humanDuration(time.Since(tl.LastErrorAt).Truncate(time.Second)), truncate(tl.LastError, 200))
@@ -1060,6 +1069,11 @@ func tenantLeasesCheck(f health.File, now time.Time) *Check {
 	}
 	if len(tl.Unplaced) > 0 {
 		c := warn("tenant-leases", "%d tenant(s) placed on no shard: %s", len(tl.Unplaced), truncate(strings.Join(tl.Unplaced, "; "), 300))
+		return &c
+	}
+	if tl.SweepsStuck {
+		c := warn("tenant-leases", "deleting what removed tenants left keeps failing: %s; delete it by hand if it cannot succeed, then forget its row in removed_tenants",
+			truncate(strings.Join(tl.SweepsFailing, "; "), 300))
 		return &c
 	}
 	if tl.AssignError != "" {

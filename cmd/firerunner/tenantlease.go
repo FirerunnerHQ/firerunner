@@ -49,6 +49,8 @@ type leaseStore interface {
 	Placement(ctx context.Context) ([]jobstore.ShardState, map[string]jobstore.Assignment, map[string]string, error)
 	Assign(ctx context.Context, sh jobstore.Shard, next map[string]jobstore.Assignment) error
 	Drain(ctx context.Context, sh jobstore.Shard) error
+	RemovedTenants(ctx context.Context) ([]jobstore.Removed, error)
+	ForgetRemoved(ctx context.Context, id string, upTo time.Time, url string) error
 }
 
 // newShard is this process among the shards. Its id is its host name and a
@@ -116,6 +118,12 @@ type tenantLeaser struct {
 	unplaced    map[string]string
 	assignErr   string
 	assignErrAt time.Time
+	// sweeps are the sweeps planned, by account: tenants removed while no
+	// shard served them, whose account's lease this shard asks for.
+	sweeps map[string]*plannedSweep
+	// sweepFailures are the removals whose sweeps failed, until one
+	// succeeds or the removal is gone.
+	sweepFailures map[sweepKey]*sweepFailure
 }
 
 func (l *tenantLeaser) clock() time.Time {
@@ -159,6 +167,7 @@ func (l *tenantLeaser) step(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	l.sweepHeld(ctx)
 	moved, err := l.assign(ctx)
 	if err != nil || !moved {
 		return err
@@ -173,7 +182,8 @@ func (l *tenantLeaser) assign(ctx context.Context) (bool, error) {
 	l.mu.Lock()
 	leader := l.assigningLocked()
 	if !leader {
-		l.unplaced, l.assignErr = nil, ""
+		// Only the assigner plans sweeps: another may plan them now.
+		l.unplaced, l.assignErr, l.sweeps = nil, "", nil
 	}
 	places, listed := placesOf(l.list), l.listed
 	l.mu.Unlock()
@@ -181,6 +191,7 @@ func (l *tenantLeaser) assign(ctx context.Context) (bool, error) {
 		// Before a list, every tenant would read as removed.
 		return false, nil
 	}
+	outer := ctx
 	ctx, cancel := context.WithTimeout(ctx, leaseRenewTimeout)
 	defer cancel()
 	shards, current, holders, err := l.store.Placement(ctx)
@@ -189,6 +200,7 @@ func (l *tenantLeaser) assign(ctx context.Context) (bool, error) {
 		l.mu.Lock()
 		l.unplaced, l.assignErr = unplaced, ""
 		l.mu.Unlock()
+		l.planSweeps(outer, holders, next)
 		if maps.Equal(next, current) {
 			return false, nil
 		}
@@ -253,6 +265,7 @@ func (l *tenantLeaser) renew(ctx context.Context) error {
 		want.Listed = append(want.Listed, config.AccountOf(c.URL))
 	}
 	want.ListOK = l.listOK
+	want.Accounts = append(want.Accounts, l.sweepAccountsLocked()...)
 	l.mu.Unlock()
 
 	sent := l.clock()
@@ -349,6 +362,12 @@ func (l *tenantLeaser) status() *health.TenantLeases {
 	st := &health.TenantLeases{Shard: l.shard.ID, Tenants: n, Listed: len(l.list),
 		LastRenewed: l.lastRenewed, LastError: l.lastErr, LastErrorAt: l.lastErrAt,
 		AssignerShard: l.assignerID, Unlisted: slices.Clone(l.unlisted)}
+	st.Sweeping = l.set.sweeping()
+	st.SweepsPlanned = l.plannedLocked()
+	st.SweepsFailing, st.SweepsStuck = l.failingLocked()
+	slices.Sort(st.Sweeping)
+	slices.Sort(st.SweepsPlanned)
+	slices.Sort(st.SweepsFailing)
 	if l.assigningLocked() {
 		st.Assigner = true
 		for _, id := range slices.Sorted(maps.Keys(l.unplaced)) {

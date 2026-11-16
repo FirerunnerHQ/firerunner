@@ -595,4 +595,18 @@ func TestHandsOff(t *testing.T) {
 			t.Errorf("removed, %s: stopPlan = %+v, want remove %v", c.name, p, c.want)
 		}
 	}
+
+	// Planned while it held, then lapsed as its runners finished: it
+	// deletes nothing after all.
+	lapsing := false
+	ctx, drop := context.WithCancelCause(context.WithValue(context.Background(), leaseKey{}, func() bool { return lapsing }))
+	drop(errTenantRemoved)
+	p := s.stopPlan(ctx)
+	if !p.removesNow(ctx) {
+		t.Fatal("a removal under its lease does not remove")
+	}
+	lapsing = true
+	if p.removesNow(ctx) {
+		t.Fatal("a removal whose lease lapsed while it drained removes")
+	}
 }
