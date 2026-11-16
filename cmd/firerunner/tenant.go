@@ -314,8 +314,8 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 		stopLimit: panicStopLimit(get().Limits.JobDuration),
 		stop: func(ctx context.Context, st *servedTenant) {
 			p := s.stopPlan(ctx)
-			if p.closeFirst {
-				st.close(context.WithoutCancel(ctx))
+			if p.sessionsFirst {
+				st.closeSessions(context.WithoutCancel(ctx))
 			}
 			st.drain(p.handOff)
 			switch {
@@ -324,7 +324,7 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
 				defer cancel()
 				st.remove(rctx)
-			case !p.closeFirst:
+			case !p.sessionsFirst:
 				st.close(context.WithoutCancel(ctx))
 			}
 		},
@@ -994,6 +994,14 @@ func panicStopLimit(job time.Duration) time.Duration {
 	return max(job, 0) + jobLifetimeSlack
 }
 
+// closeSessions closes the tenant's scale set sessions and keeps its scale
+// sets: it is handed off.
+func (st *servedTenant) closeSessions(ctx context.Context) {
+	for _, l := range st.listeners {
+		l.CloseSession(ctx)
+	}
+}
+
 // close closes the tenant's scale set sessions.
 func (st *servedTenant) close(ctx context.Context) {
 	for _, l := range st.listeners {
@@ -1068,22 +1076,22 @@ func (st *servedTenant) runs(cfg *config.Config) []func(context.Context) error {
 	return runs
 }
 
-// tenantStop is how a tenant's run ends: whether it closes its sessions
-// before its runners finish rather than after, leaves its busy EC2 runners
-// to the next process or shard, and deletes its scale sets.
-type tenantStop struct{ closeFirst, handOff, remove bool }
+// tenantStop is how a tenant's run ends: whether it closes only its
+// sessions, before its runners finish, rather than closing its scale sets
+// after; leaves its busy EC2 runners to the next process or shard; and
+// deletes its scale sets.
+type tenantStop struct{ sessionsFirst, handOff, remove bool }
 
 // stopPlan is how a tenant whose run's context has ended stops, by why it
 // ended. A tenant handed off to another shard closes its sessions first, so
-// that shard opens them at once rather than after GitHub's hold; its scale
-// sets stay (KeepOnClose, which handsOff implies). A removed one deletes
-// them once its runners have finished.
+// that shard opens them at once rather than after GitHub's hold, and never
+// deletes a scale set: the next shard may be serving it already. A removed
+// one deletes them once its runners have finished.
 func (s *shard) stopPlan(tenantCtx context.Context) tenantStop {
-	handOff := s.handsOff(tenantCtx)
 	return tenantStop{
-		closeFirst: handOff && handedOffTenant(tenantCtx),
-		handOff:    handOff,
-		remove:     removedTenant(tenantCtx),
+		sessionsFirst: handedOffTenant(tenantCtx),
+		handOff:       s.handsOff(tenantCtx),
+		remove:        removedTenant(tenantCtx),
 	}
 }
 

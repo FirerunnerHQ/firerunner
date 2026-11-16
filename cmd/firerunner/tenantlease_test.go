@@ -101,15 +101,22 @@ func TestTenantSetServesOnlyWhatItLeases(t *testing.T) {
 	l.set.applyLeases(list, map[string]time.Time{"b": c.now().Add(20 * time.Second)})
 	l.ended("a", errTenantHandedOff)
 	l.started("b")
-	l.set.applyLeases(list, map[string]time.Time{"a": c.now().Add(20 * time.Second), "b": c.now().Add(20 * time.Second)})
-	select {
-	case s := <-l.starts:
-		t.Fatalf("%s started before a's last run ended", s.id)
-	default:
-	}
+	both := map[string]time.Time{"a": c.now().Add(20 * time.Second), "b": c.now().Add(20 * time.Second)}
+	l.set.applyLeases(list, both)
 	l.finish("a")
 	l.started("a")
-	l.noOverlap()
+	l.noOverlap() // a's new run started only once its last had ended
+
+	// Changed, on a leased shard: handed off, its sessions closed at once
+	// and nothing deleted, and started again as listed.
+	changed := []config.Tenant{listed("a", 2, "x", "y"), listed("b", 2, "x")}
+	l.set.applyLeases(changed, both)
+	l.ended("a", errTenantHandedOff)
+	l.finish("a")
+	if s := l.started("a"); len(s.cur().Tiers) != 2 {
+		t.Fatalf("restarted with tiers %v, want the new entry's", s.cur().Tiers)
+	}
+	list = changed
 	l.mu.Lock()
 	removed := slices.Clone(l.removed)
 	l.mu.Unlock()
@@ -164,6 +171,28 @@ func TestTenantSetHandsOffAtTheDeadline(t *testing.T) {
 	}
 }
 
+// A timer that fires before the deadline, as one may on a clock that
+// moved, waits for the deadline again rather than leaving the run without
+// one.
+func TestTenantSetTimerFiringEarlyWaitsAgain(t *testing.T) {
+	l, c := leaseLab(t)
+	list := []config.Tenant{listed("a", 2, "x")}
+	l.set.applyLeases(list, map[string]time.Time{"a": c.now().Add(20 * time.Second)})
+	l.started("a")
+	before := l.runs()
+	c.mu.Lock()
+	early := c.timers[len(c.timers)-1]
+	early.stopped = true
+	c.mu.Unlock()
+	early.f()
+	l.unchanged(before)
+	if n := c.armed(); n != 1 {
+		t.Fatalf("%d timers armed after an early one, want 1", n)
+	}
+	c.advance(20 * time.Second)
+	l.ended("a", errTenantHandedOff)
+}
+
 // A run past its deadline whose timer has not fired yet is handed off by
 // the next apply, renewed or not.
 func TestTenantSetApplyHandsOffARunPastItsDeadline(t *testing.T) {
@@ -183,6 +212,25 @@ func TestTenantSetApplyHandsOffARunPastItsDeadline(t *testing.T) {
 // The tenant's launches are fenced by its deadline from the moment it is
 // served: a tier asks, and is held once the deadline has passed.
 func TestTenantSetFencesLaunchesByTheDeadline(t *testing.T) {
+	fenceLab(t, func(c *leaseClock, _ *tenantSet) {
+		c.mu.Lock()
+		c.t = c.t.Add(20 * time.Second) // past the deadline; the timer not fired yet
+		c.mu.Unlock()
+	})
+}
+
+// A tenant whose lease another shard takes is fenced at once, its
+// deadline still ahead: a launch on its way stops at the fence.
+func TestTenantSetFencesAHandOffAtOnce(t *testing.T) {
+	fenceLab(t, func(_ *leaseClock, set *tenantSet) {
+		set.applyLeases([]config.Tenant{listed("a", 2, "x")}, map[string]time.Time{})
+	})
+}
+
+// fenceLab serves tenant a under a lease with one tier, launches a runner,
+// does close, and checks the tier's next launch is held by the fence.
+func fenceLab(t *testing.T, close func(*leaseClock, *tenantSet)) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := newLeaseClock()
@@ -206,9 +254,7 @@ func TestTenantSetFencesLaunchesByTheDeadline(t *testing.T) {
 	sched.Reconcile(ctx, 1)
 	<-launched
 
-	c.mu.Lock()
-	c.t = c.t.Add(20 * time.Second) // past the deadline; the timer not fired yet
-	c.mu.Unlock()
+	close(c, set)
 	sched.Reconcile(ctx, 2)
 	n, h := sched.Holding()
 	if n != 1 || h.Kind != scheduler.HoldFenced || !strings.Contains(h.Why, `lease on tenant "a" was not renewed`) {

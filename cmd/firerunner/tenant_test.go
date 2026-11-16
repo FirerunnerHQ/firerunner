@@ -573,7 +573,7 @@ func TestHandsOff(t *testing.T) {
 			t.Errorf("%s: handsOff = %v, want %v", c.name, got, c.want)
 		}
 		p := s.stopPlan(c.tenant)
-		want := tenantStop{handOff: c.want, closeFirst: c.want && c.tenant == handedOff, remove: c.tenant == removed}
+		want := tenantStop{handOff: c.want, sessionsFirst: c.tenant == handedOff, remove: c.tenant == removed}
 		if p != want {
 			t.Errorf("%s: stopPlan = %+v, want %+v", c.name, p, want)
 		}

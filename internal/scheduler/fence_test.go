@@ -42,10 +42,8 @@ func TestFenceHoldsLaunchesAndStopsNothing(t *testing.T) {
 	if n, h := s[1].Holding(); n != 1 || h.Kind != HoldFenced {
 		t.Fatalf("tier b held %d %+v", n, h)
 	}
-	select {
-	case r := <-prov.entered:
-		t.Fatalf("launched %s behind a closed fence", r)
-	default:
+	if r0, r1 := s[0].Running(), s[1].Running(); r0 != 1 || r1 != 0 {
+		t.Fatalf("running %d and %d behind a closed fence, want 1 and 0", r0, r1)
 	}
 	if len(*stops) != 0 || prov.cause(a) != nil {
 		t.Fatalf("the fence stopped a runner: %+v %v", *stops, prov.cause(a))

@@ -161,7 +161,8 @@ func openTenants(spec string, newSSM func() (ssmGetAPI, error), newDB func() (te
 // A shard that serves a tenant only while it holds the tenant's lease
 // applies its list with applyLeases: a tenant is then served until a
 // deadline, and handed off once that passes unrenewed, or once another
-// shard holds its lease.
+// shard holds its lease. A tenant changed there is handed off too, and
+// starts again once its sessions close: its lease may go meanwhile.
 type tenantSet struct {
 	ctx context.Context
 	// run serves a tenant until ctx ends. cur returns its entry as listed
@@ -235,8 +236,14 @@ func (ts *tenantSet) clock() time.Time {
 }
 
 // endLocked stops a run, for cause, and moves it from running to those
-// ending. The caller holds ts.mu.
+// ending. A run handed off is fenced at once: a launch on its way must not
+// get past the fence while its deadline is still ahead. The caller holds
+// ts.mu.
 func (ts *tenantSet) endLocked(r *tenantRun, cause error) {
+	if errors.Is(cause, errTenantHandedOff) {
+		now := ts.clock()
+		r.deadline.Store(&now)
+	}
 	r.cancel(cause)
 	if r.stopTimer != nil {
 		r.stopTimer()
@@ -271,8 +278,13 @@ func (ts *tenantSet) renewLocked(r *tenantRun, deadline time.Time) {
 func (ts *tenantSet) expire(r *tenantRun) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	if ts.running[r.id] != r || !r.expired(ts.clock()) {
-		return // ended already, or renewed since
+	if ts.running[r.id] != r {
+		return // ended already
+	}
+	if !r.expired(ts.clock()) {
+		// Renewed since, or a clock that moved: wait for the deadline again.
+		ts.renewLocked(r, *r.deadline.Load())
+		return
 	}
 	ts.log.Warn("tenant's lease not renewed in time: handing it off; launches stop, and its busy runners finish", "tenant", r.id)
 	ts.endLocked(r, errTenantHandedOff)
@@ -351,8 +363,16 @@ func (ts *tenantSet) applyLeases(list []config.Tenant, leases map[string]time.Ti
 					"from", was.EffectiveLimits().Runners, "to", c.EffectiveLimits().Runners)
 				continue
 			}
-			ts.endLocked(old, errTenantChanged)
-			ts.log.Info("tenant changed in the list: it starts again as listed once its runners finish", "tenant", c.ID)
+			if leases != nil {
+				// Ended as a hand-off: its lease may go meanwhile, and the
+				// next run, here or on another shard, must not wait on its
+				// sessions until its runners finish.
+				ts.endLocked(old, errTenantHandedOff)
+				ts.log.Info("tenant changed in the list: it starts again as listed once its sessions close", "tenant", c.ID)
+			} else {
+				ts.endLocked(old, errTenantChanged)
+				ts.log.Info("tenant changed in the list: it starts again as listed once its runners finish", "tenant", c.ID)
+			}
 		} else if leases == nil {
 			ts.log.Info("tenant added to the list", "tenant", c.ID)
 		} else {
