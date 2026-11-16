@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -88,11 +89,11 @@ func (s *TenantStore) Join(ctx context.Context, sh Shard) error {
 	})
 }
 
-// Renew beats sh's heartbeat, and takes or renews the lease of each account
-// in accounts for ttl, in one transaction. It returns the accounts whose
-// lease sh holds now: a lease another shard holds and has not let expire is
-// not taken. sh's leases on accounts it no longer asks for are released at
-// once, so another shard may take them.
+// Renew beats sh's heartbeat, and takes or renews for ttl the lease of each
+// account assigned to sh (Assign) and each in accounts, in one transaction.
+// It returns the accounts whose lease sh holds now: a lease another shard
+// holds and has not let expire is not taken. sh's leases on accounts it no
+// longer asks for are released at once, so another shard may take them.
 //
 // Every time is the database's. A caller that serves an account only until
 // a deadline it sets before calling, shorter than ttl, on its own monotonic
@@ -117,11 +118,20 @@ func (s *TenantStore) Renew(ctx context.Context, sh Shard, accounts []string, tt
 		if tag.RowsAffected() == 0 {
 			return ErrNotJoined
 		}
+		rows, err := tx.Query(ctx, `SELECT account FROM assignments WHERE shard = $1`, sh.ID)
+		if err != nil {
+			return fmt.Errorf("read the assignments: %w", err)
+		}
+		assigned, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return fmt.Errorf("read the assignments: %w", err)
+		}
+		accounts := append(slices.Clone(accounts), assigned...)
 		if _, err := tx.Exec(ctx, `UPDATE leases SET expires_at = now()
 			WHERE shard = $1 AND expires_at > now() AND account <> ALL(coalesce($2::text[], '{}'))`, sh.ID, accounts); err != nil {
 			return fmt.Errorf("release the leases no longer wanted: %w", err)
 		}
-		rows, err := tx.Query(ctx, `INSERT INTO leases (account, shard, expires_at)
+		rows, err = tx.Query(ctx, `INSERT INTO leases (account, shard, expires_at)
 			SELECT a, $1, now() + make_interval(secs => $3) FROM (SELECT DISTINCT unnest($2::text[]) AS a) wanted ORDER BY a
 			ON CONFLICT (account) DO UPDATE SET shard = excluded.shard,
 				epoch = leases.epoch + (leases.shard <> excluded.shard)::int,
