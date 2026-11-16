@@ -1327,6 +1327,16 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// failure there touches nobody else. The list is read again every
 	// tenantsInterval, and tenants start, change and stop to match it. They
 	// end with runCtx, and drain themselves.
+	//
+	// sweepRemoved deletes what a removed tenant left: its scale sets by
+	// name, then its machines by owner tag. forgetRemoved, with the tenants
+	// in the job store, records it done there, so that no shard sweeps it.
+	sweepRemoved := func(ctx context.Context, c config.Tenant) {
+		t := extraTenant(cfg, c, tenantOwner, appJWT)
+		s.removeLeftovers(ctx, t, c.Tiers)
+		s.endRemoved(ctx, t)
+	}
+	var forgetRemoved func(id string)
 	tenants := &tenantSet{
 		ctx: runCtx, log: log,
 		run: func(ctx context.Context, cur func() config.Tenant, served func(*servedTenant)) {
@@ -1338,9 +1348,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			}
 		},
 		removed: func(c config.Tenant) {
-			t := extraTenant(cfg, c, tenantOwner, appJWT)
-			s.removeLeftovers(runCtx, t, c.Tiers)
-			s.endRemoved(runCtx, t)
+			sweepRemoved(runCtx, c)
+			if forgetRemoved != nil {
+				forgetRemoved(c.ID)
+			}
 		},
 	}
 	s.tenants.Store(tenants)
@@ -1372,13 +1383,21 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if db != nil {
 			// After the leases are released, on the way out.
 			defer db.Close()
+			// A removal done here is done: no sweep repeats it.
+			forgetRemoved = func(id string) {
+				fctx, cancel := context.WithTimeout(context.WithoutCancel(runCtx), forgetRemovedTimeout)
+				defer cancel()
+				if err := db.ForgetRemoved(fctx, id, time.Time{}); err != nil {
+					log.Warn("removed tenant not forgotten: a shard may delete what it left again", "tenant", id, "err", err)
+				}
+			}
 		}
 		if err != nil {
 			return fmt.Errorf("--tenants: %w", err)
 		}
 		catalog = &tenantCatalog{src: src, check: cfg.CheckTenants, set: tenants, log: log.With("component", "tenants")}
 		if cfg.TenantLeases { // validated: --tenants db:, so db is open
-			leaser = &tenantLeaser{store: db, shard: newShard(owner, tenantOwner), set: tenants, log: log.With("component", "tenant-leases")}
+			leaser = &tenantLeaser{store: db, shard: newShard(owner, tenantOwner), set: tenants, sweep: sweepRemoved, log: log.With("component", "tenant-leases")}
 			catalog.leaser = leaser
 		}
 		if err := catalog.read(runCtx); err != nil {

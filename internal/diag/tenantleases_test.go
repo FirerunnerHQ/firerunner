@@ -91,6 +91,13 @@ func TestStatusAndDoctorShowTheTenantLeases(t *testing.T) {
 	}
 	f.TenantLeases.Unlisted = nil
 
+	f.TenantLeases.Sweeping = []string{"gone"}
+	write()
+	if s := status(); !strings.Contains(s, "no shard served them left: gone") {
+		t.Fatalf("status while sweeping:\n%s", s)
+	}
+	f.TenantLeases.Sweeping = nil
+
 	f.TenantLeases.LastError, f.TenantLeases.LastErrorAt = "renew the leases: connection refused", now
 	write()
 	if s := status(); !strings.Contains(s, "last renewal failed") || !strings.Contains(s, "connection refused") {

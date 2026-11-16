@@ -27,6 +27,10 @@ type fakeLeases struct {
 	err   error
 	// holders is what Placement reads as the leases' holders.
 	holders map[string]string
+	// removed is what RemovedTenants reads; ForgetRemoved takes from it
+	// and records in forgotten.
+	removed   []jobstore.Removed
+	forgotten []string
 	// wants are the renewals' asks.
 	// shards and assignments are what Placement reads; Assign writes
 	// assignments, and counts in assigns.
@@ -122,6 +126,22 @@ func (f *fakeLeases) Assign(_ context.Context, _ jobstore.Shard, next map[string
 	}
 	f.assignments = maps.Clone(next)
 	f.assigns++
+	return nil
+}
+
+func (f *fakeLeases) RemovedTenants(context.Context) ([]jobstore.Removed, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.removed), nil
+}
+
+func (f *fakeLeases) ForgetRemoved(_ context.Context, id string, removedAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removed = slices.DeleteFunc(f.removed, func(r jobstore.Removed) bool {
+		return r.ID == id && (removedAt.IsZero() || r.RemovedAt.Equal(removedAt))
+	})
+	f.forgotten = append(f.forgotten, id)
 	return nil
 }
 

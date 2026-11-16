@@ -224,6 +224,9 @@ type TenantLeases struct {
 	// does not name, which it does not take: its list is older than the
 	// assigner's, or rejected here.
 	Unlisted []string `json:"unlisted,omitempty"`
+	// Sweeping are the tenants removed while no shard served them whose
+	// leftovers this shard is deleting, by id.
+	Sweeping []string `json:"sweeping,omitempty"`
 	// LastRenewed is the last successful renewal; zero before the first.
 	LastRenewed time.Time `json:"last_renewed,omitzero"`
 	LastError   string    `json:"last_error,omitempty"`

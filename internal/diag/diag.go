@@ -511,6 +511,9 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			if len(tl.Unlisted) > 0 {
 				fmt.Fprintf(w, "  assigned here but not in this shard's list, so not served: %s\n", truncate(strings.Join(tl.Unlisted, ", "), 200))
 			}
+			if len(tl.Sweeping) > 0 {
+				fmt.Fprintf(w, "  deleting what tenants removed while no shard served them left: %s\n", truncate(strings.Join(tl.Sweeping, ", "), 200))
+			}
 			if tl.Failing() {
 				fmt.Fprintf(w, "  last renewal failed %s ago; each tenant is handed off 20s after the last successful renewal was sent: %s\n",
 					humanDuration(time.Since(tl.LastErrorAt).Truncate(time.Second)), truncate(tl.LastError, 200))

@@ -49,6 +49,8 @@ type leaseStore interface {
 	Placement(ctx context.Context) ([]jobstore.ShardState, map[string]jobstore.Assignment, map[string]string, error)
 	Assign(ctx context.Context, sh jobstore.Shard, next map[string]jobstore.Assignment) error
 	Drain(ctx context.Context, sh jobstore.Shard) error
+	RemovedTenants(ctx context.Context) ([]jobstore.Removed, error)
+	ForgetRemoved(ctx context.Context, id string, removedAt time.Time) error
 }
 
 // newShard is this process among the shards. Its id is its host name and a
@@ -92,8 +94,15 @@ type tenantLeaser struct {
 	tick  <-chan time.Time
 	after func(time.Duration) <-chan time.Time
 
+	// sweep, when set, deletes what a removed tenant left: its scale sets
+	// by name, and its machines by owner tag. The assigner runs it for a
+	// tenant removed while no shard served it (planSweeps).
+	sweep func(ctx context.Context, c config.Tenant)
+
 	// joined is run's: whether the shard is registered.
 	joined bool
+	// sweepWG counts the sweeps running.
+	sweepWG sync.WaitGroup
 
 	mu     sync.Mutex
 	list   []config.Tenant
@@ -116,6 +125,9 @@ type tenantLeaser struct {
 	unplaced    map[string]string
 	assignErr   string
 	assignErrAt time.Time
+	// sweeps are the removed tenants' leftovers this shard deletes, by
+	// account.
+	sweeps map[string]*tenantSweep
 }
 
 func (l *tenantLeaser) clock() time.Time {
@@ -189,6 +201,7 @@ func (l *tenantLeaser) assign(ctx context.Context) (bool, error) {
 		l.mu.Lock()
 		l.unplaced, l.assignErr = unplaced, ""
 		l.mu.Unlock()
+		l.planSweeps(ctx, holders)
 		if maps.Equal(next, current) {
 			return false, nil
 		}
@@ -253,6 +266,7 @@ func (l *tenantLeaser) renew(ctx context.Context) error {
 		want.Listed = append(want.Listed, config.AccountOf(c.URL))
 	}
 	want.ListOK = l.listOK
+	want.Accounts = append(want.Accounts, l.sweepAccountsLocked()...)
 	l.mu.Unlock()
 
 	sent := l.clock()
@@ -264,6 +278,13 @@ func (l *tenantLeaser) renew(ctx context.Context) error {
 	if err != nil {
 		l.lastErr, l.lastErrAt = err.Error(), time.Now()
 		l.log.Warn("tenant leases not renewed: each tenant is handed off at its deadline unless a renewal succeeds first", "shard", l.shard.ID, "err", err)
+		// A sweep may not outlive a lease it cannot confirm.
+		for account, s := range l.sweeps {
+			if s.cancel != nil {
+				s.cancel()
+				delete(l.sweeps, account)
+			}
+		}
 		return err
 	}
 	l.lastRenewed = time.Now()
@@ -273,6 +294,7 @@ func (l *tenantLeaser) renew(ctx context.Context) error {
 		l.held[a] = deadline
 	}
 	l.assignerID, l.unlisted = r.Assigner, r.Unlisted
+	l.runSweepsLocked(ctx)
 	l.set.renewRemoving(l.held)
 	if l.listed {
 		l.applyLocked()
@@ -326,6 +348,7 @@ func (l *tenantLeaser) drain(ctx context.Context) {
 // to take at once. Call it once the tenants have stopped: their sessions
 // are closed.
 func (l *tenantLeaser) release(ctx context.Context) {
+	l.sweepWG.Wait() // stopped with the leases' renewals
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaseReleaseTimeout)
 	defer cancel()
 	if err := l.store.Release(ctx, l.shard); err != nil {
@@ -349,6 +372,8 @@ func (l *tenantLeaser) status() *health.TenantLeases {
 	st := &health.TenantLeases{Shard: l.shard.ID, Tenants: n, Listed: len(l.list),
 		LastRenewed: l.lastRenewed, LastError: l.lastErr, LastErrorAt: l.lastErrAt,
 		AssignerShard: l.assignerID, Unlisted: slices.Clone(l.unlisted)}
+	st.Sweeping = l.sweepingLocked()
+	slices.Sort(st.Sweeping)
 	if l.assigningLocked() {
 		st.Assigner = true
 		for _, id := range slices.Sorted(maps.Keys(l.unplaced)) {

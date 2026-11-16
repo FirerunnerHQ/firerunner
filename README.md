@@ -252,7 +252,8 @@ seconds, and follows it without a restart:
   `--ec2-reaper` is `off` (`dry-run` only logs them). Delete in the runner
   group's settings what they leave: a tier or group an earlier entry named,
   and scale sets of an installation removed while no daemon ran, or while
-  this one stopped; end that installation's instances, found by its
+  this one stopped (daemons under `--tenant-leases` delete those, below);
+  end that installation's instances, found by its
   `firerunner:owner` tag (`OWNER/ID`), by hand too. EC2 is swept twice,
   the second time 2 minutes on for a launch still in flight, so the
   installation, or another on its account, listed again starts only after
@@ -322,7 +323,11 @@ takes any free lease, ignoring the assignments.
   expire, and GitHub holds its sessions for about 50 seconds.
 - An installation removed keeps its lease until its scale sets are deleted.
   If the lease lapses first, nothing is deleted, as another shard may serve
-  its account by then: delete what it left by hand, as the log says.
+  its account by then. One removed while no shard served it (its shard
+  crashed, it was placed on none, or no daemon ran) is kept in the
+  `removed_tenants` table; the assigning shard takes its account's lease
+  and deletes what it left, scale sets and machines, then forgets it.
+  `firerunner status` lists those it is deleting.
 - A renewal that fails is tried again every 2 seconds. A shard that cannot
   join (its database down, or owners that do not fit) serves its own tiers
   and no installation, and keeps trying.
