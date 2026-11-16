@@ -86,6 +86,13 @@ type Tier struct {
 	// "plan_tier" (its plan leaves the tier out), "held" (by its state or
 	// entitlement) or "suspended".
 	HeldJobs map[string]int `json:"held_jobs,omitempty"`
+	// Stranded counts jobs GitHub stopped assigning to the scale set while
+	// no session was open, since the daemon started: an outage of more than
+	// about 4 minutes. Each was given a runner of its own (Rescuing).
+	Stranded int `json:"stranded,omitempty"`
+	// Rescuing is how many stranded jobs still have a runner added for them,
+	// until GitHub takes them up again or 10 minutes pass.
+	Rescuing int `json:"rescuing,omitempty"`
 }
 
 // Held is the launches a tier's tenant holds back, and why.
@@ -403,6 +410,20 @@ func (tr *Tracker) HeldJob(kind string) {
 		tr.t.HeldJobs = map[string]int{}
 	}
 	tr.t.HeldJobs[kind]++
+}
+
+// StrandedJob counts a job stranded while the tier had no session.
+func (tr *Tracker) StrandedJob() {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.t.Stranded++
+}
+
+// SetRescuing records how many stranded jobs have a runner added for them.
+func (tr *Tracker) SetRescuing(n int) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.t.Rescuing = n
 }
 
 // Stopped counts a runner ended for its tenant's limits.

@@ -453,6 +453,10 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			if len(t.HeldJobs) > 0 {
 				fmt.Fprintf(w, "  %s jobs held since start, by what held them: %s\n", t.Name, countList(t.HeldJobs))
 			}
+			if t.Stranded > 0 {
+				fmt.Fprintf(w, "  %s STRANDED since start: %d job(s) queued through an outage of more than about 4 minutes; a runner each was launched for them (%d still on)\n",
+					t.Name, t.Stranded, t.Rescuing)
+			}
 			if len(t.Launches) > 0 {
 				fmt.Fprintf(w, "  %s launches: %d from the pool, %d cold, %d cold with the pool kept\n",
 					t.Name, t.Launches["pool"], t.Launches["cold"], t.Launches["kept"])

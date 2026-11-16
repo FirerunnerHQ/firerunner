@@ -1117,6 +1117,21 @@ message, the job waited queued, and it ran after the restart. In that setup
 GitHub never sent `JobAvailable` messages (0 in 33 jobs); it assigns jobs to a
 JIT scale set directly.
 
+**Jobs queued through a longer outage.** GitHub keeps that assignment for
+only about 4 minutes with no session open. After that it cancels it: the
+next session receives the job's assignment and, in the same message, its
+completion as `canceled` with no runner. The job itself stays queued, but
+GitHub counts it nowhere in the statistics, and it would run only once the
+installation queued another job. So firerunner launches one runner on the
+tier for each such job, which GitHub hands the job to once it is online
+(measured: 55 s after a restart). The extra runner lasts until GitHub
+assigns or starts the job again, or 10 minutes pass. A job its user
+cancelled during the outage looks the same and costs that one idle runner.
+The daemon logs `job stranded` with the job, and `status` counts them per
+tier (`stranded` since start, `rescuing` now). A rising count means
+outages longer than 4 minutes: a control VM replaced after a failure, or a
+crash loop.
+
 `FR_CHAOS_EXIT_AFTER_DELETE=1` makes the daemon exit right after deleting a
 message. Since actions/scaleset v0.5.0 a message is deleted only after it is acted
 on, so a crash before that has it delivered again rather than lost. It is a fault-injection switch for recovery tests

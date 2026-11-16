@@ -318,10 +318,15 @@ deploy/cloudformation/deploy-control.sh firerunner v0.2.0   # roll back: the sam
 ```
 
 The refresh terminates the old VM before launching the new one: two
-listeners on one scale set fight over its session. Expect about two
-minutes with no listener. Jobs already running keep running on their own
-instances; the new VM's reaper ends what they leave behind. Queued jobs
-wait and are picked up by the new listener.
+listeners on one scale set fight over its session. Expect about 30 s with
+no listener: in a deploy measured on 2026-11-15, every tier was served 31 s
+after the old VM began terminating. Jobs already running keep running on
+their own instances; the new VM's reaper ends what they leave behind.
+Queued jobs wait and are picked up by the new listener. After an outage of
+more than about 4 minutes, such as a VM the group replaces after a failure,
+GitHub gives up on the jobs it had assigned; firerunner launches a runner
+for each of them (see "Jobs queued through a longer outage" in the
+top-level README).
 
 Changing `env` or `tiers` takes a refresh too. Run `deploy-control.sh` with
 the current version.

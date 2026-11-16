@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -92,6 +93,8 @@ type ScaleSet struct {
 	jitClients *clientPool
 	// stats holds the latest statistics GitHub sent with a message.
 	stats statsRecorder
+	// rescue keeps the tier's stranded jobs across sessions.
+	rescue rescues
 	// mu guards recycle, the cancel func of the live session's context; nil
 	// when no session is live.
 	mu      sync.Mutex
@@ -397,6 +400,8 @@ func (s *ScaleSet) runSession(ctx context.Context, sess session, onDesired Desir
 		stats:        &s.stats,
 		acquire:      ts.AcquireJobs,
 		endSession:   func(err error) { cancel(fmt.Errorf("%w: %w", errSessionEnded, err)) },
+		rescue:       &s.rescue,
+		opened:       time.Now(),
 	}
 	if capacity != nil {
 		a.capacity = capacity
@@ -714,6 +719,12 @@ type scaler struct {
 	acquire func(ctx context.Context, ids []int64) ([]int64, error)
 	// endSession ends the session once the message in hand is deleted.
 	endSession func(error)
+	// rescue adds a runner for each job GitHub stranded while no session was
+	// open (see rescues); opened is when this session opened, and sawJobs is
+	// set by its first message with jobs.
+	rescue  *rescues
+	opened  time.Time
+	sawJobs bool
 }
 
 var _ sslistener.Scaler = (*scaler)(nil)
@@ -770,6 +781,7 @@ func (a *scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 			}
 		}
 	}
+	a.rescueStranded(msg)
 	count := 0
 	if msg.Statistics != nil {
 		count = msg.Statistics.TotalAssignedJobs
@@ -811,6 +823,14 @@ func (a *scaler) recordHeld(assigned []*scaleset.JobAssigned) {
 
 func (a *scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
 	// The scheduler adds its warm-runner floor to GitHub's count itself.
+	// GitHub counts no stranded job: each adds a runner here.
+	if a.rescue != nil {
+		n := a.rescue.count()
+		count += n
+		if a.health != nil {
+			a.health.SetRescuing(n)
+		}
+	}
 	running := a.onDesired(ctx, count)
 	a.advertiseCapacity()
 	return running, nil
@@ -836,6 +856,54 @@ func (a *scaler) advertiseCapacity() {
 		a.lastAdvert = c
 	}
 	a.setCapacity(c)
+}
+
+// rescueStranded starts a rescue for each job msg shows stranded, and ends
+// those of the jobs GitHub assigns, starts or completes again: then it counts
+// them itself, or they need no runner.
+func (a *scaler) rescueStranded(msg *scaleset.RunnerScaleSetMessage) {
+	if a.rescue == nil {
+		return
+	}
+	found := stranded(msg, a.opened, !a.sawJobs)
+	if len(msg.JobAssignedMessages)+len(msg.JobStartedMessages)+len(msg.JobCompletedMessages) > 0 {
+		a.sawJobs = true
+	}
+	isStranded := func(id string) bool {
+		return slices.ContainsFunc(found, func(j *scaleset.JobAssigned) bool { return j.JobID == id })
+	}
+	var again []string
+	for _, j := range msg.JobAssignedMessages {
+		if j != nil {
+			again = append(again, j.JobID)
+		}
+	}
+	for _, j := range msg.JobStartedMessages {
+		if j != nil {
+			again = append(again, j.JobID)
+		}
+	}
+	for _, j := range msg.JobCompletedMessages {
+		if j != nil {
+			again = append(again, j.JobID)
+		}
+	}
+	for _, id := range again {
+		if id != "" && !isStranded(id) && a.rescue.forget(id) {
+			a.log.Info("stranded job taken up again", "jobId", id)
+		}
+	}
+	for _, j := range found {
+		if !a.rescue.add(j.JobID) {
+			continue
+		}
+		a.log.Warn("job stranded: GitHub cancelled its assignment while no session was open; launching a runner for it",
+			"jobId", j.JobID, "repository", j.OwnerName+"/"+j.RepositoryName, "runId", j.WorkflowRunID,
+			"job", j.JobDisplayName, "assignedAt", j.ScaleSetAssignTime, "for", rescueFor)
+		if a.health != nil {
+			a.health.StrandedJob()
+		}
+	}
 }
 
 func (a *scaler) HandleJobStarted(ctx context.Context, j *scaleset.JobStarted) error {
