@@ -35,6 +35,12 @@ const tenantUsage = `usage:
       [--min-severity N] [--env-file FILE|none] [--json]
       list the GuardDuty findings on OWNER's EC2 instances in this account
       and the tenant each names; writes nothing
+  firerunner tenant import FILE [--env-file FILE|none]
+      write the tenants list in FILE (- for stdin) to the job store's
+      tenants table, which --tenants db: reads: the whole list, checked
+      first as the daemon checks one; a tenant it leaves out is removed
+  firerunner tenant export [--env-file FILE|none]
+      print the job store's tenants list
 
 ID is a tenant's id in the --tenants catalog, or _install for the install's
 own tiers. SPEC is where the daemon reads tenant states, as its
@@ -107,6 +113,8 @@ type tenantOpeners struct {
 	// guardDuty returns the client and this account's id, whose findings
 	// alone count ("" for every account's).
 	guardDuty func() (guardduty.API, string, error)
+	// list connects to the tenants table of --tenants db:.
+	list func(*config.Config) (tenantListStore, error)
 }
 
 // tenantArgs are the subcommand's parsed arguments.
@@ -133,7 +141,7 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) (cod
 		return 0
 	}
 	switch args[0] {
-	case "suspend", "resume", "clear-flag", "list", "findings":
+	case "suspend", "resume", "clear-flag", "list", "findings", "import", "export":
 	default:
 		return usageErr("firerunner tenant: unknown action %q", args[0])
 	}
@@ -142,6 +150,9 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) (cod
 	rest, err := diagEnv("tenant", args[1:], stderr)
 	if err != nil {
 		return usageErr("firerunner tenant: %v", err)
+	}
+	if args[0] == "import" || args[0] == "export" {
+		return tenantListCmd(append([]string{args[0]}, rest...), stdout, stderr, open.list)
 	}
 	a, help, err := parseTenantArgs(append([]string{args[0]}, rest...))
 	if help {
@@ -425,6 +436,7 @@ func openTenant() tenantOpeners {
 	return tenantOpeners{
 		states: func(spec string) (tenantstate.Store, error) { return tenantstate.Open(spec, newSSM) },
 		flags:  func(spec string) (tenantstate.FlagStore, error) { return tenantstate.OpenFlags(spec, newSSM) },
+		list:   openTenantList,
 		guardDuty: func() (guardduty.API, string, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()

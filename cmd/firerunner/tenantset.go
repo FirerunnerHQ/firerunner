@@ -19,6 +19,7 @@ import (
 
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/health"
+	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
 // tenantsInterval is how often the daemon reads its tenants list: a tenant
@@ -95,9 +96,35 @@ func (s ssmTenants) Load(ctx context.Context) ([]byte, error) {
 
 func (s ssmTenants) String() string { return config.TenantsSSM + s.name }
 
+// tenantsLoader is the job store's side of dbTenants; a *jobstore.TenantStore.
+type tenantsLoader interface {
+	Load(ctx context.Context) ([]byte, error)
+}
+
+// dbTenants is the tenants table of the job store's database. A database not
+// set up yet is errTenantsMissing.
+type dbTenants struct{ store tenantsLoader }
+
+func (d dbTenants) Load(ctx context.Context) ([]byte, error) {
+	b, err := d.store.Load(ctx)
+	if errors.Is(err, jobstore.ErrNoTenants) {
+		return nil, fmt.Errorf("%w: %w", errTenantsMissing, err)
+	}
+	return b, err
+}
+
+func (dbTenants) String() string { return config.TenantsDB + " (the job store's tenants table)" }
+
 // openTenants returns the source --tenants names. newSSM is asked for a
-// client only for a parameter.
-func openTenants(spec string, newSSM func() (ssmGetAPI, error)) (tenantSource, error) {
+// client only for a parameter, newDB for the job store only for db:.
+func openTenants(spec string, newSSM func() (ssmGetAPI, error), newDB func() (tenantsLoader, error)) (tenantSource, error) {
+	if spec == config.TenantsDB {
+		store, err := newDB()
+		if err != nil {
+			return nil, err
+		}
+		return dbTenants{store: store}, nil
+	}
 	name, ok := config.TenantsParameter(spec)
 	if !ok {
 		return fileTenants(spec), nil

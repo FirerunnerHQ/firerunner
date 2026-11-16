@@ -167,6 +167,29 @@ func TestTenantsInSSM(t *testing.T) {
 	}
 }
 
+// db: is the job store's tenants table: it needs the store's URL, and names
+// nothing more.
+func TestTenantsInDB(t *testing.T) {
+	c := tenantConfig()
+	c.TenantsPath = "db:"
+	if err := c.validateTenants(); err == nil || !strings.Contains(err.Error(), "FR_JOB_EVENTS_DSN") {
+		t.Fatalf("db: with no job store: %v", err)
+	}
+	c.JobEventsDSNFile = "/etc/firerunner/job-events-dsn"
+	if err := c.validateTenants(); err != nil {
+		t.Fatalf("db: with a job store: %v", err)
+	}
+	c.TenantsPath = "db:tenants"
+	if err := c.validateTenants(); err == nil {
+		t.Fatal(`"db:tenants" accepted`)
+	}
+	t.Setenv("FR_JOB_EVENTS_DSN", "postgres://u@h/db")
+	p, err := Parse([]string{"--url", "https://github.com/o", "--token", "t", "--tenants", "db:"})
+	if err != nil || p.TenantsPath != "db:" || p.Tenants != nil {
+		t.Fatalf("Parse: %v, tenants %q %v", err, p.TenantsPath, p.Tenants)
+	}
+}
+
 // A parameter is not a file: Parse reads nothing for it.
 func TestParseLeavesAParameterToTheDaemon(t *testing.T) {
 	c, err := Parse([]string{"--url", "https://github.com/o", "--token", "t", "--tenants", "ssm:/fr/control/tenants"})
