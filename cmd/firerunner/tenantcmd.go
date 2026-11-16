@@ -31,10 +31,10 @@ const tenantUsage = `usage:
       clear the tenant's flag for review, once reviewed
   firerunner tenant list [--state SPEC] [--env-file FILE|none] [--json]
       list the suspended tenants, and those flagged for review
-  firerunner tenant findings [--owner OWNER] [--since DURATION]
-      [--min-severity N] [--env-file FILE|none] [--json]
-      list the GuardDuty findings on OWNER's EC2 instances in this account
-      and the tenant each names; writes nothing
+  firerunner tenant findings [--owner OWNER] [--tenant-owner OWNER]
+      [--since DURATION] [--min-severity N] [--env-file FILE|none] [--json]
+      list the GuardDuty findings on OWNER's EC2 instances and its tenants'
+      in this account, and the tenant each names; writes nothing
   firerunner tenant import FILE [--env-file FILE|none]
       write the tenants list in FILE (- for stdin) to the job store's
       tenants table, which --tenants db: reads: the whole list, checked
@@ -58,8 +58,9 @@ suspension holds across restarts until resumed.
 With --guardduty, a daemon reads GuardDuty's findings every 2 minutes and
 flags the tenant whose machine one names, by its firerunner:owner tag; status
 and doctor show the flag. A flag never suspends: review it, then suspend the
-tenant or clear the flag. findings defaults to --owner FR_OWNER, --since 24h
-and --min-severity FR_GUARDDUTY_MIN_SEVERITY or 4.
+tenant or clear the flag. findings defaults to --owner FR_OWNER,
+--tenant-owner FR_TENANT_OWNER or else the owner, --since 24h and
+--min-severity FR_GUARDDUTY_MIN_SEVERITY or 4.
 exit status: 0 done, 1 failed, 2 usage error
 `
 
@@ -120,11 +121,13 @@ type tenantOpeners struct {
 // tenantArgs are the subcommand's parsed arguments.
 type tenantArgs struct {
 	action, spec, reason, owner string
-	since                       time.Duration
-	minSeverity                 float64
-	ids                         []string
-	asJSON                      bool
-	set                         map[string]bool
+	// tenantOwner is the tenants' owner tag (--tenant-owner); "" is owner.
+	tenantOwner string
+	since       time.Duration
+	minSeverity float64
+	ids         []string
+	asJSON      bool
+	set         map[string]bool
 }
 
 // tenantCmd runs "firerunner tenant ..." and returns the exit status.
@@ -277,7 +280,7 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) (cod
 // parseTenantArgs reads the action, its ids and flags, and checks them. help
 // is true when they ask for the usage.
 func parseTenantArgs(args []string) (a tenantArgs, help bool, err error) {
-	a = tenantArgs{action: args[0], spec: os.Getenv("FR_TENANT_STATE"), owner: os.Getenv("FR_OWNER"),
+	a = tenantArgs{action: args[0], spec: os.Getenv("FR_TENANT_STATE"), owner: os.Getenv("FR_OWNER"), tenantOwner: os.Getenv("FR_TENANT_OWNER"),
 		since: 24 * time.Hour, minSeverity: guardduty.DefaultMinSeverity, set: map[string]bool{}}
 	switch a.action {
 	case "suspend", "resume", "clear-flag", "list", "findings":
@@ -304,7 +307,7 @@ func parseTenantArgs(args []string) (a tenantArgs, help bool, err error) {
 			}
 			a.asJSON = true
 			continue
-		case "--state", "--reason", "--owner", "--since", "--min-severity":
+		case "--state", "--reason", "--owner", "--tenant-owner", "--since", "--min-severity":
 			if !hasVal {
 				if i+1 >= len(rest) {
 					return a, false, fmt.Errorf("%s needs a value", name)
@@ -320,6 +323,8 @@ func parseTenantArgs(args []string) (a tenantArgs, help bool, err error) {
 				a.reason = val
 			case "--owner":
 				a.owner = val
+			case "--tenant-owner":
+				a.tenantOwner = val
 			case "--since":
 				if a.since, err = time.ParseDuration(val); err != nil || a.since <= 0 {
 					return a, false, fmt.Errorf("--since %q: give a duration such as 24h", val)
@@ -338,7 +343,7 @@ func parseTenantArgs(args []string) (a tenantArgs, help bool, err error) {
 	}
 	takesID := a.action != "list" && a.action != "findings"
 	for flag, actions := range map[string]string{
-		"--reason": "suspend", "--owner": "findings", "--since": "findings", "--min-severity": "findings",
+		"--reason": "suspend", "--owner": "findings", "--tenant-owner": "findings", "--since": "findings", "--min-severity": "findings",
 		"--state": "suspend resume clear-flag list",
 	} {
 		if a.set[flag] && !strings.Contains(" "+actions+" ", " "+a.action+" ") {
@@ -387,7 +392,11 @@ func tenantFindings(ctx context.Context, a tenantArgs, stdout, stderr io.Writer,
 	if detectors == 0 {
 		fmt.Fprintln(stderr, "firerunner tenant findings: GuardDuty has no detector in this region")
 	}
-	tenantOf := guardduty.Owners(a.owner, nil)
+	tenants := a.tenantOwner
+	if tenants == "" {
+		tenants = a.owner
+	}
+	tenantOf := guardduty.Owners(a.owner, tenants, nil)
 	r := tenantReport{}
 	for _, f := range found {
 		id, ok := tenantOf(f.Owner)

@@ -762,7 +762,7 @@ func (s *shard) watchFindings(ctx context.Context, cfg *config.Config, owner str
 		return ts == nil || ts.known(id)
 	}
 	s.findings = &guardduty.Poller{
-		API: api, Store: store, Account: account, Tenant: guardduty.Owners(owner, known),
+		API: api, Store: store, Account: account, Tenant: guardduty.Owners(owner, tenantOwnerOf(cfg, owner), known),
 		MinSeverity: cfg.GuardDutyMinSeverity, Interval: guardduty.DefaultInterval, Log: glog,
 		OnFlag: func(f guardduty.Flagged) {
 			tenant := f.Tenant
@@ -1179,6 +1179,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 	}
 
+	tenantOwner := tenantOwnerOf(cfg, owner)
+
 	// One JWT source for the shard: every tenant is an installation of one App.
 	appJWT, err := newAppJWT(ctx, cfg, privateKey)
 	if err != nil {
@@ -1328,7 +1330,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	tenants := &tenantSet{
 		ctx: runCtx, log: log,
 		run: func(ctx context.Context, cur func() config.Tenant, served func(*servedTenant)) {
-			s.runTenant(ctx, cur, served, live, owner, appJWT)
+			s.runTenant(ctx, cur, served, live, tenantOwner, appJWT)
 		},
 		setMax: func(id string, max int) {
 			if b, ok := live.bounds()[id]; ok {
@@ -1336,14 +1338,16 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			}
 		},
 		removed: func(c config.Tenant) {
-			t := extraTenant(cfg, c, owner, appJWT)
+			t := extraTenant(cfg, c, tenantOwner, appJWT)
 			s.removeLeftovers(runCtx, t, c.Tiers)
 			s.endRemoved(runCtx, t)
 		},
 	}
 	s.tenants.Store(tenants)
 	var catalog *tenantCatalog
+	var leaser *tenantLeaser
 	if cfg.TenantsPath != "" {
+		var db *jobstore.TenantStore
 		src, err := openTenants(cfg.TenantsPath, func() (ssmGetAPI, error) {
 			awsCfg, err := loadAWSConfig(ctx, cfg)
 			if err != nil {
@@ -1362,15 +1366,30 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			if err != nil {
 				return nil, err
 			}
-			go func() { <-ctx.Done(); store.Close() }()
+			db = store
 			return store, nil
 		})
+		if db != nil {
+			// After the leases are released, on the way out.
+			defer db.Close()
+		}
 		if err != nil {
 			return fmt.Errorf("--tenants: %w", err)
 		}
 		catalog = &tenantCatalog{src: src, check: cfg.CheckTenants, set: tenants, log: log.With("component", "tenants")}
+		if cfg.TenantLeases { // validated: --tenants db:, so db is open
+			leaser = &tenantLeaser{store: db, shard: jobstore.Shard{ID: shardID(), Owner: owner, TenantOwner: tenantOwner}, set: tenants, log: log.With("component", "tenant-leases")}
+			if err := leaser.join(runCtx); err != nil {
+				return fmt.Errorf("--tenant-leases: %w", err)
+			}
+			catalog.leaser = leaser
+		}
 		if err := catalog.read(runCtx); err != nil {
 			log.Error("tenants list not read; serving the install alone until it is", "source", src.String(), "err", err)
+		}
+		if leaser != nil {
+			_ = leaser.renew(runCtx)
+			go leaser.run(runCtx)
 		}
 		go catalog.run(runCtx)
 	}
@@ -1397,9 +1416,12 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		f.Tenants = live.tenants(states, flags)
 		s.entitlementHealth(f)
-		f.TenantCatalog = nil
+		f.TenantCatalog, f.TenantLeases = nil, nil
 		if catalog != nil {
 			f.TenantCatalog = catalog.status()
+		}
+		if leaser != nil {
+			f.TenantLeases = leaser.status()
 		}
 	}, log)
 
@@ -1416,6 +1438,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	log.Info("shutdown signalled, draining in-flight microVMs")
 	served.drain(s.handsOff(ctx))
 	tenants.wait()
+	if leaser != nil {
+		// Every tenant's sessions are closed: another shard may take them.
+		leaser.release(ctx)
+	}
 	log.Info("firerunner stopped")
 
 	if runErr != nil && ctx.Err() == nil {

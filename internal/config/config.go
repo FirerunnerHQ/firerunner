@@ -64,6 +64,14 @@ type Config struct {
 	TiersPath   string
 	TenantsPath string
 	Tenants     []Tenant
+	// TenantLeases serves a tenant of --tenants db: only while this process
+	// holds the lease on its account in the job store, so that several
+	// daemons share one list.
+	TenantLeases bool
+	// TenantOwner is the tenants' owner: each one's instances are tagged
+	// <TenantOwner>/<id>. Empty is the install's (Owner). Shards of one
+	// tenants list share it, each with its own Owner.
+	TenantOwner string
 	// Limits are the install's own (--limit-*): none by default, as the
 	// install is its operator's. Tenants set theirs in the catalog.
 	Limits Limits
@@ -425,6 +433,8 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.DurationVar(&c.Limits.JobDuration, "limit-job-duration", er.duration("FR_LIMIT_JOB_DURATION", 0), "end the runner of an install's job that has run this long, failing the job (0 = no limit; at least 1m). A tenant sets its own in the --tenants catalog")
 	fs.StringVar(&c.TenantState, "tenant-state", env("FR_TENANT_STATE", ""), "where tenant suspensions are kept (firerunner tenant suspend): an absolute file path, or ssm: and an SSM path holding one parameter per suspended tenant. Read at start and every 15 s; a suspended tenant's launches are held and its runners ended. Off when empty")
 	fs.StringVar(&c.Entitlements, "entitlements", env("FR_ENTITLEMENTS", ""), "where billing keeps what each tenant of the catalog may run: an absolute file path, or ssm: and an SSM path holding one parameter per tenant (account and budget state, valid until). Read at start and every 30 s. A tenant with no record, a suspended account or a capped budget is held: its jobs wait, with the reason; an expired record holds unless it names an active account. The install itself is never held. Off when empty")
+	fs.BoolVar(&c.TenantLeases, "tenant-leases", er.boolean("FR_TENANT_LEASES", false), "serve a tenant of --tenants db: only while this process holds the lease on its GitHub account in the job store's database, renewed every 10s, so that several daemons (shards) share one tenants list and each tenant is served by one at a time. A shard that cannot renew stops launching for a tenant within 20s; another takes it over once the lease has expired (30s). Every shard needs the same --owner, which it requires")
+	fs.StringVar(&c.TenantOwner, "tenant-owner", env("FR_TENANT_OWNER", ""), "the owner of the tenants' instances, tagged firerunner:owner <tenant-owner>/<id>; defaults to --owner. Shards of one tenants list (--tenant-leases) share it, each with an --owner of its own: a tenant's busy runners are handed to the next shard by it, while a shard's own tiers and pool stay its own")
 	fs.BoolVar(&c.GuardDuty, "guardduty", er.boolean("FR_GUARDDUTY", false), "read AWS GuardDuty's findings on the install's EC2 instances every 2 minutes and flag the tenant each names, by its firerunner:owner tag, for review in firerunner status and doctor. A flag never suspends: review it, then firerunner tenant suspend or clear-flag. Flags are kept beside --tenant-state, which it needs")
 	fs.Float64Var(&c.GuardDutyMinSeverity, "guardduty-min-severity", er.float("FR_GUARDDUTY_MIN_SEVERITY", 4), "the least GuardDuty severity that flags a tenant: 1-10; 4 is Medium, 7 High")
 	fs.StringVar(&c.TiersPath, "tiers", env("FR_TIERS", ""), "path to a JSON tier catalog (array of {name,labels,provisioner,min,max} plus {vcpu,mem_mib,golden,toolcache} for a firecracker tier or an ec2 block for an ec2 tier). When set, firerunner serves every tier from this one process and developers pick one with runs-on: <name>; --max-runners is the slot budget shared by the firecracker tiers. When unset, a single firecracker tier is derived from --name/--vcpu/--mem-mib/--golden.")

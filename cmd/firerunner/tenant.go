@@ -264,6 +264,15 @@ func (s *shard) eventsFor(t tenant) jobevent.Sink {
 }
 
 // extraTenant is a tenant from the --tenants file, on the install's App.
+// tenantOwnerOf is the owner tag the tenants' instances are tagged under,
+// <it>/<id>: --tenant-owner, or else the install's owner.
+func tenantOwnerOf(cfg *config.Config, owner string) string {
+	if cfg.TenantOwner != "" {
+		return cfg.TenantOwner
+	}
+	return owner
+}
+
 func extraTenant(cfg *config.Config, c config.Tenant, owner string, jwt *ghauth.JWT) tenant {
 	group := c.RunnerGroup
 	if group == "" {

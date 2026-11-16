@@ -193,14 +193,15 @@ func finding(f types.Finding, detector string) (Finding, bool) {
 }
 
 // Owners maps an owner tag to the tenant it names: install's own tag to
-// tenantstate.Install, and install/<id> to id, for an id known reports (any
-// valid id when known is nil). It names no other.
-func Owners(install string, known func(id string) bool) func(owner string) (string, bool) {
+// tenantstate.Install, and tenants/<id> to id, for an id known reports (any
+// valid id when known is nil). It names no other. tenants is the tenants'
+// owner (--tenant-owner), install's unless shards share it.
+func Owners(install, tenants string, known func(id string) bool) func(owner string) (string, bool) {
 	return func(owner string) (string, bool) {
 		if owner == install {
 			return tenantstate.Install, true
 		}
-		id, ok := strings.CutPrefix(owner, install+"/")
+		id, ok := strings.CutPrefix(owner, tenants+"/")
 		if !ok || id == tenantstate.Install || !tenantstate.ValidID(id) {
 			return "", false
 		}

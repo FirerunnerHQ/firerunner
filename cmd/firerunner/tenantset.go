@@ -190,8 +190,10 @@ type tenantSet struct {
 	ending []*tenantRun
 	// closed is set once wait is called: nothing starts after.
 	closed bool
-	// listed is set once a list has been applied.
+	// listed is set once a list has been applied, and ids holds the ids
+	// it lists: on a leased shard, some of them served by other shards.
 	listed bool
+	ids    map[string]bool
 	wg     sync.WaitGroup
 }
 
@@ -208,6 +210,10 @@ type tenantRun struct {
 	// hands it off then; it is guarded by the set's mu.
 	deadline  atomic.Pointer[time.Time]
 	stopTimer func() bool
+	// removing is set once the run ends because its tenant was removed:
+	// it deletes the tenant's scale sets once its runners finish. Guarded
+	// by the set's mu.
+	removing bool
 }
 
 // fence returns why the run may launch nothing more, or "" while it may:
@@ -244,6 +250,7 @@ func (ts *tenantSet) endLocked(r *tenantRun, cause error) {
 		now := ts.clock()
 		r.deadline.Store(&now)
 	}
+	r.removing = errors.Is(cause, errTenantRemoved)
 	r.cancel(cause)
 	if r.stopTimer != nil {
 		r.stopTimer()
@@ -326,6 +333,7 @@ func (ts *tenantSet) applyLeases(list []config.Tenant, leases map[string]time.Ti
 	for _, c := range list {
 		want[c.ID] = true
 	}
+	ts.ids = want
 	for _, id := range slices.Sorted(maps.Keys(ts.running)) {
 		if !want[id] {
 			ts.endLocked(ts.running[id], errTenantRemoved)
@@ -421,6 +429,25 @@ func (ts *tenantSet) applyLeases(list []config.Tenant, leases map[string]time.Ti
 	}
 }
 
+// removing returns the accounts of the runs removed that have not ended
+// yet: each deletes its scale sets, by name in its account, once its
+// runners finish, so the account must not be served elsewhere until then.
+func (ts *tenantSet) removing() []string {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	var accounts []string
+	for _, r := range ts.ending {
+		select {
+		case <-r.done:
+		default:
+			if r.removing {
+				accounts = append(accounts, r.account)
+			}
+		}
+	}
+	return accounts
+}
+
 // wait returns once every tenant's loop has ended. Nothing starts after it
 // is called, whatever is applied.
 func (ts *tenantSet) wait() {
@@ -435,14 +462,15 @@ func (ts *tenantSet) wait() {
 	ts.wg.Wait()
 }
 
-// known reports whether id is a tenant listed now, or one stopped that may
-// still have machines: GuardDuty findings on its machines flag it. Before
-// any list is applied, every id is: a tenant's machines from before a
-// restart may be running, and a finding passed over is not read again.
+// known reports whether id is a tenant listed now, served here or by
+// another shard, or one stopped that may still have machines: GuardDuty
+// findings on its machines flag it. Before any list is applied, every id
+// is: a tenant's machines from before a restart may be running, and a
+// finding passed over is not read again.
 func (ts *tenantSet) known(id string) bool {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	if !ts.listed {
+	if !ts.listed || ts.ids[id] {
 		return true
 	}
 	if _, ok := ts.running[id]; ok {
@@ -475,7 +503,9 @@ type tenantCatalog struct {
 	src   tenantSource
 	check func([]config.Tenant) error
 	set   *tenantSet
-	log   *slog.Logger
+	// leaser, when set, applies each list instead of set: under leases.
+	leaser *tenantLeaser
+	log    *slog.Logger
 	// tick replaces the interval's ticker in tests.
 	tick <-chan time.Time
 
@@ -516,7 +546,11 @@ func (c *tenantCatalog) read(ctx context.Context) error {
 		c.log.Warn("tenants list not applied; serving the tenants as they were", "source", c.src.String(), "err", err)
 		return err
 	}
-	c.set.apply(list)
+	if c.leaser != nil {
+		c.leaser.apply(list)
+	} else {
+		c.set.apply(list)
+	}
 	c.mu.Lock()
 	c.applied = true
 	c.mu.Unlock()

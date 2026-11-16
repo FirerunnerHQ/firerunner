@@ -87,6 +87,19 @@ func (c *Config) checkTenantsSpec() error {
 	if c.TenantsPath == TenantsDB && c.JobEventsDSN == "" && c.JobEventsDSNFile == "" {
 		return errors.New("--tenants db: reads the job store's database: set FR_JOB_EVENTS_DSN or FR_JOB_EVENTS_DSN_FILE")
 	}
+	if o := c.TenantOwner; o != "" && (len(o) > 64 || strings.HasPrefix(strings.ToLower(o), "aws:") || strings.TrimSpace(o) != o || strings.Contains(o, "/")) {
+		// A / would make <it>/<id> read as another owner's tenant.
+		return fmt.Errorf("--tenant-owner %q must be at most 64 characters, not start with aws:, have no surrounding spaces and no /", o)
+	}
+	if c.TenantLeases && c.TenantsPath != TenantsDB {
+		return errors.New("--tenant-leases keeps the leases beside the tenants table: set --tenants db:")
+	}
+	if c.TenantLeases && (c.Owner == "" || c.TenantOwner == "") {
+		// A tenant handed to another shard leaves it its busy runners, which
+		// that shard's reaper finds by the tenant's owner tag; a shard's own
+		// tiers and pool are its alone, by its --owner.
+		return errors.New("--tenant-leases needs --tenant-owner, the same on every shard, by which a tenant's busy runners are handed to the next one; and --owner, a different one on each")
+	}
 	name, ok := TenantsParameter(c.TenantsPath)
 	if !ok {
 		return nil
