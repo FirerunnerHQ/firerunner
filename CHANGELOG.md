@@ -8,6 +8,74 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-11-17
+
+### Added
+
+- The CloudFormation templates (`control.yaml`, `byoc-role.yaml`,
+  `reaper.yaml`) take a `TenantOwner` parameter: when set, the control VM's
+  role, the bring-your-own-cloud role and the reaper Lambda also cover
+  instances tagged `<TenantOwner>/<id>`, and the control VM runs with
+  `FR_TENANT_OWNER`. Daemons that share a tenants list under
+  `--tenant-leases` each run in a stack of their own with one `TenantOwner`.
+- Daemons sharing a tenants list under `--tenant-leases` now spread the
+  installations among themselves. One of them assigns each installation's
+  account to the live daemon with the fewest tiers, at most 500 tiers a
+  daemon, and moves it only when its daemon stops, stops beating, or fails
+  to apply the tenants list. An installation listing more than 40 tiers is
+  placed on no daemon. `firerunner status` and `doctor` say which daemon
+  assigns, and on that one which installations are not placed and why. A
+  daemon that stops hands its installations to the others at once. Upgrade
+  every daemon together: an older one ignores the assignments.
+- `--tenant-leases` lets several daemons share one `--tenants db:` list.
+  Each serves an installation only while it holds the lease on its GitHub
+  account in the job store's database, renewed every 10 seconds and retried
+  every 2 seconds after a failure. A daemon that cannot renew stops
+  launching for it within 20 seconds and hands it off: its sessions close,
+  its busy runners finish, and another daemon takes it over once the lease
+  expires (30 seconds). Every daemon needs the same `--tenant-owner`, an
+  `--owner` of its own and, with EC2 tiers, the same `--ec2-pool-key-file`.
+  `firerunner status` shows the daemon's shard id and how many
+  installations it holds, and `firerunner doctor` warns while renewals
+  fail (`tenant-leases`).
+- `--tenant-owner` sets the owner tag of the installations' instances,
+  `<tenant-owner>/<id>`, apart from `--owner`. Daemons that share a list
+  share it, each with an `--owner` of its own. It defaults to `--owner`, as
+  before. `firerunner tenant findings` takes it too.
+- `firerunner tenant shards` (`--json`) shows, from the job store, the
+  daemons that share a tenants list under `--tenant-leases`: each one's
+  state, which serves or is assigned each installation and why one is not
+  served, which assigns, the removals not yet cleaned up, and the problems
+  to look at. It writes nothing.
+- With `--tenants db:` and `--tenant-leases`, an installation removed from
+  the list no longer leaves its scale sets and machines behind when no
+  daemon served it at the time (its daemon crashed, it was placed on none,
+  or no daemon ran), or when its daemon's deletion failed or lost the
+  lease midway. The job store keeps each removal in a `removed_tenants`
+  table until all the installation left is deleted, and the assigning
+  daemon deletes it under the lease on its account. `firerunner status`
+  lists the sweeps under way and planned.
+- `--tenants db:` reads the tenants list from a `tenants` table in the job
+  store's database (`FR_JOB_EVENTS_DSN`), one row an installation, so the
+  list has no length limit. `firerunner tenant import FILE` writes a whole
+  list there, checked first as the daemon checks one, and `firerunner tenant
+  export` prints it.
+
+### Changed
+
+- `scripts/e2e/inventory.sh` lists and cleans up an owner's tenants'
+  instances (`<owner>/<id>`) too, which a session left behind before.
+- `scripts/e2e/control-vm.sh up` can bring up a shard: `--env` adds settings
+  to the session's `control/env`, `--job-store-schema` gives it the shared job
+  store on a schema of its own, `--tenant-owner` and `--pool-key-secret` set
+  the stack's `TenantOwner` and `PoolKeySecretArn`, and `--share-prefix-of`
+  runs a second session on the first's parameters.
+
+### Fixed
+
+- An `FR_TENANTS` set in the stack's `control/env` (such as `db:`) is no
+  longer overridden by the control VM's default, the `tenants` parameter.
+
 ## [0.1.26] - 2026-11-16
 
 ### Fixed
@@ -697,7 +765,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.26...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.27...HEAD
+[0.1.27]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.27
 [0.1.26]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.26
 [0.1.25]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.25
 [0.1.24]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.24
