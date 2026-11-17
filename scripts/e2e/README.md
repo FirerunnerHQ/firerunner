@@ -144,6 +144,29 @@ The shared stack itself, made and deployed as
 [`deploy/cloudformation/README.md`](../../deploy/cloudformation/README.md) describes, is never
 changed by these scripts.
 
+## Shards: two control VMs on one tenants list
+
+To test daemons that share a tenants list under leases (`--tenant-leases`),
+run two sessions, each with an owner of its own, on one session's
+parameters, one tenant owner and one pool key:
+
+```bash
+# The first shard writes the parameters: the list from the job store, on a
+# schema of its own (create it before the daemon can use it), under leases.
+FR_OWNER=e2e-<you>-a scripts/e2e/control-vm.sh up --env FR_TENANTS=db: --env FR_TENANT_LEASES=true \
+  --job-store-schema e2e_<you> --tenant-owner e2e-<you>-t
+# The second runs on the first's parameters, with the first's pool key (its
+# stack's PoolKeySecret output).
+FR_OWNER=e2e-<you>-b scripts/e2e/control-vm.sh up --share-prefix-of e2e-<you>-a \
+  --tenant-owner e2e-<you>-t --pool-key-secret <first stack's PoolKeySecret>
+scripts/e2e/remote-exec.sh <either VM> -- firerunner tenant shards
+```
+
+Write the list with `firerunner tenant import` on either VM. Take the second
+down before the first, whose parameters it runs on, then clean up the tenants'
+instances: `FR_OWNER=e2e-<you>-t scripts/e2e/inventory.sh --cleanup --yes`.
+`inventory.sh` covers an owner's tenants (`<owner>/<id>`) too.
+
 ## Credentials
 
 Three separate credentials are involved, and none of them lives in this

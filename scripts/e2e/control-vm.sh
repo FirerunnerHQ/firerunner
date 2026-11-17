@@ -4,6 +4,9 @@
 #
 # Usage:
 #   scripts/e2e/control-vm.sh up [--version V] [--tiers FILE] [--cache off|disk|s3]
+#                                [--env FR_NAME=VALUE]... [--job-store-schema S]
+#                                [--tenant-owner T] [--pool-key-secret ARN]
+#                                [--share-prefix-of OWNER]
 #   scripts/e2e/control-vm.sh status
 #   scripts/e2e/control-vm.sh install FILE
 #   scripts/e2e/control-vm.sh down
@@ -35,6 +38,16 @@
 #            firerunner would refuse its own configuration.
 #            To test a pool or hot runners, pass --tiers FILE,
 #            which is taken as written.
+#            Shards (daemons sharing one tenants list under leases):
+#            --env adds a line to the session's control/env, such as
+#            FR_TENANTS=db: or FR_TENANT_LEASES=true. --job-store-schema S
+#            gives the session the shared stack's job-store URL with search
+#            path S, a schema of its own (which must exist before the daemon
+#            can use it). --tenant-owner and --pool-key-secret set the stack's
+#            TenantOwner and PoolKeySecretArn. --share-prefix-of OWNER runs
+#            the stack on that session's parameters instead of writing its
+#            own: every shard reads one list, catalog and tenant state.
+#            It takes none of the options that write parameters.
 #   status   the stack, its VM, whether firerunner is active there, and the
 #            session's tier names.
 #   install  replaces the VM's firerunner binary with FILE (a linux build for
@@ -59,7 +72,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="$HERE/../../deploy/cloudformation/control.yaml"
 
 usage() {
-	sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,57p' "$0" | sed 's/^# \{0,1\}//'
 	exit "${1:-0}"
 }
 cmd="${1:-}"
@@ -69,9 +82,31 @@ up | status | install | down | list) shift ;;
 '') usage 2 >&2 ;;
 *) e2e_log "unknown command: $cmd" && usage 2 >&2 ;;
 esac
-version="" tiers_file="" binary="" cache=""
+version="" tiers_file="" binary="" cache="" schema="" tenant_owner="" pool_key="" share_of=""
+extra_env=()
 while [ $# -gt 0 ]; do
 	case "$cmd $1" in
+	"up --env")
+		[[ "${2:-}" =~ ^FR_[A-Z0-9_]+=[^[:cntrl:]]*$ ]] || e2e_die 2 "--env ${2:-}: want FR_NAME=VALUE on one line"
+		extra_env+=("$2") && shift
+		;;
+	"up --job-store-schema")
+		schema="${2:-}" && shift
+		[[ "$schema" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || e2e_die 2 "--job-store-schema $schema: want a lower-case SQL name"
+		;;
+	"up --tenant-owner")
+		tenant_owner="${2:-}" && shift
+		e2e_check_name --tenant-owner "$tenant_owner"
+		;;
+	"up --pool-key-secret")
+		pool_key="${2:-}" && shift
+		[[ "$pool_key" =~ ^arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$ ]] ||
+			e2e_die 2 "--pool-key-secret: want a Secrets Manager secret ARN"
+		;;
+	"up --share-prefix-of")
+		share_of="${2:-}" && shift
+		e2e_check_name --share-prefix-of "$share_of"
+		;;
 	"up --version") version="${2:-}" && shift ;;
 	"up --tiers") tiers_file="${2:-}" && shift ;;
 	"up --cache")
@@ -87,6 +122,9 @@ while [ $# -gt 0 ]; do
 	esac
 	shift
 done
+if [ -n "$share_of" ] && [ -n "$version$tiers_file$schema${extra_env[*]:-}" ]; then
+	e2e_die 2 "--share-prefix-of runs on that session's parameters: it takes no --version, --tiers, --env or --job-store-schema"
+fi
 
 e2e_aws
 e2e_need_cmd jq
@@ -210,7 +248,7 @@ not_shared_owner() {
 # --- up ----------------------------------------------------------------------
 
 seed_and_create() {
-	local b base_prefix prefix zone_id jit zone repo base_version sums env kms key token tiers suffix keys a
+	local b base_prefix prefix zone_id jit zone repo
 	b="$(stack_json "$base")"
 	[ -n "$b" ] || e2e_die 2 "FR_E2E_STACK=$base: no such stack"
 	not_shared_owner "$b"
@@ -222,7 +260,23 @@ seed_and_create() {
 	[ -n "$base_prefix" ] && [ -n "$zone_id" ] && [ -n "$jit" ] ||
 		e2e_die 2 "$base lacks the ParameterPrefix, HostedZoneId or JitHost output: is it a deploy/cloudformation/control.yaml stack?"
 	prefix="$base_prefix/sessions/$owner"
+	cache="${cache:-$(param "$b" Cache)}"
+	cache="${cache:-off}"
+	if [ -n "$share_of" ]; then
+		[ "$share_of" != "$owner" ] || e2e_die 2 "--share-prefix-of names this session's own owner"
+		prefix="$base_prefix/sessions/$share_of"
+		[ -n "$(ssm_get "$prefix/control/version")" ] ||
+			e2e_die 2 "--share-prefix-of $share_of: no session parameters under $prefix; bring that session up first"
+		e2e_log "running on $share_of's parameters under $prefix"
+	else
+		seed "$b" "$base_prefix" "$prefix" "$repo"
+	fi
+	create "$b" "$prefix" "$zone_id" "$zone"
+}
 
+# seed BASE_JSON BASE_PREFIX PREFIX REPO: the session's parameters.
+seed() {
+	local b="$1" base_prefix="$2" prefix="$3" repo="$4" base_version sums env kms key token tiers suffix a v line dsn
 	base_version="$(ssm_get "$base_prefix/control/version")"
 	version="${version:-${FR_E2E_VERSION:-$base_version}}"
 	[ -n "$version" ] || e2e_die 2 "no release to run: pass --version or set FR_E2E_VERSION"
@@ -261,8 +315,6 @@ seed_and_create() {
 	# The cache follows the shared stack's unless given. firerunner refuses a
 	# catalog whose tiers want a cache the stack does not run, and the VM
 	# would be replaced over and over: refuse here, before anything is made.
-	cache="${cache:-$(param "$b" Cache)}"
-	cache="${cache:-off}"
 	if [ "$cache" = off ]; then
 		cached="$(jq -r '[.[] | select(.ec2.cache == true) | .name] | join(" ")' <<<"$tiers")"
 		[ -z "$cached" ] || e2e_die 2 "tiers $cached use ec2.cache, but the cache is off: pass --cache disk or --cache s3"
@@ -292,6 +344,20 @@ seed_and_create() {
 		copy_params "$a" "$prefix/${a#"$base_prefix"/}"
 	done < <(grep -oE "=ssm:$base_prefix/[^[:space:]\"']+" <<<"$env" | sed 's/^=ssm://' | sort -u)
 	env="${env//=ssm:$base_prefix\//=ssm:$prefix/}"
+	# ${a[@]+...}: bash 3.2 takes an empty array for unset under set -u.
+	for line in ${extra_env[@]+"${extra_env[@]}"}; do
+		env+=$'\n'"$line"
+	done
+
+	# The job store: the shared stack's URL, on a schema of the session's
+	# own. Its value never reaches a log or a command line.
+	if [ -n "$schema" ]; then
+		dsn="$(ssm_get "$base_prefix/control/job-events-dsn")"
+		[ -n "$dsn" ] || e2e_die 2 "--job-store-schema: $base_prefix/control/job-events-dsn is not set"
+		case "$dsn" in *\?*) dsn+="&" ;; *) dsn+="?" ;; esac
+		ssm_put "$prefix/control/job-events-dsn" SecureString "${dsn}options=-csearch_path%3D$schema"
+		e2e_log "the job store: the shared one, on schema $schema"
+	fi
 
 	ssm_put "$prefix/control/env" String "$env"
 	ssm_put "$prefix/control/tiers" String "$tiers"
@@ -303,15 +369,22 @@ seed_and_create() {
 	ssm_put "$prefix/control/sha256sums" String "$sums"
 	ssm_put "$prefix/control/version" String "$version"
 	e2e_log "parameters under $prefix: $version, tiers $(jq -r '[.[].name] | join(" ")' <<<"$tiers")"
+}
 
+# create BASE_JSON PREFIX ZONE_ID ZONE: the session's stack, on PREFIX.
+create() {
+	local b="$1" prefix="$2" zone_id="$3" zone="$4" keys
 	keys="$(aws cloudformation get-template-summary --template-body "file://$TEMPLATE" \
 		--query 'Parameters[].ParameterKey' --output json)" || e2e_die 1 "get-template-summary failed"
-	jq -c --argjson keys "$keys" --arg o "$owner" --arg p "$prefix" --arg z "$zone_id" --arg zn "$zone" --arg c "$cache" '
-		[.Parameters[] | select(.ParameterKey | IN("Owner", "ParameterPrefix", "HostedZoneId", "ZoneName", "JitName", "Cache") | not)
+	jq -c --argjson keys "$keys" --arg o "$owner" --arg p "$prefix" --arg z "$zone_id" --arg zn "$zone" --arg c "$cache" \
+		--arg to "$tenant_owner" --arg pk "$pool_key" '
+		[.Parameters[] | select(.ParameterKey | IN("Owner", "ParameterPrefix", "HostedZoneId", "ZoneName", "JitName", "Cache",
+			"TenantOwner", "PoolKeySecretArn") | not)
 			| {ParameterKey, ParameterValue}]
 		+ [{ParameterKey: "Owner", ParameterValue: $o}, {ParameterKey: "ParameterPrefix", ParameterValue: $p},
 			{ParameterKey: "HostedZoneId", ParameterValue: $z}, {ParameterKey: "ZoneName", ParameterValue: $zn},
-			{ParameterKey: "JitName", ParameterValue: $o}, {ParameterKey: "Cache", ParameterValue: $c}]
+			{ParameterKey: "JitName", ParameterValue: $o}, {ParameterKey: "Cache", ParameterValue: $c},
+			{ParameterKey: "TenantOwner", ParameterValue: $to}, {ParameterKey: "PoolKeySecretArn", ParameterValue: $pk}]
 		| map(select(.ParameterKey | IN($keys[])))' <<<"$b" >"$work/params.json"
 	aws cloudformation create-stack --stack-name "$stack" --template-body "file://$TEMPLATE" \
 		--capabilities CAPABILITY_IAM --parameters "file://$work/params.json" \
