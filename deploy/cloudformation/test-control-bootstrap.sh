@@ -173,6 +173,16 @@ echo '[{"id":"t1"}]' > "$STATE/ssm/tenants"
 expect "tenants: boots" "$(cat "$STATE/out" 2>/dev/null)" run
 expect "tenants: env names the parameter" "$(envfile)" grep -qx "FR_TENANTS=ssm:/fr/control/tenants" <(envfile)
 expect "tenants: no copy on disk" "" test ! -e "$FR_ROOT/etc/firerunner/tenants.json"
+expect "tenants: no tenant owner unless the stack names one" "$(envfile)" bash -c "! grep -q FR_TENANT_OWNER '$FR_ROOT/etc/firerunner/firerunner.env'"
+# Daemons sharing a list under leases: the operator's FR_TENANTS stands, and
+# the stack's TenantOwner reaches the daemon.
+setup
+printf 'FR_URL=https://github.com/acme\nFR_APP_CLIENT_ID=Iv1\nFR_APP_INSTALLATION_ID=42\nFR_TENANTS=db:\nFR_TENANT_LEASES=true\n' > "$STATE/ssm/env"
+echo 'FR_TENANT_OWNER=fr-tenants' >> "$FR_ROOT/etc/firerunner/bootstrap.env"
+expect "shards: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "shards: the operator's tenants source stands" "$(envfile)" grep -qx "FR_TENANTS=db:" <(envfile)
+expect "shards: no second tenants source" "$(envfile)" bash -c "[ \$(grep -c '^FR_TENANTS=' '$FR_ROOT/etc/firerunner/firerunner.env') = 1 ]"
+expect "shards: env has the tenant owner" "$(envfile)" grep -qx "FR_TENANT_OWNER=fr-tenants" <(envfile)
 # Tenant suspensions: the daemon reads them from SSM when the role can, and
 # a stack whose role cannot leaves them off, with a hint, and still boots.
 setup
@@ -459,7 +469,7 @@ import re, sys
 s = open(sys.argv[1]).read()
 m = re.search(r"Fn::Base64: !Sub\n            - \|\n(.*?)\n            - ZoneId", s, re.S)
 body = "\n".join(l[14:] for l in m.group(1).split("\n"))
-vals = {"AWS::Region": "us-west-2", "ParameterPrefix": "/fr", "Owner": "prod-a", "AWS::StackName": "fr",
+vals = {"AWS::Region": "us-west-2", "ParameterPrefix": "/fr", "Owner": "prod-a", "TenantOwner": "", "AWS::StackName": "fr",
         "ZoneId": "Z123", "JitName": "control", "ZoneName": "fr.internal", "JitPort": "8098", "ReleaseRepo": "acme/fr",
         "Cache": "s3", "CachePort": "8099", "CacheBucketName": "fr-cache-bucket", "RootVolumeGiB": "30",
         "CacheRoleArn": "arn:aws:iam::123456789012:role/fr-CacheRole-0aaa",

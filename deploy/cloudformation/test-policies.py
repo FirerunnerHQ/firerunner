@@ -120,9 +120,11 @@ print("ok   control.yaml: IMDS is IPv4 only")
 # reach them, or its launches are denied while its scale sets look healthy.
 for name in ("control.yaml", "byoc-role.yaml", "reaper.yaml"):
     for line in open(os.path.join(HERE, name)):
-        if "Tag/firerunner:owner" in line and '[!Ref Owner, !Sub "${Owner}/*"]' not in line:
-            sys.exit(f"FAIL {name}: an owner condition leaves out tenants: {line.strip()}")
-print("ok   every owner condition covers the install's tenants")
+        if "Tag/firerunner:owner" in line and '[!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]]' not in line:
+            sys.exit(f"FAIL {name}: an owner condition leaves out tenants, under Owner or TenantOwner: {line.strip()}")
+    if "HasTenantOwner: !Not [!Equals [!Ref TenantOwner, \"\"]]" not in open(os.path.join(HERE, name)).read():
+        sys.exit(f"FAIL {name}: HasTenantOwner must be set exactly when TenantOwner is")
+print("ok   every owner condition covers the install's tenants, under Owner or TenantOwner")
 
 # The JIT name cleanup may delete one A record, the JIT name, in the one zone,
 # and nothing else: on a zone it was given, the zone's other records are

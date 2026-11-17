@@ -14,6 +14,15 @@ Parameters:
     Type: String
     AllowedPattern: "[A-Za-z0-9][A-Za-z0-9._-]{0,62}"
     Description: The install's firerunner:owner tag (control.yaml's Owner), and its tenants' (Owner/id). Nothing else is touched.
+  TenantOwner:
+    Type: String
+    Default: ""
+    AllowedPattern: "([A-Za-z0-9][A-Za-z0-9._-]{0,62})?"
+    Description: >-
+      The tenants' firerunner:owner tag (FR_TENANT_OWNER), when not this
+      install's Owner: their instances carry <TenantOwner>/<id>. Daemons that
+      share one tenants list under leases (--tenant-leases) share it, each
+      with an Owner of its own. Empty: Owner.
   MaxAgeMinutes:
     Type: String
     AllowedPattern: "([3-9][0-9]|[1-9][0-9]{2,5})"
@@ -40,6 +49,7 @@ Parameters:
       owner tag. Empty trusts the owner tag.
 
 Conditions:
+  HasTenantOwner: !Not [!Equals [!Ref TenantOwner, ""]]
   HasPoolKey: !Not [!Equals [!Ref PoolKeySecret, ""]]
 
 Resources:
@@ -60,7 +70,7 @@ Resources:
               - Effect: Allow
                 Action: [ec2:TerminateInstances, ec2:CancelSpotInstanceRequests]
                 Resource: "*"
-                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] } }
+                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] } }
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !GetAtt LogGroup.Arn
@@ -88,13 +98,16 @@ Resources:
       Timeout: 120
       Role: !GetAtt Role.Arn
       Environment:
-        Variables: { OWNER: !Ref Owner, MAX_AGE_MINUTES: !Ref MaxAgeMinutes, DRY_RUN: !Ref DryRun, POOL_KEY_SECRET: !Ref PoolKeySecret }
+        Variables: { OWNER: !Ref Owner, TENANT_OWNER: !Ref TenantOwner, MAX_AGE_MINUTES: !Ref MaxAgeMinutes, DRY_RUN: !Ref DryRun, POOL_KEY_SECRET: !Ref PoolKeySecret }
       Code:
         ZipFile: |
           import datetime, hashlib, hmac, json, os, struct
           import boto3
 
           OWNER = os.environ["OWNER"]
+          # The tenants' owner, when daemons sharing a list under leases tag
+          # their instances <TENANT_OWNER>/<id>; empty: OWNER's.
+          TENANT_OWNER = os.environ.get("TENANT_OWNER", "")
           MAX_AGE = datetime.timedelta(minutes=int(os.environ["MAX_AGE_MINUTES"]))
           DRY_RUN = os.environ.get("DRY_RUN") == "true"
           POOL_KEY_SECRET = os.environ.get("POOL_KEY_SECRET", "")
@@ -167,7 +180,7 @@ Resources:
               key = pool_key(sm)
               out = {"ended": [], "would_end": [], "kept_open_request": [], "unproven": [], "failed": [], "dry_run": DRY_RUN}
               pages = ec2.get_paginator("describe_instances").paginate(Filters=[
-                  {"Name": "tag:firerunner:owner", "Values": [OWNER, OWNER + "/*"]},
+                  {"Name": "tag:firerunner:owner", "Values": [OWNER, OWNER + "/*"] + ([TENANT_OWNER + "/*"] if TENANT_OWNER else [])},
                   {"Name": "instance-state-name", "Values": ["pending", "running", "stopped"]},
               ])
               for page in pages:

@@ -188,7 +188,12 @@ status` says why; a job past its duration has its runner ended, and fails. A
 changed list takes effect when the VM is replaced, as its other parameters do.
 
 Each gets its own scale sets and the owner tag `<owner>/<id>`, which the VM's role
-and the reaper Lambda also cover. A tenant that stops is tried again by itself,
+and the reaper Lambda also cover. Daemons that share one tenants list under
+leases (`FR_TENANTS=db:` and `FR_TENANT_LEASES=true` in `control/env`) each
+run in a stack of their own, with an `Owner` of its own and one `TenantOwner`
+for all: their tenants' instances are tagged `<TenantOwner>/<id>`, which the
+control role, `byoc-role.yaml` and `reaper.yaml` then cover too. The bootstrap
+leaves an `FR_TENANTS` set in `control/env` as it is. A tenant that stops is tried again by itself,
 and shows in `firerunner status` meanwhile; the others are not touched. A tenant's
 tiers run with caches off and no hot runners or pool, and a tier's `max` applies per
 tenant. Take a tenant out of the list only once its instances are gone: only the
