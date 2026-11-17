@@ -124,6 +124,9 @@ for name in ("control.yaml", "byoc-role.yaml", "reaper.yaml"):
             sys.exit(f"FAIL {name}: an owner condition leaves out tenants, under Owner or TenantOwner: {line.strip()}")
     if "HasTenantOwner: !Not [!Equals [!Ref TenantOwner, \"\"]]" not in open(os.path.join(HERE, name)).read():
         sys.exit(f"FAIL {name}: HasTenantOwner must be set exactly when TenantOwner is")
+    # A glob in TenantOwner would make <TenantOwner>/* match every owner.
+    if 'TenantOwner:\n    Type: String\n    Default: ""\n    AllowedPattern: "([A-Za-z0-9][A-Za-z0-9._-]{0,62})?"' not in open(os.path.join(HERE, name)).read():
+        sys.exit(f"FAIL {name}: TenantOwner must be empty or a plain name: no glob, no /")
 print("ok   every owner condition covers the install's tenants, under Owner or TenantOwner")
 
 # The JIT name cleanup may delete one A record, the JIT name, in the one zone,
@@ -180,14 +183,22 @@ pool_key = resource("PoolKey")
 if "Type: AWS::SecretsManager::Secret" not in pool_key or "PasswordLength: 64" not in pool_key or \
         "GenerateSecretString:" not in pool_key or "SecretString:" in pool_key.replace("GenerateSecretString:", ""):
     sys.exit("FAIL control.yaml: PoolKey must be a generated 64-character secret")
+# Or, for shards, one given secret (PoolKeySecretArn) in its place: the
+# stack then makes none, and reads that one alone.
+if "Condition: OwnPoolKey" not in pool_key or 'OwnPoolKey: !Equals [!Ref PoolKeySecretArn, ""]' not in control:
+    sys.exit("FAIL control.yaml: PoolKey must be made exactly when no PoolKeySecretArn is given")
+OWN_OR_GIVEN = "!If [OwnPoolKey, !Ref PoolKey, !Ref PoolKeySecretArn]"
 grants = re.findall(r"secretsmanager:[A-Za-z*]+", control)
 if grants != ["secretsmanager:GetSecretValue"] or "secretsmanager" in runner_compute:
     sys.exit(f"FAIL control.yaml: the secrets grants are {grants}; want GetSecretValue alone, outside runner-compute")
 get = control_policy.split("Action: secretsmanager:GetSecretValue", 1)[1].split("- Effect", 1)[0]
-if get.strip() != "Resource: !Ref PoolKey":
+if get.strip() != "Resource: " + OWN_OR_GIVEN:
     sys.exit("FAIL control.yaml: the control role may read only the pool key")
-if "FR_POOL_KEY_SECRET=${PoolKey}" not in resource("LaunchTemplate"):
+template = resource("LaunchTemplate")
+if "FR_POOL_KEY_SECRET=${PoolKeySecretRef}" not in template or "PoolKeySecretRef: " + OWN_OR_GIVEN not in template:
     sys.exit("FAIL control.yaml: the control VM is not told the pool key's secret")
+if not re.search(r'PoolKeySecretArn:\n    Type: String\n    Default: ""\n    AllowedPattern: "\(arn:\[a-z-\]\+:secretsmanager:', control):
+    sys.exit("FAIL control.yaml: PoolKeySecretArn must be empty or a Secrets Manager ARN")
 print("ok   control.yaml: only the control role reads the pool key, and only it")
 
 # The runner subnets deny outbound SMTP through their network ACL, numbered

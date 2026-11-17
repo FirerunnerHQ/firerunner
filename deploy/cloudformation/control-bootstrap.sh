@@ -173,6 +173,12 @@ env_text=$(param env)
 parse_env "$env_text"
 setenv FR_TIERS "$etc/tiers.json"
 setenv FR_OWNER "$FR_OWNER"
+# The VM's role covers <TenantOwner>/* of the stack alone: one named in
+# control/env would have every launch for a tenant denied.
+if has_env FR_TENANT_OWNER; then
+	log "$FR_PREFIX/control/env sets FR_TENANT_OWNER: set the stack's TenantOwner parameter instead, which the VM's role covers"
+	false
+fi
 if [ -n "${FR_TENANT_OWNER:-}" ]; then
 	setenv FR_TENANT_OWNER "$FR_TENANT_OWNER"
 fi

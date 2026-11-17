@@ -352,8 +352,10 @@ own, for its own tiers and pool, and with EC2 tiers the same pool key
 its to end. The CloudFormation templates scope the control VM's role and the
 reaper to `<Owner>` and `<Owner>/*`, and to `<TenantOwner>/*` when their
 `TenantOwner` parameter is set, which the bootstrap passes on as
-`FR_TENANT_OWNER`; the list's source and `FR_TENANT_LEASES` go in the
-stack's `control/env`. A shard refuses to start beside a live one whose
+`FR_TENANT_OWNER`. Each shard runs in a stack of its own, all on one
+`ParameterPrefix`, so that they read one `control/env` (where
+`FR_TENANTS=db:` and `FR_TENANT_LEASES=true` go), one tenant state and one
+set of entitlements, and with one pool key (`PoolKeySecretArn`). A shard refuses to start beside a live one whose
 `--tenant-owner` differs or whose `--owner` is the same. `firerunner status`
 shows the shard and how many installations it holds; `firerunner doctor`
 warns while renewals fail (`tenant-leases`). `firerunner tenant shards`

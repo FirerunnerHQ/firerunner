@@ -13,7 +13,7 @@ Parameters:
   Owner:
     Type: String
     AllowedPattern: "[A-Za-z0-9][A-Za-z0-9._-]{0,62}"
-    Description: The install's firerunner:owner tag (control.yaml's Owner), and its tenants' (Owner/id). Nothing else is touched.
+    Description: The install's firerunner:owner tag (control.yaml's Owner), and its tenants' (Owner/id), and TenantOwner/id when TenantOwner is set. Nothing else is touched.
   TenantOwner:
     Type: String
     Default: ""

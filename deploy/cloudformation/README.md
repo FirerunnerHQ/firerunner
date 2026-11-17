@@ -8,7 +8,7 @@ or deploy them from other tooling:
 |---|---|---|
 | [`network.yaml`](network.yaml) | a VPC with public subnets in 2–3 zones, and the runners' security group (no inbound) | — (or bring your own VPC) |
 | [`control.yaml`](control.yaml) | the control plane: an Auto Scaling group of one VM, its role, its security group, a private DNS zone | a VPC, subnets, the runners' group |
-| [`reaper.yaml`](reaper.yaml) (optional) | a scheduled Lambda that ends the install's instances running past a limit | the install's `Owner` |
+| [`reaper.yaml`](reaper.yaml) (optional) | a scheduled Lambda that ends the install's instances running past a limit | the install's `Owner` (and `TenantOwner`, for shards) |
 | [`byoc-role.yaml`](byoc-role.yaml) (bring your own cloud) | a role a control plane in another account assumes, with an external ID, to run runners here | that account's ID, an external ID, `Owner` |
 
 They take parameters only. Their outputs feed the next template, or
@@ -188,12 +188,26 @@ status` says why; a job past its duration has its runner ended, and fails. A
 changed list takes effect when the VM is replaced, as its other parameters do.
 
 Each gets its own scale sets and the owner tag `<owner>/<id>`, which the VM's role
-and the reaper Lambda also cover. Daemons that share one tenants list under
-leases (`FR_TENANTS=db:` and `FR_TENANT_LEASES=true` in `control/env`) each
-run in a stack of their own, with an `Owner` of its own and one `TenantOwner`
-for all: their tenants' instances are tagged `<TenantOwner>/<id>`, which the
-control role, `byoc-role.yaml` and `reaper.yaml` then cover too. The bootstrap
-leaves an `FR_TENANTS` set in `control/env` as it is. A tenant that stops is tried again by itself,
+and the reaper Lambda also cover.
+
+**Several daemons on one list (shards).** Daemons that share one tenants list
+under leases (`FR_TENANTS=db:` and `FR_TENANT_LEASES=true` in `control/env`)
+each run in a stack of their own:
+
+- each with an `Owner` of its own, and one `TenantOwner` for all, which is
+  no install's `Owner`: their tenants' instances are tagged
+  `<TenantOwner>/<id>`, which the control role, `byoc-role.yaml` and
+  `reaper.yaml` then cover too. Set it on the stack, never as
+  `FR_TENANT_OWNER` in `control/env`, which the bootstrap refuses;
+- all on one `ParameterPrefix`: one `control/env`, tier catalog and App key,
+  and one tenant state and set of entitlements, which a tenant must keep
+  wherever it moves. A stack makes no parameter under its prefix;
+- all with one pool key: give every stack the same `PoolKeySecretArn`, such
+  as the first stack's `PoolKeySecret` output, kept while any uses it. With
+  a key each, a shard cannot prove the runners another hands it are its to
+  end, and leaves them to their maximum lifetime.
+
+The bootstrap leaves an `FR_TENANTS` set in `control/env` as it is. A tenant that stops is tried again by itself,
 and shows in `firerunner status` meanwhile; the others are not touched. A tenant's
 tiers run with caches off and no hot runners or pool, and a tier's `max` applies per
 tenant. Take a tenant out of the list only once its instances are gone: only the
@@ -410,7 +424,7 @@ it ends anything. [`reaper.yaml`](reaper.yaml) is a backstop for when the
 control VM is not there.
 
 - **What it does.** A Lambda runs every `EveryMinutes` (default 15). It
-  ends the install's instances (by `Owner`) whose latest start is more than
+  ends the install's instances (by `Owner`, and `<TenantOwner>/*` when set) whose latest start is more than
   `MaxAgeMinutes` ago (default 720). That covers running instances, and used
   instances left stopped.
 - **Stopped pool instances (`ready`, `warming`) are kept.**
@@ -441,7 +455,8 @@ another AWS account, such as a hosted one, run runners in this account.
 
 - **What it grants.** Exactly the runner-compute permissions of
   `control.yaml`'s role, and nothing else:
-  - launch instances only tagged with this `Owner`, with their volumes,
+  - launch instances only tagged with this `Owner` (or `<Owner>/*`, or
+    `<TenantOwner>/*` when set), with their volumes,
     into this `VpcId`'s subnets and security groups;
   - start, re-tag, modify and terminate only instances with that tag;
   - cancel only that tag's spot requests;
