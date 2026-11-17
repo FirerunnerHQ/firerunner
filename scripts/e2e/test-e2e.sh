@@ -754,7 +754,10 @@ reservations() { jq -cn --argjson i "[$(
 )]" '{Reservations: [{Instances: $i}]}'; }
 inventory_answers() {
 	# The filter leaks another owner's instance: the script must drop it.
-	answer instances 1 "$(reservations "$(inst i-0mine running e2e-test)" "$(inst i-0pool stopped e2e-test)" "$(inst i-0other running e2e-other)")"
+	# A tenant's instance carries <owner>/<id>; an owner that merely
+	# starts with this one's is another's.
+	answer instances 1 "$(reservations "$(inst i-0mine running e2e-test)" "$(inst i-0pool stopped e2e-test)" "$(inst i-0other running e2e-other)" \
+		"$(inst i-0tenant running e2e-test/acme)" "$(inst i-0near running e2e-tester)")"
 	answer spots 1 '{"SpotInstanceRequests":[{"SpotInstanceRequestId":"sir-1","State":"active","Type":"persistent","InstanceId":"i-0pool","Tags":[{"Key":"firerunner:owner","Value":"e2e-test"}]},{"SpotInstanceRequestId":"sir-x","State":"open","Type":"persistent","Tags":[{"Key":"firerunner:owner","Value":"e2e-other"}]}]}'
 	answer volumes 1 '{"Volumes":[{"VolumeId":"vol-used","State":"in-use","Tags":[{"Key":"firerunner:owner","Value":"e2e-test"}]},{"VolumeId":"vol-free","State":"available","Tags":[{"Key":"firerunner:owner","Value":"e2e-test"}]}]}'
 	answer control-vms 1 '{"Reservations":[]}'
@@ -765,9 +768,9 @@ fresh inventory-list
 inventory_answers
 run inventory.sh
 expect "inventory: exit 0" "$(dump)" rc_is 0
-expect "inventory: filters on the owner tag" "" called "tag:firerunner:owner,Values=e2e-test"
-expect "inventory: lists only the owner's resources" "$(cat "$STATE/out")" \
-	last_json '.owner == "e2e-test" and ([.instances[].id] == ["i-0mine", "i-0pool"]) and ([.spot_requests[].id] == ["sir-1"]) and ([.volumes[].id] == ["vol-used", "vol-free"])'
+expect "inventory: filters on the owner tag and its tenants'" "" called "tag:firerunner:owner,Values=e2e-test,e2e-test/\\*"
+expect "inventory: lists only the owner's resources, its tenants' too" "$(cat "$STATE/out")" \
+	last_json '.owner == "e2e-test" and ([.instances[].id] == ["i-0mine", "i-0pool", "i-0tenant"]) and ([.spot_requests[].id] == ["sir-1"]) and ([.volumes[].id] == ["vol-used", "vol-free"])'
 expect "inventory: lists without changing anything" "" not_called "terminate-instances"
 run inventory.sh --owner e2e-other
 expect "inventory: lists another owner" "$(dump)" last_json '[.instances[].id] == ["i-0other"]'
@@ -775,7 +778,7 @@ expect "inventory: lists another owner" "$(dump)" last_json '[.instances[].id] =
 fresh inventory-dry-run
 inventory_answers
 run inventory.sh --cleanup
-expect "cleanup: dry run by default" "$(dump)" last_json '.dry_run == true and .cancel_spot_requests == ["sir-1"] and .terminate_instances == ["i-0mine", "i-0pool"] and .delete_volumes == ["vol-free"]'
+expect "cleanup: dry run by default" "$(dump)" last_json '.dry_run == true and .cancel_spot_requests == ["sir-1"] and .terminate_instances == ["i-0mine", "i-0pool", "i-0tenant"] and .delete_volumes == ["vol-free"]'
 expect "cleanup: dry run cancels nothing" "" not_called "cancel-spot-instance-requests"
 expect "cleanup: dry run terminates nothing" "" not_called "terminate-instances"
 
@@ -784,7 +787,8 @@ inventory_answers
 run inventory.sh --cleanup --yes
 expect "cleanup: exit 0" "$(dump)" rc_is 0
 expect "cleanup: cancels the owner's spot requests" "" called "cancel-spot-instance-requests --spot-instance-request-ids sir-1$"
-expect "cleanup: terminates the owner's instances" "" called "terminate-instances --instance-ids i-0mine i-0pool$"
+expect "cleanup: terminates the owner's instances, its tenants' too" "" called "terminate-instances --instance-ids i-0mine i-0pool i-0tenant$"
+expect "cleanup: never terminates an owner that only starts like this one" "" not_called "i-0near"
 expect "cleanup: cancels before it terminates" "$(cat "$STATE/calls")" \
 	[ "$(line_of cancel-spot)" -lt "$(line_of terminate-instances)" ]
 expect "cleanup: never terminates another owner's instance" "" not_called "i-0other"
@@ -984,6 +988,50 @@ expect "up with ssm settings: copies what they name" "" \
 expect "up with ssm settings: each with its own type" "" grep -qx "$S/control/entitlements/beta SecureString" "$STATE/ssm-types"
 expect "up with ssm settings: keeps the shared ones" "" [ -e "$STATE/ssm/fr/e2e/control/entitlements/acme" ]
 
+# Shards: settings added to control/env, the shared job store on a schema of
+# the session's, and the stack's TenantOwner and PoolKeySecretArn.
+vm_fresh vm-up-shard
+ssm_seed /fr/e2e/control/job-events-dsn "postgres://u:DB-SECRET@db.internal/fr"
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack CREATE_COMPLETE)"
+answer invocation 1 "$(inv Success 0 $'active\nfirerunner v1.2.0\n' '')"
+POOL_ARN=arn:aws:secretsmanager:region-1:000000000000:secret:fr-PoolKey-0aaa
+run control-vm.sh up --env FR_TENANTS=db: --env FR_TENANT_LEASES=true --job-store-schema e2e_shards \
+	--tenant-owner e2e-tenants --pool-key-secret "$POOL_ARN"
+expect "up as a shard: exit 0" "$(dump)" rc_is 0
+expect "up as a shard: adds the settings to control/env" "$(ssm_val $S/control/env)" \
+	bash -c "grep -qx 'FR_TENANTS=db:' '$STATE/ssm$S/control/env' && grep -qx 'FR_TENANT_LEASES=true' '$STATE/ssm$S/control/env'"
+expect "up as a shard: the job store on the session's schema" "" \
+	[ "$(ssm_val $S/control/job-events-dsn)" = "postgres://u:DB-SECRET@db.internal/fr?options=-csearch_path%3De2e_shards" ]
+expect "up as a shard: as a SecureString" "" grep -qx "$S/control/job-events-dsn SecureString" "$STATE/ssm-types"
+expect "up as a shard: never passes the URL on a command line" "" not_called DB-SECRET
+# shellcheck disable=SC2016 # $k is jq's
+expect "up as a shard: sets TenantOwner and PoolKeySecretArn" "$(cat "$STATE/create-params.json")" \
+	jqe --arg k "$POOL_ARN" 'map({key: .ParameterKey, value: .ParameterValue}) | from_entries | .TenantOwner == "e2e-tenants" and .PoolKeySecretArn == $k' "$STATE/create-params.json"
+
+# A second shard runs on the first's parameters, and writes none.
+vm_fresh vm-up-share
+answer stack-st-e2e-test 1 "$NOSTACK"
+answer stack-st-e2e-test 2 "$(session_stack CREATE_COMPLETE)"
+answer invocation 1 "$(inv Success 0 $'active\nfirerunner v1.2.0\n' '')"
+run control-vm.sh up --share-prefix-of e2e-other --tenant-owner e2e-tenants
+expect "up on another session's parameters: exit 0" "$(dump)" rc_is 0
+expect "up on another session's parameters: its prefix is that session's" "$(cat "$STATE/create-params.json")" \
+	jqe 'map({key: .ParameterKey, value: .ParameterValue}) | from_entries | .ParameterPrefix == "/fr/e2e/sessions/e2e-other" and .Owner == "e2e-test"' "$STATE/create-params.json"
+expect "up on another session's parameters: writes no parameter" "" not_called "put-parameter"
+
+vm_fresh vm-up-share-missing
+answer stack-st-e2e-test 1 "$NOSTACK"
+run control-vm.sh up --share-prefix-of e2e-nobody
+expect "up on a session that has no parameters: refuses" "$(dump)" rc_is 2
+expect "up on a session that has no parameters: says to bring it up" "" err_has "bring that session up first"
+run control-vm.sh up --share-prefix-of e2e-other --env FR_X=1
+expect "up on another session's parameters with --env: a usage error" "$(dump)" rc_is 2
+run control-vm.sh up --env 'NOT_FR=1'
+expect "up with an --env not FR_: a usage error" "$(dump)" rc_is 2
+run control-vm.sh up --job-store-schema 'Bad;drop'
+expect "up with a schema not a plain name: a usage error" "$(dump)" rc_is 2
+
 vm_fresh vm-up-no-credential
 rm "$STATE/ssm/fr/e2e/control/app-private-key"
 answer stack-st-e2e-test 1 "$NOSTACK"
@@ -1145,7 +1193,7 @@ expect "down: deletes the session's JIT name" "$(cat "$STATE/rr-change.json" 2>&
 expect "down: deletes the session's parameters" "" test ! -e "$STATE/ssm$S/control/tiers" -a ! -e "$STATE/ssm$S/runner-ami"
 expect "down: keeps the shared parameters" "" [ -e "$STATE/ssm/fr/e2e/control/tiers" ]
 expect "down: keeps other sessions' parameters" "" [ -e "$STATE/ssm/fr/e2e/sessions/e2e-other/control/version" ]
-expect "down: reports" "" last_json '.parameters_deleted == 3 and .jit_name_deleted == true and .cleanup.terminate_instances == ["i-0mine", "i-0pool"]'
+expect "down: reports" "" last_json '.parameters_deleted == 3 and .jit_name_deleted == true and .cleanup.terminate_instances == ["i-0mine", "i-0pool", "i-0tenant"]'
 expect "down: no cache bucket, none deleted" "" not_called "delete-bucket"
 
 vm_fresh vm-down-leftover-bucket

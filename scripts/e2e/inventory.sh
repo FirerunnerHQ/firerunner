@@ -7,8 +7,9 @@
 #   scripts/e2e/inventory.sh --cleanup --yes              do it
 #
 # firerunner tags every instance, volume and spot request it creates with
-# firerunner:owner=<FR_OWNER>. This lists those of OWNER (default: your own,
-# see env.sh) that still exist, as one JSON object on stdout:
+# firerunner:owner=<FR_OWNER>, and its tenants' with <FR_OWNER>/<id>. This
+# lists those of OWNER and its tenants (default: your own, see env.sh) that
+# still exist, as one JSON object on stdout:
 #   {owner, instances: [{id, state, type, tier, runner, pool, launched, spot_request}],
 #    spot_requests: [{id, state, type, instance}], volumes: [{id, state}],
 #    control_vms: [live control VMs of OWNER]}
@@ -58,10 +59,10 @@ fi
 e2e_aws
 e2e_need_cmd jq
 
-tag="Name=tag:firerunner:owner,Values=$owner"
+tag="Name=tag:firerunner:owner,Values=$owner,$owner/*"
 # Each list is filtered again on the tag here, so a filter typo cannot widen it.
 # shellcheck disable=SC2016 # a jq program
-mine_only='((.Tags // []) | from_entries)["firerunner:owner"] == $o'
+mine_only='((.Tags // []) | from_entries)["firerunner:owner"] as $w | $w == $o or ($w // "" | startswith($o + "/"))'
 instances="$(aws ec2 describe-instances --output json --filters "$tag" \
 	Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down |
 	jq -c --arg o "$owner" "[.Reservations[].Instances[] | select($mine_only) | ((.Tags // []) | from_entries) as \$t | {
