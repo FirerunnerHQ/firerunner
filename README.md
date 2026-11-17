@@ -354,7 +354,11 @@ reaper to `<Owner>` and `<Owner>/*`; a shard's role also needs
 `<tenant-owner>/*`, which no template parameter grants yet. A shard refuses to start beside a live one whose
 `--tenant-owner` differs or whose `--owner` is the same. `firerunner status`
 shows the shard and how many installations it holds; `firerunner doctor`
-warns while renewals fail (`tenant-leases`).
+warns while renewals fail (`tenant-leases`). `firerunner tenant shards`
+(`--json`), run anywhere with the job store's settings, shows them all at
+once from the database: each shard and its state, which shard serves or
+is assigned each installation and why one is not served, the removals not
+yet cleaned up, and a list of problems.
 
 **When one installation fails.** Each installation of the list runs in a loop
 of its own. A failure there (a start GitHub refuses, a scale set deleted, a

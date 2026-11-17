@@ -41,6 +41,10 @@ const tenantUsage = `usage:
       first as the daemon checks one; a tenant it leaves out is removed
   firerunner tenant export [--env-file FILE|none]
       print the job store's tenants list
+  firerunner tenant shards [--env-file FILE|none] [--json]
+      show the daemons that share that list under --tenant-leases (shards):
+      which serves each tenant, which assigns, the removals not yet cleaned
+      up, and the problems, from the job store; writes nothing
 
 ID is a tenant's id in the --tenants catalog, or _install for the install's
 own tiers. SPEC is where the daemon reads tenant states, as its
@@ -114,8 +118,10 @@ type tenantOpeners struct {
 	// guardDuty returns the client and this account's id, whose findings
 	// alone count ("" for every account's).
 	guardDuty func() (guardduty.API, string, error)
-	// list connects to the tenants table of --tenants db:.
-	list func(*config.Config) (tenantListStore, error)
+	// list connects to the tenants table of --tenants db:, and shards to
+	// the shards' tables beside it.
+	list   func(*config.Config) (tenantListStore, error)
+	shards func(*config.Config) (shardsStore, error)
 }
 
 // tenantArgs are the subcommand's parsed arguments.
@@ -144,7 +150,7 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) (cod
 		return 0
 	}
 	switch args[0] {
-	case "suspend", "resume", "clear-flag", "list", "findings", "import", "export":
+	case "suspend", "resume", "clear-flag", "list", "findings", "import", "export", "shards":
 	default:
 		return usageErr("firerunner tenant: unknown action %q", args[0])
 	}
@@ -156,6 +162,9 @@ func tenantCmd(args []string, stdout, stderr io.Writer, open tenantOpeners) (cod
 	}
 	if args[0] == "import" || args[0] == "export" {
 		return tenantListCmd(append([]string{args[0]}, rest...), stdout, stderr, open.list)
+	}
+	if args[0] == "shards" {
+		return tenantShardsCmd(rest, stdout, stderr, open.shards)
 	}
 	a, help, err := parseTenantArgs(append([]string{args[0]}, rest...))
 	if help {
@@ -446,6 +455,7 @@ func openTenant() tenantOpeners {
 		states: func(spec string) (tenantstate.Store, error) { return tenantstate.Open(spec, newSSM) },
 		flags:  func(spec string) (tenantstate.FlagStore, error) { return tenantstate.OpenFlags(spec, newSSM) },
 		list:   openTenantList,
+		shards: openShards,
 		guardDuty: func() (guardduty.API, string, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
