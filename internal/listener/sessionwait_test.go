@@ -1,0 +1,63 @@
+package listener
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+// sessionOpener answers a session conflict the first busy times, then opens.
+func sessionOpener(busy int, other error) (func(context.Context) (int, error), *int) {
+	tries := 0
+	return func(context.Context) (int, error) {
+		tries++
+		if other != nil {
+			return 0, other
+		}
+		if tries <= busy {
+			return 0, errors.New("409 Conflict: the runner scale set already has an active session")
+		}
+		return tries, nil
+	}, &tries
+}
+
+// Without wait, a conflict is retried as long as a crashed process's hold
+// lasts, then fails; with it, for as long as the context lasts, as a standby
+// for another daemon's session.
+func TestRetrySession(t *testing.T) {
+	ctx := context.Background()
+	open, tries := sessionOpener(sessionAttempts+5, nil)
+	if _, err := retrySession(ctx, open, false, time.Millisecond, testLogger()); err == nil || *tries != sessionAttempts {
+		t.Fatalf("without wait: %v after %d tries, want the conflict after %d", err, *tries, sessionAttempts)
+	}
+
+	open, tries = sessionOpener(sessionAttempts+5, nil)
+	got, err := retrySession(ctx, open, true, time.Millisecond, testLogger())
+	if err != nil || got != sessionAttempts+6 {
+		t.Fatalf("with wait: %d, %v after %d tries, want the session at try %d", got, err, *tries, sessionAttempts+6)
+	}
+
+	cctx, cancel := context.WithCancel(ctx)
+	open, _ = sessionOpener(1<<30, nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := retrySession(cctx, open, true, time.Millisecond, testLogger())
+		done <- err
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("with wait, cancelled: %v, want the context's error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("with wait: did not stop with its context")
+	}
+
+	other := errors.New("401 Unauthorized")
+	open, tries = sessionOpener(0, other)
+	if _, err := retrySession(ctx, open, true, time.Millisecond, testLogger()); !errors.Is(err, other) || *tries != 1 {
+		t.Fatalf("another error: %v after %d tries, want it at once", err, *tries)
+	}
+}

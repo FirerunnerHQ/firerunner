@@ -577,6 +577,10 @@ type File struct {
 	// the daemon has one. A list read but rejected counts as a failed read:
 	// the tenants served stay as they were.
 	TenantCatalog *TenantStates `json:"tenant_catalog,omitempty"`
+	// InstallStandby is set while the install's own tiers wait for their
+	// scale sets' sessions, which another shard of the same configuration
+	// holds (--tenant-leases): this one takes them over when that one stops.
+	InstallStandby bool `json:"install_standby,omitempty"`
 	// TenantLeases is how renewing the tenants' leases goes, when the
 	// daemon serves them under leases (--tenant-leases).
 	TenantLeases *TenantLeases `json:"tenant_leases,omitempty"`

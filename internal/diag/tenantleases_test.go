@@ -128,6 +128,13 @@ func TestStatusAndDoctorShowTheTenantLeases(t *testing.T) {
 		t.Fatalf("doctor before a renewal = %+v", c)
 	}
 
+	f.InstallStandby = true
+	write()
+	if s := status(); !strings.Contains(s, "the install's tiers: standing by") {
+		t.Fatalf("status of a shard standing by for the install:\n%s", s)
+	}
+	f.InstallStandby = false
+
 	f.TenantLeases = nil
 	write()
 	if c := check(); c != nil {

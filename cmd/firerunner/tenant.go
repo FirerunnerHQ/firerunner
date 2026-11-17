@@ -41,7 +41,11 @@ type tenant struct {
 	URL         string
 	RunnerGroup string
 	KeepOnClose bool
-	Token       string
+	// WaitForSession stands its tiers by while another daemon holds their
+	// scale sets' sessions, rather than failing (listener.Config): the
+	// install of a shard under leases, which every shard runs.
+	WaitForSession bool
+	Token          string
 	// Auth is App's installation, with JWTs signed once for the whole shard.
 	Auth  ghauth.App
 	Tiers []config.Tier
@@ -194,11 +198,12 @@ func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tr
 		MaxRunners:   tier.Max,
 		// A named install outlives its process: keep its scale set across
 		// restarts and control VM replacements.
-		KeepOnClose: t.KeepOnClose,
-		Token:       t.Token,
-		App:         t.Auth,
-		Version:     version,
-		Logger:      log,
+		KeepOnClose:    t.KeepOnClose,
+		WaitForSession: t.WaitForSession,
+		Token:          t.Token,
+		App:            t.Auth,
+		Version:        version,
+		Logger:         log,
 	}
 }
 

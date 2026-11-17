@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -1288,21 +1289,6 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		s.watchFindings(ctx, cfg, owner, api, store, account, log)
 	}
 
-	served, err := s.start(ctx, t, hooks)
-	if err != nil {
-		return err
-	}
-	defer served.close(context.WithoutCancel(ctx))
-	live.add(served)
-
-	log.Info("firerunner starting",
-		"url", cfg.URL,
-		"tiers", len(served.tiers),
-		"tenants", cfg.TenantsPath,
-		"maxRunners", cfg.MaxRunners,
-	)
-	served.logTiers()
-
 	if s.fc != nil {
 		// Reclaim taps and job dirs orphaned by a previous unclean exit before
 		// we start allocating new slots, so a crash-restart cycle can't exhaust
@@ -1432,6 +1418,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		f.Tenants = live.tenants(states, flags)
 		s.entitlementHealth(f)
+		f.InstallStandby = installStandby.Load()
 		f.TenantCatalog, f.TenantLeases = nil, nil
 		if catalog != nil {
 			f.TenantCatalog = catalog.status()
@@ -1441,10 +1428,37 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 	}, log)
 
-	// A panic in one of the install's own tiers restarts the daemon, after
-	// a drain no longer than its runners' lifetime.
-	installPanic := sync.OnceFunc(func() { _ = guardAfterPanic(nil, panicStopLimit(served.t.Limits.JobDuration), "the install", log) })
-	runErr := serveTiers(runCtx, cancel, served.names(), served.runs(cfg), installPanic, log)
+	// The install's own tiers start after the tenants, which do not wait on
+	// them. Under leases, every shard runs the same configuration, and so
+	// the same install: GitHub gives its scale sets' sessions to one shard
+	// at a time, and the others stand by to take them over, as long as it
+	// takes, launching nothing meanwhile.
+	t.WaitForSession = cfg.TenantLeases
+	if t.WaitForSession {
+		installStandby.Store(true)
+	}
+	// ctx, not runCtx: the pool and reaper it starts run on through a drain.
+	served, runErr := s.start(ctx, t, hooks)
+	installStandby.Store(false)
+	if runErr == nil {
+		defer served.close(context.WithoutCancel(ctx))
+		live.add(served)
+		log.Info("firerunner starting",
+			"url", cfg.URL,
+			"tiers", len(served.tiers),
+			"tenants", cfg.TenantsPath,
+			"maxRunners", cfg.MaxRunners,
+		)
+		served.logTiers()
+
+		// A panic in one of the install's own tiers restarts the daemon,
+		// after a drain no longer than its runners' lifetime.
+		installPanic := sync.OnceFunc(func() { _ = guardAfterPanic(nil, panicStopLimit(served.t.Limits.JobDuration), "the install", log) })
+		runErr = serveTiers(runCtx, cancel, served.names(), served.runs(cfg), installPanic, log)
+	} else if runCtx.Err() == nil {
+		// The install did not start: stop the tenants as on any exit.
+		log.Error("the install's tiers did not start; stopping", "err", runErr)
+	}
 	cancel()
 	if leaser != nil {
 		// The assigner moves this shard's tenants to the others now.
@@ -1456,7 +1470,9 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	stopHealth()
 
 	log.Info("shutdown signalled, draining in-flight microVMs")
-	served.drain(s.handsOff(ctx))
+	if served != nil {
+		served.drain(s.handsOff(ctx))
+	}
 	tenants.wait()
 	if leaser != nil {
 		// Every tenant's sessions are closed: another shard may take them.
@@ -1469,3 +1485,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	return nil
 }
+
+// installStandby is set while the install's tiers wait for sessions
+// another shard holds (--tenant-leases), for health.
+var installStandby atomic.Bool

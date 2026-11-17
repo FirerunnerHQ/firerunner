@@ -36,6 +36,13 @@ type Config struct {
 	// is replaced) keeps one scale set across restarts: deleting it on
 	// every graceful stop would make each deploy recreate it.
 	KeepOnClose bool
+	// WaitForSession waits for the scale set's message session for as long
+	// as the context lasts, at start and at each reconnect, rather than
+	// failing once a crashed process's hold should have expired: another
+	// daemon serving the same scale set holds it (a shard of one tenants
+	// list, all on one configuration), and this one stands by to take it
+	// over. GitHub gives the session to one listener at a time.
+	WaitForSession bool
 
 	// Auth: a personal access token, or a GitHub App (preferred, per GitHub).
 	Token string
@@ -147,7 +154,7 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		return nil, err
 	}
 
-	first, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.Logger)
+	first, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.WaitForSession, cfg.Logger)
 	if err != nil {
 		if !reused {
 			// Best-effort cleanup of the scale set we just created.
@@ -175,7 +182,7 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	})
 	s.jitClients.seed(client)
 	s.open = func(ctx context.Context) (session, error) {
-		sess, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.Logger)
+		sess, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.WaitForSession, cfg.Logger)
 		if err != nil {
 			return nil, err
 		}
@@ -225,30 +232,52 @@ func registerScaleSet(ctx context.Context, client *scaleset.Client, cfg Config, 
 // session conflict. After an unclean shutdown (SIGKILL, OOM, power loss) the
 // previous session stays active server-side until it times out (~1 min), so a
 // restarting service would otherwise crash-loop. Retrying lets it self-heal.
-// Any non-conflict error (e.g. bad auth) fails fast.
-func openSessionWithRetry(ctx context.Context, client *scaleset.Client, scaleSetID int, owner string, log *slog.Logger) (*scaleset.MessageSessionClient, error) {
-	const attempts = 12
-	const delay = 10 * time.Second
+// Any non-conflict error (e.g. bad auth) fails fast. With wait, a conflict
+// is retried for as long as ctx lasts: another live daemon holds it.
+func openSessionWithRetry(ctx context.Context, client *scaleset.Client, scaleSetID int, owner string, wait bool, log *slog.Logger) (*scaleset.MessageSessionClient, error) {
+	return retrySession(ctx, func(ctx context.Context) (*scaleset.MessageSessionClient, error) {
+		return client.MessageSessionClient(ctx, scaleSetID, owner)
+	}, wait, sessionRetryDelay, log)
+}
 
+// sessionRetryDelay is how long to wait between attempts at a session
+// another holds; sessionAttempts how many, but with wait.
+const (
+	sessionRetryDelay = 10 * time.Second
+	sessionAttempts   = 12
+)
+
+// retrySession opens a session with open, retrying a conflict every delay:
+// sessionAttempts times, or, with wait, until ctx ends.
+func retrySession[S any](ctx context.Context, open func(context.Context) (S, error), wait bool, delay time.Duration, log *slog.Logger) (S, error) {
+	var zero S
 	var err error
-	for i := 0; i < attempts; i++ {
-		var session *scaleset.MessageSessionClient
-		session, err = client.MessageSessionClient(ctx, scaleSetID, owner)
+	for i := 0; wait || i < sessionAttempts; i++ {
+		var session S
+		session, err = open(ctx)
 		if err == nil {
+			if wait && i > 0 {
+				log.Info("took over the scale set's message session", "after", i)
+			}
 			return session, nil
 		}
 		if !isSessionConflict(err) {
-			return nil, err
+			return zero, err
 		}
-		log.Warn("scale set session still held by a previous run; waiting for it to expire",
-			"attempt", i+1, "maxAttempts", attempts)
+		switch {
+		case !wait:
+			log.Warn("scale set session still held by a previous run; waiting for it to expire",
+				"attempt", i+1, "maxAttempts", sessionAttempts)
+		case i == 0:
+			log.Info("another daemon holds the scale set's message session: standing by to take it over")
+		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return zero, ctx.Err()
 		case <-time.After(delay):
 		}
 	}
-	return nil, err
+	return zero, err
 }
 
 // isSessionConflict reports whether err is GitHub's "scale set already has an

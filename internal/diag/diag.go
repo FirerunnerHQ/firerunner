@@ -488,6 +488,9 @@ func renderStatusText(r StatusReport, w io.Writer) {
 					humanDuration(time.Since(tc.LastErrorAt).Truncate(time.Second)), truncate(tc.LastError, 200))
 			}
 		}
+		if l.InstallStandby {
+			fmt.Fprintln(w, "  the install's tiers: standing by; another shard holds their scale sets' sessions, and this one takes them over when it stops")
+		}
 		if tl := l.TenantLeases; tl != nil {
 			last := "never"
 			if !tl.LastRenewed.IsZero() {
