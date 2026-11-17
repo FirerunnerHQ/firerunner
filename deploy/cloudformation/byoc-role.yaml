@@ -33,6 +33,15 @@ Parameters:
     Type: String
     AllowedPattern: "[A-Za-z0-9][A-Za-z0-9._-]{0,62}"
     Description: The install's firerunner:owner tag; the role touches only instances carrying it.
+  TenantOwner:
+    Type: String
+    Default: ""
+    AllowedPattern: "([A-Za-z0-9][A-Za-z0-9._-]{0,62})?"
+    Description: >-
+      The tenants' firerunner:owner tag (FR_TENANT_OWNER), when not this
+      install's Owner: their instances carry <TenantOwner>/<id>. Daemons that
+      share one tenants list under leases (--tenant-leases) share it, each
+      with an Owner of its own. Empty: Owner.
   ParameterPrefix:
     Type: String
     Default: /firerunner
@@ -40,6 +49,7 @@ Parameters:
     Description: SSM path the control plane may read runner AMI parameters under.
 
 Conditions:
+  HasTenantOwner: !Not [!Equals [!Ref TenantOwner, ""]]
   OneRole: !Not [!Equals [!Ref TrustedRoleName, ""]]
 
 Resources:
@@ -73,7 +83,7 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
-                Condition: { StringLike: { "aws:RequestTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] } }
+                Condition: { StringLike: { "aws:RequestTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] } }
               - Effect: Allow
                 Action: ec2:RunInstances
                 Resource:
@@ -95,12 +105,12 @@ Resources:
                 Resource: "*"
                 Condition:
                   StringEquals: { ec2:CreateAction: RunInstances }
-                  StringLike: { "aws:RequestTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] }
+                  StringLike: { "aws:RequestTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] }
               - Effect: Allow
                 Action: ec2:CreateTags
                 Resource: "*"
                 Condition:
-                  StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] }
+                  StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] }
                   ForAllValues:StringNotEquals: { aws:TagKeys: [firerunner:owner] }
               - Effect: Allow
                 Action:
@@ -119,11 +129,11 @@ Resources:
               - Effect: Allow
                 Action: [ec2:TerminateInstances, ec2:StartInstances, ec2:ModifyInstanceAttribute]
                 Resource: "*"
-                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] } }
+                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] } }
               - Effect: Allow
                 Action: ec2:CancelSpotInstanceRequests
                 Resource: "*"
-                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] } }
+                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] } }
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/*"

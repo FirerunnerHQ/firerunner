@@ -350,8 +350,12 @@ next shard finds the runners handed to it. Each needs an `--owner` of its
 own, for its own tiers and pool, and with EC2 tiers the same pool key
 (`FR_EC2_POOL_KEY_FILE`), by which the next shard proves those runners are
 its to end. The CloudFormation templates scope the control VM's role and the
-reaper to `<Owner>` and `<Owner>/*`; a shard's role also needs
-`<tenant-owner>/*`, which no template parameter grants yet. A shard refuses to start beside a live one whose
+reaper to `<Owner>` and `<Owner>/*`, and to `<TenantOwner>/*` when their
+`TenantOwner` parameter is set, which the bootstrap passes on as
+`FR_TENANT_OWNER`. Each shard runs in a stack of its own, all on one
+`ParameterPrefix`, so that they read one `control/env` (where
+`FR_TENANTS=db:` and `FR_TENANT_LEASES=true` go), one tenant state and one
+set of entitlements, and with one pool key (`PoolKeySecretArn`). A shard refuses to start beside a live one whose
 `--tenant-owner` differs or whose `--owner` is the same. `firerunner status`
 shows the shard and how many installations it holds; `firerunner doctor`
 warns while renewals fail (`tenant-leases`). `firerunner tenant shards`

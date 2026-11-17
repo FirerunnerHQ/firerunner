@@ -113,6 +113,15 @@ setenv() {
 	envs+=("$1=$2")
 }
 
+# has_env NAME: whether a setting of NAME has been added.
+has_env() {
+	local kv
+	for kv in "${envs[@]}"; do
+		[ "${kv%%=*}" = "$1" ] && return 0
+	done
+	return 1
+}
+
 # parse_env TEXT: add the settings in $FR_PREFIX/control/env. Each line is
 # blank, a # comment, or FR_NAME=value, the value plain or in one pair of
 # single or double quotes. Anything else fails, naming the line's number but
@@ -164,6 +173,15 @@ env_text=$(param env)
 parse_env "$env_text"
 setenv FR_TIERS "$etc/tiers.json"
 setenv FR_OWNER "$FR_OWNER"
+# The VM's role covers <TenantOwner>/* of the stack alone: one named in
+# control/env would have every launch for a tenant denied.
+if has_env FR_TENANT_OWNER; then
+	log "$FR_PREFIX/control/env sets FR_TENANT_OWNER: set the stack's TenantOwner parameter instead, which the VM's role covers"
+	false
+fi
+if [ -n "${FR_TENANT_OWNER:-}" ]; then
+	setenv FR_TENANT_OWNER "$FR_TENANT_OWNER"
+fi
 setenv FR_AWS_REGION "$AWS_REGION"
 setenv FR_JIT_ADDR "$ip:$FR_JIT_PORT"
 setenv FR_JIT_HOST "$FR_JIT_HOST"
@@ -210,7 +228,9 @@ fi
 # The daemon reads its tenants from this parameter every 30 s, and starts,
 # changes and stops them to match: a tenant needs no new VM. Until the
 # parameter exists, there are none; once read, removing them all takes [].
-setenv FR_TENANTS "ssm:$FR_PREFIX/control/tenants"
+# Unless the operator names another source in control/env, such as db:
+# for daemons that share a list under --tenant-leases.
+has_env FR_TENANTS || setenv FR_TENANTS "ssm:$FR_PREFIX/control/tenants"
 # Suspensions live under this path; the daemon reads it every 15 s. A stack
 # made before the VM's role could read it leaves suspension off, rather than
 # a daemon that cannot read whether its tenants are suspended. Any other

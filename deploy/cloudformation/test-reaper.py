@@ -103,8 +103,8 @@ class FakeSecrets:
 
 
 class ReaperTest(unittest.TestCase):
-    def run_reaper(self, instances, dry_run="false", **fake):
-        mod = load({"OWNER": "acme", "MAX_AGE_MINUTES": "720", "DRY_RUN": dry_run})
+    def run_reaper(self, instances, dry_run="false", tenant_owner="", **fake):
+        mod = load({"OWNER": "acme", "TENANT_OWNER": tenant_owner, "MAX_AGE_MINUTES": "720", "DRY_RUN": dry_run})
         ec2 = FakeEC2(instances, **fake)
         out = mod.handler({}, None, ec2=ec2, now=NOW)
         return out, ec2
@@ -118,6 +118,12 @@ class ReaperTest(unittest.TestCase):
         _, ec2 = self.run_reaper([])
         self.assertIn({"Name": "tag:firerunner:owner", "Values": ["acme", "acme/*"]}, ec2.filters)
         self.assertIn({"Name": "instance-state-name", "Values": ["pending", "running", "stopped"]}, ec2.filters)
+
+    def test_scoped_to_the_tenants_owner_too(self):
+        # Daemons that share a tenants list tag the tenants' instances
+        # <tenant owner>/<id>, apart from each daemon's own owner.
+        _, ec2 = self.run_reaper([], tenant_owner="fr")
+        self.assertIn({"Name": "tag:firerunner:owner", "Values": ["acme", "acme/*", "fr/*"]}, ec2.filters)
 
     def test_cancels_the_spot_request_before_terminating(self):
         _, ec2 = self.run_reaper([inst("i-spot", 800, spot="sir-1")])

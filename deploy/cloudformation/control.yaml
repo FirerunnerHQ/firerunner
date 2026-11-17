@@ -12,6 +12,15 @@ Parameters:
       This install's firerunner:owner tag (FR_OWNER). Every replacement VM
       uses it, so it takes over its predecessor's pool and leftovers. Scopes
       the VM's terminate/start/modify permissions.
+  TenantOwner:
+    Type: String
+    Default: ""
+    AllowedPattern: "([A-Za-z0-9][A-Za-z0-9._-]{0,62})?"
+    Description: >-
+      The tenants' firerunner:owner tag (FR_TENANT_OWNER), when not this
+      install's Owner: their instances carry <TenantOwner>/<id>. Daemons that
+      share one tenants list under leases (--tenant-leases) share it, each
+      with an Owner of its own. Empty: Owner.
   VpcId:
     Type: AWS::EC2::VPC::Id
   SubnetIds:
@@ -83,6 +92,17 @@ Parameters:
       An AWS KMS key holding the GitHub App's private key (see the README,
       "Keeping the App key in KMS"). Set, the VM signs with it and is given
       no key: <prefix>/control/app-private-key is not read.
+  PoolKeySecretArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "(arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+)?"
+    Description: >-
+      A Secrets Manager secret holding the pool key, instead of the one this
+      stack makes: daemons that share a tenants list under leases each run in
+      a stack of their own, and must sign with one key, so that each proves
+      the runners another hands it are its to end. Give each stack the same
+      secret, say the first stack's PoolKeySecret output; it must outlive
+      them all. Empty: this stack's own.
   RootVolumeGiB:
     Type: Number
     Default: 30
@@ -92,10 +112,12 @@ Parameters:
       local blobs, copies and staged uploads are capped to a share of it.
 
 Conditions:
+  HasTenantOwner: !Not [!Equals [!Ref TenantOwner, ""]]
   CreateZone: !Equals [!Ref HostedZoneId, ""]
   CacheOn: !Not [!Equals [!Ref Cache, "off"]]
   CacheS3: !Equals [!Ref Cache, "s3"]
   AppKeyInKMS: !Not [!Equals [!Ref AppKMSKeyArn, ""]]
+  OwnPoolKey: !Equals [!Ref PoolKeySecretArn, ""]
 
 Resources:
   Zone:
@@ -175,7 +197,7 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
-                Condition: { StringLike: { "aws:RequestTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] } }
+                Condition: { StringLike: { "aws:RequestTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] } }
               - Effect: Allow
                 Action: ec2:RunInstances
                 Resource:
@@ -197,12 +219,12 @@ Resources:
                 Resource: "*"
                 Condition:
                   StringEquals: { ec2:CreateAction: RunInstances }
-                  StringLike: { "aws:RequestTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] }
+                  StringLike: { "aws:RequestTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] }
               - Effect: Allow
                 Action: ec2:CreateTags
                 Resource: "*"
                 Condition:
-                  StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] }
+                  StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] }
                   ForAllValues:StringNotEquals: { aws:TagKeys: [firerunner:owner] }
               - Effect: Allow
                 Action:
@@ -221,11 +243,11 @@ Resources:
               - Effect: Allow
                 Action: [ec2:TerminateInstances, ec2:StartInstances, ec2:ModifyInstanceAttribute]
                 Resource: "*"
-                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] } }
+                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] } }
               - Effect: Allow
                 Action: ec2:CancelSpotInstanceRequests
                 Resource: "*"
-                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*"] } }
+                Condition: { StringLike: { "aws:ResourceTag/firerunner:owner": [!Ref Owner, !Sub "${Owner}/*", !If [HasTenantOwner, !Sub "${TenantOwner}/*", !Sub "${Owner}/*"]] } }
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/*"
@@ -286,7 +308,7 @@ Resources:
               # The pool key, and no other secret.
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Ref PoolKey
+                Resource: !If [OwnPoolKey, !Ref PoolKey, !Ref PoolKeySecretArn]
               - Effect: Allow
                 Action: autoscaling:SetInstanceHealth
                 Resource: !Sub "arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-control"
@@ -304,6 +326,7 @@ Resources:
   # end.
   PoolKey:
     Type: AWS::SecretsManager::Secret
+    Condition: OwnPoolKey
     Properties:
       Description: !Sub "firerunner (${AWS::StackName}): the key that signs EC2 pool instances"
       GenerateSecretString:
@@ -539,6 +562,7 @@ Resources:
               cat > /etc/firerunner/bootstrap.env <<'EOF'
               FR_PREFIX=${ParameterPrefix}
               FR_OWNER=${Owner}
+              FR_TENANT_OWNER=${TenantOwner}
               FR_ASG=${AWS::StackName}-control
               FR_ZONE_ID=${ZoneId}
               FR_JIT_HOST=${JitName}.${ZoneName}
@@ -550,7 +574,7 @@ Resources:
               FR_CACHE_ROLE_ARN=${CacheRoleArn}
               FR_ROOT_GIB=${RootVolumeGiB}
               FR_APP_KMS_KEY=${AppKMSKeyArn}
-              FR_POOL_KEY_SECRET=${PoolKey}
+              FR_POOL_KEY_SECRET=${PoolKeySecretRef}
               EOF
               version=$(aws ssm get-parameter --name ${ParameterPrefix}/control/version --query Parameter.Value --output text)
               case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) false ;; esac
@@ -572,6 +596,7 @@ Resources:
               # IAM may show CacheAssume a little after it exists; the daemon
               # retries until it may assume the role.
               CacheRoleArn: !If [CacheS3, !GetAtt CacheRole.Arn, ""]
+              PoolKeySecretRef: !If [OwnPoolKey, !Ref PoolKey, !Ref PoolKeySecretArn]
 
   ControlGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -612,8 +637,8 @@ Outputs:
   ParameterPrefix:
     Value: !Ref ParameterPrefix
   PoolKeySecret:
-    Description: The pool key's secret; give it to reaper.yaml so that it ends only what this install launched.
-    Value: !Ref PoolKey
+    Description: The pool key's secret; give it to reaper.yaml so that it ends only what this install launched, and to the other shards' stacks (PoolKeySecretArn).
+    Value: !If [OwnPoolKey, !Ref PoolKey, !Ref PoolKeySecretArn]
   CacheBucket:
     Condition: CacheS3
     Description: cache-server's bucket (prefix firerunner-cache/); kept when the stack is deleted.
