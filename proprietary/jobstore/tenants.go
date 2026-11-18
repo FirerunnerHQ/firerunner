@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -20,6 +21,8 @@ var ErrNoTenants = errors.New("the job store has no tenants table yet")
 // one place. It holds each entry as written; checking one is the caller's.
 type TenantStore struct {
 	pool *pgxpool.Pool
+	// prepared is set once this process has set the database up.
+	prepared atomic.Bool
 }
 
 // OpenTenants connects to the store's database. It fails only on a URL that
