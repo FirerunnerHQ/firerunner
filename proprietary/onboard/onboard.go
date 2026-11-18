@@ -4,11 +4,11 @@
 //
 // A webhook is a trigger, not the truth: GitHub delivers each at least
 // once, in any order, and does not retry a failed one by itself. So a
-// delivery is verified, applied once, under a lock on its account (an
-// organization has one installation of the App at a time, and keeps its
-// tenant id across reinstalls), and, with Config.Lookup, applies the
-// installation's state as GitHub reports it then, not as the event says.
-// Without Lookup an event older than the one applied for its installation
+// delivery is verified and applied once, beside no other delivery, to its
+// account: an organization has one installation of the App at a time, and
+// keeps its tenant id across reinstalls. With Config.Lookup it applies the
+// installation's state as GitHub reports it then, not as the event says;
+// without, an event older than the one applied for its installation
 // changes nothing.
 //
 // An organization's rename reaches the tenant's URL at the installation's
@@ -106,7 +106,7 @@ type Outcome struct {
 
 // Store is where deliveries are applied; a *jobstore.TenantStore.
 type Store interface {
-	Onboard(ctx context.Context, delivery, event string, account int64, fn func(jobstore.OnboardTx) (string, error)) (string, error)
+	Onboard(ctx context.Context, delivery, event string, fn func(jobstore.OnboardTx) (string, error)) (string, error)
 }
 
 // ErrSignature is a delivery whose signature does not hold: not GitHub's,
@@ -170,7 +170,7 @@ func Handle(ctx context.Context, cfg Config, store Store, d Delivery) (Outcome, 
 		return out, errors.New("installation event: no installation id, account or updated_at")
 	}
 	out.Action, out.Installation, out.Account = ev.Action, in.ID, in.Account.Login
-	recorded, err := store.Onboard(ctx, d.ID, d.Event, in.Account.ID, func(tx jobstore.OnboardTx) (string, error) {
+	recorded, err := store.Onboard(ctx, d.ID, d.Event, func(tx jobstore.OnboardTx) (string, error) {
 		o := out
 		if err := apply(ctx, cfg, tx, ev, &o); err != nil {
 			return "", err
@@ -185,7 +185,7 @@ func Handle(ctx context.Context, cfg Config, store Store, d Delivery) (Outcome, 
 }
 
 // apply moves the installation to the state it is in, and its account's
-// tenant with it. The caller holds the account for the transaction.
+// tenant with it. No other delivery runs beside it.
 func apply(ctx context.Context, cfg Config, tx jobstore.OnboardTx, ev installationEvent, out *Outcome) error {
 	in := ev.Installation
 	login, kind := in.Account.Login, in.Account.Type
@@ -196,6 +196,10 @@ func apply(ctx context.Context, cfg Config, tx jobstore.OnboardTx, ev installati
 			return fmt.Errorf("read installation %d from GitHub: %w", in.ID, err)
 		}
 		switch {
+		case !o.Found && ev.Action != "deleted":
+			// deleted is final: one lookup racing a creation, or a
+			// transient 404, must not make it so. A retry decides.
+			return fmt.Errorf("installation %d: GitHub does not have it, but the event is %s", in.ID, ev.Action)
 		case !o.Found:
 			state = "deleted"
 		case o.AccountID != in.Account.ID:
@@ -241,39 +245,43 @@ func apply(ctx context.Context, cfg Config, tx jobstore.OnboardTx, ev installati
 	}
 
 	// An account has one installation at a time, and GitHub numbers them
-	// in order: an event of an older one is history.
+	// in order: an older one is gone once a newer one exists, whatever its
+	// own events say, or whether they arrive at all.
 	latest, hasLatest, err := tx.LatestInstallation(ctx, in.Account.ID, in.ID)
 	if err != nil {
 		return err
 	}
-	if hasLatest && latest.ID > in.ID {
-		next.State, next.Reason = "deleted", fmt.Sprintf("superseded by installation %d", latest.ID)
-		out.Result, out.Reason = "stale", "the account has a newer installation"
-		return tx.PutInstallation(ctx, next)
-	}
 	if next.Tenant == "" && hasLatest {
 		next.Tenant = latest.Tenant
 	}
+	if hasLatest && latest.ID > in.ID {
+		if err := supersede(ctx, tx, &next, latest.ID); err != nil {
+			return err
+		}
+		out.Result, out.Reason = "stale", "the account has a newer installation"
+		return tx.PutInstallation(ctx, next)
+	}
+	older := hasLatest && latest.State != "deleted"
 
 	switch state {
 	case "active":
-		reason, err := list(ctx, cfg, tx, &next, login, kind, latest, hasLatest)
+		reason, listed, err := list(ctx, cfg, tx, &next, login, kind, latest, hasLatest)
 		if err != nil {
 			return err
 		}
-		if reason != "" {
+		switch {
+		case reason != "" && listed:
+			// An entry listed before stays as it was, and so does the
+			// installation's state, which keeps it from an import.
+			next.State, next.Reason = "active", reason
+			out.Result, out.Reason, out.Tenant = "refused", reason+"; its tenant stays listed as it was", next.Tenant
+		case reason != "":
 			next.State, next.Reason = "refused", reason
 			out.Result, out.Reason, out.Tenant = "refused", reason, ""
-			return tx.PutInstallation(ctx, next)
+		default:
+			next.State, next.Reason = "active", ""
+			out.Result, out.Tenant = "listed", next.Tenant
 		}
-		if hasLatest && latest.State != "deleted" {
-			latest.State, latest.Reason = "deleted", fmt.Sprintf("superseded by installation %d", in.ID)
-			if err := tx.PutInstallation(ctx, latest); err != nil {
-				return err
-			}
-		}
-		next.State, next.Reason = "active", ""
-		out.Result, out.Tenant = "listed", next.Tenant
 	case "suspended", "deleted":
 		if next.Tenant != "" {
 			// Only if the entry is still this installation's: a newer one
@@ -285,65 +293,120 @@ func apply(ctx context.Context, cfg Config, tx jobstore.OnboardTx, ev installati
 		next.State, next.Reason = state, ""
 		out.Result = map[string]string{"suspended": "suspended", "deleted": "removed"}[state]
 	}
+	if older {
+		// This installation exists, so the older one does not: its tenant
+		// goes unless this one just took it over.
+		if err := supersede(ctx, tx, &latest, in.ID); err != nil {
+			return err
+		}
+		if err := tx.PutInstallation(ctx, latest); err != nil {
+			return err
+		}
+	}
 	return tx.PutInstallation(ctx, next)
 }
 
-// list lists the installation's tenant, or returns why it gets none.
-func list(ctx context.Context, cfg Config, tx jobstore.OnboardTx, next *jobstore.Installation, login, kind string, latest jobstore.Installation, hasLatest bool) (string, error) {
+// supersede marks an installation deleted for a newer one on its account,
+// and deletes its tenant if its entry is still the installation's.
+func supersede(ctx context.Context, tx jobstore.OnboardTx, in *jobstore.Installation, newer int64) error {
+	if in.Tenant != "" {
+		if _, err := tx.DeleteTenant(ctx, in.Tenant, in.ID); err != nil {
+			return err
+		}
+	}
+	in.State, in.Reason = "deleted", fmt.Sprintf("superseded by installation %d", newer)
+	return nil
+}
+
+// list lists the installation's tenant, or returns why it gets none, and
+// whether its tenant was listed before, which it then leaves as it was.
+func list(ctx context.Context, cfg Config, tx jobstore.OnboardTx, next *jobstore.Installation, login, kind string, latest jobstore.Installation, hasLatest bool) (string, bool, error) {
+	entries, err := tx.Tenants(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	ours := func(installation int64) bool {
+		return installation == next.ID || hasLatest && installation == latest.ID
+	}
+	parsed := make(map[string]config.Tenant, len(entries))
+	for id, raw := range entries {
+		var t config.Tenant
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return "", false, fmt.Errorf("tenant %q: %w", id, err)
+		}
+		parsed[id] = t
+	}
+	mine, listed := parsed[next.Tenant]
+	listed = listed && next.Tenant != "" && ours(mine.InstallationID)
+
 	if kind != "Organization" {
-		return "firerunner serves organizations; this is a personal account", nil
+		return "firerunner serves organizations; this is a personal account", listed, nil
 	}
 	url := "https://github.com/" + login
 	account := config.AccountOf(url)
 	for _, r := range cfg.Reserved {
 		if strings.EqualFold(r, account) {
-			return "this organization is served by the install itself", nil
+			return "this organization is served by the install itself", listed, nil
 		}
 	}
-	entries, err := tx.Tenants(ctx)
-	if err != nil {
-		return "", err
+	// taken says why id cannot be this account's: listed for another
+	// installation, or given to another organization, which may list it
+	// again.
+	taken := func(id string) (string, error) {
+		if t, ok := parsed[id]; ok && !ours(t.InstallationID) {
+			return "listed for another installation", nil
+		}
+		other, err := tx.TenantTaken(ctx, id, next.AccountID)
+		if err != nil || !other {
+			return "", err
+		}
+		return "another organization's", nil
 	}
 	if next.Tenant == "" {
-		next.Tenant = tenantID(login, next.AccountID)
-	}
-	ours := func(installation int64) bool {
-		return installation == next.ID || hasLatest && installation == latest.ID
-	}
-	tenants := make([]config.Tenant, 0, len(entries)+1)
-	var mine *config.Tenant
-	for id, raw := range entries {
-		var t config.Tenant
-		if err := json.Unmarshal(raw, &t); err != nil {
-			return "", fmt.Errorf("tenant %q: %w", id, err)
+		candidates := []string{tenantID(login, next.AccountID), "a" + strconv.FormatInt(next.AccountID, 10)}
+		for _, id := range candidates {
+			why, err := taken(id)
+			if err != nil {
+				return "", false, err
+			}
+			if why == "" {
+				next.Tenant = id
+				break
+			}
 		}
-		switch {
-		case id == next.Tenant && !ours(t.InstallationID):
-			return fmt.Sprintf("tenant id %q is listed for another installation", id), nil
-		case id == next.Tenant:
-			mine = &t
+		if next.Tenant == "" {
+			return fmt.Sprintf("tenant ids %q and %q are both taken", candidates[0], candidates[1]), false, nil
+		}
+	} else if why, err := taken(next.Tenant); err != nil || why != "" {
+		return fmt.Sprintf("tenant id %q is %s", next.Tenant, why), listed, err
+	}
+
+	tenants := make([]config.Tenant, 0, len(parsed)+1)
+	for id, t := range parsed {
+		if id == next.Tenant {
 			continue
-		case config.AccountOf(t.URL) == account:
-			return fmt.Sprintf("this organization is listed already, as tenant %q", id), nil
+		}
+		if config.AccountOf(t.URL) == account {
+			return fmt.Sprintf("this organization is listed already, as tenant %q", id), listed, nil
 		}
 		tenants = append(tenants, t)
 	}
 	t := config.Tenant{ID: next.Tenant, Tiers: cfg.Tiers, RunnerGroup: cfg.RunnerGroup}
-	if mine != nil {
+	if listed {
 		// An entry an operator changed (limits, tiers) keeps the change.
-		t = *mine
+		t = mine
 	}
 	t.URL, t.InstallationID = url, next.ID
 	if cfg.Check != nil {
 		if err := cfg.Check(append(tenants, t)); err != nil {
-			return fmt.Sprintf("the tenants list would not be served with it: %v", err), nil
+			return fmt.Sprintf("the tenants list would not be served with it: %v", err), listed, nil
 		}
 	}
 	b, err := json.Marshal(t)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return "", tx.PutTenant(ctx, jobstore.Entry{ID: t.ID, Entry: b})
+	return "", false, tx.PutTenant(ctx, jobstore.Entry{ID: t.ID, Entry: b})
 }
 
 var plainLogin = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)

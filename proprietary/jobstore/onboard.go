@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Installation is one of the hosted App's installations as onboarding has
@@ -43,6 +44,9 @@ type OnboardTx interface {
 	// order, and an account has one at a time.
 	LatestInstallation(ctx context.Context, account, except int64) (Installation, bool, error)
 	PutInstallation(ctx context.Context, in Installation) error
+	// TenantTaken reports whether onboarding gave the tenant id to an
+	// installation of another account.
+	TenantTaken(ctx context.Context, tenant string, account int64) (bool, error)
 	// Tenants returns the tenants list's entries, by id.
 	Tenants(ctx context.Context) (map[string]json.RawMessage, error)
 	PutTenant(ctx context.Context, e Entry) error
@@ -52,17 +56,20 @@ type OnboardTx interface {
 }
 
 // Onboard applies one webhook delivery: fn, in one transaction, which no
-// other delivery for the account runs beside, whichever installation it
-// names. A delivery whose id was applied before is ErrDelivered, with the
+// other delivery, nor a Replace, runs beside: each reads the tenants list
+// the one before left, and checks the list it leaves. Webhooks are few
+// enough for that. A delivery whose id was applied before is ErrDelivered, with the
 // outcome it had then, and fn is not run. fn returns the outcome to record.
-func (s *TenantStore) Onboard(ctx context.Context, delivery, event string, account int64, fn func(OnboardTx) (string, error)) (string, error) {
+func (s *TenantStore) Onboard(ctx context.Context, delivery, event string, fn func(OnboardTx) (string, error)) (string, error) {
 	if err := s.prepareOnce(ctx); err != nil {
 		return "", err
 	}
 	var outcome string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('firerunner account ' || $1::bigint, 0))`, account); err != nil {
-			return fmt.Errorf("wait for the account's other deliveries: %w", err)
+		// SHARE ROW EXCLUSIVE conflicts with itself and with Replace's
+		// EXCLUSIVE, and leaves the daemons' reads alone.
+		if _, err := tx.Exec(ctx, `LOCK TABLE installations IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+			return fmt.Errorf("wait for the other deliveries: %w", err)
 		}
 		tag, err := tx.Exec(ctx, `INSERT INTO webhook_deliveries (delivery_id, event, outcome) VALUES ($1, $2, '')
 			ON CONFLICT (delivery_id) DO NOTHING`, delivery, event)
@@ -90,9 +97,10 @@ func (s *TenantStore) Onboard(ctx context.Context, delivery, event string, accou
 }
 
 // ErrOnboarded is a tenants list that leaves out tenants onboarding
-// listed for installations still active: written, they would never be
-// served again, as nothing re-lists them.
-var ErrOnboarded = errors.New("the list leaves out onboarded tenants")
+// listed for installations still active (written, they would never be
+// served again, as nothing re-lists them), or that changes which
+// installation an onboarded tenant is.
+var ErrOnboarded = errors.New("the list changes onboarded tenants")
 
 // onboardedLeftOut returns the tenants of active installations that ids
 // leaves out.
@@ -108,8 +116,73 @@ func onboardedLeftOut(ctx context.Context, tx pgx.Tx, ids []string) ([]string, e
 	return left, nil
 }
 
+// onboardedRewritten returns why entries would change onboarded tenants
+// under onboarding: an entry of a tenant onboarding gave an installation
+// must name that tenant's latest installation, and only while it is
+// active; else onboarding could no longer remove it, or an import from
+// an old file would list an organization that left.
+func onboardedRewritten(ctx context.Context, tx pgx.Tx, entries []Entry) ([]string, error) {
+	rows, err := tx.Query(ctx, `SELECT DISTINCT ON (tenant) tenant, installation_id, state FROM installations
+		WHERE tenant <> '' ORDER BY tenant, installation_id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("read the onboarded tenants: %w", err)
+	}
+	type latest struct {
+		id    int64
+		state string
+	}
+	onboarded := map[string]latest{}
+	for rows.Next() {
+		var tenant string
+		var l latest
+		if err := rows.Scan(&tenant, &l.id, &l.state); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("read the onboarded tenants: %w", err)
+		}
+		onboarded[tenant] = l
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the onboarded tenants: %w", err)
+	}
+	var bad []string
+	for _, e := range entries {
+		l, ok := onboarded[e.ID]
+		if !ok {
+			continue
+		}
+		var entry struct {
+			InstallationID int64 `json:"installation_id"`
+		}
+		if err := json.Unmarshal(e.Entry, &entry); err != nil {
+			return nil, fmt.Errorf("tenant %q: %w", e.ID, err)
+		}
+		switch {
+		case l.state != "active":
+			bad = append(bad, fmt.Sprintf("%s (its installation %d is %s)", e.ID, l.id, l.state))
+		case entry.InstallationID != l.id:
+			bad = append(bad, fmt.Sprintf("%s (onboarded for installation %d, not %d)", e.ID, l.id, entry.InstallationID))
+		}
+	}
+	return bad, nil
+}
+
 func onboardedError(left []string) error {
-	return fmt.Errorf("%w: %s; their organizations have the App installed, and suspending or uninstalling it there removes them", ErrOnboarded, strings.Join(left, ", "))
+	return fmt.Errorf("%w: it leaves out %s, whose organizations have the App installed; suspending or uninstalling it there removes them", ErrOnboarded, strings.Join(left, ", "))
+}
+
+// InstallationGone reports whether onboarding found the App's installation
+// uninstalled or suspended: GitHub gives it no token then.
+func (s *TenantStore) InstallationGone(ctx context.Context, installation int64) (bool, error) {
+	var gone bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM installations WHERE installation_id = $1 AND state IN ('deleted', 'suspended'))`, installation).Scan(&gone)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P01" { // no onboarding here
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read installation %d: %w", installation, err)
+	}
+	return gone, nil
 }
 
 // prepareOnce sets the database up, once a process.
@@ -160,6 +233,14 @@ func (t onboardTx) PutInstallation(ctx context.Context, in Installation) error {
 		return fmt.Errorf("write installation %d: %w", in.ID, err)
 	}
 	return nil
+}
+
+func (t onboardTx) TenantTaken(ctx context.Context, tenant string, account int64) (bool, error) {
+	var taken bool
+	if err := t.tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM installations WHERE tenant = $1 AND account_id <> $2)`, tenant, account).Scan(&taken); err != nil {
+		return false, fmt.Errorf("read who has tenant id %q: %w", tenant, err)
+	}
+	return taken, nil
 }
 
 func (t onboardTx) Tenants(ctx context.Context) (map[string]json.RawMessage, error) {

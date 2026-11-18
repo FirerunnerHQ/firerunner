@@ -34,7 +34,7 @@ func newFake() *fakeStore {
 	return &fakeStore{installations: map[int64]jobstore.Installation{}, tenants: map[string]json.RawMessage{}, delivered: map[string]string{}}
 }
 
-func (f *fakeStore) Onboard(_ context.Context, delivery, _ string, _ int64, fn func(jobstore.OnboardTx) (string, error)) (string, error) {
+func (f *fakeStore) Onboard(_ context.Context, delivery, _ string, fn func(jobstore.OnboardTx) (string, error)) (string, error) {
 	if out, ok := f.delivered[delivery]; ok {
 		return out, jobstore.ErrDelivered
 	}
@@ -71,6 +71,15 @@ func (t *fakeTx) LatestInstallation(_ context.Context, account, except int64) (j
 func (t *fakeTx) PutInstallation(_ context.Context, in jobstore.Installation) error {
 	t.installations[in.ID] = in
 	return nil
+}
+
+func (t *fakeTx) TenantTaken(_ context.Context, tenant string, account int64) (bool, error) {
+	for _, in := range t.installations {
+		if in.Tenant == tenant && in.AccountID != account {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (t *fakeTx) Tenants(context.Context) (map[string]json.RawMessage, error) {
@@ -364,7 +373,7 @@ func TestConflictsRefused(t *testing.T) {
 		login   string
 		want    string
 	}{
-		"id of another organization":  {map[string]json.RawMessage{"acme": operator("acme", "https://github.com/acme-old", 5)}, "acme", "listed for another installation"},
+		"both ids taken":              {map[string]json.RawMessage{"acme": operator("acme", "https://github.com/acme-old", 5), "a900": operator("a900", "https://github.com/x", 6)}, "acme", "both taken"},
 		"organization listed already": {map[string]json.RawMessage{"big": operator("big", "https://github.com/ACME/repo", 5)}, "acme", "listed already, as tenant \"big\""},
 		"the install's own":           {nil, "Home", "served by the install itself"},
 	}
@@ -383,6 +392,78 @@ func TestConflictsRefused(t *testing.T) {
 				t.Fatalf("tenants changed: %v", s.tenants)
 			}
 		})
+	}
+}
+
+// A login whose tenant id is another organization's, listed or not (an
+// organization renamed keeps its id), gets its account's id instead.
+func TestTenantIDTakenFallsBack(t *testing.T) {
+	s := newFake()
+	s.tenants["acme"] = json.RawMessage(`{"id":"acme","url":"https://github.com/acme-old","installation_id":5,"tiers":["linux-2"]}`)
+	if out := handle(t, s, event("created", 74, "acme", "", 0)); out.Result != "listed" || out.Tenant != "a900" {
+		t.Fatalf("outcome %+v", out)
+	}
+
+	// Renamed from acme to newco, suspended, so its tenant is unlisted:
+	// a new acme must not take the id it will come back to.
+	s = newFake()
+	handle(t, s, accountEvent("created", 75, 800, "acme", "", 0))
+	handle(t, s, accountEvent("suspend", 75, 800, "newco", "", time.Minute))
+	if out := handle(t, s, accountEvent("created", 76, 801, "acme", "", 2*time.Minute)); out.Result != "listed" || out.Tenant != "a801" {
+		t.Fatalf("a new organization on a suspended one's login: %+v", out)
+	}
+	if out := handle(t, s, accountEvent("unsuspend", 75, 800, "newco", "", 3*time.Minute)); out.Result != "listed" || out.Tenant != "acme" {
+		t.Fatalf("the renamed organization's unsuspend: %+v", out)
+	}
+}
+
+// An older installation's tenant goes once a newer one exists on its
+// account, whether or not the newer one is served, and whether or not the
+// older one's own uninstall ever arrives.
+func TestNewerInstallationNotServed(t *testing.T) {
+	for name, c := range map[string]struct {
+		kind  string
+		first string
+	}{
+		"newer suspended":           {"", "suspend"},
+		"newer refused":             {"User", "created"},
+		"newer suspended, old late": {"", "suspend+old"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newFake()
+			handle(t, s, event("created", 80, "acme", "", 0))
+			action := strings.TrimSuffix(c.first, "+old")
+			handle(t, s, event(action, 81, "acme", c.kind, time.Minute))
+			if strings.HasSuffix(c.first, "+old") {
+				if out := handle(t, s, event("deleted", 80, "acme", "", 2*time.Minute)); out.Result != "stale" {
+					t.Fatalf("old uninstall: %+v", out)
+				}
+			}
+			if len(s.tenants) != 0 {
+				t.Fatalf("the old installation's tenant outlived it: %v", s.tenants)
+			}
+			if old := s.installations[80]; old.State != "deleted" {
+				t.Fatalf("old installation %+v", old)
+			}
+		})
+	}
+}
+
+// A refusal of an installation already listed (the catalog changed under
+// it, say) leaves its tenant listed as it was, and the installation
+// active, so that an import still keeps it.
+func TestRefusalKeepsAListedTenant(t *testing.T) {
+	s := newFake()
+	handle(t, s, event("created", 82, "acme", "", 0))
+	before := string(s.tenants["acme"])
+	conf := cfg
+	conf.Check = func([]config.Tenant) error { return errors.New("tier linux-2 is not in the catalog") }
+	out := handleWith(t, conf, s, event("unsuspend", 82, "acme", "", time.Minute))
+	if out.Result != "refused" || !strings.Contains(out.Reason, "stays listed") {
+		t.Fatalf("outcome %+v", out)
+	}
+	if string(s.tenants["acme"]) != before || s.installations[82].State != "active" {
+		t.Fatalf("tenant %s, installation %+v", s.tenants["acme"], s.installations[82])
 	}
 }
 
@@ -462,8 +543,11 @@ func TestLookupIsTheTruth(t *testing.T) {
 		t.Fatalf("an old creation of an installation GitHub reports suspended: %+v", out)
 	}
 	gh = Observed{}
-	if out := handleWith(t, conf, s, event("unsuspend", 68, "acme", "", time.Hour)); out.Result != "removed" || s.installations[68].State != "deleted" {
-		t.Fatalf("an installation GitHub no longer has: %+v", out)
+	if _, err := Handle(context.Background(), conf, s, event("unsuspend", 68, "acme", "", time.Hour)); err == nil || s.installations[68].State == "deleted" {
+		t.Fatalf("one lookup that finds no installation, for an unsuspend, made it deleted: %v", err)
+	}
+	if out := handleWith(t, conf, s, event("deleted", 68, "acme", "", time.Hour)); out.Result != "removed" || s.installations[68].State != "deleted" {
+		t.Fatalf("an uninstall GitHub confirms: %+v", out)
 	}
 }
 

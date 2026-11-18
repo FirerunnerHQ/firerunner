@@ -1377,6 +1377,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			defer db.Close()
 			// A removal done here is done: no sweep repeats it.
 			s.tenantListed = db.TenantListed
+			s.installationGone = db.InstallationGone
 			forgetRemoved = func(id string, upTo time.Time, url string) error {
 				fctx, cancel := context.WithTimeout(context.WithoutCancel(runCtx), forgetRemovedTimeout)
 				defer cancel()

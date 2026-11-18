@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 var day = time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)
@@ -34,12 +36,12 @@ func entryOf(id string, inst int64) Entry {
 func TestOnboardOnce(t *testing.T) {
 	s, _ := openTenantStore(t)
 	ctx := context.Background()
-	out, err := s.Onboard(ctx, "d1", "installation", 900, putTenant("acme", 7))
+	out, err := s.Onboard(ctx, "d1", "installation", putTenant("acme", 7))
 	if err != nil || out != "put acme" {
 		t.Fatalf("first: %q, %v", out, err)
 	}
 	ran := false
-	out, err = s.Onboard(ctx, "d1", "installation", 900, func(OnboardTx) (string, error) { ran = true; return "again", nil })
+	out, err = s.Onboard(ctx, "d1", "installation", func(OnboardTx) (string, error) { ran = true; return "again", nil })
 	if !errors.Is(err, ErrDelivered) || out != "put acme" || ran {
 		t.Fatalf("again: %q, %v, ran %v", out, err, ran)
 	}
@@ -54,7 +56,7 @@ func TestOnboardOnce(t *testing.T) {
 func TestOnboardFailureRollsBack(t *testing.T) {
 	s, _ := openTenantStore(t)
 	ctx := context.Background()
-	_, err := s.Onboard(ctx, "d1", "installation", 900, func(tx OnboardTx) (string, error) {
+	_, err := s.Onboard(ctx, "d1", "installation", func(tx OnboardTx) (string, error) {
 		if _, err := putTenant("acme", 7)(tx); err != nil {
 			return "", err
 		}
@@ -66,17 +68,17 @@ func TestOnboardFailureRollsBack(t *testing.T) {
 	if list, _ := s.Load(ctx); string(list) != "[]" {
 		t.Fatalf("a failed delivery left %s", list)
 	}
-	if out, err := s.Onboard(ctx, "d1", "installation", 900, putTenant("acme", 7)); err != nil || out != "put acme" {
+	if out, err := s.Onboard(ctx, "d1", "installation", putTenant("acme", 7)); err != nil || out != "put acme" {
 		t.Fatalf("retry: %q, %v", out, err)
 	}
 }
 
-// Deliveries for one account never run beside each other: each reads what
+// Deliveries never run beside each other: each reads what
 // the one before it wrote.
 func TestOnboardSerialisesAnAccount(t *testing.T) {
 	s, _ := openTenantStore(t)
 	ctx := context.Background()
-	if _, err := s.Onboard(ctx, "seed", "installation", 900, putTenant("acme", 7)); err != nil {
+	if _, err := s.Onboard(ctx, "seed", "installation", putTenant("acme", 7)); err != nil {
 		t.Fatal(err)
 	}
 	var inside, most atomic.Int32
@@ -85,7 +87,7 @@ func TestOnboardSerialisesAnAccount(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := s.Onboard(ctx, fmt.Sprintf("d%d", i), "installation", 900, func(tx OnboardTx) (string, error) {
+			_, err := s.Onboard(ctx, fmt.Sprintf("d%d", i), "installation", func(tx OnboardTx) (string, error) {
 				n := inside.Add(1)
 				defer inside.Add(-1)
 				for m := most.Load(); n > m && !most.CompareAndSwap(m, n); m = most.Load() {
@@ -106,7 +108,7 @@ func TestOnboardSerialisesAnAccount(t *testing.T) {
 	}
 	wg.Wait()
 	if most.Load() != 1 {
-		t.Fatalf("%d deliveries of one account ran at once", most.Load())
+		t.Fatalf("%d deliveries ran at once", most.Load())
 	}
 	if in := readInstallation(t, s, 7); !in.UpdatedAt.Equal(day.Add(8 * time.Second)) {
 		t.Fatalf("updated_at %v: an update was lost", in.UpdatedAt)
@@ -118,12 +120,12 @@ func TestOnboardSerialisesAnAccount(t *testing.T) {
 func TestOnboardDeleteTenant(t *testing.T) {
 	s, _ := openTenantStore(t)
 	ctx := context.Background()
-	if _, err := s.Onboard(ctx, "d1", "installation", 900, putTenant("acme", 8)); err != nil {
+	if _, err := s.Onboard(ctx, "d1", "installation", putTenant("acme", 8)); err != nil {
 		t.Fatal(err)
 	}
 	del := func(delivery string, inst int64) bool {
 		var deleted bool
-		_, err := s.Onboard(ctx, delivery, "installation", 900, func(tx OnboardTx) (string, error) {
+		_, err := s.Onboard(ctx, delivery, "installation", func(tx OnboardTx) (string, error) {
 			var err error
 			deleted, err = tx.DeleteTenant(ctx, "acme", inst)
 			return "", err
@@ -153,11 +155,11 @@ func TestOnboardLatestInstallation(t *testing.T) {
 	s, _ := openTenantStore(t)
 	ctx := context.Background()
 	for _, id := range []int64{12, 30, 21} {
-		if _, err := s.Onboard(ctx, fmt.Sprint(id), "installation", 900, putTenant("acme", id)); err != nil {
+		if _, err := s.Onboard(ctx, fmt.Sprint(id), "installation", putTenant("acme", id)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	_, err := s.Onboard(ctx, "q", "installation", 900, func(tx OnboardTx) (string, error) {
+	_, err := s.Onboard(ctx, "q", "installation", func(tx OnboardTx) (string, error) {
 		if in, ok, err := tx.LatestInstallation(ctx, 900, 0); err != nil || !ok || in.ID != 30 {
 			t.Errorf("latest: %+v %v %v", in, ok, err)
 		}
@@ -166,6 +168,15 @@ func TestOnboardLatestInstallation(t *testing.T) {
 		}
 		if _, ok, err := tx.LatestInstallation(ctx, 901, 0); err != nil || ok {
 			t.Errorf("another account: %v %v", ok, err)
+		}
+		if taken, err := tx.TenantTaken(ctx, "acme", 900); err != nil || taken {
+			t.Errorf("acme taken from its own account: %v %v", taken, err)
+		}
+		if taken, err := tx.TenantTaken(ctx, "acme", 901); err != nil || !taken {
+			t.Errorf("acme not taken from another account: %v %v", taken, err)
+		}
+		if taken, err := tx.TenantTaken(ctx, "other", 901); err != nil || taken {
+			t.Errorf("an id nobody has taken: %v %v", taken, err)
 		}
 		ts, err := tx.Tenants(ctx)
 		if err != nil || len(ts) != 1 || !jsonHas(ts["acme"], `"installation_id": 21`) {
@@ -178,12 +189,92 @@ func TestOnboardLatestInstallation(t *testing.T) {
 	}
 }
 
+// An import never changes which installation an onboarded tenant is, nor
+// lists one whose installation is not active.
+func TestReplaceKeepsOnboardedInstallations(t *testing.T) {
+	s, _ := openTenantStore(t)
+	ctx := context.Background()
+	if _, err := s.Onboard(ctx, "d1", "installation", putTenant("acme", 7)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Replace(ctx, []Entry{entryOf("acme", 6)}); !errors.Is(err, ErrOnboarded) {
+		t.Fatalf("import naming another installation: %v", err)
+	}
+	if _, err := s.Onboard(ctx, "d2", "installation", func(tx OnboardTx) (string, error) {
+		in, _, err := tx.Installation(ctx, 7)
+		in.State = "suspended"
+		if err == nil {
+			_, err = tx.DeleteTenant(ctx, "acme", 7)
+		}
+		if err == nil {
+			err = tx.PutInstallation(ctx, in)
+		}
+		return "", err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Replace(ctx, []Entry{entryOf("acme", 7)}); !errors.Is(err, ErrOnboarded) {
+		t.Fatalf("import listing a suspended installation's tenant: %v", err)
+	}
+	if list, _ := s.Load(ctx); string(list) != "[]" {
+		t.Fatalf("list %s", list)
+	}
+}
+
+// A delivery waits for an import under way, and reads the list it left:
+// the two never interleave.
+func TestReplaceAndOnboardSerialise(t *testing.T) {
+	s, dsn := openTenantStore(t)
+	ctx := context.Background()
+	if err := s.Replace(ctx, nil); err != nil { // set up
+		t.Fatal(err)
+	}
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // a no-op once committed
+	if _, err := tx.Exec(ctx, `LOCK TABLE installations IN EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO tenants (id, entry) VALUES ('op', '{"id":"op"}')`); err != nil {
+		t.Fatal(err)
+	}
+	read := make(chan int, 1)
+	go func() {
+		_, err := s.Onboard(ctx, "d1", "installation", func(tx OnboardTx) (string, error) {
+			ts, err := tx.Tenants(ctx)
+			read <- len(ts)
+			return "", err
+		})
+		if err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case n := <-read:
+		t.Fatalf("the delivery ran beside the import, and read %d tenants", n)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := <-read; n != 1 {
+		t.Fatalf("the delivery read %d tenants, not the import's 1", n)
+	}
+}
+
 // An import that leaves out a tenant onboarding listed for an active
 // installation writes nothing; once the installation is gone, it may.
 func TestReplaceKeepsOnboardedTenants(t *testing.T) {
 	s, _ := openTenantStore(t)
 	ctx := context.Background()
-	if _, err := s.Onboard(ctx, "d1", "installation", 900, putTenant("acme", 7)); err != nil {
+	if _, err := s.Onboard(ctx, "d1", "installation", putTenant("acme", 7)); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Replace(ctx, []Entry{entry("b", "https://github.com/b")}); !errors.Is(err, ErrOnboarded) {
@@ -195,7 +286,7 @@ func TestReplaceKeepsOnboardedTenants(t *testing.T) {
 	if err := s.Replace(ctx, []Entry{entryOf("acme", 7), entry("b", "https://github.com/b")}); err != nil {
 		t.Fatalf("import keeping acme: %v", err)
 	}
-	_, err := s.Onboard(ctx, "d2", "installation", 900, func(tx OnboardTx) (string, error) {
+	_, err := s.Onboard(ctx, "d2", "installation", func(tx OnboardTx) (string, error) {
 		in, _, err := tx.Installation(ctx, 7)
 		in.State = "deleted"
 		if err == nil {
@@ -217,7 +308,7 @@ var reads atomic.Int32
 func readInstallation(t *testing.T, s *TenantStore, id int64) Installation {
 	t.Helper()
 	var in Installation
-	_, err := s.Onboard(context.Background(), fmt.Sprintf("read-%d", reads.Add(1)), "test", 900, func(tx OnboardTx) (string, error) {
+	_, err := s.Onboard(context.Background(), fmt.Sprintf("read-%d", reads.Add(1)), "test", func(tx OnboardTx) (string, error) {
 		var err error
 		in, _, err = tx.Installation(context.Background(), id)
 		return "", err

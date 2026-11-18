@@ -682,6 +682,40 @@ func TestRemoveLeftovers(t *testing.T) {
 	}
 }
 
+// A removed tenant whose App installation is gone (uninstalled or
+// suspended) has scale sets nothing can delete: removeLeftovers leaves
+// them, rather than failing for ever. Unknown, it tries.
+func TestRemoveLeftoversInstallationGone(t *testing.T) {
+	for name, c := range map[string]struct {
+		gone      bool
+		err       error
+		wantAsked int
+	}{
+		"gone":       {gone: true, wantAsked: 0},
+		"not gone":   {gone: false, wantAsked: 2},
+		"unreadable": {err: errors.New("db down"), wantAsked: 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			asked := 0
+			var askedFor int64
+			s := &shard{log: slog.New(slog.DiscardHandler), cfg: &config.Config{RunnerGroup: "firerunner"},
+				removeByName: func(context.Context, listener.Config) (bool, error) {
+					asked++
+					return false, errors.New("no token for a deleted installation")
+				},
+				installationGone: func(_ context.Context, installation int64) (bool, error) {
+					askedFor = installation
+					return c.gone, c.err
+				}}
+			tc := config.Tenant{ID: "acme", URL: "https://github.com/acme", InstallationID: 7, Tiers: []string{"small", "big"}}
+			err := s.removeLeftovers(context.Background(), extraTenant(s.cfg, tc, "inst", nil), tc.Tiers)
+			if asked != c.wantAsked || askedFor != 7 || (err == nil) != c.gone {
+				t.Fatalf("asked %d (want %d) for installation %d, err %v", asked, c.wantAsked, askedFor, err)
+			}
+		})
+	}
+}
+
 // removeLeftovers says when a tier's scale set is not gone; and a lease
 // that lapses stops it at once, the call under way and every tier after.
 func TestRemoveLeftoversStopsWhenItsLeaseLapses(t *testing.T) {

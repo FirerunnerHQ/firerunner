@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 
 	"github.com/jackc/pgx/v5"
@@ -69,7 +70,8 @@ type Entry struct {
 // out is deleted, and only an entry that changed is rewritten, so updated_at
 // says when each last did. It sets the database up first, as the daemon's
 // writer does. A list that leaves out a tenant onboarding listed for an
-// installation still active is ErrOnboarded, and writes nothing.
+// installation still active, or changes one onboarding gave an
+// installation, is ErrOnboarded, and writes nothing.
 func (s *TenantStore) Replace(ctx context.Context, entries []Entry) error {
 	if err := prepare(ctx, s.pool); err != nil {
 		return fmt.Errorf("set up the job store: %w", err)
@@ -90,6 +92,13 @@ func (s *TenantStore) Replace(ctx context.Context, entries []Entry) error {
 		}
 		if len(left) > 0 {
 			return onboardedError(left)
+		}
+		bad, err := onboardedRewritten(ctx, tx, entries)
+		if err != nil {
+			return err
+		}
+		if len(bad) > 0 {
+			return fmt.Errorf("%w: %s; onboarding lists those for their organizations' installations", ErrOnboarded, strings.Join(bad, ", "))
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM tenants WHERE id <> ALL($1)`, ids); err != nil {
 			return fmt.Errorf("delete the tenants left out: %w", err)
