@@ -271,3 +271,37 @@ if secrets != ["!If [OwnPoolKey, !Ref PoolKey, !Ref PoolKeySecretArn]", "!Ref On
 if "- !If\n                - Onboard\n                - Effect: Allow\n                  Action: secretsmanager:GetSecretValue" not in control_policy:
     sys.exit("FAIL control.yaml: the webhook secret grant must be under the Onboard condition")
 print("ok   control.yaml: the control VM reads onboarding's queue and secret only with onboarding on, and never sends")
+
+# The ingress's envelope is the worker's: the keys the mapping template
+# writes are onboard.Envelope's JSON tags, and the body goes as it arrived,
+# base64 by API Gateway itself (a binary media type), never decoded.
+worker = open(os.path.join(HERE, "..", "..", "proprietary", "onboard", "worker.go")).read()
+env_struct = re.search(r"type Envelope struct \{(.*?)\n\}", worker, re.S).group(1)
+tags = re.findall(r'json:"([a-z_]+)"', env_struct)
+vtl = re.search(r"application/json: \|-\n(.*?)\n        IntegrationResponses", onboarding, re.S).group(1)
+keys = re.findall(r'"([a-z_]+)":"', vtl)
+if keys != tags:
+    sys.exit(f"FAIL onboarding.yaml: the template writes {keys}; onboard.Envelope reads {tags}")
+if "BinaryMediaTypes: [application/json]" not in onboarding or "ContentHandling: CONVERT_TO_TEXT" not in onboarding or \
+        "#set($b = $input.body)" not in vtl or "base64Encode" in vtl:
+    sys.exit("FAIL onboarding.yaml: the body must reach the queue base64 as it arrived (application/json binary, CONVERT_TO_TEXT)")
+print("ok   onboarding.yaml: the envelope is onboard.Envelope's, the body as it arrived")
+# SQS refusing a message is a failure GitHub sees; GitHub's headers are
+# required; and a message as large as SQS takes fits.
+if 'SelectionPattern: "4\\\\d{2}|5\\\\d{2}"' not in onboarding:
+    sys.exit("FAIL onboarding.yaml: an SQS 4xx or 5xx must answer 500")
+for h in ("X-GitHub-Delivery", "X-GitHub-Event", "X-Hub-Signature-256"):
+    if f"method.request.header.{h}: true" not in onboarding:
+        sys.exit(f"FAIL onboarding.yaml: {h} must be required")
+if onboarding.count("MaximumMessageSize: 1048576") != 2:
+    sys.exit("FAIL onboarding.yaml: both queues must take SQS's largest message")
+print("ok   onboarding.yaml: SQS's refusals answer 500, GitHub's headers required, large deliveries fit")
+# A deployment is a snapshot, made anew only under a new logical id: its
+# name carries a hash of what it deploys.
+import hashlib
+a, b = onboarding.index("\n  Api:\n"), onboarding.index("\n  # A deployment is a snapshot")
+want = "Deployment" + hashlib.sha256(onboarding[a:b].encode()).hexdigest()[:10]
+names = re.findall(r"^  (Deployment[0-9a-f]*):$", onboarding, re.M)
+if names != [want] or f"DeploymentId: !Ref {want}" not in onboarding:
+    sys.exit(f"FAIL onboarding.yaml: the API changed, so its deployment must too: rename {names} to {want}, and the stage's DeploymentId")
+print("ok   onboarding.yaml: the deployment is named by what it deploys")

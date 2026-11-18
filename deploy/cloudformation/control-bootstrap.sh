@@ -290,6 +290,11 @@ if [ -n "${FR_ONBOARD_QUEUE_URL:-}" ] || [ -n "${FR_ONBOARD_WEBHOOK_SECRET:-}" ]
 		log "$FR_ONBOARD_WEBHOOK_SECRET: the webhook secret is empty"
 		false
 	fi
+	if [[ "$webhook_secret" == "{"* ]]; then
+		# The console's key/value form: every signature would fail.
+		log "$FR_ONBOARD_WEBHOOK_SECRET holds JSON (key/value): store the webhook secret as plaintext"
+		false
+	fi
 	printf '%s\n' "$webhook_secret" > "$etc/onboard-webhook-secret"
 	webhook_secret=''
 	setenv FR_ONBOARD_WEBHOOK_SECRET_FILE "$etc/onboard-webhook-secret"

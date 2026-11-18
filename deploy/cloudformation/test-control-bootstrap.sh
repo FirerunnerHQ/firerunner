@@ -440,6 +440,21 @@ onboard_env
 failed "onboarding with an empty secret"
 expect "onboarding with an empty secret: says why" "$(cat "$STATE/out")" grep -q 'the webhook secret is empty' "$STATE/out"
 setup
+onboard_env
+echo '{"secret":"whsec-planted9"}' > "$STATE/webhook-secret"
+failed "onboarding with a key/value secret"
+expect "onboarding with a key/value secret: says why, not the secret" "$(cat "$STATE/out")" \
+	bash -c "grep -q 'store the webhook secret as plaintext' '$STATE/out' && ! grep -q planted9 '$STATE/out'"
+setup
+onboard_env
+touch "$STATE/sm-denied"
+failed "onboarding secret denied"
+expect "onboarding secret denied: says why" "$(cat "$STATE/out")" grep -q 'AccessDeniedException' "$STATE/out"
+setup
+onboard_env "" "$hooksecret"
+failed "onboarding without its queue"
+expect "onboarding without its queue: says why" "$(cat "$STATE/out")" grep -q 'needs both the queue' "$STATE/out"
+setup
 echo "FR_ONBOARD_QUEUE_URL=$hookqueue" >> "$STATE/ssm/env"
 failed "onboarding from control/env"
 expect "onboarding from control/env: says to use the stack" "$(cat "$STATE/out")" grep -q 'OnboardWebhookSecretArn instead' "$STATE/out"

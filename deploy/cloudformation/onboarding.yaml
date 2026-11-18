@@ -31,17 +31,25 @@ Parameters:
 Resources:
   # Fourteen days, SQS's most: a delivery outlives an outage of the control
   # plane, and a dead letter waits for its replay.
+  #
+  # 1 MiB, SQS's most: a delivery is its body base64 (4/3 of it) and GitHub's
+  # headers, so a body of about 760 KB fits. installation.created lists the
+  # repositories selected, about 150 bytes each: some 5,000. A larger one
+  # SQS refuses; GitHub shows the delivery failed, and onboarding waits for
+  # the installation's next event.
   DeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
       SqsManagedSseEnabled: true
       MessageRetentionPeriod: 1209600
+      MaximumMessageSize: 1048576
 
   Queue:
     Type: AWS::SQS::Queue
     Properties:
       SqsManagedSseEnabled: true
       MessageRetentionPeriod: 1209600
+      MaximumMessageSize: 1048576
       # The worker asks for 120 s on each receive; this is the default.
       VisibilityTimeout: 120
       RedrivePolicy:
@@ -75,6 +83,20 @@ Resources:
       Name: !Sub "${AWS::StackName}-webhooks"
       Description: The GitHub App's webhooks, onto an SQS queue (firerunner onboarding).
       EndpointConfiguration: { Types: [REGIONAL] }
+      # A JSON body is taken as bytes, so the template sees it base64, as it
+      # arrived: the signature is over those bytes, and decoding it as text
+      # and encoding it back need not give them again.
+      BinaryMediaTypes: [application/json]
+
+  # Refuses (400) a request without GitHub's headers before it reaches the
+  # queue: a cheap filter of what is plainly not GitHub's, not a defence;
+  # the signature, verified on the control VM, is.
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref Api
+      ValidateRequestParameters: true
+      ValidateRequestBody: false
 
   WebhookResource:
     Type: AWS::ApiGateway::Resource
@@ -83,8 +105,9 @@ Resources:
       ParentId: !GetAtt Api.RootResourceId
       PathPart: webhook
 
-  # The envelope the worker reads (onboard.Envelope): GitHub's three headers,
-  # and the body base64, as it arrived, as the signature is over those bytes.
+  # The envelope the worker reads (onboard.Envelope; test-policies.py keeps
+  # the two alike): GitHub's three headers (a query parameter of the name
+  # would win, affecting only its caller's request), and the body base64, as it arrived, as the signature is over those bytes.
   # Only application/json is taken, as the App sends (its webhook's content
   # type); anything else is refused (415), not enqueued. SQS refusing the
   # message (one larger than its limit, say) answers 500, and GitHub keeps
@@ -96,20 +119,28 @@ Resources:
       ResourceId: !Ref WebhookResource
       HttpMethod: POST
       AuthorizationType: NONE
+      RequestValidatorId: !Ref RequestValidator
+      RequestParameters:
+        method.request.header.X-GitHub-Delivery: true
+        method.request.header.X-GitHub-Event: true
+        method.request.header.X-Hub-Signature-256: true
       Integration:
         Type: AWS
         IntegrationHttpMethod: POST
         Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${Queue.QueueName}"
         Credentials: !GetAtt IngressRole.Arn
         PassthroughBehavior: NEVER
+        # With application/json binary (Api), the template's $input.body is
+        # the body base64.
+        ContentHandling: CONVERT_TO_TEXT
         RequestParameters:
           integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
         RequestTemplates:
-          application/json: |
+          application/json: |-
             #set($d = $util.escapeJavaScript($input.params('X-GitHub-Delivery')))
             #set($e = $util.escapeJavaScript($input.params('X-GitHub-Event')))
             #set($s = $util.escapeJavaScript($input.params('X-Hub-Signature-256')))
-            #set($b = $util.base64Encode($input.body))
+            #set($b = $input.body)
             #set($msg = '{"delivery":"' + $d + '","event":"' + $e + '","signature":"' + $s + '","body":"' + $b + '"}')
             Action=SendMessage&MessageBody=$util.urlEncode($msg)
         IntegrationResponses:
@@ -124,7 +155,11 @@ Resources:
         - StatusCode: "200"
         - StatusCode: "500"
 
-  Deployment:
+  # A deployment is a snapshot: CloudFormation makes a new one only for a
+  # new logical id. So its name ends in a hash of what it deploys (Api to
+  # WebhookMethod), which test-policies.py checks: a change there without a
+  # new name fails the test, which prints the name to use.
+  Deploymenta6bdbd9fd6:
     Type: AWS::ApiGateway::Deployment
     DependsOn: WebhookMethod
     Properties:
@@ -134,7 +169,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref Api
-      DeploymentId: !Ref Deployment
+      DeploymentId: !Ref Deploymenta6bdbd9fd6
       StageName: v1
       MethodSettings:
         - ResourcePath: "/*"
