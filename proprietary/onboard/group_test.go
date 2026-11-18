@@ -30,7 +30,7 @@ func writes(f *fakeAPI) []string {
 func TestSyncGroupCreates(t *testing.T) {
 	f, gh := newAPI(t)
 	f.repos = []Repository{repo(1, "app", "private"), repo(2, "site", "public"), repo(3, "infra", "internal")}
-	res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner")
+	res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestSyncGroupAll(t *testing.T) {
 	f, gh := newAPI(t)
 	f.selection = "all"
 	f.repos = []Repository{repo(1, "app", "private"), repo(2, "site", "public")}
-	res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner")
+	res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 0)
 	if err != nil || res.State != "ready" || !res.All || res.Served != 1 {
 		t.Fatalf("result %+v, %v", res, err)
 	}
@@ -60,19 +60,19 @@ func TestSyncGroupAll(t *testing.T) {
 	}
 }
 
-// A group that exists is put right: its visibility, public repositories
-// kept out, and exactly the installation's repositories, one removed from
-// the installation included.
+// The group onboarding created is put right: its name, its visibility,
+// public repositories kept out, and exactly the installation's
+// repositories, one removed from the installation included.
 func TestSyncGroupUpdates(t *testing.T) {
 	f, gh := newAPI(t)
 	f.groups = []RunnerGroup{{ID: 1, Name: "Default", Default: true, Visibility: "all"}, {ID: 5, Name: "FireRunner", Visibility: "all", AllowsPublicRepositories: true}}
 	f.groupRepos[5] = []int64{1, 2, 9}
 	f.repos = []Repository{repo(1, "app", "private")}
-	res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner")
+	res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 5)
 	if err != nil || res.State != "ready" || res.GroupID != 5 {
 		t.Fatalf("result %+v, %v", res, err)
 	}
-	if g := f.groups[1]; g.Visibility != "selected" || g.AllowsPublicRepositories {
+	if g := f.groups[1]; g.Name != "firerunner" || g.Visibility != "selected" || g.AllowsPublicRepositories {
 		t.Fatalf("group %+v", g)
 	}
 	if !slices.Equal(f.groupRepos[5], []int64{1}) {
@@ -84,7 +84,7 @@ func TestSyncGroupUpdates(t *testing.T) {
 
 	// Right already: the repositories are set again, nothing else.
 	f.requests = nil
-	if _, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner"); err != nil {
+	if _, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 5); err != nil {
 		t.Fatal(err)
 	}
 	if w := writes(f); !slices.Equal(w, []string{"PUT /orgs/acme/actions/runner-groups/5/repositories"}) {
@@ -98,9 +98,11 @@ func TestSyncGroupNeverTheDefault(t *testing.T) {
 	f, gh := newAPI(t)
 	f.groups = []RunnerGroup{{ID: 1, Name: "firerunner", Default: true, Visibility: "all"}}
 	f.repos = []Repository{repo(1, "app", "private")}
-	res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner")
-	if err != nil || res.State != "unavailable" || !strings.Contains(res.Reason, "default") {
-		t.Fatalf("result %+v, %v", res, err)
+	for _, owned := range []int64{0, 1} {
+		res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", owned)
+		if err != nil || res.State != "unavailable" || !strings.Contains(res.Reason, "did not create") {
+			t.Fatalf("owned %d: result %+v, %v", owned, res, err)
+		}
 	}
 	if w := writes(f); len(w) != 0 {
 		t.Fatalf("writes %v", w)
@@ -129,7 +131,7 @@ func TestSyncGroupRefused(t *testing.T) {
 			if c.rateLimit {
 				g = rateLimited{gh}
 			}
-			res, err := SyncGroup(context.Background(), g, 7, "acme", "firerunner")
+			res, err := SyncGroup(context.Background(), g, 7, "acme", "firerunner", 0)
 			if c.wantErr {
 				if err == nil {
 					t.Fatalf("no error: %+v", res)
@@ -155,6 +157,8 @@ func (r rateLimited) CreateRunnerGroup(context.Context, int64, string, GroupSpec
 type groupStore struct {
 	rows    map[int64]jobstore.Installation
 	results map[int64]GroupResult
+	owned   map[int64]int64
+	locked  map[int64]bool
 	fail    error
 }
 
@@ -174,7 +178,28 @@ func (s *groupStore) ActiveInstallations(context.Context) ([]jobstore.Installati
 	return out, nil
 }
 
-func (s *groupStore) RecordGroup(_ context.Context, id int64, b json.RawMessage) error {
+func (s *groupStore) LockInstallation(_ context.Context, id int64) (func(), error) {
+	if s.locked == nil {
+		s.locked = map[int64]bool{}
+	}
+	if s.locked[id] {
+		return nil, errors.New("locked twice")
+	}
+	s.locked[id] = true
+	return func() { s.locked[id] = false }, nil
+}
+
+func (s *groupStore) OwnedGroup(_ context.Context, id int64) (int64, error) {
+	return s.owned[id], nil
+}
+
+func (s *groupStore) RecordGroup(_ context.Context, id, group int64, b json.RawMessage) error {
+	if s.owned == nil {
+		s.owned = map[int64]int64{}
+	}
+	if group != 0 {
+		s.owned[id] = group
+	}
 	var r GroupResult
 	if err := json.Unmarshal(b, &r); err != nil {
 		return err
@@ -260,5 +285,104 @@ func TestKeepGroupOutcome(t *testing.T) {
 	bad := sign(Delivery{ID: "r2", Event: "installation_repositories", Body: []byte(`{"action":"added"}`)})
 	if _, err := Handle(context.Background(), cfg, s, bad); err == nil {
 		t.Fatal("no installation id was no error")
+	}
+}
+
+// A group of the name that onboarding did not create is the
+// organization's own: never adopted, never changed.
+func TestSyncGroupNotOurs(t *testing.T) {
+	f, gh := newAPI(t)
+	f.groups = []RunnerGroup{{ID: 5, Name: "FireRunner", Visibility: "all"}}
+	f.groupRepos[5] = []int64{42}
+	f.repos = []Repository{repo(1, "app", "private")}
+	res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 0)
+	if err != nil || res.State != "unavailable" || !strings.Contains(res.Reason, "did not create") {
+		t.Fatalf("result %+v, %v", res, err)
+	}
+	if w := writes(f); len(w) != 0 || f.groups[0].Visibility != "all" {
+		t.Fatalf("writes %v, group %+v", w, f.groups[0])
+	}
+}
+
+// Onboarding's group deleted by the organization is created again; one
+// renamed while another group took its name is left, and says why.
+func TestSyncGroupOwnedGone(t *testing.T) {
+	f, gh := newAPI(t)
+	f.repos = []Repository{repo(1, "app", "private")}
+	res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 77)
+	if err != nil || res.State != "ready" || res.GroupID != 100 || len(f.groups) != 1 {
+		t.Fatalf("deleted: result %+v, %v, groups %+v", res, err, f.groups)
+	}
+
+	f, gh = newAPI(t)
+	f.repos = []Repository{repo(1, "app", "private")}
+	f.groups = []RunnerGroup{{ID: 5, Name: "ours-renamed", Visibility: "selected"}, {ID: 6, Name: "firerunner", Visibility: "all"}}
+	res, err = SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 5)
+	if err != nil || res.State != "unavailable" || !strings.Contains(res.Reason, "renamed") {
+		t.Fatalf("renamed: result %+v, %v", res, err)
+	}
+	if w := writes(f); len(w) != 0 {
+		t.Fatalf("writes %v", w)
+	}
+}
+
+// An installation that has not granted the runner permission cannot get
+// a token for it: shown, not retried for ever.
+func TestSyncGroupNoPermission(t *testing.T) {
+	f, gh := newAPI(t)
+	f.refuse["POST /app/installations/7/access_tokens"] = 422
+	res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 0)
+	if err != nil || res.State != "unavailable" || !strings.Contains(res.Reason, "permission") {
+		t.Fatalf("result %+v, %v", res, err)
+	}
+}
+
+// A secondary rate limit answers 403 with Retry-After: retried, not shown
+// as a refusal.
+func TestSyncGroupSecondaryRateLimit(t *testing.T) {
+	f, gh := newAPI(t)
+	f.repos = []Repository{repo(1, "app", "private")}
+	f.refuse["POST /orgs/acme/actions/runner-groups"] = 403
+	f.refuseHeader["Retry-After"] = "60"
+	if res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 0); err == nil {
+		t.Fatalf("no error: %+v", res)
+	}
+}
+
+// A repository deleted between the listing and the setting is a failure to
+// retry, which lists them again; not a refusal.
+func TestSyncGroupRepositoryGone(t *testing.T) {
+	f, gh := newAPI(t)
+	f.repos = []Repository{repo(1, "app", "private")}
+	f.groups = []RunnerGroup{{ID: 5, Name: "firerunner", Visibility: "selected"}}
+	f.refuse["PUT /orgs/acme/actions/runner-groups/5/repositories"] = 422
+	if res, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 5); err == nil {
+		t.Fatalf("no error: %+v", res)
+	}
+}
+
+// Keep records the group it created, keeps that one after, and holds the
+// installation's lock throughout.
+func TestKeeperOwnsWhatItCreates(t *testing.T) {
+	f, gh := newAPI(t)
+	f.repos = []Repository{repo(1, "app", "private")}
+	store := &groupStore{results: map[int64]GroupResult{}, rows: map[int64]jobstore.Installation{
+		7: {ID: 7, AccountID: 900, AccountLogin: "acme", State: "active"},
+	}}
+	k := Keeper{Store: store, GitHub: gh, Group: "firerunner"}
+	for range 2 {
+		if _, kept, err := k.Keep(context.Background(), 7); !kept || err != nil {
+			t.Fatalf("kept %v, %v", kept, err)
+		}
+	}
+	if store.owned[7] != 100 || len(f.groups) != 1 || store.results[7].State != "ready" {
+		t.Fatalf("owned %v, groups %+v, result %+v", store.owned, f.groups, store.results[7])
+	}
+	if store.locked[7] {
+		t.Fatal("the lock was not released")
+	}
+	store.locked[7] = true
+	if _, _, err := k.Keep(context.Background(), 7); err == nil {
+		t.Fatal("kept without the lock")
 	}
 }

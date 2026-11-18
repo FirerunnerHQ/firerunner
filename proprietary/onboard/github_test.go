@@ -48,6 +48,9 @@ type fakeAPI struct {
 	groups        []RunnerGroup
 	groupRepos    map[int64][]int64
 	refuse        map[string]int // "METHOD path" -> status
+	refuseHeader  map[string]string
+	// unauthorized, while > 0, answers that many installation calls 401.
+	unauthorized int
 }
 
 func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -63,6 +66,9 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.bodies[key] = body
 	}
 	if code, ok := f.refuse[key]; ok {
+		for k, v := range f.refuseHeader {
+			w.Header().Set(k, v)
+		}
 		w.WriteHeader(code)
 		fmt.Fprintf(w, `{"message":"refused by the fake"}`)
 		return
@@ -73,6 +79,11 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.t.Errorf("%s with %q: the App's own calls take its JWT, the rest an installation token", key, auth)
 	}
 	write := func(v any) { _ = json.NewEncoder(w).Encode(v) }
+	if !app && f.unauthorized > 0 {
+		f.unauthorized--
+		w.WriteHeader(401)
+		return
+	}
 	switch {
 	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/app/installations/"):
 		var id int64
@@ -100,6 +111,7 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "PATCH" && strings.HasPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/"):
 		for i := range f.groups {
 			if r.URL.Path == fmt.Sprintf("/orgs/acme/actions/runner-groups/%d", f.groups[i].ID) {
+				f.groups[i].Name = body["name"].(string)
 				f.groups[i].Visibility = body["visibility"].(string)
 				f.groups[i].AllowsPublicRepositories = body["allows_public_repositories"].(bool)
 			}
@@ -146,7 +158,7 @@ func ids(v any) []int64 {
 }
 
 func newAPI(t *testing.T) (*fakeAPI, *GitHub) {
-	f := &fakeAPI{t: t, bodies: map[string]map[string]any{}, installations: map[int64]string{}, groupRepos: map[int64][]int64{}, refuse: map[string]int{}, selection: "selected"}
+	f := &fakeAPI{t: t, bodies: map[string]map[string]any{}, installations: map[int64]string{}, groupRepos: map[int64][]int64{}, refuse: map[string]int{}, refuseHeader: map[string]string{}, selection: "selected"}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	return f, NewGitHub(srv.URL, testJWT(t))
@@ -225,5 +237,55 @@ func TestGitHubGroupWrites(t *testing.T) {
 	err = gh.SetGroupRepositories(ctx, 7, "acme", 100, nil)
 	if statusOf(err) != 403 || !strings.Contains(err.Error(), "refused by the fake") {
 		t.Fatalf("a refusal: %v", err)
+	}
+}
+
+// A token GitHub no longer takes is forgotten, and the next call mints one.
+func TestGitHubTokenRefused(t *testing.T) {
+	f, gh := newAPI(t)
+	ctx := context.Background()
+	if _, err := gh.RunnerGroups(ctx, 7, "acme"); err != nil {
+		t.Fatal(err)
+	}
+	f.unauthorized = 1
+	if _, err := gh.RunnerGroups(ctx, 7, "acme"); statusOf(err) != 401 {
+		t.Fatalf("err %v", err)
+	}
+	if _, err := gh.RunnerGroups(ctx, 7, "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if f.tokens != 2 {
+		t.Fatalf("%d tokens minted, want a second after the 401", f.tokens)
+	}
+}
+
+// Every page of groups is read.
+func TestGitHubRunnerGroupsPages(t *testing.T) {
+	f, gh := newAPI(t)
+	for i := range 150 {
+		f.groups = append(f.groups, RunnerGroup{ID: int64(i + 1), Name: fmt.Sprintf("g%d", i)})
+	}
+	gs, err := gh.RunnerGroups(context.Background(), 7, "acme")
+	if err != nil || len(gs) != 150 {
+		t.Fatalf("%d groups, %v", len(gs), err)
+	}
+}
+
+// Rate limits and GitHub's own failures are to retry; other refusals not.
+func TestStatusErrorRetryable(t *testing.T) {
+	for _, c := range []struct {
+		e    StatusError
+		want bool
+	}{
+		{StatusError{Code: 403}, false},
+		{StatusError{Code: 403, RateLimited: true}, true},
+		{StatusError{Code: 403, RetryAfter: true}, true},
+		{StatusError{Code: 429}, true},
+		{StatusError{Code: 502}, true},
+		{StatusError{Code: 422}, false},
+	} {
+		if got := c.e.Retryable(); got != c.want {
+			t.Errorf("%+v: %v, want %v", c.e, got, c.want)
+		}
 	}
 }

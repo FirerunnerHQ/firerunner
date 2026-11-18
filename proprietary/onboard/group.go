@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -68,19 +69,24 @@ type GroupResult struct {
 	Public []string `json:"public,omitempty"`
 }
 
-// SyncGroup makes the organization's runner group named name open to the
+// SyncGroup makes the runner group onboarding created in the organization
+// (owned, 0 before it has; created now if so, named name) open to the
 // repositories the installation may access, public ones never: GitHub
 // holds a public repository's jobs from the group itself
 // (allows_public_repositories), so a repository made public later gets
 // none either. An installation of all the organization's repositories gets
 // a group open to every one that is not public, which takes in a new
-// repository at once. The organization's default group is never changed:
-// other runners serve it. An error is one to retry; a group GitHub will
-// not create or change is a result, unavailable, with GitHub's reason.
-func SyncGroup(ctx context.Context, gh Groups, installation int64, org, name string) (GroupResult, error) {
+// repository at once.
+//
+// A group onboarding did not create is never changed, the organization's
+// default above all, even under the name: its runners and repositories are
+// the organization's own. An error is one to retry; GitHub refusing what
+// the group needs (a plan without runner groups, the App's permission
+// withdrawn, the name taken) is a result, unavailable, with the reason.
+func SyncGroup(ctx context.Context, gh Groups, installation int64, org, name string, owned int64) (GroupResult, error) {
 	repos, all, err := gh.Repositories(ctx, installation)
 	if err != nil {
-		return GroupResult{}, fmt.Errorf("list the installation's repositories: %w", err)
+		return refusedOr(GroupResult{}, "give the installation's repositories (has it granted the App the organization's self-hosted runners permission?)", err, http.StatusForbidden, http.StatusNotFound, http.StatusUnprocessableEntity)
 	}
 	spec := GroupSpec{Name: name, Visibility: "private"}
 	res := GroupResult{All: all}
@@ -99,53 +105,57 @@ func SyncGroup(ctx context.Context, gh Groups, installation int64, org, name str
 
 	groups, err := gh.RunnerGroups(ctx, installation, org)
 	if err != nil {
-		return refusedOr(res, "list the organization's runner groups", err)
+		return refusedOr(res, "list the organization's runner groups", err, http.StatusForbidden, http.StatusNotFound)
 	}
-	var group *RunnerGroup
+	var mine, named *RunnerGroup
 	for i := range groups {
+		if owned != 0 && groups[i].ID == owned && !groups[i].Default {
+			mine = &groups[i]
+		}
 		if strings.EqualFold(groups[i].Name, name) {
-			group = &groups[i]
+			named = &groups[i]
 		}
 	}
-	switch {
-	case group == nil:
+	if mine == nil {
+		// None yet, or the organization deleted it.
+		if named != nil {
+			res.State, res.Reason = "unavailable", fmt.Sprintf("the organization has a runner group named %q that onboarding did not create; rename or delete it, and onboarding creates its own", named.Name)
+			return res, nil
+		}
 		g, err := gh.CreateRunnerGroup(ctx, installation, org, spec)
 		if err != nil {
-			return refusedOr(res, "create the runner group", err)
+			return refusedOr(res, "create the runner group", err, http.StatusForbidden, http.StatusNotFound, http.StatusUnprocessableEntity)
 		}
 		res.State, res.GroupID = "ready", g.ID
 		return res, nil
-	case group.Default:
-		res.State, res.Reason = "unavailable", fmt.Sprintf("runner group %q is the organization's default, which onboarding never changes", group.Name)
+	}
+	if named != nil && named != mine {
+		res.State, res.Reason = "unavailable", fmt.Sprintf("onboarding's runner group was renamed %q, and another group has its name %q", mine.Name, named.Name)
 		return res, nil
 	}
-	if group.Visibility != spec.Visibility || group.AllowsPublicRepositories {
-		if err := gh.UpdateRunnerGroup(ctx, installation, org, group.ID, GroupSpec{Name: group.Name, Visibility: spec.Visibility}); err != nil {
-			return refusedOr(res, "update the runner group", err)
+	if mine.Name != name || mine.Visibility != spec.Visibility || mine.AllowsPublicRepositories {
+		// Renamed back too: the scale sets register in it by name.
+		if err := gh.UpdateRunnerGroup(ctx, installation, org, mine.ID, GroupSpec{Name: name, Visibility: spec.Visibility}); err != nil {
+			return refusedOr(res, "update the runner group", err, http.StatusForbidden)
 		}
 	}
 	if spec.Visibility == "selected" {
-		if err := gh.SetGroupRepositories(ctx, installation, org, group.ID, spec.Repositories); err != nil {
-			return refusedOr(res, "set the runner group's repositories", err)
+		// A repository deleted since it was listed fails this with 404 or
+		// 422: an error, and the retry lists the repositories again.
+		if err := gh.SetGroupRepositories(ctx, installation, org, mine.ID, spec.Repositories); err != nil {
+			return refusedOr(res, "set the runner group's repositories", err, http.StatusForbidden)
 		}
 	}
-	res.State, res.GroupID = "ready", group.ID
+	res.State, res.GroupID = "ready", mine.ID
 	return res, nil
 }
 
-// refusedOr is GitHub refusing what the group needs (a plan without
-// runner groups, the App's permission withdrawn) as a result, and any
-// other failure, which a retry may get past, as an error.
-func refusedOr(res GroupResult, what string, err error) (GroupResult, error) {
+// refusedOr is GitHub refusing what the group needs, with one of codes and
+// not to be retried, as a result; any other failure, which a retry may get
+// past, as an error.
+func refusedOr(res GroupResult, what string, err error, codes ...int) (GroupResult, error) {
 	var se *StatusError
-	refused := false
-	if errors.As(err, &se) {
-		switch se.Code {
-		case http.StatusForbidden, http.StatusNotFound, http.StatusUnprocessableEntity:
-			refused = !se.RateLimited
-		}
-	}
-	if !refused {
+	if !errors.As(err, &se) || se.Retryable() || !slices.Contains(codes, se.Code) {
 		return GroupResult{}, fmt.Errorf("%s: %w", what, err)
 	}
 	res.State = "unavailable"

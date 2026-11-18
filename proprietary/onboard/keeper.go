@@ -14,7 +14,12 @@ import (
 type GroupStore interface {
 	ReadInstallation(ctx context.Context, id int64) (jobstore.Installation, bool, error)
 	ActiveInstallations(ctx context.Context) ([]jobstore.Installation, error)
-	RecordGroup(ctx context.Context, id int64, result json.RawMessage) error
+	// LockInstallation holds the installation's group for one keeper,
+	// across processes.
+	LockInstallation(ctx context.Context, id int64) (unlock func(), err error)
+	// OwnedGroup is the group onboarding created for it, or 0.
+	OwnedGroup(ctx context.Context, id int64) (int64, error)
+	RecordGroup(ctx context.Context, id, group int64, result json.RawMessage) error
 }
 
 // Keeper keeps the runner group of each installation onboarding lists a
@@ -37,6 +42,11 @@ func (k Keeper) Keep(ctx context.Context, installation int64) (GroupResult, bool
 	if k.Group == "" {
 		return GroupResult{}, false, errors.New("onboarding keeps a runner group of a name: none is set")
 	}
+	unlock, err := k.Store.LockInstallation(ctx, installation)
+	if err != nil {
+		return GroupResult{}, false, err
+	}
+	defer unlock()
 	in, ok, err := k.Store.ReadInstallation(ctx, installation)
 	if err != nil || !ok || in.State != "active" {
 		return GroupResult{}, false, err
@@ -47,13 +57,17 @@ func (k Keeper) Keep(ctx context.Context, installation int64) (GroupResult, bool
 		if err != nil {
 			return GroupResult{}, false, fmt.Errorf("read installation %d from GitHub: %w", installation, err)
 		}
-		if !o.Found || o.Suspended || o.AccountID != in.AccountID {
+		if !o.Found || o.Suspended || o.AccountID != in.AccountID || o.Type != "Organization" {
 			// Its own delivery settles the installation; nothing to keep.
 			return GroupResult{}, false, nil
 		}
 		org = o.Login
 	}
-	res, err := SyncGroup(ctx, k.GitHub, installation, org, k.Group)
+	owned, err := k.Store.OwnedGroup(ctx, installation)
+	if err != nil {
+		return GroupResult{}, false, err
+	}
+	res, err := SyncGroup(ctx, k.GitHub, installation, org, k.Group, owned)
 	if err != nil {
 		return GroupResult{}, false, fmt.Errorf("installation %d (%s): %w", installation, org, err)
 	}
@@ -61,7 +75,7 @@ func (k Keeper) Keep(ctx context.Context, installation int64) (GroupResult, bool
 	if err != nil {
 		return GroupResult{}, false, err
 	}
-	if err := k.Store.RecordGroup(ctx, installation, b); err != nil {
+	if err := k.Store.RecordGroup(ctx, installation, res.GroupID, b); err != nil {
 		return GroupResult{}, false, err
 	}
 	return res, true, nil

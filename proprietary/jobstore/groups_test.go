@@ -3,6 +3,7 @@ package jobstore
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // Installations read outside a delivery, and their runner groups' results
@@ -38,13 +39,61 @@ func TestInstallationGroups(t *testing.T) {
 	if r, err := s.GroupResult(ctx, 7); err != nil || string(r) != "{}" {
 		t.Fatalf("before kept: %s, %v", r, err)
 	}
-	if err := s.RecordGroup(ctx, 7, []byte(`{"state":"ready","group_id":5,"served":2}`)); err != nil {
+	if g, err := s.OwnedGroup(ctx, 7); err != nil || g != 0 {
+		t.Fatalf("owned before: %d, %v", g, err)
+	}
+	if err := s.RecordGroup(ctx, 7, 5, []byte(`{"state":"ready","group_id":5,"served":2}`)); err != nil {
 		t.Fatal(err)
 	}
 	if r, err := s.GroupResult(ctx, 7); err != nil || !jsonHas(r, `"group_id": 5`) {
 		t.Fatalf("recorded: %s, %v", r, err)
 	}
-	if err := s.RecordGroup(ctx, 99, []byte(`{}`)); err == nil {
-		t.Fatal("recorded for an installation that does not exist")
+	// A refusal later keeps the group onboarding owns.
+	if err := s.RecordGroup(ctx, 7, 0, []byte(`{"state":"unavailable"}`)); err != nil {
+		t.Fatal(err)
 	}
+	if g, err := s.OwnedGroup(ctx, 7); err != nil || g != 5 {
+		t.Fatalf("owned after a refusal: %d, %v", g, err)
+	}
+	// An installation suspended meanwhile records nothing.
+	if err := s.RecordGroup(ctx, 8, 9, []byte(`{"state":"ready"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := s.GroupResult(ctx, 8); string(r) != "{}" {
+		t.Fatalf("recorded for a suspended installation: %s", r)
+	}
+	if g, _ := s.OwnedGroup(ctx, 8); g != 0 {
+		t.Fatalf("owned for a suspended installation: %d", g)
+	}
+}
+
+// One keeper at a time holds an installation's group; another
+// installation's is free.
+func TestLockInstallation(t *testing.T) {
+	s, _ := openTenantStore(t)
+	ctx := context.Background()
+	unlock, err := s.LockInstallation(ctx, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.LockInstallation(ctx, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other()
+	got := make(chan func(), 1)
+	go func() {
+		u, err := s.LockInstallation(ctx, 7)
+		if err != nil {
+			t.Error(err)
+		}
+		got <- u
+	}()
+	select {
+	case <-got:
+		t.Fatal("two keepers held one installation")
+	case <-time.After(300 * time.Millisecond):
+	}
+	unlock()
+	(<-got)()
 }

@@ -49,7 +49,15 @@ type StatusError struct {
 	Method, Path string
 	Code         int
 	Message      string
-	RateLimited  bool
+	// RateLimited is a spent primary rate limit; RetryAfter, GitHub asking
+	// to wait (a secondary rate limit, which also answers 403).
+	RateLimited, RetryAfter bool
+}
+
+// Retryable reports whether the same request may succeed later as it is:
+// a rate limit, or GitHub's own failure.
+func (e *StatusError) Retryable() bool {
+	return e.RateLimited || e.RetryAfter || e.Code == http.StatusTooManyRequests || e.Code >= 500
 }
 
 func (e *StatusError) Error() string {
@@ -57,8 +65,8 @@ func (e *StatusError) Error() string {
 	if e.Message != "" {
 		msg += ": " + e.Message
 	}
-	if e.RateLimited {
-		msg += " (rate limit spent)"
+	if e.RateLimited || e.RetryAfter {
+		msg += " (rate limited)"
 	}
 	return msg
 }
@@ -100,12 +108,14 @@ func (g *GitHub) Installation(ctx context.Context, id int64) (Observed, error) {
 }
 
 // token returns a token of the installation's, narrowed to what keeping
-// its runner group needs.
+// its runner group needs. The lock is not held across the mint: two
+// callers may mint one each, which is harmless.
 func (g *GitHub) token(ctx context.Context, installation int64) (string, error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	now := g.now()
-	if t, ok := g.tokens[installation]; ok && t.expiry.Sub(now) > 5*time.Minute {
+	t, ok := g.tokens[installation]
+	g.mu.Unlock()
+	if ok && t.expiry.Sub(now) > 5*time.Minute {
 		return t.value, nil
 	}
 	signed, err := g.JWT.Token(ctx)
@@ -121,22 +131,43 @@ func (g *GitHub) token(ctx context.Context, installation int64) (string, error) 
 		if statusOf(err) == http.StatusUnauthorized {
 			g.JWT.Refused(signed)
 		}
-		return "", err
+		return "", fmt.Errorf("installation token: %w", err)
 	}
 	if out.Token == "" || !out.ExpiresAt.After(now.Add(5*time.Minute)) {
 		return "", errors.New("GitHub returned no usable installation token")
 	}
+	g.mu.Lock()
+	for id, old := range g.tokens {
+		if !old.expiry.After(now) {
+			delete(g.tokens, id)
+		}
+	}
 	g.tokens[installation] = token{out.Token, out.ExpiresAt}
+	g.mu.Unlock()
 	return out.Token, nil
+}
+
+// call makes a request with the installation's token, and forgets a token
+// GitHub no longer takes.
+func (g *GitHub) call(ctx context.Context, installation int64, method, path string, body io.Reader, out any) error {
+	tok, err := g.token(ctx, installation)
+	if err != nil {
+		return err
+	}
+	err = g.do(ctx, method, path, tok, body, out)
+	if statusOf(err) == http.StatusUnauthorized {
+		g.mu.Lock()
+		if g.tokens[installation].value == tok {
+			delete(g.tokens, installation)
+		}
+		g.mu.Unlock()
+	}
+	return err
 }
 
 // Repositories lists the repositories the installation may access, and
 // whether it may access all of the account's.
 func (g *GitHub) Repositories(ctx context.Context, installation int64) ([]Repository, bool, error) {
-	tok, err := g.token(ctx, installation)
-	if err != nil {
-		return nil, false, err
-	}
 	var all []Repository
 	selection := ""
 	for page := 1; ; page++ {
@@ -145,7 +176,7 @@ func (g *GitHub) Repositories(ctx context.Context, installation int64) ([]Reposi
 			RepositorySelection string       `json:"repository_selection"`
 			Repositories        []Repository `json:"repositories"`
 		}
-		if err := g.do(ctx, http.MethodGet, fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page), tok, nil, &out); err != nil {
+		if err := g.call(ctx, installation, http.MethodGet, fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page), nil, &out); err != nil {
 			return nil, false, err
 		}
 		selection = out.RepositorySelection
@@ -158,17 +189,13 @@ func (g *GitHub) Repositories(ctx context.Context, installation int64) ([]Reposi
 
 // RunnerGroups lists the organization's runner groups.
 func (g *GitHub) RunnerGroups(ctx context.Context, installation int64, org string) ([]RunnerGroup, error) {
-	tok, err := g.token(ctx, installation)
-	if err != nil {
-		return nil, err
-	}
 	var all []RunnerGroup
 	for page := 1; ; page++ {
 		var out struct {
 			TotalCount   int           `json:"total_count"`
 			RunnerGroups []RunnerGroup `json:"runner_groups"`
 		}
-		if err := g.do(ctx, http.MethodGet, fmt.Sprintf("/orgs/%s/actions/runner-groups?per_page=100&page=%d", url.PathEscape(org), page), tok, nil, &out); err != nil {
+		if err := g.call(ctx, installation, http.MethodGet, fmt.Sprintf("/orgs/%s/actions/runner-groups?per_page=100&page=%d", url.PathEscape(org), page), nil, &out); err != nil {
 			return nil, err
 		}
 		all = append(all, out.RunnerGroups...)
@@ -180,16 +207,12 @@ func (g *GitHub) RunnerGroups(ctx context.Context, installation int64, org strin
 
 // CreateRunnerGroup creates the organization's runner group as spec says.
 func (g *GitHub) CreateRunnerGroup(ctx context.Context, installation int64, org string, spec GroupSpec) (RunnerGroup, error) {
-	tok, err := g.token(ctx, installation)
-	if err != nil {
-		return RunnerGroup{}, err
-	}
 	body := map[string]any{"name": spec.Name, "visibility": spec.Visibility, "allows_public_repositories": false}
 	if spec.Visibility == "selected" {
 		body["selected_repository_ids"] = nonNil(spec.Repositories)
 	}
 	var out RunnerGroup
-	err = g.do(ctx, http.MethodPost, fmt.Sprintf("/orgs/%s/actions/runner-groups", url.PathEscape(org)), tok, jsonBody(body), &out)
+	err := g.call(ctx, installation, http.MethodPost, fmt.Sprintf("/orgs/%s/actions/runner-groups", url.PathEscape(org)), jsonBody(body), &out)
 	return out, err
 }
 
@@ -197,22 +220,14 @@ func (g *GitHub) CreateRunnerGroup(ctx context.Context, installation int64, org 
 // repositories out. The repositories of a selected group are
 // SetGroupRepositories'.
 func (g *GitHub) UpdateRunnerGroup(ctx context.Context, installation int64, org string, id int64, spec GroupSpec) error {
-	tok, err := g.token(ctx, installation)
-	if err != nil {
-		return err
-	}
 	body := map[string]any{"name": spec.Name, "visibility": spec.Visibility, "allows_public_repositories": false}
-	return g.do(ctx, http.MethodPatch, fmt.Sprintf("/orgs/%s/actions/runner-groups/%d", url.PathEscape(org), id), tok, jsonBody(body), nil)
+	return g.call(ctx, installation, http.MethodPatch, fmt.Sprintf("/orgs/%s/actions/runner-groups/%d", url.PathEscape(org), id), jsonBody(body), nil)
 }
 
 // SetGroupRepositories makes repositories the selected group's, all of them.
 func (g *GitHub) SetGroupRepositories(ctx context.Context, installation int64, org string, id int64, repositories []int64) error {
-	tok, err := g.token(ctx, installation)
-	if err != nil {
-		return err
-	}
 	body := map[string]any{"selected_repository_ids": nonNil(repositories)}
-	return g.do(ctx, http.MethodPut, fmt.Sprintf("/orgs/%s/actions/runner-groups/%d/repositories", url.PathEscape(org), id), tok, jsonBody(body), nil)
+	return g.call(ctx, installation, http.MethodPut, fmt.Sprintf("/orgs/%s/actions/runner-groups/%d/repositories", url.PathEscape(org), id), jsonBody(body), nil)
 }
 
 func nonNil(ids []int64) []int64 {
@@ -249,7 +264,7 @@ func (g *GitHub) do(ctx context.Context, method, path, auth string, body io.Read
 		}
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&msg)
 		return &StatusError{Method: method, Path: strings.SplitN(path, "?", 2)[0], Code: resp.StatusCode,
-			Message: msg.Message, RateLimited: resp.Header.Get("X-RateLimit-Remaining") == "0"}
+			Message: msg.Message, RateLimited: resp.Header.Get("X-RateLimit-Remaining") == "0", RetryAfter: resp.Header.Get("Retry-After") != ""}
 	}
 	if out == nil || resp.StatusCode == http.StatusNoContent {
 		return nil

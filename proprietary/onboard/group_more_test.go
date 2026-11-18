@@ -32,7 +32,7 @@ func TestSyncGroupClosesToPublic(t *testing.T) {
 	f, gh := newAPI(t)
 	f.groups = []RunnerGroup{{ID: 5, Name: "firerunner", Visibility: "selected", AllowsPublicRepositories: true}}
 	f.repos = []Repository{repo(1, "app", "private")}
-	if _, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner"); err != nil {
+	if _, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 5); err != nil {
 		t.Fatal(err)
 	}
 	if f.groups[0].AllowsPublicRepositories {
@@ -49,5 +49,36 @@ func TestKeeperSkipsInactive(t *testing.T) {
 	}}
 	if _, kept, err := (Keeper{Store: store, GitHub: gh, Group: "firerunner"}).Keep(context.Background(), 9); kept || err != nil || len(f.requests) != 0 {
 		t.Fatalf("kept %v, %v, requests %v", kept, err, f.requests)
+	}
+}
+
+// Onboarding's group renamed by the organization, and otherwise right, is
+// named back: the tenant's scale sets find it by name.
+func TestSyncGroupRenamedBack(t *testing.T) {
+	f, gh := newAPI(t)
+	f.groups = []RunnerGroup{{ID: 5, Name: "ci-runners", Visibility: "selected"}}
+	f.repos = []Repository{repo(1, "app", "private")}
+	if _, err := SyncGroup(context.Background(), gh, 7, "acme", "firerunner", 5); err != nil {
+		t.Fatal(err)
+	}
+	if f.groups[0].Name != "firerunner" {
+		t.Fatalf("group %+v", f.groups[0])
+	}
+}
+
+// An installation GitHub reports on an account that is not an
+// organization is not kept.
+func TestKeeperSkipsNonOrganization(t *testing.T) {
+	f, gh := newAPI(t)
+	f.repos = []Repository{repo(1, "app", "private")}
+	f.installations[7] = `{"id":7,"account":{"id":900,"login":"acme","type":"User"}}`
+	store := &groupStore{results: map[int64]GroupResult{}, rows: map[int64]jobstore.Installation{
+		7: {ID: 7, AccountID: 900, AccountLogin: "acme", State: "active"},
+	}}
+	if _, kept, err := (Keeper{Store: store, GitHub: gh, Lookup: gh.Installation, Group: "firerunner"}).Keep(context.Background(), 7); kept || err != nil {
+		t.Fatalf("kept %v, %v", kept, err)
+	}
+	if len(f.groups) != 0 {
+		t.Fatalf("groups %+v", f.groups)
 	}
 }
