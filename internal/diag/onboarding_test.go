@@ -44,7 +44,7 @@ func TestStatusAndDoctorShowOnboarding(t *testing.T) {
 		}
 		return nil
 	}
-	if s := status(); !strings.Contains(s, "applied 3 webhook deliveries (last 5s ago), dropped 1") {
+	if s := status(); !strings.Contains(s, "applied 3 webhook deliveries (last 5s ago)") || !strings.Contains(s, "dropped 1 malformed") {
 		t.Fatalf("status:\n%s", s)
 	}
 	if c := check(); c == nil || c.Level != levelPass {
@@ -63,6 +63,24 @@ func TestStatusAndDoctorShowOnboarding(t *testing.T) {
 	if c := check(); c == nil || c.Level != levelPass {
 		t.Fatalf("doctor after a later delivery = %+v", c)
 	}
+
+	f.Onboarding.Rejected, f.Onboarding.LastRejectAt = 2, now
+	if s := status(); !strings.Contains(s, "is --onboard-webhook-secret-file the App's webhook secret") {
+		t.Fatalf("status rejecting:\n%s", s)
+	}
+	if c := check(); c == nil || c.Level != levelWarn || !strings.Contains(c.Detail, "dead-letter") {
+		t.Fatalf("doctor rejecting = %+v", c)
+	}
+	f.Onboarding.LastDelivery = now.Add(time.Second)
+	if c := check(); c == nil || c.Level != levelPass {
+		t.Fatalf("doctor after a delivery applied since = %+v", c)
+	}
+
+	f.Onboarding.ReceiveError, f.Onboarding.ReceiveErrorAt = "throttled", now
+	if c := check(); c == nil || c.Level != levelWarn || !strings.Contains(c.Detail, "queue") {
+		t.Fatalf("doctor receive = %+v", c)
+	}
+	f.Onboarding.ReceiveError = ""
 
 	f.Onboarding.KeepAllError = "installation 7 (acme): 502"
 	if c := check(); c == nil || c.Level != levelWarn || !strings.Contains(c.Detail, "runner groups") {

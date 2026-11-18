@@ -42,9 +42,10 @@ func (e Envelope) delivery() (Delivery, error) {
 
 const (
 	// visibility is how long a received delivery is hidden from another
-	// receive: the time to apply it and keep its group. One not deleted
-	// by then is delivered again; the queue's redrive policy moves one
-	// received too often to its dead-letter queue.
+	// receive: the time to apply it, one GitHub lookup and a transaction.
+	// Its group is kept after it is deleted. One not deleted by then is
+	// delivered again; the queue's redrive policy moves one received too
+	// often to its dead-letter queue.
 	visibility = 120 * time.Second
 	// idleWait is how often a shard not holding the assigner's lease looks
 	// again.
@@ -67,9 +68,11 @@ type Worker struct {
 	// Active reports whether this shard is the one to work.
 	Active func() bool
 	Log    *slog.Logger
-	// now and sleep are the clock; tests replace them.
-	now   func() time.Time
-	sleep func(ctx context.Context, d time.Duration)
+	// now and sleep are the clock, and leaseCheck how often a KeepAll
+	// looks whether this shard is still the one; tests replace them.
+	now        func() time.Time
+	sleep      func(ctx context.Context, d time.Duration)
+	leaseCheck time.Duration
 
 	mu       sync.Mutex
 	status   WorkerStatus
@@ -78,15 +81,27 @@ type Worker struct {
 
 // WorkerStatus is what the worker has done, for status and doctor.
 type WorkerStatus struct {
-	Active       bool      `json:"active"`
-	Applied      int       `json:"applied"`
-	Dropped      int       `json:"dropped"`
+	Active  bool `json:"active"`
+	Applied int  `json:"applied"`
+	// Dropped are malformed deliveries, deleted: they never apply.
+	Dropped int `json:"dropped"`
+	// Rejected are deliveries whose signature does not hold, left on the
+	// queue for its dead-letter queue: a webhook secret rotated on GitHub
+	// before --onboard-webhook-secret-file makes GitHub's own fail, and
+	// they can be replayed from there.
+	Rejected     int       `json:"rejected"`
+	LastRejectAt time.Time `json:"last_reject_at,omitzero"`
+	// Failed are deliveries that failed to apply, left for a retry.
 	Failed       int       `json:"failed"`
 	LastDelivery time.Time `json:"last_delivery,omitzero"`
 	LastError    string    `json:"last_error,omitempty"`
 	LastErrorAt  time.Time `json:"last_error_at,omitzero"`
-	KeptAllAt    time.Time `json:"kept_all_at,omitzero"`
-	KeepAllError string    `json:"keep_all_error,omitempty"`
+	// ReceiveError is the queue's last failure, cleared by a receive that
+	// succeeds.
+	ReceiveError   string    `json:"receive_error,omitempty"`
+	ReceiveErrorAt time.Time `json:"receive_error_at,omitzero"`
+	KeptAllAt      time.Time `json:"kept_all_at,omitzero"`
+	KeepAllError   string    `json:"keep_all_error,omitempty"`
 }
 
 // Status returns what the worker has done.
@@ -124,7 +139,8 @@ func (w *Worker) Run(ctx context.Context) {
 }
 
 // Step works once: idles a while when not active; else keeps every group
-// if due, then receives and applies one batch.
+// if due, then receives and applies one delivery. One at a time, so the
+// visibility timeout bounds one delivery's work, not a batch's.
 func (w *Worker) Step(ctx context.Context) {
 	active := w.Active()
 	w.mu.Lock()
@@ -136,31 +152,23 @@ func (w *Worker) Step(ctx context.Context) {
 		return
 	}
 	if due {
-		err := w.Keeper.KeepAll(ctx)
-		w.mu.Lock()
-		w.lastKeep = w.clock()
-		w.status.KeptAllAt, w.status.KeepAllError = w.lastKeep, ""
-		if err != nil {
-			w.status.KeepAllError = err.Error()
-		}
-		w.mu.Unlock()
-		if err != nil {
-			w.Log.Warn("onboarding: keeping the runner groups", "err", err)
-		}
+		w.keepAll(ctx)
 	}
 	out, err := w.Queue.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(w.QueueURL),
-		MaxNumberOfMessages: 10,
+		MaxNumberOfMessages: 1,
 		WaitTimeSeconds:     20,
 		VisibilityTimeout:   int32(visibility / time.Second),
 	})
 	if err != nil {
 		if ctx.Err() == nil {
-			w.failed(fmt.Errorf("receive: %w", err))
+			w.Log.Warn("onboarding: receiving from the queue", "err", err)
+			w.count(func(s *WorkerStatus) { s.ReceiveError, s.ReceiveErrorAt = err.Error(), w.clock() })
 			w.wait(ctx, idleWait)
 		}
 		return
 	}
+	w.count(func(s *WorkerStatus) { s.ReceiveError, s.ReceiveErrorAt = "", time.Time{} })
 	for _, m := range out.Messages {
 		if ctx.Err() != nil || !w.Active() {
 			// Not deleted: delivered again, to whichever shard works.
@@ -170,7 +178,48 @@ func (w *Worker) Step(ctx context.Context) {
 	}
 }
 
-// apply applies one message, and deletes it unless a retry may succeed.
+// keepAll keeps every installation's group, and stops once this shard is
+// no longer the one to work.
+func (w *Worker) keepAll(ctx context.Context) {
+	kctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
+	defer close(done)
+	every := w.leaseCheck
+	if every == 0 {
+		every = idleWait
+	}
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-kctx.Done():
+				return
+			case <-time.After(every):
+				if !w.Active() {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	err := w.Keeper.KeepAll(kctx)
+	w.mu.Lock()
+	w.lastKeep = w.clock()
+	w.status.KeptAllAt, w.status.KeepAllError = w.lastKeep, ""
+	if err != nil && kctx.Err() == nil {
+		w.status.KeepAllError = err.Error()
+	}
+	w.mu.Unlock()
+	if err != nil && kctx.Err() == nil {
+		w.Log.Warn("onboarding: keeping the runner groups", "err", err)
+	}
+}
+
+// apply applies one message, and deletes it once it is applied, or will
+// never apply. Its runner group is kept after: a failure there is kept by
+// the next KeepAll, and the delivery is applied either way.
 func (w *Worker) apply(ctx context.Context, m sqstypes.Message) {
 	var env Envelope
 	d, err := func() (Delivery, error) {
@@ -184,31 +233,37 @@ func (w *Worker) apply(ctx context.Context, m sqstypes.Message) {
 		out, err = Handle(ctx, w.Config, w.Store, d)
 	}
 	switch {
-	case errors.Is(err, ErrSignature), errors.Is(err, ErrMalformed):
-		// Never applies: not GitHub's, or not what it sends.
+	case errors.Is(err, ErrSignature):
+		// Left for the dead-letter queue: GitHub's own fail while the
+		// secret here is not the App's, and replay from there once it is.
+		w.Log.Warn("onboarding: delivery rejected: its signature does not hold against --onboard-webhook-secret-file; left for the dead-letter queue", "delivery", env.Delivery, "event", env.Event)
+		w.count(func(s *WorkerStatus) { s.Rejected++; s.LastRejectAt = w.clock() })
+		return
+	case errors.Is(err, ErrMalformed):
+		// Never applies: not what GitHub sends.
 		w.Log.Warn("onboarding: delivery dropped", "delivery", env.Delivery, "event", env.Event, "err", err)
 		w.count(func(s *WorkerStatus) { s.Dropped++ })
 	case err != nil:
-		w.failed(fmt.Errorf("delivery %s: %w", env.Delivery, err))
+		if ctx.Err() == nil { // stopping is no failure: delivered again
+			w.failed(fmt.Errorf("delivery %s: %w", env.Delivery, err))
+		}
 		return
 	default:
 		w.Log.Info("onboarding: delivery applied", "delivery", out.Delivery, "event", out.Event, "action", out.Action,
 			"installation", out.Installation, "account", out.Account, "tenant", out.Tenant, "result", out.Result, "reason", out.Reason)
 		w.count(func(s *WorkerStatus) { s.Applied++; s.LastDelivery = w.clock() })
-		if out.KeepGroup {
-			// A failure here is kept by the next KeepAll; the delivery is
-			// applied either way.
-			if res, kept, err := w.Keeper.Keep(ctx, out.Installation); err != nil {
-				w.Log.Warn("onboarding: keeping a runner group", "installation", out.Installation, "err", err)
-			} else if kept {
-				w.Log.Info("onboarding: runner group kept", "installation", out.Installation, "state", res.State, "reason", res.Reason,
-					"group", res.GroupID, "all", res.All, "served", res.Served, "public", len(res.Public))
-			}
-		}
 	}
 	if _, err := w.Queue.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(w.QueueURL), ReceiptHandle: m.ReceiptHandle}); err != nil {
 		// Delivered again, and applied once: the job store says duplicate.
 		w.Log.Warn("onboarding: deleting a delivery from the queue", "delivery", env.Delivery, "err", err)
+	}
+	if out.KeepGroup && ctx.Err() == nil {
+		if res, kept, err := w.Keeper.Keep(ctx, out.Installation); err != nil {
+			w.Log.Warn("onboarding: keeping a runner group", "installation", out.Installation, "err", err)
+		} else if kept {
+			w.Log.Info("onboarding: runner group kept", "installation", out.Installation, "state", res.State, "reason", res.Reason,
+				"group", res.GroupID, "all", res.All, "served", res.Served, "public", len(res.Public))
+		}
 	}
 }
 

@@ -60,12 +60,34 @@ func newOnboarding(ctx context.Context, cfg *config.Config, db *jobstore.TenantS
 	if err != nil {
 		return nil, err
 	}
+	queue := awssqs.NewFromConfig(awsCfg, func(o *awssqs.Options) {
+		if r := queueRegion(cfg.OnboardQueueURL); r != "" {
+			o.Region = r
+		}
+	})
 	return &onboard.Worker{
-		Queue: awssqs.NewFromConfig(awsCfg), QueueURL: cfg.OnboardQueueURL,
+		Queue: queue, QueueURL: cfg.OnboardQueueURL,
 		Config: oc, Store: db,
 		Keeper: onboard.Keeper{Store: db, GitHub: gh, Lookup: gh.Installation, Group: cfg.OnboardRunnerGroup},
 		Active: leaser.assigning, Log: log,
 	}, nil
+}
+
+// queueRegion is the region an SQS queue URL names
+// (https://sqs.REGION.amazonaws.com/...), or "": the queue may be in
+// another region than the daemon's own.
+func queueRegion(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	if rest, ok := strings.CutPrefix(host, "sqs."); ok {
+		if region, _, ok := strings.Cut(rest, ".amazonaws.com"); ok && region != "" && !strings.Contains(region, ".") {
+			return region
+		}
+	}
+	return ""
 }
 
 func healthOnboarding(st onboard.WorkerStatus) *health.Onboarding {

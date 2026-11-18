@@ -91,3 +91,19 @@ func TestNewOnboarding(t *testing.T) {
 		t.Fatal("active at the lease's deadline")
 	}
 }
+
+// The SQS client goes to the region the queue's URL names.
+func TestQueueRegion(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://sqs.eu-west-1.amazonaws.com/000000000000/q": "eu-west-1",
+		"https://SQS.us-east-2.amazonaws.com/000000000000/q": "us-east-2",
+		"https://vpce-1.sqs.us-east-1.vpce.amazonaws.com/q":  "",
+		"https://queue.amazonaws.com/000000000000/q":         "",
+		"https://sqs.us-east-1.vpce.amazonaws.com/q":         "",
+		"%": "",
+	} {
+		if got := queueRegion(raw); got != want {
+			t.Errorf("queueRegion(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}

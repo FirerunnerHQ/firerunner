@@ -590,19 +590,35 @@ type File struct {
 }
 
 // Onboarding is hosted onboarding's worker: the deliveries it applied,
-// dropped (never to apply: unsigned or malformed) and failed (left on the
-// queue for a retry), and keeping every installation's runner group.
+// dropped (malformed), rejected (unsigned, left for the dead-letter queue)
+// and failed (left on the queue for a retry), the queue's own failures,
+// and keeping every installation's runner group.
 type Onboarding struct {
 	// Active is set on the shard that applies them: the assigner's.
-	Active       bool      `json:"active"`
-	Applied      int       `json:"applied"`
-	Dropped      int       `json:"dropped"`
+	Active  bool `json:"active"`
+	Applied int  `json:"applied"`
+	// Dropped are malformed deliveries, deleted.
+	Dropped int `json:"dropped"`
+	// Rejected are deliveries whose signature does not hold, left for the
+	// queue's dead-letter queue.
+	Rejected     int       `json:"rejected"`
+	LastRejectAt time.Time `json:"last_reject_at,omitzero"`
+	// Failed are deliveries that failed to apply, left for a retry.
 	Failed       int       `json:"failed"`
 	LastDelivery time.Time `json:"last_delivery,omitzero"`
 	LastError    string    `json:"last_error,omitempty"`
 	LastErrorAt  time.Time `json:"last_error_at,omitzero"`
-	KeptAllAt    time.Time `json:"kept_all_at,omitzero"`
-	KeepAllError string    `json:"keep_all_error,omitempty"`
+	// ReceiveError is the queue's last failure, until a receive succeeds.
+	ReceiveError   string    `json:"receive_error,omitempty"`
+	ReceiveErrorAt time.Time `json:"receive_error_at,omitzero"`
+	KeptAllAt      time.Time `json:"kept_all_at,omitzero"`
+	KeepAllError   string    `json:"keep_all_error,omitempty"`
+}
+
+// Rejecting reports whether deliveries were rejected since the last one
+// applied: the webhook secret here is likely not the App's.
+func (o *Onboarding) Rejecting() bool {
+	return o.Rejected > 0 && !o.LastRejectAt.Before(o.LastDelivery)
 }
 
 // Failing reports whether the last thing the worker did was fail.
