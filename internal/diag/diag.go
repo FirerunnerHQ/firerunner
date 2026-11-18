@@ -489,7 +489,7 @@ func renderStatusText(r StatusReport, w io.Writer) {
 			}
 		}
 		if l.InstallStandby {
-			fmt.Fprintln(w, "  the install's tiers: standing by; another shard holds their scale sets' sessions, and this one takes them over when it stops")
+			fmt.Fprintln(w, "  the install's tiers: standing by; another shard holds their scale sets' sessions, which this one takes over once that shard stops")
 		}
 		if tl := l.TenantLeases; tl != nil {
 			last := "never"

@@ -43,8 +43,11 @@ type tenant struct {
 	KeepOnClose bool
 	// WaitForSession stands its tiers by while another daemon holds their
 	// scale sets' sessions, rather than failing (listener.Config): the
-	// install of a shard under leases, which every shard runs.
+	// install of a shard under leases, which every shard runs. Its tiers'
+	// sessions open all together or not at all, and Standby, when set, is
+	// told whether it stands by.
 	WaitForSession bool
+	Standby        func(bool)
 	Token          string
 	// Auth is App's installation, with JWTs signed once for the whole shard.
 	Auth  ghauth.App
@@ -533,6 +536,10 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (_ *serv
 		tierJobs[tier.Name] = assigned.New(poolPolicy(tier))
 		tierScheds[tier.Name] = &atomic.Pointer[scheduler.Scheduler]{}
 	}
+	// The tiers' stopped pools fill and refill in the background for the
+	// life of the process, once every tier's session is open: one standing
+	// by for another daemon's sessions launches nothing.
+	var pools []interface{ Run(context.Context) }
 	var newEC2 func(config.Tier) provisioner.Provisioner
 	if s.ec2Client != nil {
 		newEC2 = func(tier config.Tier) provisioner.Provisioner {
@@ -540,11 +547,10 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (_ *serv
 			sched := tierScheds[tier.Name]
 			o.OnRunnerJob = alsoMarkBusy(o.OnRunnerJob, sched.Load)
 			p := s.ec2Client.Tier(o)
-			// A tier's stopped pool fills and refills in the background for
-			// the life of the process; its instances stay stopped on exit and
-			// are found again on the next start.
+			// Its instances stay stopped on exit and are found again on the
+			// next start.
 			if pool := p.Pool(); pool != nil {
-				go pool.Run(ctx)
+				pools = append(pools, pool)
 			}
 			return p
 		}
@@ -577,6 +583,19 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (_ *serv
 		tierScheds[tier.Name].Store(sched)
 		st.scheds = append(st.scheds, sched)
 	}
+	if t.WaitForSession {
+		sets := make([]sessionSet, len(st.listeners))
+		for i, l := range st.listeners {
+			sets[i] = l
+		}
+		if err := openTogether(ctx, sets, sessionWait, t.Standby, log); err != nil {
+			st.close(context.WithoutCancel(ctx))
+			return nil, err
+		}
+	}
+	for _, pool := range pools {
+		go pool.Run(ctx)
+	}
 
 	if s.ec2Client != nil && cfg.EC2Reaper != "off" {
 		reaper := s.ec2Client.NewReaper(s.tenantReaperOptions(t, st.listeners, log))
@@ -593,6 +612,66 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (_ *serv
 		}
 	}
 	return st, nil
+}
+
+// sessionWait is how long a tenant standing by for another daemon's
+// sessions waits between attempts at them all.
+const sessionWait = 10 * time.Second
+
+// sessionSet is a scale set whose session opens once; a *listener.ScaleSet.
+type sessionSet interface {
+	TryOpenSession(ctx context.Context) (bool, error)
+	ReleaseSession(ctx context.Context)
+}
+
+// openTogether opens the sessions of sets all together, or holds none: a
+// tenant served by daemons that share its scale sets (shards of one
+// configuration) is served by whichever opens them all. Holding some while
+// it waits for the rest, two daemons could each hold part and wait on the
+// other for good. It tries them in order, every wait, and on the first one
+// held releases those it opened, until ctx ends. standby, when set, is told
+// whether it stands by.
+func openTogether(ctx context.Context, sets []sessionSet, wait time.Duration, standby func(bool), log *slog.Logger) error {
+	if standby == nil {
+		standby = func(bool) {}
+	}
+	defer standby(false)
+	for round := 0; ; round++ {
+		opened := 0
+		for _, s := range sets {
+			ok, err := s.TryOpenSession(ctx)
+			if err != nil {
+				releaseAll(ctx, sets[:opened])
+				return err
+			}
+			if !ok {
+				break
+			}
+			opened++
+		}
+		if opened == len(sets) {
+			if round > 0 {
+				log.Info("took over the scale sets' sessions another daemon held", "after", round)
+			}
+			return nil
+		}
+		releaseAll(ctx, sets[:opened])
+		if round == 0 {
+			log.Info("another daemon holds the scale sets' sessions: standing by to take them over")
+		}
+		standby(true)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+func releaseAll(ctx context.Context, sets []sessionSet) {
+	for _, s := range sets {
+		s.ReleaseSession(context.WithoutCancel(ctx))
+	}
 }
 
 // alsoMarkBusy adds marking the runner busy, on the scheduler sched returns

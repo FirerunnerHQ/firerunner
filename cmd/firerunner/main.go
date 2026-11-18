@@ -1214,7 +1214,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if appJWT != nil {
 		t.Auth = ghauth.App{InstallationID: cfg.AppInstallID, JWT: appJWT}
 	}
-	s := &shard{cfg: cfg, log: log, events: events, exiting: ctx}
+	// exiting ends with ctx, or when the daemon stops for want of its own
+	// tiers: either way its tenants hand off rather than wait.
+	exiting, exit := context.WithCancel(ctx)
+	defer exit()
+	s := &shard{cfg: cfg, log: log, events: events, exiting: exiting}
 
 	// Each tier is its own GitHub scale set; developers pick one with
 	// runs-on: <tier name>. One Firecracker provisioner backs every Firecracker
@@ -1433,13 +1437,9 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// the same install: GitHub gives its scale sets' sessions to one shard
 	// at a time, and the others stand by to take them over, as long as it
 	// takes, launching nothing meanwhile.
-	t.WaitForSession = cfg.TenantLeases
-	if t.WaitForSession {
-		installStandby.Store(true)
-	}
+	t.WaitForSession, t.Standby = cfg.TenantLeases, installStandby.Store
 	// ctx, not runCtx: the pool and reaper it starts run on through a drain.
 	served, runErr := s.start(ctx, t, hooks)
-	installStandby.Store(false)
 	if runErr == nil {
 		defer served.close(context.WithoutCancel(ctx))
 		live.add(served)
@@ -1456,8 +1456,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		installPanic := sync.OnceFunc(func() { _ = guardAfterPanic(nil, panicStopLimit(served.t.Limits.JobDuration), "the install", log) })
 		runErr = serveTiers(runCtx, cancel, served.names(), served.runs(cfg), installPanic, log)
 	} else if runCtx.Err() == nil {
-		// The install did not start: stop the tenants as on any exit.
+		// The install did not start: stop the tenants as the daemon's exit
+		// does, handing their busy runners to the next start rather than
+		// waiting for their jobs.
 		log.Error("the install's tiers did not start; stopping", "err", runErr)
+		exit()
 	}
 	cancel()
 	if leaser != nil {

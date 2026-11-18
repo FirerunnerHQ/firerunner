@@ -282,8 +282,13 @@ func TestListenerConfigIsTheTenantsApp(t *testing.T) {
 	jwt := ghauth.NewJWT("Iv1", nil)
 	ten := tenant{URL: "https://github.com/acme", Auth: ghauth.App{InstallationID: 7, JWT: jwt}}
 	lc := s.listenerConfig(ten, config.Tier{Name: "t", Max: 3}, tenantHooks{}, health.NewTracker("t"), assigned.New(nil), s.log, nil)
-	if lc.App.InstallationID != 7 || lc.App.JWT != jwt || lc.URL != ten.URL || lc.MaxRunners != 3 {
+	if lc.App.InstallationID != 7 || lc.App.JWT != jwt || lc.URL != ten.URL || lc.MaxRunners != 3 || lc.WaitForSession {
 		t.Fatalf("listener config = %+v", lc)
+	}
+	// The install of a shard waits for sessions another shard holds.
+	ten.WaitForSession = true
+	if lc := s.listenerConfig(ten, config.Tier{Name: "t"}, tenantHooks{}, health.NewTracker("t"), assigned.New(nil), s.log, nil); !lc.WaitForSession {
+		t.Fatal("WaitForSession not passed to the listener")
 	}
 }
 

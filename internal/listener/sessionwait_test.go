@@ -22,6 +22,47 @@ func sessionOpener(busy int, other error) (func(context.Context) (int, error), *
 	}, &tries
 }
 
+// TryOpenSession opens once: false while another holds the session, an
+// error for anything else; ReleaseSession closes one opened, for another to
+// take, and Close and CloseSession hold no session to close.
+func TestTryAndReleaseSession(t *testing.T) {
+	held := true
+	var opened []*fakeSession
+	s := &ScaleSet{log: testLogger(), scaleSetID: 4, created: false}
+	s.tryOpen = func(context.Context) (session, error) {
+		if held {
+			return nil, errors.New("409 Conflict: the runner scale set already has an active session")
+		}
+		f := &fakeSession{}
+		opened = append(opened, f)
+		return f, nil
+	}
+	ctx := context.Background()
+	s.CloseSession(ctx) // none open: nothing to close
+	if ok, err := s.TryOpenSession(ctx); ok || err != nil {
+		t.Fatalf("held: %v, %v", ok, err)
+	}
+	held = false
+	if ok, err := s.TryOpenSession(ctx); !ok || err != nil || len(opened) != 1 {
+		t.Fatalf("free: %v, %v, %d opened", ok, err, len(opened))
+	}
+	if ok, _ := s.TryOpenSession(ctx); !ok || len(opened) != 1 {
+		t.Fatal("an open session opened again")
+	}
+	s.ReleaseSession(ctx)
+	if !opened[0].closed.Load() || s.session != nil {
+		t.Fatal("not released")
+	}
+	s.ReleaseSession(ctx) // none open
+	if err := s.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.tryOpen = func(context.Context) (session, error) { return nil, errors.New("401 Unauthorized") }
+	if ok, err := s.TryOpenSession(ctx); ok || err == nil {
+		t.Fatalf("another error: %v, %v", ok, err)
+	}
+}
+
 // Without wait, a conflict is retried as long as a crashed process's hold
 // lasts, then fails; with it, for as long as the context lasts, as a standby
 // for another daemon's session.
