@@ -93,6 +93,11 @@ type shard struct {
 	// tenant id is listed there now: a removal ends no machine by its owner
 	// tag once it is, as they are a run's of the id listed again.
 	tenantListed func(ctx context.Context, id string) (bool, error)
+	// installationGone, with hosted onboarding, reports whether the App's
+	// installation was uninstalled or suspended: GitHub then gives it no
+	// token, so its scale sets cannot be deleted, and trying again would
+	// never end (#170).
+	installationGone func(ctx context.Context, installation int64) (bool, error)
 	// applyMu makes each applyState decide and apply as one step: the
 	// watchers and the tenant loops call it at once, and a decision taken
 	// on older inputs must not land after one taken on newer.
@@ -375,11 +380,25 @@ func (s *shard) loop(get func() tenant, live *liveTenants) *tenantLoop {
 // It goes on as the daemon stops, each tier bounded, but stops at once,
 // mid-call too, once its lease lapses (leaseLapse): another shard may
 // serve the account then, under the same scale set names. It returns an
-// error unless every tier's scale set is gone.
+// error unless every tier's scale set is gone, or the tenant's App
+// installation is (installationGone): nothing can delete them then, and a
+// reinstall or unsuspend serves them again by name.
 func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) error {
 	remove := s.removeByName
 	if remove == nil {
 		remove = listener.RemoveByName
+	}
+	if s.installationGone != nil {
+		gctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
+		gone, err := s.installationGone(gctx, t.Auth.InstallationID)
+		cancel()
+		switch {
+		case err != nil:
+			s.log.Warn("could not read whether a removed tenant's App installation is gone; deleting its scale sets", "tenant", t.ID, "err", err)
+		case gone:
+			s.log.Info("a removed tenant's App installation is gone; its scale sets cannot be deleted, and are left to it", "tenant", t.ID, "installation", t.Auth.InstallationID)
+			return nil
+		}
 	}
 	lapse := leaseLapse(ctx)
 	var errs []error
