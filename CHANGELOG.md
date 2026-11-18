@@ -8,6 +8,30 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-11-18
+
+### Changed
+
+- The daemon starts the installations of its tenants list before its own
+  tiers, so they no longer wait for those to register. If its own tiers
+  then fail to start, the tenants hand their busy runners on as at any exit.
+- A tier's warm pool starts filling once every tier of its install or
+  tenant has registered, rather than as each does.
+
+### Fixed
+
+- Daemons sharing a tenants list under `--tenant-leases` share one
+  configuration, and so one install. Each but the first could not open the
+  install's sessions, never served an installation of the list, and exited
+  after two minutes, again and again. A shard now starts the list's
+  installations before the install's own tiers, and stands by for the
+  install as long as another shard holds its sessions: it opens them all
+  together or holds none, launches nothing for the install meanwhile (no
+  warm pool either), and takes it over once that shard stops.
+  `firerunner status` shows a shard standing by.
+- Two daemons creating one scale set at once no longer fail the one that
+  loses the race: it takes the scale set the other made.
+
 ## [0.1.27] - 2026-11-17
 
 ### Added
@@ -765,7 +789,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.27...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.28...HEAD
+[0.1.28]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.28
 [0.1.27]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.27
 [0.1.26]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.26
 [0.1.25]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.25
