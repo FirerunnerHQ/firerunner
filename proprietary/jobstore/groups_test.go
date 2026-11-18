@@ -2,6 +2,7 @@ package jobstore
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -62,8 +63,10 @@ func TestInstallationGroups(t *testing.T) {
 	if r, _ := s.GroupResult(ctx, 8); string(r) != "{}" {
 		t.Fatalf("recorded for a suspended installation: %s", r)
 	}
-	if g, _ := s.OwnedGroup(ctx, 8); g != 0 {
-		t.Fatalf("owned for a suspended installation: %d", g)
+	// Its account's group (installation 7's, the same account), not the 9 it
+	// tried to record.
+	if g, _ := s.OwnedGroup(ctx, 8); g != 5 {
+		t.Fatalf("owned for a suspended installation: %d, want its account's 5", g)
 	}
 }
 
@@ -96,4 +99,46 @@ func TestLockInstallation(t *testing.T) {
 	}
 	unlock()
 	(<-got)()
+}
+
+// An organization that uninstalls and installs again keeps the group
+// onboarding created under its first installation; another organization's
+// is never its own.
+func TestOwnedGroupAcrossReinstalls(t *testing.T) {
+	s, _ := openTenantStore(t)
+	ctx := context.Background()
+	put := func(id, account int64, state string) {
+		t.Helper()
+		_, err := s.Onboard(ctx, fmt.Sprintf("d%d-%s", id, state), "installation", func(tx OnboardTx) (string, error) {
+			return "", tx.PutInstallation(ctx, Installation{ID: id, AccountID: account, AccountLogin: "org", AccountType: "Organization",
+				Tenant: "org", State: state, UpdatedAt: day})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(10, 900, "active")
+	if err := s.RecordGroup(ctx, 10, 3, []byte(`{"state":"ready","group_id":3}`)); err != nil {
+		t.Fatal(err)
+	}
+	put(10, 900, "deleted")
+	put(11, 900, "active")
+	if g, err := s.OwnedGroup(ctx, 11); err != nil || g != 3 {
+		t.Fatalf("after a reinstall: %d, %v; want the first installation's group 3", g, err)
+	}
+	put(12, 901, "active")
+	if g, err := s.OwnedGroup(ctx, 12); err != nil || g != 0 {
+		t.Fatalf("another organization: %d, %v", g, err)
+	}
+	// Created again under the new installation (the old one deleted at
+	// GitHub): the newer group is the one kept.
+	if err := s.RecordGroup(ctx, 11, 7, []byte(`{"state":"ready","group_id":7}`)); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := s.OwnedGroup(ctx, 11); err != nil || g != 7 {
+		t.Fatalf("after a new group: %d, %v; want 7", g, err)
+	}
+	if g, err := s.OwnedGroup(ctx, 99); err != nil || g != 0 {
+		t.Fatalf("no such installation: %d, %v", g, err)
+	}
 }
