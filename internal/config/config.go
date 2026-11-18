@@ -72,6 +72,16 @@ type Config struct {
 	// <TenantOwner>/<id>. Empty is the install's (Owner). Shards of one
 	// tenants list share it, each with its own Owner.
 	TenantOwner string
+	// OnboardQueueURL is the SQS queue the hosted App's webhooks arrive
+	// on; set, the shard that holds the assigner's lease turns them into
+	// tenants (hosted onboarding). OnboardWebhookSecretFile holds the
+	// App's webhook secret; OnboardTiers are a new tenant's tiers, and
+	// OnboardRunnerGroup the runner group onboarding keeps in each
+	// organization, which its tenants' scale sets go in.
+	OnboardQueueURL          string
+	OnboardWebhookSecretFile string
+	OnboardTiers             []string
+	OnboardRunnerGroup       string
 	// Limits are the install's own (--limit-*): none by default, as the
 	// install is its operator's. Tenants set theirs in the catalog.
 	Limits Limits
@@ -392,6 +402,7 @@ func FromFlags(args []string) (*Config, error) {
 // flagVals holds the flag values Parse turns into Config fields after parsing.
 type flagVals struct {
 	labels, jailerCgroup, egress, dnsServers string
+	onboardTiers                             string
 	metaRefresh                              time.Duration
 	logMaxMiB, logDirMaxMiB                  int
 }
@@ -434,6 +445,10 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.StringVar(&c.TenantState, "tenant-state", env("FR_TENANT_STATE", ""), "where tenant suspensions are kept (firerunner tenant suspend): an absolute file path, or ssm: and an SSM path holding one parameter per suspended tenant. Read at start and every 15 s; a suspended tenant's launches are held and its runners ended. Off when empty")
 	fs.StringVar(&c.Entitlements, "entitlements", env("FR_ENTITLEMENTS", ""), "where billing keeps what each tenant of the catalog may run: an absolute file path, or ssm: and an SSM path holding one parameter per tenant (account and budget state, valid until). Read at start and every 30 s. A tenant with no record, a suspended account or a capped budget is held: its jobs wait, with the reason; an expired record holds unless it names an active account. The install itself is never held. Off when empty")
 	fs.BoolVar(&c.TenantLeases, "tenant-leases", er.boolean("FR_TENANT_LEASES", false), "serve a tenant of --tenants db: only while this process holds the lease on its GitHub account in the job store's database, renewed every 10s, so that several daemons (shards) share one tenants list and each tenant is served by one at a time. A shard that cannot renew stops launching for a tenant within 20s; another takes it over once the lease has expired (30s). Every shard needs the same --tenant-owner, an --owner of its own and, with EC2 tiers, the same --ec2-pool-key-file")
+	fs.StringVar(&c.OnboardQueueURL, "onboard-queue-url", env("FR_ONBOARD_QUEUE_URL", ""), "the SQS queue URL the hosted GitHub App's webhooks arrive on (hosted onboarding): the shard holding the assigner's lease turns installations into tenants of --tenants db: and keeps each organization's --onboard-runner-group. Needs --tenant-leases, --onboard-webhook-secret-file and --onboard-tiers")
+	fs.StringVar(&c.OnboardWebhookSecretFile, "onboard-webhook-secret-file", "", "a file holding the hosted App's webhook secret, which signs every delivery. Default FR_ONBOARD_WEBHOOK_SECRET_FILE")
+	fs.StringVar(&v.onboardTiers, "onboard-tiers", env("FR_ONBOARD_TIERS", ""), "comma-separated catalog tiers every onboarded tenant gets")
+	fs.StringVar(&c.OnboardRunnerGroup, "onboard-runner-group", env("FR_ONBOARD_RUNNER_GROUP", "firerunner"), "the runner group onboarding creates and keeps in each organization, open to the installation's repositories that are not public; never the organization's default group")
 	fs.StringVar(&c.TenantOwner, "tenant-owner", env("FR_TENANT_OWNER", ""), "the owner of the tenants' instances, tagged firerunner:owner <tenant-owner>/<id>; defaults to --owner. Shards of one tenants list (--tenant-leases) share it, each with an --owner of its own: a tenant's busy runners are handed to the next shard by it, while a shard's own tiers and pool stay its own")
 	fs.BoolVar(&c.GuardDuty, "guardduty", er.boolean("FR_GUARDDUTY", false), "read AWS GuardDuty's findings on the install's EC2 instances every 2 minutes and flag the tenant each names, by its firerunner:owner tag, for review in firerunner status and doctor. A flag never suspends: review it, then firerunner tenant suspend or clear-flag. Flags are kept beside --tenant-state, which it needs")
 	fs.Float64Var(&c.GuardDutyMinSeverity, "guardduty-min-severity", er.float("FR_GUARDDUTY_MIN_SEVERITY", 4), "the least GuardDuty severity that flags a tenant: 1-10; 4 is Medium, 7 High")
@@ -518,12 +533,20 @@ func Parse(args []string) (*Config, error) {
 	if c.EC2PoolKeyFile == "" {
 		c.EC2PoolKeyFile = env("FR_EC2_POOL_KEY_FILE", "")
 	}
+	if c.OnboardWebhookSecretFile == "" {
+		c.OnboardWebhookSecretFile = env("FR_ONBOARD_WEBHOOK_SECRET_FILE", "")
+	}
 	c.JobEventsDSN = env("FR_JOB_EVENTS_DSN", "")
 	c.JobEventsDSNFile = env("FR_JOB_EVENTS_DSN_FILE", "")
 	// Surface any malformed FR_* env values now, so a typo fails closed instead
 	// of silently running with a default.
 	if err := er.err(); err != nil {
 		return nil, err
+	}
+	for _, t := range strings.Split(v.onboardTiers, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			c.OnboardTiers = append(c.OnboardTiers, t)
+		}
 	}
 	if v.labels != "" {
 		for _, l := range strings.Split(v.labels, ",") {
@@ -705,6 +728,9 @@ func (c *Config) validate() error {
 		if err := tenantstate.CheckSpec(c.Entitlements); err != nil {
 			return fmt.Errorf("--entitlements %w", err)
 		}
+	}
+	if err := c.checkOnboard(); err != nil {
+		return err
 	}
 	if c.GuardDuty && c.TenantState == "" {
 		return errors.New("--guardduty needs --tenant-state: flags are kept beside the tenant states")
@@ -1253,4 +1279,26 @@ func (r *envReader) duration(key string, def time.Duration) time.Duration {
 		return d
 	}
 	return def
+}
+
+// checkOnboard checks hosted onboarding's settings; the tiers against the
+// catalog are the onboarding package's to check, at start.
+func (c *Config) checkOnboard() error {
+	if c.OnboardQueueURL == "" {
+		return nil
+	}
+	if u, err := url.Parse(c.OnboardQueueURL); err != nil || u.Scheme != "https" || u.Host == "" {
+		return fmt.Errorf("--onboard-queue-url %q: an https SQS queue URL", c.OnboardQueueURL)
+	}
+	switch {
+	case !c.TenantLeases:
+		return errors.New("--onboard-queue-url writes the tenants table, which --tenant-leases serves: set it")
+	case c.OnboardWebhookSecretFile == "":
+		return errors.New("--onboard-queue-url needs --onboard-webhook-secret-file: an unsigned delivery is never applied")
+	case len(c.OnboardTiers) == 0:
+		return errors.New("--onboard-queue-url needs --onboard-tiers, the tiers a new tenant gets")
+	case strings.TrimSpace(c.OnboardRunnerGroup) == "" || strings.EqualFold(c.OnboardRunnerGroup, "default"):
+		return fmt.Errorf("--onboard-runner-group %q: a group of onboarding's own, never the organization's default", c.OnboardRunnerGroup)
+	}
+	return nil
 }

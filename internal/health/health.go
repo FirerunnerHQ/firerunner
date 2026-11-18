@@ -584,6 +584,30 @@ type File struct {
 	// TenantLeases is how renewing the tenants' leases goes, when the
 	// daemon serves them under leases (--tenant-leases).
 	TenantLeases *TenantLeases `json:"tenant_leases,omitempty"`
+	// Onboarding is how applying the hosted App's webhooks goes, when the
+	// daemon does (--onboard-queue-url).
+	Onboarding *Onboarding `json:"onboarding,omitempty"`
+}
+
+// Onboarding is hosted onboarding's worker: the deliveries it applied,
+// dropped (never to apply: unsigned or malformed) and failed (left on the
+// queue for a retry), and keeping every installation's runner group.
+type Onboarding struct {
+	// Active is set on the shard that applies them: the assigner's.
+	Active       bool      `json:"active"`
+	Applied      int       `json:"applied"`
+	Dropped      int       `json:"dropped"`
+	Failed       int       `json:"failed"`
+	LastDelivery time.Time `json:"last_delivery,omitzero"`
+	LastError    string    `json:"last_error,omitempty"`
+	LastErrorAt  time.Time `json:"last_error_at,omitzero"`
+	KeptAllAt    time.Time `json:"kept_all_at,omitzero"`
+	KeepAllError string    `json:"keep_all_error,omitempty"`
+}
+
+// Failing reports whether the last thing the worker did was fail.
+func (o *Onboarding) Failing() bool {
+	return o.LastError != "" && !o.LastErrorAt.Before(o.LastDelivery)
 }
 
 // ConnRefusals is a listener's connections refused at its connection caps.

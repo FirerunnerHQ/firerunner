@@ -343,6 +343,24 @@ takes any free lease, ignoring the assignments.
 - A renewal that fails is tried again every 2 seconds. A shard that cannot
   join (its database down, or owners that do not fit) serves no installation
   of the list, and keeps trying.
+
+**Onboarding from the App's webhooks (hosted).** With `--onboard-queue-url`
+(`FR_ONBOARD_QUEUE_URL`), the shard that holds the assigner's lease reads the
+App's webhook deliveries from that SQS queue, where an ingress puts each with
+its GitHub headers. A delivery whose signature does not hold against
+`--onboard-webhook-secret-file` is dropped. An organization that installs the
+App becomes an installation of the list, with `--onboard-tiers` and the
+default limits. A personal account, the install's own organization, or one
+listed already is refused, with the reason kept. One that suspends or
+uninstalls it is removed, as above. Each delivery is applied once, one at a
+time, and with the installation's state as GitHub reports it then. In each
+organization the shard also keeps a runner group of its own,
+`--onboard-runner-group`. That group is open to the installation's
+repositories that are not public, never to a public one. A group of that name
+that the organization made itself is left alone, and so is its default group.
+A delivery that fails stays on the queue to be retried; set a redrive policy
+to a dead-letter queue. `firerunner status` counts the deliveries applied,
+dropped and failed, and `doctor` warns while they fail.
 - Shards share one configuration, and so one install (`--url`): GitHub gives
   each of its tiers' scale sets' sessions to one shard at a time. A shard
   opens all of the install's sessions or none, so that two never each hold

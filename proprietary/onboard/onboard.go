@@ -117,6 +117,10 @@ type Store interface {
 // or for another secret.
 var ErrSignature = errors.New("the webhook signature does not hold")
 
+// ErrMalformed is a delivery that will never apply, however often it is
+// tried: not what GitHub sends.
+var ErrMalformed = errors.New("the delivery is malformed")
+
 // Verify checks a delivery's X-Hub-Signature-256 against secret.
 func Verify(secret, body []byte, signature string) error {
 	got, ok := strings.CutPrefix(signature, "sha256=")
@@ -150,16 +154,16 @@ type installationEvent struct {
 }
 
 // Handle verifies a delivery and applies it. A delivery whose signature
-// does not hold is ErrSignature, and changes nothing; one that does not
-// parse, or fails to apply, is an error, and changes nothing either, so
-// it can be retried. Events onboarding does not act on are ignored.
+// does not hold is ErrSignature, and one that does not parse ErrMalformed:
+// neither changes anything, nor ever will. One that fails to apply is
+// another error, and changes nothing either, so it can be retried. Events onboarding does not act on are ignored.
 func Handle(ctx context.Context, cfg Config, store Store, d Delivery) (Outcome, error) {
 	out := Outcome{Delivery: d.ID, Event: d.Event}
 	if err := Verify(cfg.Secret, d.Body, d.Signature); err != nil {
 		return out, err
 	}
 	if d.ID == "" {
-		return out, errors.New("the delivery has no X-GitHub-Delivery id")
+		return out, fmt.Errorf("%w: no X-GitHub-Delivery id", ErrMalformed)
 	}
 	if d.Event == "installation_repositories" {
 		// Which repositories it may access is GitHub's to say when the
@@ -170,7 +174,7 @@ func Handle(ctx context.Context, cfg Config, store Store, d Delivery) (Outcome, 
 			} `json:"installation"`
 		}
 		if err := json.Unmarshal(d.Body, &ev); err != nil || ev.Installation.ID <= 0 {
-			return out, fmt.Errorf("installation_repositories event: no installation id (%v)", err)
+			return out, fmt.Errorf("%w: installation_repositories event with no installation id (%v)", ErrMalformed, err)
 		}
 		out.Installation, out.KeepGroup = ev.Installation.ID, true
 		out.Result, out.Reason = "ignored", "changes the runner group's repositories, not the tenant"
@@ -182,11 +186,11 @@ func Handle(ctx context.Context, cfg Config, store Store, d Delivery) (Outcome, 
 	}
 	var ev installationEvent
 	if err := json.Unmarshal(d.Body, &ev); err != nil {
-		return out, fmt.Errorf("installation event: %w", err)
+		return out, fmt.Errorf("%w: installation event: %v", ErrMalformed, err)
 	}
 	in := ev.Installation
 	if in.ID <= 0 || in.Account.ID <= 0 || in.Account.Login == "" || in.UpdatedAt.IsZero() {
-		return out, errors.New("installation event: no installation id, account or updated_at")
+		return out, fmt.Errorf("%w: installation event with no installation id, account or updated_at", ErrMalformed)
 	}
 	out.Action, out.Installation, out.Account = ev.Action, in.ID, in.Account.Login
 	recorded, err := store.Onboard(ctx, d.ID, d.Event, func(tx jobstore.OnboardTx) (string, error) {

@@ -956,11 +956,14 @@ func captureStderr(t *testing.T, f func()) string {
 func TestParse_NeverEchoesCredentials(t *testing.T) {
 	// The flag package prints every flag's default on -h and on any parse
 	// error; credentials from the env must not be among them.
-	t.Setenv("FR_TOKEN", "ghp_SECRET")
-	t.Setenv("FR_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----SECRET")
+	// The planted values hold a word no usage text does: env names such as
+	// FR_ONBOARD_WEBHOOK_SECRET_FILE do hold "SECRET".
+	t.Setenv("FR_TOKEN", "ghp_PLANTED7")
+	t.Setenv("FR_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----PLANTED7")
+	t.Setenv("FR_ONBOARD_WEBHOOK_SECRET_FILE", "/run/PLANTED7")
 	for _, args := range [][]string{{"-h"}, {"--bogus"}, {"--vcpu", "x"}} {
 		out := captureStderr(t, func() { _, _ = Parse(args) })
-		if strings.Contains(out, "SECRET") {
+		if strings.Contains(out, "PLANTED7") {
 			t.Fatalf("%v printed a credential:\n%s", args, out)
 		}
 		if !strings.Contains(out, "FR_TOKEN") {
@@ -969,7 +972,7 @@ func TestParse_NeverEchoesCredentials(t *testing.T) {
 	}
 	// The env still supplies them, and a flag still wins.
 	c, err := Parse(nil)
-	if err != nil || c.Token != "ghp_SECRET" || !strings.Contains(c.AppPrivateKey, "BEGIN") {
+	if err != nil || c.Token != "ghp_PLANTED7" || !strings.Contains(c.AppPrivateKey, "BEGIN") || c.OnboardWebhookSecretFile != "/run/PLANTED7" {
 		t.Fatalf("env fallback: %+v %v", c, err)
 	}
 	c, err = Parse([]string{"--token", "flag-token"})

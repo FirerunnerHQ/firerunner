@@ -491,6 +491,24 @@ func renderStatusText(r StatusReport, w io.Writer) {
 		if l.InstallStandby {
 			fmt.Fprintln(w, "  the install's tiers: standing by; another shard holds their scale sets' sessions, which this one takes over once that shard stops")
 		}
+		if o := l.Onboarding; o != nil {
+			switch {
+			case !o.Active:
+				fmt.Fprintln(w, "  onboarding: another shard (the assigner) applies the App's webhooks")
+			default:
+				last := "none yet"
+				if !o.LastDelivery.IsZero() {
+					last = humanDuration(time.Since(o.LastDelivery).Truncate(time.Second)) + " ago"
+				}
+				fmt.Fprintf(w, "  onboarding: applied %d webhook deliveries (last %s), dropped %d unsigned or malformed, %d failed and left for a retry\n", o.Applied, last, o.Dropped, o.Failed)
+				if o.Failing() {
+					fmt.Fprintf(w, "  onboarding: last delivery failed %s ago: %s\n", humanDuration(time.Since(o.LastErrorAt).Truncate(time.Second)), truncate(o.LastError, 200))
+				}
+				if o.KeepAllError != "" {
+					fmt.Fprintf(w, "  onboarding: keeping the runner groups failed: %s\n", truncate(o.KeepAllError, 200))
+				}
+			}
+		}
 		if tl := l.TenantLeases; tl != nil {
 			last := "never"
 			if !tl.LastRenewed.IsZero() {
@@ -878,6 +896,9 @@ func listenerChecks(fc provisioner.FirecrackerConfig, now time.Time) []Check {
 	if c := tenantLeasesCheck(li.File, now); c != nil {
 		checks = append(checks, *c)
 	}
+	if c := onboardingCheck(li.File, now); c != nil {
+		checks = append(checks, *c)
+	}
 	if c := tenantCatalogCheck(li.File, now); c != nil {
 		checks = append(checks, *c)
 	}
@@ -1044,6 +1065,30 @@ func tenantCatalogCheck(f health.File, now time.Time) *Check {
 		return &c
 	}
 	c := pass("tenant-catalog", "read from %s %s ago", tc.Store, humanDuration(now.Sub(tc.LastRead).Truncate(time.Second)))
+	return &c
+}
+
+// onboardingCheck judges hosted onboarding's worker, nil when the daemon
+// runs none: WARN while deliveries fail (they wait on the queue, and its
+// dead-letter queue takes one that fails too often) or keeping the runner
+// groups fails, else PASS.
+func onboardingCheck(f health.File, now time.Time) *Check {
+	o := f.Onboarding
+	switch {
+	case o == nil:
+		return nil
+	case !o.Active:
+		c := pass("onboarding", "another shard, the assigner, applies the App's webhooks")
+		return &c
+	case o.Failing():
+		c := warn("onboarding", "webhook deliveries fail (%s ago): %s; they wait on the queue, and one that fails too often goes to its dead-letter queue",
+			humanDuration(now.Sub(o.LastErrorAt).Truncate(time.Second)), truncate(o.LastError, 200))
+		return &c
+	case o.KeepAllError != "":
+		c := warn("onboarding", "keeping the organizations' runner groups failed: %s; retried every 10 minutes", truncate(o.KeepAllError, 300))
+		return &c
+	}
+	c := pass("onboarding", "applied %d webhook deliveries, dropped %d unsigned or malformed", o.Applied, o.Dropped)
 	return &c
 }
 

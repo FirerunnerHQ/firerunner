@@ -184,18 +184,20 @@ func TestRunRejectsEmptyAppKey(t *testing.T) {
 }
 
 func TestConfigCheckUnknownFlagNeverPrintsSecrets(t *testing.T) {
-	t.Setenv("FR_TOKEN", "ghp_SECRET")
-	t.Setenv("FR_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----SECRET")
+	// A word no usage text holds: env names such as
+	// FR_ONBOARD_WEBHOOK_SECRET_FILE do hold "SECRET".
+	t.Setenv("FR_TOKEN", "ghp_PLANTED7")
+	t.Setenv("FR_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----PLANTED7")
 	out := captureStderrMain(t, func() {
 		var o, e bytes.Buffer
 		if code := configCmd([]string{"check", "--json", "--bogus"}, &o, &e); code != 2 {
 			t.Errorf("exit %d, want 2", code)
 		}
-		if strings.Contains(o.String()+e.String(), "SECRET") {
+		if strings.Contains(o.String()+e.String(), "PLANTED7") {
 			t.Errorf("credential in output:\n%s%s", o.String(), e.String())
 		}
 	})
-	if strings.Contains(out, "SECRET") {
+	if strings.Contains(out, "PLANTED7") {
 		t.Fatalf("credential on stderr:\n%s", out)
 	}
 }
