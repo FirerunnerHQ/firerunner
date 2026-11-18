@@ -207,6 +207,33 @@ each run in a stack of their own:
   a key each, a shard cannot prove the runners another hands it are its to
   end, and leaves them to their maximum lifetime.
 
+**Onboarding from the hosted App's webhooks.** `onboarding.yaml` is the
+ingress. An API Gateway endpoint puts each webhook delivery on an SQS queue
+as it arrived, running no code and holding no secret. Deliveries that keep
+failing go to a dead-letter queue. To turn it on:
+
+1. Deploy `onboarding.yaml` once per hosted control plane.
+2. Put the App's webhook secret in a Secrets Manager secret.
+3. Set the App's webhook URL to the stack's `WebhookUrl` output, its
+   content type to `application/json`, and its secret to that one.
+   Subscribe it to the `installation` and `installation_repositories`
+   events. Its permissions are the organization's self-hosted runners
+   (write) and metadata (read).
+4. Give every shard's stack `OnboardQueueUrl` and `OnboardQueueArn` (the
+   ingress stack's `QueueUrl` and `QueueArn` outputs) and
+   `OnboardWebhookSecretArn`. The template takes all three or none. The VM's
+   role may then read and delete from that queue and read that secret,
+   nothing more. The bootstrap writes the secret to a root-only file, and
+   refuses the two settings in `control/env`.
+5. In `control/env`, set the tiers a new tenant gets (`FR_ONBOARD_TIERS`),
+   and optionally its runner group (`FR_ONBOARD_RUNNER_GROUP`, by default
+   `firerunner`).
+
+Only the shard that assigns applies deliveries. Replay the dead-letter queue
+(`aws sqs start-message-move-task`) after rotating the webhook secret: GitHub
+signs with the new secret before the VMs read it. Replay it, too, after an
+outage that outlasted the queue's `MaxReceiveCount` receives.
+
 The bootstrap leaves an `FR_TENANTS` set in `control/env` as it is. A tenant that stops is tried again by itself,
 and shows in `firerunner status` meanwhile; the others are not touched. A tenant's
 tiers run with caches off and no hot runners or pool, and a tier's `max` applies per

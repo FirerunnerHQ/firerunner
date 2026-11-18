@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  firerunner hosted onboarding's webhook ingress (#170): the GitHub App's
+  webhooks go to an API Gateway endpoint, which puts each, as it arrived, on
+  an SQS queue, running no code. The control VMs read the queue
+  (control.yaml's OnboardQueueUrl and OnboardQueueArn) and verify each
+  delivery's signature; the ingress verifies nothing and holds no secret.
+
+Parameters:
+  MaxReceiveCount:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    MaxValue: 1000
+    Description: >-
+      How often a delivery is received before it moves to the dead-letter
+      queue: one that keeps failing (the database, GitHub), or whose
+      signature does not hold (a webhook secret mid-rotation). Replay it from
+      there.
+  RateLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Requests a second the endpoint takes, beyond which it answers 429 (GitHub's webhooks are few; anyone may call the URL).
+  BurstLimit:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: Requests the endpoint takes at once above RateLimit.
+
+Resources:
+  # Fourteen days, SQS's most: a delivery outlives an outage of the control
+  # plane, and a dead letter waits for its replay.
+  #
+  # 1 MiB, SQS's most: a delivery is its body base64 (4/3 of it) and GitHub's
+  # headers, so a body of about 760 KB fits. installation.created lists the
+  # repositories selected, about 150 bytes each: some 5,000. A larger one
+  # SQS refuses; GitHub shows the delivery failed, and onboarding waits for
+  # the installation's next event.
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      MaximumMessageSize: 1048576
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      MaximumMessageSize: 1048576
+      # The worker asks for 120 s on each receive; this is the default.
+      VisibilityTimeout: 120
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  # API Gateway may send to this queue, and do nothing else.
+  IngressRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: send
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Queue.Arn
+
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-webhooks"
+      Description: The GitHub App's webhooks, onto an SQS queue (firerunner onboarding).
+      EndpointConfiguration: { Types: [REGIONAL] }
+      # A JSON body is taken as bytes, so the template sees it base64, as it
+      # arrived: the signature is over those bytes, and decoding it as text
+      # and encoding it back need not give them again.
+      BinaryMediaTypes: [application/json]
+
+  # Refuses (400) a request without GitHub's headers before it reaches the
+  # queue: a cheap filter of what is plainly not GitHub's, not a defence;
+  # the signature, verified on the control VM, is.
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref Api
+      ValidateRequestParameters: true
+      ValidateRequestBody: false
+
+  WebhookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: webhook
+
+  # The envelope the worker reads (onboard.Envelope; test-policies.py keeps
+  # the two alike): GitHub's three headers (a query parameter of the name
+  # would win, affecting only its caller's request), and the body base64, as it arrived, as the signature is over those bytes.
+  # Only application/json is taken, as the App sends (its webhook's content
+  # type); anything else is refused (415), not enqueued. SQS refusing the
+  # message (one larger than its limit, say) answers 500, and GitHub keeps
+  # the delivery failed, to be redelivered from the App's settings.
+  WebhookMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref WebhookResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref RequestValidator
+      RequestParameters:
+        method.request.header.X-GitHub-Delivery: true
+        method.request.header.X-GitHub-Event: true
+        method.request.header.X-Hub-Signature-256: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${Queue.QueueName}"
+        Credentials: !GetAtt IngressRole.Arn
+        PassthroughBehavior: NEVER
+        # With application/json binary (Api), the template's $input.body is
+        # the body base64.
+        ContentHandling: CONVERT_TO_TEXT
+        RequestParameters:
+          integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+        RequestTemplates:
+          application/json: |-
+            #set($d = $util.escapeJavaScript($input.params('X-GitHub-Delivery')))
+            #set($e = $util.escapeJavaScript($input.params('X-GitHub-Event')))
+            #set($s = $util.escapeJavaScript($input.params('X-Hub-Signature-256')))
+            #set($b = $input.body)
+            #set($msg = '{"delivery":"' + $d + '","event":"' + $e + '","signature":"' + $s + '","body":"' + $b + '"}')
+            Action=SendMessage&MessageBody=$util.urlEncode($msg)
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseTemplates:
+              application/json: '{"queued":true}'
+          - StatusCode: "500"
+            SelectionPattern: "4\\d{2}|5\\d{2}"
+            ResponseTemplates:
+              application/json: '{"queued":false}'
+      MethodResponses:
+        - StatusCode: "200"
+        - StatusCode: "500"
+
+  # A deployment is a snapshot: CloudFormation makes a new one only for a
+  # new logical id. So its name ends in a hash of what it deploys (Api to
+  # WebhookMethod), which test-policies.py checks: a change there without a
+  # new name fails the test, which prints the name to use.
+  Deploymenta6bdbd9fd6:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: WebhookMethod
+    Properties:
+      RestApiId: !Ref Api
+
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref Api
+      DeploymentId: !Ref Deploymenta6bdbd9fd6
+      StageName: v1
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: !Ref RateLimit
+          ThrottlingBurstLimit: !Ref BurstLimit
+
+Outputs:
+  WebhookUrl:
+    Description: The GitHub App's webhook URL. Its content type is application/json, and its secret the one in control.yaml's OnboardWebhookSecretArn.
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${Stage}/webhook"
+  QueueUrl:
+    Description: control.yaml's OnboardQueueUrl.
+    Value: !Ref Queue
+  QueueArn:
+    Description: control.yaml's OnboardQueueArn.
+    Value: !GetAtt Queue.Arn
+  DeadLetterQueueUrl:
+    Description: Deliveries received too often; replay them to the queue (aws sqs start-message-move-task).
+    Value: !Ref DeadLetterQueue

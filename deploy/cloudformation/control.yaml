@@ -103,6 +103,27 @@ Parameters:
       the runners another hands it are its to end. Give each stack the same
       secret, say the first stack's PoolKeySecret output; it must outlive
       them all. Empty: this stack's own.
+  OnboardQueueUrl:
+    Type: String
+    Default: ""
+    AllowedPattern: "(https://sqs\\.[a-z0-9-]+\\.amazonaws\\.com/[0-9]{12}/[A-Za-z0-9_-]+)?"
+    Description: >-
+      Hosted onboarding (see the README): onboarding.yaml's QueueUrl, the
+      queue the GitHub App's webhooks arrive on. Set with OnboardQueueArn
+      and OnboardWebhookSecretArn; the tenants, their tiers
+      (FR_ONBOARD_TIERS) and leases are <prefix>/control/env's. Empty: off.
+  OnboardQueueArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "(arn:[a-z-]+:sqs:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+)?"
+    Description: onboarding.yaml's QueueArn, which the VM may read and delete from.
+  OnboardWebhookSecretArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "(arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+)?"
+    Description: >-
+      A Secrets Manager secret holding the GitHub App's webhook secret, which
+      the VM verifies every delivery with.
   RootVolumeGiB:
     Type: Number
     Default: 30
@@ -111,6 +132,20 @@ Parameters:
       The control VM's root volume (gp3). With Cache on, cache-server's
       local blobs, copies and staged uploads are capped to a share of it.
 
+Rules:
+  OnboardTogether:
+    Assertions:
+      - Assert: !Or
+          - !And
+            - !Equals [!Ref OnboardQueueUrl, ""]
+            - !Equals [!Ref OnboardQueueArn, ""]
+            - !Equals [!Ref OnboardWebhookSecretArn, ""]
+          - !And
+            - !Not [!Equals [!Ref OnboardQueueUrl, ""]]
+            - !Not [!Equals [!Ref OnboardQueueArn, ""]]
+            - !Not [!Equals [!Ref OnboardWebhookSecretArn, ""]]
+        AssertDescription: OnboardQueueUrl, OnboardQueueArn and OnboardWebhookSecretArn are set together, or none.
+
 Conditions:
   HasTenantOwner: !Not [!Equals [!Ref TenantOwner, ""]]
   CreateZone: !Equals [!Ref HostedZoneId, ""]
@@ -118,6 +153,10 @@ Conditions:
   CacheS3: !Equals [!Ref Cache, "s3"]
   AppKeyInKMS: !Not [!Equals [!Ref AppKMSKeyArn, ""]]
   OwnPoolKey: !Equals [!Ref PoolKeySecretArn, ""]
+  Onboard: !And
+    - !Not [!Equals [!Ref OnboardQueueUrl, ""]]
+    - !Not [!Equals [!Ref OnboardQueueArn, ""]]
+    - !Not [!Equals [!Ref OnboardWebhookSecretArn, ""]]
 
 Resources:
   Zone:
@@ -305,10 +344,25 @@ Resources:
                   Resource: !Ref AppKMSKeyArn
                   Condition: { StringEquals: { "kms:SigningAlgorithm": RSASSA_PKCS1_V1_5_SHA_256, "kms:MessageType": DIGEST } }
                 - !Ref AWS::NoValue
-              # The pool key, and no other secret.
+              # The pool key; with onboarding, its webhook secret below; no
+              # other secret.
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !If [OwnPoolKey, !Ref PoolKey, !Ref PoolKeySecretArn]
+              # Hosted onboarding: its queue, read and emptied, never sent to,
+              # and its webhook secret.
+              - !If
+                - Onboard
+                - Effect: Allow
+                  Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                  Resource: !Ref OnboardQueueArn
+                - !Ref AWS::NoValue
+              - !If
+                - Onboard
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref OnboardWebhookSecretArn
+                - !Ref AWS::NoValue
               - Effect: Allow
                 Action: autoscaling:SetInstanceHealth
                 Resource: !Sub "arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-control"
@@ -575,6 +629,8 @@ Resources:
               FR_ROOT_GIB=${RootVolumeGiB}
               FR_APP_KMS_KEY=${AppKMSKeyArn}
               FR_POOL_KEY_SECRET=${PoolKeySecretRef}
+              FR_ONBOARD_QUEUE_URL=${OnboardQueueUrl}
+              FR_ONBOARD_WEBHOOK_SECRET=${OnboardWebhookSecretArn}
               EOF
               version=$(aws ssm get-parameter --name ${ParameterPrefix}/control/version --query Parameter.Value --output text)
               case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) false ;; esac

@@ -52,10 +52,14 @@ guardduty)
 	if [ -f "$STATE/gd-none" ]; then echo 0; else echo 1; fi
 	;;
 secretsmanager)
-	# The secret is $STATE/pool-key; the call is recorded.
+	# The pool key is $STATE/pool-key, the webhook secret (a secret id
+	# naming webhook) $STATE/webhook-secret; the call is recorded.
 	echo "$*" >> "$STATE/secretsmanager"
 	[ ! -f "$STATE/sm-denied" ] || { echo "An error occurred (AccessDeniedException) when calling the GetSecretValue operation" >&2; exit 254; }
-	cat "$STATE/pool-key"
+	case "$*" in
+	*webhook*) cat "$STATE/webhook-secret" ;;
+	*) cat "$STATE/pool-key" ;;
+	esac
 	;;
 *) echo "$*" >> "$STATE/$svc" ;;
 esac
@@ -266,6 +270,30 @@ expect "no pool key: nothing in the env" "$(envfile)" bash -c "! grep -q FR_EC2_
 expect "no pool key: says to update the stack" "$(cat "$STATE/out")" grep -q 'no FR_POOL_KEY_SECRET' "$STATE/out"
 expect "no pool key: no secret read" "" test ! -f "$STATE/secretsmanager"
 
+# Hosted onboarding: the webhook secret fetched into a root-only file the
+# env names, never the env or the log; the queue from the stack.
+hooksecret=arn:aws:secretsmanager:us-west-2:123456789012:secret:fr-webhook-0aaa
+hookqueue=https://sqs.us-west-2.amazonaws.com/123456789012/fr-onboard
+onboard_env() {
+	printf 'FR_ONBOARD_QUEUE_URL=%s\nFR_ONBOARD_WEBHOOK_SECRET=%s\n' "${1-$hookqueue}" "${2-$hooksecret}" >> "$FR_ROOT/etc/firerunner/bootstrap.env"
+}
+setup
+onboard_env
+echo "whsec-planted9" > "$STATE/webhook-secret"
+expect "onboarding: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "onboarding: read from its secret" "$(cat "$STATE/secretsmanager" 2>/dev/null)" \
+	grep -q -- "get-secret-value --secret-id $hooksecret --query SecretString --output text" "$STATE/secretsmanager"
+expect "onboarding: env names the file and the queue" "$(envfile)" \
+	bash -c "grep -qx 'FR_ONBOARD_WEBHOOK_SECRET_FILE=$FR_ROOT/etc/firerunner/onboard-webhook-secret' '$FR_ROOT/etc/firerunner/firerunner.env' && grep -qx 'FR_ONBOARD_QUEUE_URL=$hookqueue' '$FR_ROOT/etc/firerunner/firerunner.env'"
+expect "onboarding: the file holds it" "" grep -qx "whsec-planted9" "$FR_ROOT/etc/firerunner/onboard-webhook-secret"
+expect "onboarding: file owner-only" "$(ls -l "$FR_ROOT/etc/firerunner")" \
+	bash -c "[ \"\$(stat -c %a '$FR_ROOT/etc/firerunner/onboard-webhook-secret' 2>/dev/null || stat -f %Lp '$FR_ROOT/etc/firerunner/onboard-webhook-secret')\" = 600 ]"
+expect "onboarding: not in the env file, the check's env or the log" "" \
+	bash -c "! grep -qF whsec-planted9 '$FR_ROOT/etc/firerunner/firerunner.env' '$STATE/check-env' '$STATE/out'"
+setup
+expect "no onboarding: boots" "$(cat "$STATE/out" 2>/dev/null)" run
+expect "no onboarding: nothing in the env" "$(envfile)" bash -c "! grep -q FR_ONBOARD '$FR_ROOT/etc/firerunner/firerunner.env'"
+
 # 2. A PAT instead of an app key.
 setup
 rm "$STATE/ssm/app-private-key"
@@ -401,6 +429,36 @@ failed "pool key short"
 expect "pool key short: says why, not the key" "$(cat "$STATE/out")" \
 	bash -c "grep -q 'fewer than 32' '$STATE/out' && ! grep -q pwned '$STATE/out'"
 
+# 4d. Onboarding set by half, with an empty secret, or from control/env.
+setup
+onboard_env "$hookqueue" ""
+failed "onboarding without its secret"
+expect "onboarding without its secret: says why" "$(cat "$STATE/out")" grep -q 'needs both the queue' "$STATE/out"
+setup
+onboard_env
+: > "$STATE/webhook-secret"
+failed "onboarding with an empty secret"
+expect "onboarding with an empty secret: says why" "$(cat "$STATE/out")" grep -q 'the webhook secret is empty' "$STATE/out"
+setup
+onboard_env
+echo '{"secret":"whsec-planted9"}' > "$STATE/webhook-secret"
+failed "onboarding with a key/value secret"
+expect "onboarding with a key/value secret: says why, not the secret" "$(cat "$STATE/out")" \
+	bash -c "grep -q 'store the webhook secret as plaintext' '$STATE/out' && ! grep -q planted9 '$STATE/out'"
+setup
+onboard_env
+touch "$STATE/sm-denied"
+failed "onboarding secret denied"
+expect "onboarding secret denied: says why" "$(cat "$STATE/out")" grep -q 'AccessDeniedException' "$STATE/out"
+setup
+onboard_env "" "$hooksecret"
+failed "onboarding without its queue"
+expect "onboarding without its queue: says why" "$(cat "$STATE/out")" grep -q 'needs both the queue' "$STATE/out"
+setup
+echo "FR_ONBOARD_QUEUE_URL=$hookqueue" >> "$STATE/ssm/env"
+failed "onboarding from control/env"
+expect "onboarding from control/env: says to use the stack" "$(cat "$STATE/out")" grep -q 'OnboardWebhookSecretArn instead' "$STATE/out"
+
 # 5. firerunner rejects the config.
 setup
 touch "$STATE/check-fails"
@@ -482,7 +540,8 @@ vals = {"AWS::Region": "us-west-2", "ParameterPrefix": "/fr", "Owner": "prod-a",
         "Cache": "s3", "CachePort": "8099", "CacheBucketName": "fr-cache-bucket", "RootVolumeGiB": "30",
         "CacheRoleArn": "arn:aws:iam::123456789012:role/fr-CacheRole-0aaa",
         "AppKMSKeyArn": "", "PoolKey": "arn:aws:secretsmanager:us-west-2:123456789012:secret:fr-PoolKey-0aaa",
-        "PoolKeySecretRef": "arn:aws:secretsmanager:us-west-2:123456789012:secret:fr-PoolKey-0aaa"}
+        "PoolKeySecretRef": "arn:aws:secretsmanager:us-west-2:123456789012:secret:fr-PoolKey-0aaa",
+        "OnboardQueueUrl": "", "OnboardWebhookSecretArn": ""}
 body = re.sub(r"\$\{([A-Za-z:]+)\}", lambda m: vals[m.group(1)], body)
 print(body.replace("/etc/firerunner", sys.argv[2] + "/etc/firerunner"))
 PY2

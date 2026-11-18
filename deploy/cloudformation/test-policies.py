@@ -189,10 +189,12 @@ if "Condition: OwnPoolKey" not in pool_key or 'OwnPoolKey: !Equals [!Ref PoolKey
     sys.exit("FAIL control.yaml: PoolKey must be made exactly when no PoolKeySecretArn is given")
 OWN_OR_GIVEN = "!If [OwnPoolKey, !Ref PoolKey, !Ref PoolKeySecretArn]"
 grants = re.findall(r"secretsmanager:[A-Za-z*]+", control)
-if grants != ["secretsmanager:GetSecretValue"] or "secretsmanager" in runner_compute:
-    sys.exit(f"FAIL control.yaml: the secrets grants are {grants}; want GetSecretValue alone, outside runner-compute")
+# Two: the pool key, and onboarding's webhook secret, which the onboarding
+# check below pins to its parameter and condition.
+if grants != ["secretsmanager:GetSecretValue"] * 2 or "secretsmanager" in runner_compute:
+    sys.exit(f"FAIL control.yaml: the secrets grants are {grants}; want GetSecretValue alone, twice, outside runner-compute")
 get = control_policy.split("Action: secretsmanager:GetSecretValue", 1)[1].split("- Effect", 1)[0]
-if get.strip() != "Resource: " + OWN_OR_GIVEN:
+if get.strip().splitlines()[0] != "Resource: " + OWN_OR_GIVEN:
     sys.exit("FAIL control.yaml: the control role may read only the pool key")
 template = resource("LaunchTemplate")
 if "FR_POOL_KEY_SECRET=${PoolKeySecretRef}" not in template or "PoolKeySecretRef: " + OWN_OR_GIVEN not in template:
@@ -241,3 +243,65 @@ if read.strip().splitlines()[0] != 'Resource: !Sub "arn:${AWS::Partition}:guardd
         "guardduty" in runner_compute:
     sys.exit("FAIL control.yaml: GuardDuty findings must be read only from this account's detectors, outside runner-compute")
 print("ok   control.yaml: the control VM writes only tenant flags, and only reads GuardDuty")
+
+# Hosted onboarding. The ingress runs no code and verifies nothing, so its
+# role may only send to its own queue; the control VM only reads and
+# deletes from it, never sends (a forged delivery would still need the
+# webhook secret, but the VM has no reason to send), and only with
+# onboarding on. Its secret grants are the pool key's and, with
+# onboarding, the webhook secret's: no other.
+onboarding = open(os.path.join(HERE, "onboarding.yaml")).read()
+sqs_in = re.findall(r"sqs:[A-Z][A-Za-z*]*", onboarding)
+if sqs_in != ["sqs:SendMessage"] or "Resource: !GetAtt Queue.Arn" not in onboarding:
+    sys.exit(f"FAIL onboarding.yaml: the ingress role's SQS grants are {sqs_in}; want SendMessage on its queue alone")
+if onboarding.count("PolicyName:") != 1 or "ManagedPolicyArns" in onboarding or "AWS::Lambda" in onboarding:
+    sys.exit("FAIL onboarding.yaml: the ingress holds one policy and runs no code")
+if "PassthroughBehavior: NEVER" not in onboarding or "application/json: |" not in onboarding:
+    sys.exit("FAIL onboarding.yaml: only application/json is enqueued; anything else must be refused")
+print("ok   onboarding.yaml: the ingress only sends to its own queue, and runs no code")
+sqs_ctl = re.findall(r"sqs:[A-Z][A-Za-z*]*", control)
+if sorted(sqs_ctl) != sorted(["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"]):
+    sys.exit(f"FAIL control.yaml: the control role's SQS grants are {sqs_ctl}; want to read and delete, never to send")
+onb = control_policy.split("- Onboard\n", 1)
+if len(onb) != 2 or "Resource: !Ref OnboardQueueArn" not in onb[1].split("- !Ref AWS::NoValue", 1)[0]:
+    sys.exit("FAIL control.yaml: the queue grant must be on OnboardQueueArn alone, under the Onboard condition")
+secrets = re.findall(r"Action: secretsmanager:GetSecretValue\n\s+Resource: (.*)", control_policy)
+if secrets != ["!If [OwnPoolKey, !Ref PoolKey, !Ref PoolKeySecretArn]", "!Ref OnboardWebhookSecretArn"]:
+    sys.exit(f"FAIL control.yaml: the control role reads secrets {secrets}; want the pool key's and onboarding's webhook secret")
+if "- !If\n                - Onboard\n                - Effect: Allow\n                  Action: secretsmanager:GetSecretValue" not in control_policy:
+    sys.exit("FAIL control.yaml: the webhook secret grant must be under the Onboard condition")
+print("ok   control.yaml: the control VM reads onboarding's queue and secret only with onboarding on, and never sends")
+
+# The ingress's envelope is the worker's: the keys the mapping template
+# writes are onboard.Envelope's JSON tags, and the body goes as it arrived,
+# base64 by API Gateway itself (a binary media type), never decoded.
+worker = open(os.path.join(HERE, "..", "..", "proprietary", "onboard", "worker.go")).read()
+env_struct = re.search(r"type Envelope struct \{(.*?)\n\}", worker, re.S).group(1)
+tags = re.findall(r'json:"([a-z_]+)"', env_struct)
+vtl = re.search(r"application/json: \|-\n(.*?)\n        IntegrationResponses", onboarding, re.S).group(1)
+keys = re.findall(r'"([a-z_]+)":"', vtl)
+if keys != tags:
+    sys.exit(f"FAIL onboarding.yaml: the template writes {keys}; onboard.Envelope reads {tags}")
+if "BinaryMediaTypes: [application/json]" not in onboarding or "ContentHandling: CONVERT_TO_TEXT" not in onboarding or \
+        "#set($b = $input.body)" not in vtl or "base64Encode" in vtl:
+    sys.exit("FAIL onboarding.yaml: the body must reach the queue base64 as it arrived (application/json binary, CONVERT_TO_TEXT)")
+print("ok   onboarding.yaml: the envelope is onboard.Envelope's, the body as it arrived")
+# SQS refusing a message is a failure GitHub sees; GitHub's headers are
+# required; and a message as large as SQS takes fits.
+if 'SelectionPattern: "4\\\\d{2}|5\\\\d{2}"' not in onboarding:
+    sys.exit("FAIL onboarding.yaml: an SQS 4xx or 5xx must answer 500")
+for h in ("X-GitHub-Delivery", "X-GitHub-Event", "X-Hub-Signature-256"):
+    if f"method.request.header.{h}: true" not in onboarding:
+        sys.exit(f"FAIL onboarding.yaml: {h} must be required")
+if onboarding.count("MaximumMessageSize: 1048576") != 2:
+    sys.exit("FAIL onboarding.yaml: both queues must take SQS's largest message")
+print("ok   onboarding.yaml: SQS's refusals answer 500, GitHub's headers required, large deliveries fit")
+# A deployment is a snapshot, made anew only under a new logical id: its
+# name carries a hash of what it deploys.
+import hashlib
+a, b = onboarding.index("\n  Api:\n"), onboarding.index("\n  # A deployment is a snapshot")
+want = "Deployment" + hashlib.sha256(onboarding[a:b].encode()).hexdigest()[:10]
+names = re.findall(r"^  (Deployment[0-9a-f]*):$", onboarding, re.M)
+if names != [want] or f"DeploymentId: !Ref {want}" not in onboarding:
+    sys.exit(f"FAIL onboarding.yaml: the API changed, so its deployment must too: rename {names} to {want}, and the stage's DeploymentId")
+print("ok   onboarding.yaml: the deployment is named by what it deploys")
