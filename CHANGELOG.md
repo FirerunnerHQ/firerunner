@@ -8,6 +8,14 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-11-18
+
+### Added
+
+- Hosted onboarding (`--onboard-queue-url`, with `--tenant-leases`): the assigning shard reads the hosted GitHub App's webhooks from an SQS queue and turns them into installations of the tenants list. An organization that installs the App is listed with `--onboard-tiers`, and one that suspends or uninstalls it is removed. A personal account, the install's own organization, or one listed already is refused, with the reason. Each organization gets a runner group of onboarding's own (`--onboard-runner-group`), open only to the installation's repositories that are not public. `firerunner status` and `doctor` show the deliveries applied, dropped and failed.
+- `firerunner tenant import` refuses a list that drops or rewrites an installation that onboarding listed for an organization whose App is still installed.
+- `deploy/cloudformation/onboarding.yaml`: the ingress for hosted onboarding. An API Gateway endpoint puts the GitHub App's webhooks on an SQS queue, which has a dead-letter queue; the endpoint runs no code and holds no secret. `control.yaml` takes `OnboardQueueUrl`, `OnboardQueueArn` and `OnboardWebhookSecretArn`. With all three, the control VM may read that queue and that secret, and the daemon applies the webhooks.
+
 ## [0.1.28] - 2026-11-18
 
 ### Changed
@@ -789,7 +797,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.28...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.29...HEAD
+[0.1.29]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.29
 [0.1.28]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.28
 [0.1.27]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.27
 [0.1.26]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.26
