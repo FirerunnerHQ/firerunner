@@ -57,11 +57,17 @@ func (s *TenantStore) RecordGroup(ctx context.Context, id, group int64, result j
 	return nil
 }
 
-// OwnedGroup returns the runner group onboarding created for the
-// installation's organization, or 0.
+// OwnedGroup returns the runner group onboarding created in the
+// installation's organization, or 0: the account's, by whichever of its
+// installations created it, as an organization that uninstalls and installs
+// again keeps its group (found by the first hosted e2e, 2026-11-18, where a
+// reinstall took onboarding's own group for the organization's).
 func (s *TenantStore) OwnedGroup(ctx context.Context, id int64) (int64, error) {
 	var group int64
-	err := s.pool.QueryRow(ctx, `SELECT group_id FROM installations WHERE installation_id = $1`, id).Scan(&group)
+	err := s.pool.QueryRow(ctx, `SELECT o.group_id FROM installations i
+		JOIN installations o ON o.account_id = i.account_id AND o.group_id <> 0
+		WHERE i.installation_id = $1
+		ORDER BY o.group_synced_at DESC NULLS LAST, o.installation_id DESC LIMIT 1`, id).Scan(&group)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}
