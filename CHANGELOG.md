@@ -8,6 +8,13 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-11-18
+
+### Fixed
+
+- Hosted onboarding: an organization that uninstalled the App and installed it again had its runner group reported as "a runner group that onboarding did not create", and the group stopped following its repositories. Onboarding now knows the group it created by the organization, across reinstalls.
+- `onboarding.yaml`: the webhook ingress queued no delivery. API Gateway could not assume its role, whose trust policy named a source account that API Gateway does not give for an integration. Every delivery also got a 500 that GitHub showed as a failure, because the binary media type mangled the response; the body now goes base64 through the mapping template, and arrives byte-identical (measured with a non-ASCII body).
+
 ## [0.1.29] - 2026-11-18
 
 ### Added
@@ -797,7 +804,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.29...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.30...HEAD
+[0.1.30]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.30
 [0.1.29]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.29
 [0.1.28]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.28
 [0.1.27]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.27
