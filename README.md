@@ -341,8 +341,19 @@ takes any free lease, ignoring the assignments.
   whose URL moves to another account leaves its old account's scale sets,
   as a change does.
 - A renewal that fails is tried again every 2 seconds. A shard that cannot
-  join (its database down, or owners that do not fit) serves its own tiers
-  and no installation, and keeps trying.
+  join (its database down, or owners that do not fit) serves no installation
+  of the list, and keeps trying.
+- Shards share one configuration, and so one install (`--url`): GitHub gives
+  each of its tiers' scale sets' sessions to one shard at a time. A shard
+  opens all of the install's sessions or none, so that two never each hold
+  part. The others stand by for them, as long as it takes, and launch
+  nothing for the install meanwhile, no warm pool either; `firerunner status`
+  says so. One takes them over within 10 seconds of the shard that held them
+  stopping, or about a minute after it crashes, when GitHub lets its
+  sessions go. A shard serves the installations of the list whether or not
+  it holds the install's. A holder whose sessions all lapse at once (a
+  network outage) may find another shard has taken them: it keeps trying
+  to reopen them, and its warm pools keep filling, until it is restarted.
 
 Every shard needs the same `--tenant-owner` (`FR_TENANT_OWNER`): an
 installation's instances are tagged `<tenant-owner>/<id>`, which is how the

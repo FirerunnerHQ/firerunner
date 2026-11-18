@@ -36,6 +36,14 @@ type Config struct {
 	// is replaced) keeps one scale set across restarts: deleting it on
 	// every graceful stop would make each deploy recreate it.
 	KeepOnClose bool
+	// WaitForSession is for daemons that serve the same scale sets (shards
+	// of one tenants list, all on one configuration), of which one at a
+	// time holds their sessions: GitHub gives a session to one listener.
+	// New then registers the scale set and opens no session: the caller
+	// opens its sessions with TryOpenSession, all of them or none. And a
+	// session that ends is reopened for as long as the context lasts,
+	// rather than failing once a crashed process's hold should have expired.
+	WaitForSession bool
 
 	// Auth: a personal access token, or a GitHub App (preferred, per GitHub).
 	Token string
@@ -100,8 +108,10 @@ type ScaleSet struct {
 	mu      sync.Mutex
 	recycle context.CancelCauseFunc
 	session session
-	// open opens a fresh message session after the current one fails.
+	// open opens a fresh message session after the current one fails, and
+	// tryOpen opens one once.
 	open       func(context.Context) (session, error)
+	tryOpen    func(context.Context) (session, error)
 	health     *health.Tracker
 	scaleSetID int
 	// created is true only when this process created the scale set (rather than
@@ -111,7 +121,7 @@ type ScaleSet struct {
 }
 
 // New builds a scaleset client, registers the runner scale set, and opens a
-// message session. Call Close to deregister.
+// message session, but with WaitForSession. Call Close to deregister.
 func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
@@ -147,13 +157,17 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		return nil, err
 	}
 
-	first, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.Logger)
-	if err != nil {
-		if !reused {
-			// Best-effort cleanup of the scale set we just created.
-			_ = client.DeleteRunnerScaleSet(context.WithoutCancel(ctx), id)
+	var first session
+	if !cfg.WaitForSession {
+		sess, err := openSessionWithRetry(ctx, sessionClient, id, owner, false, cfg.Logger)
+		if err != nil {
+			if !reused {
+				// Best-effort cleanup of the scale set we just created.
+				_ = client.DeleteRunnerScaleSet(context.WithoutCancel(ctx), id)
+			}
+			return nil, fmt.Errorf("open message session: %w", err)
 		}
-		return nil, fmt.Errorf("open message session: %w", err)
+		first = sess
 	}
 
 	cfg.Logger.Info("registered runner scale set",
@@ -175,13 +189,49 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 	})
 	s.jitClients.seed(client)
 	s.open = func(ctx context.Context) (session, error) {
-		sess, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.Logger)
+		sess, err := openSessionWithRetry(ctx, sessionClient, id, owner, cfg.WaitForSession, cfg.Logger)
+		if err != nil {
+			return nil, err
+		}
+		return sess, nil
+	}
+	s.tryOpen = func(ctx context.Context) (session, error) {
+		sess, err := sessionClient.MessageSessionClient(ctx, id, owner)
 		if err != nil {
 			return nil, err
 		}
 		return sess, nil
 	}
 	return s, nil
+}
+
+// TryOpenSession opens the scale set's message session, once: false if
+// another listener holds it. A scale set whose session is open already
+// reports true.
+func (s *ScaleSet) TryOpenSession(ctx context.Context) (bool, error) {
+	if s.session != nil {
+		return true, nil
+	}
+	sess, err := s.tryOpen(ctx)
+	if isSessionConflict(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("open message session: %w", err)
+	}
+	s.session = sess
+	return true, nil
+}
+
+// ReleaseSession closes the scale set's session, if one is open, for
+// another listener to take: one of a set that must be opened together,
+// whose others another holds.
+func (s *ScaleSet) ReleaseSession(ctx context.Context) {
+	if s.session == nil {
+		return
+	}
+	_ = s.session.Close(ctx)
+	s.session = nil
 }
 
 // registerScaleSet gets or creates the tier's scale set through client and
@@ -212,7 +262,20 @@ func registerScaleSet(ctx context.Context, client *scaleset.Client, cfg Config, 
 	} else {
 		scaleSet, err = client.CreateRunnerScaleSet(ctx, desired)
 		if err != nil {
-			return 0, false, fmt.Errorf("create runner scale set: %w", err)
+			// Another daemon of the same configuration may have created it
+			// a moment ago: take that one. Any other failure is one.
+			if !isCreateRace(err) {
+				return 0, false, fmt.Errorf("create runner scale set: %w", err)
+			}
+			again, gerr := client.GetRunnerScaleSet(ctx, groupID, cfg.Name)
+			if gerr != nil || again == nil {
+				return 0, false, fmt.Errorf("create runner scale set: %w", err)
+			}
+			cfg.Logger.Info("runner scale set created meanwhile by another daemon: taking it", "name", cfg.Name, "createErr", err)
+			reused = true
+			if scaleSet, err = client.UpdateRunnerScaleSet(ctx, again.ID, desired); err != nil {
+				return 0, false, fmt.Errorf("update runner scale set: %w", err)
+			}
 		}
 	}
 	for _, c := range append([]*scaleset.Client{client}, others...) {
@@ -225,30 +288,59 @@ func registerScaleSet(ctx context.Context, client *scaleset.Client, cfg Config, 
 // session conflict. After an unclean shutdown (SIGKILL, OOM, power loss) the
 // previous session stays active server-side until it times out (~1 min), so a
 // restarting service would otherwise crash-loop. Retrying lets it self-heal.
-// Any non-conflict error (e.g. bad auth) fails fast.
-func openSessionWithRetry(ctx context.Context, client *scaleset.Client, scaleSetID int, owner string, log *slog.Logger) (*scaleset.MessageSessionClient, error) {
-	const attempts = 12
-	const delay = 10 * time.Second
+// Any non-conflict error (e.g. bad auth) fails fast. With wait, a conflict
+// is retried for as long as ctx lasts: another live daemon holds it.
+func openSessionWithRetry(ctx context.Context, client *scaleset.Client, scaleSetID int, owner string, wait bool, log *slog.Logger) (*scaleset.MessageSessionClient, error) {
+	return retrySession(ctx, func(ctx context.Context) (*scaleset.MessageSessionClient, error) {
+		return client.MessageSessionClient(ctx, scaleSetID, owner)
+	}, wait, sessionRetryDelay, log)
+}
 
+// sessionRetryDelay is how long to wait between attempts at a session
+// another holds; sessionAttempts how many, but with wait.
+const (
+	sessionRetryDelay = 10 * time.Second
+	sessionAttempts   = 12
+)
+
+// retrySession opens a session with open, retrying a conflict every delay:
+// sessionAttempts times, or, with wait, until ctx ends.
+func retrySession[S any](ctx context.Context, open func(context.Context) (S, error), wait bool, delay time.Duration, log *slog.Logger) (S, error) {
+	var zero S
 	var err error
-	for i := 0; i < attempts; i++ {
-		var session *scaleset.MessageSessionClient
-		session, err = client.MessageSessionClient(ctx, scaleSetID, owner)
+	for i := 0; wait || i < sessionAttempts; i++ {
+		var session S
+		session, err = open(ctx)
 		if err == nil {
+			if wait && i > 0 {
+				log.Info("took over the scale set's message session", "after", i)
+			}
 			return session, nil
 		}
 		if !isSessionConflict(err) {
-			return nil, err
+			return zero, err
 		}
-		log.Warn("scale set session still held by a previous run; waiting for it to expire",
-			"attempt", i+1, "maxAttempts", attempts)
+		switch {
+		case !wait:
+			log.Warn("scale set session still held by a previous run; waiting for it to expire",
+				"attempt", i+1, "maxAttempts", sessionAttempts)
+		case i == 0:
+			log.Info("another daemon holds the scale set's message session: standing by to take it over")
+		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return zero, ctx.Err()
 		case <-time.After(delay):
 		}
 	}
-	return nil, err
+	return zero, err
+}
+
+// isCreateRace reports whether a scale set's creation failed because one of
+// that name exists: another daemon created it after this one looked.
+func isCreateRace(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already exists") || strings.Contains(msg, "conflict")
 }
 
 // isSessionConflict reports whether err is GitHub's "scale set already has an
@@ -296,6 +388,13 @@ var (
 // alone) or a deleted scale set (ErrRestart, which restarts the daemon).
 func (s *ScaleSet) Run(ctx context.Context, onDesired DesiredFunc, onBusy BusyFunc, onCompleted CompletedFunc, capacity CapacityFunc) error {
 	sess := s.session
+	if sess == nil { // WaitForSession, and none opened: open one now
+		var err error
+		if sess, err = s.open(ctx); err != nil {
+			return err
+		}
+		s.session = sess
+	}
 	backoff := reconnectMin
 	for {
 		started := time.Now()
@@ -623,7 +722,9 @@ func jitter(d time.Duration) time.Duration {
 // CloseSession closes the message session, and keeps the scale set whoever
 // created it: its tenant is handed to another process, which serves it next.
 func (s *ScaleSet) CloseSession(ctx context.Context) {
-	_ = s.session.Close(ctx)
+	if s.session != nil {
+		_ = s.session.Close(ctx)
+	}
 	s.log.Info("closed the scale set's session: its tenant is handed off", "scaleSetID", s.scaleSetID)
 }
 
@@ -632,7 +733,9 @@ func (s *ScaleSet) CloseSession(ctx context.Context) {
 // existed from a prior run or belongs to another instance) is left in place so
 // closing one instance never tears out a set another is depending on.
 func (s *ScaleSet) Close(ctx context.Context) error {
-	_ = s.session.Close(ctx)
+	if s.session != nil {
+		_ = s.session.Close(ctx)
+	}
 	if !s.created {
 		s.log.Info("leaving reused runner scale set registered", "scaleSetID", s.scaleSetID)
 		return nil
@@ -652,7 +755,9 @@ func (s *ScaleSet) Close(ctx context.Context) error {
 // created it or found it registered: its tenant is gone, and so are the
 // labels its jobs would wait on.
 func (s *ScaleSet) Remove(ctx context.Context) error {
-	_ = s.session.Close(ctx)
+	if s.session != nil {
+		_ = s.session.Close(ctx)
+	}
 	if err := s.client.DeleteRunnerScaleSet(ctx, s.scaleSetID); err != nil {
 		return fmt.Errorf("delete runner scale set: %w", err)
 	}
