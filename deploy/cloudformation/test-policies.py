@@ -273,8 +273,10 @@ if "- !If\n                - Onboard\n                - Effect: Allow\n         
 print("ok   control.yaml: the control VM reads onboarding's queue and secret only with onboarding on, and never sends")
 
 # The ingress's envelope is the worker's: the keys the mapping template
-# writes are onboard.Envelope's JSON tags, and the body goes as it arrived,
-# base64 by API Gateway itself (a binary media type), never decoded.
+# writes are onboard.Envelope's JSON tags, and the body goes base64. As text,
+# not a binary media type: binary made API Gateway answer 500 for a queued
+# delivery; and a UTF-8 body with an em dash, CJK and a check mark came off
+# the queue byte-identical, its signature holding (measured 2026-11-18).
 worker = open(os.path.join(HERE, "..", "..", "proprietary", "onboard", "worker.go")).read()
 env_struct = re.search(r"type Envelope struct \{(.*?)\n\}", worker, re.S).group(1)
 tags = re.findall(r'json:"([a-z_]+)"', env_struct)
@@ -282,10 +284,9 @@ vtl = re.search(r"application/json: \|-\n(.*?)\n        IntegrationResponses", o
 keys = re.findall(r'"([a-z_]+)":"', vtl)
 if keys != tags:
     sys.exit(f"FAIL onboarding.yaml: the template writes {keys}; onboard.Envelope reads {tags}")
-if "BinaryMediaTypes: [application/json]" not in onboarding or "ContentHandling: CONVERT_TO_TEXT" not in onboarding or \
-        "#set($b = $input.body)" not in vtl or "base64Encode" in vtl:
-    sys.exit("FAIL onboarding.yaml: the body must reach the queue base64 as it arrived (application/json binary, CONVERT_TO_TEXT)")
-print("ok   onboarding.yaml: the envelope is onboard.Envelope's, the body as it arrived")
+if "BinaryMediaTypes" in onboarding or "ContentHandling" in onboarding or "#set($b = $util.base64Encode($input.body))" not in vtl:
+    sys.exit("FAIL onboarding.yaml: the body must go base64 by the template, the API taking no binary media type")
+print("ok   onboarding.yaml: the envelope is onboard.Envelope's, the body base64")
 # SQS refusing a message is a failure GitHub sees; GitHub's headers are
 # required; and a message as large as SQS takes fits.
 if 'SelectionPattern: "4\\\\d{2}|5\\\\d{2}"' not in onboarding:
@@ -305,3 +306,9 @@ names = re.findall(r"^  (Deployment[0-9a-f]*):$", onboarding, re.M)
 if names != [want] or f"DeploymentId: !Ref {want}" not in onboarding:
     sys.exit(f"FAIL onboarding.yaml: the API changed, so its deployment must too: rename {names} to {want}, and the stage's DeploymentId")
 print("ok   onboarding.yaml: the deployment is named by what it deploys")
+
+# Found on the first deployment: API Gateway assumes the integration's role
+# with no source account, so a condition on it refuses every delivery.
+if "aws:SourceAccount" in onboarding:
+    sys.exit("FAIL onboarding.yaml: API Gateway cannot assume a role conditioned on aws:SourceAccount")
+print("ok   onboarding.yaml: API Gateway can assume the ingress role")
