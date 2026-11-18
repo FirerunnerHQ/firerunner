@@ -68,7 +68,8 @@ type Entry struct {
 // Replace makes the stored list entries, in one transaction: a tenant left
 // out is deleted, and only an entry that changed is rewritten, so updated_at
 // says when each last did. It sets the database up first, as the daemon's
-// writer does.
+// writer does. A list that leaves out a tenant onboarding listed for an
+// installation still active is ErrOnboarded, and writes nothing.
 func (s *TenantStore) Replace(ctx context.Context, entries []Entry) error {
 	if err := prepare(ctx, s.pool); err != nil {
 		return fmt.Errorf("set up the job store: %w", err)
@@ -78,6 +79,18 @@ func (s *TenantStore) Replace(ctx context.Context, entries []Entry) error {
 		ids = append(ids, e.ID)
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// No webhook applies beside it: one could list a tenant this
+		// would then delete.
+		if _, err := tx.Exec(ctx, `LOCK TABLE installations IN EXCLUSIVE MODE`); err != nil {
+			return fmt.Errorf("wait for webhooks being applied: %w", err)
+		}
+		left, err := onboardedLeftOut(ctx, tx, ids)
+		if err != nil {
+			return err
+		}
+		if len(left) > 0 {
+			return onboardedError(left)
+		}
 		if _, err := tx.Exec(ctx, `DELETE FROM tenants WHERE id <> ALL($1)`, ids); err != nil {
 			return fmt.Errorf("delete the tenants left out: %w", err)
 		}

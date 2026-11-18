@@ -2,18 +2,20 @@ package jobstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Installation is one of the hosted App's installations as onboarding has
 // applied its webhooks (the installations table).
 type Installation struct {
 	ID           int64
+	AccountID    int64
 	AccountLogin string
 	AccountType  string
 	// Tenant is the tenants list's id it was given, or "".
@@ -36,26 +38,31 @@ const deliveriesKept = 7 * 24 * time.Hour
 type OnboardTx interface {
 	// Installation returns the installation's row, if it has one.
 	Installation(ctx context.Context, id int64) (Installation, bool, error)
+	// LatestInstallation returns the account's installation of the highest
+	// id other than except, if it has one: GitHub numbers installations in
+	// order, and an account has one at a time.
+	LatestInstallation(ctx context.Context, account, except int64) (Installation, bool, error)
 	PutInstallation(ctx context.Context, in Installation) error
-	// TenantInstallation returns the installation of the tenants list's
-	// entry of that id, if there is one.
-	TenantInstallation(ctx context.Context, tenant string) (int64, bool, error)
+	// Tenants returns the tenants list's entries, by id.
+	Tenants(ctx context.Context) (map[string]json.RawMessage, error)
 	PutTenant(ctx context.Context, e Entry) error
-	DeleteTenant(ctx context.Context, tenant string) error
+	// DeleteTenant deletes the tenant if its entry is still the
+	// installation's, and reports whether it did.
+	DeleteTenant(ctx context.Context, tenant string, installation int64) (bool, error)
 }
 
 // Onboard applies one webhook delivery: fn, in one transaction, which no
-// other delivery of the installation runs beside. A delivery whose id was
-// applied before is ErrDelivered, with the outcome it had then, and fn is
-// not run. fn returns the outcome to record.
-func (s *TenantStore) Onboard(ctx context.Context, delivery, event string, installation int64, fn func(OnboardTx) (string, error)) (string, error) {
+// other delivery for the account runs beside, whichever installation it
+// names. A delivery whose id was applied before is ErrDelivered, with the
+// outcome it had then, and fn is not run. fn returns the outcome to record.
+func (s *TenantStore) Onboard(ctx context.Context, delivery, event string, account int64, fn func(OnboardTx) (string, error)) (string, error) {
 	if err := s.prepareOnce(ctx); err != nil {
 		return "", err
 	}
 	var outcome string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('firerunner installation ' || $1::bigint, 0))`, installation); err != nil {
-			return fmt.Errorf("wait for the installation's other deliveries: %w", err)
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('firerunner account ' || $1::bigint, 0))`, account); err != nil {
+			return fmt.Errorf("wait for the account's other deliveries: %w", err)
 		}
 		tag, err := tx.Exec(ctx, `INSERT INTO webhook_deliveries (delivery_id, event, outcome) VALUES ($1, $2, '')
 			ON CONFLICT (delivery_id) DO NOTHING`, delivery, event)
@@ -82,20 +89,27 @@ func (s *TenantStore) Onboard(ctx context.Context, delivery, event string, insta
 	return outcome, err
 }
 
-// InstallationGone reports whether onboarding found the installation
-// deleted or suspended: its tokens no longer work, so what it registered
-// at GitHub cannot be deleted, and need not be swept again.
-func (s *TenantStore) InstallationGone(ctx context.Context, installation int64) (bool, error) {
-	var gone bool
-	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM installations WHERE installation_id = $1 AND state IN ('deleted', 'suspended'))`, installation).Scan(&gone)
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "42P01" { // no onboarding yet
-		return false, nil
-	}
+// ErrOnboarded is a tenants list that leaves out tenants onboarding
+// listed for installations still active: written, they would never be
+// served again, as nothing re-lists them.
+var ErrOnboarded = errors.New("the list leaves out onboarded tenants")
+
+// onboardedLeftOut returns the tenants of active installations that ids
+// leaves out.
+func onboardedLeftOut(ctx context.Context, tx pgx.Tx, ids []string) ([]string, error) {
+	rows, err := tx.Query(ctx, `SELECT tenant FROM installations WHERE state = 'active' AND tenant <> '' AND tenant <> ALL(coalesce($1, '{}'::text[])) ORDER BY tenant`, ids)
 	if err != nil {
-		return false, fmt.Errorf("read installation %d: %w", installation, err)
+		return nil, fmt.Errorf("read the onboarded tenants: %w", err)
 	}
-	return gone, nil
+	left, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("read the onboarded tenants: %w", err)
+	}
+	return left, nil
+}
+
+func onboardedError(left []string) error {
+	return fmt.Errorf("%w: %s; their organizations have the App installed, and suspending or uninstalling it there removes them", ErrOnboarded, strings.Join(left, ", "))
 }
 
 // prepareOnce sets the database up, once a process.
@@ -112,41 +126,60 @@ func (s *TenantStore) prepareOnce(ctx context.Context) error {
 
 type onboardTx struct{ tx pgx.Tx }
 
-func (t onboardTx) Installation(ctx context.Context, id int64) (Installation, bool, error) {
-	in := Installation{ID: id}
-	err := t.tx.QueryRow(ctx, `SELECT account_login, account_type, tenant, state, reason, updated_at FROM installations WHERE installation_id = $1`, id).
-		Scan(&in.AccountLogin, &in.AccountType, &in.Tenant, &in.State, &in.Reason, &in.UpdatedAt)
+const installationColumns = `installation_id, account_id, account_login, account_type, tenant, state, reason, updated_at`
+
+func scanInstallation(row pgx.Row) (Installation, bool, error) {
+	var in Installation
+	err := row.Scan(&in.ID, &in.AccountID, &in.AccountLogin, &in.AccountType, &in.Tenant, &in.State, &in.Reason, &in.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Installation{}, false, nil
 	}
 	if err != nil {
-		return Installation{}, false, fmt.Errorf("read installation %d: %w", id, err)
+		return Installation{}, false, fmt.Errorf("read an installation: %w", err)
 	}
 	return in, true, nil
 }
 
+func (t onboardTx) Installation(ctx context.Context, id int64) (Installation, bool, error) {
+	return scanInstallation(t.tx.QueryRow(ctx, `SELECT `+installationColumns+` FROM installations WHERE installation_id = $1`, id))
+}
+
+func (t onboardTx) LatestInstallation(ctx context.Context, account, except int64) (Installation, bool, error) {
+	return scanInstallation(t.tx.QueryRow(ctx, `SELECT `+installationColumns+` FROM installations
+		WHERE account_id = $1 AND installation_id <> $2 ORDER BY installation_id DESC LIMIT 1`, account, except))
+}
+
 func (t onboardTx) PutInstallation(ctx context.Context, in Installation) error {
-	_, err := t.tx.Exec(ctx, `INSERT INTO installations (installation_id, account_login, account_type, tenant, state, reason, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (installation_id) DO UPDATE SET account_login = excluded.account_login, account_type = excluded.account_type,
-			tenant = excluded.tenant, state = excluded.state, reason = excluded.reason, updated_at = excluded.updated_at, applied_at = now()`,
-		in.ID, in.AccountLogin, in.AccountType, in.Tenant, in.State, in.Reason, in.UpdatedAt)
+	_, err := t.tx.Exec(ctx, `INSERT INTO installations (`+installationColumns+`)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (installation_id) DO UPDATE SET account_id = excluded.account_id, account_login = excluded.account_login,
+			account_type = excluded.account_type, tenant = excluded.tenant, state = excluded.state, reason = excluded.reason,
+			updated_at = excluded.updated_at, applied_at = now()`,
+		in.ID, in.AccountID, in.AccountLogin, in.AccountType, in.Tenant, in.State, in.Reason, in.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("write installation %d: %w", in.ID, err)
 	}
 	return nil
 }
 
-func (t onboardTx) TenantInstallation(ctx context.Context, tenant string) (int64, bool, error) {
-	var id int64
-	err := t.tx.QueryRow(ctx, `SELECT coalesce((entry->>'installation_id')::bigint, 0) FROM tenants WHERE id = $1`, tenant).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, nil
-	}
+func (t onboardTx) Tenants(ctx context.Context) (map[string]json.RawMessage, error) {
+	rows, err := t.tx.Query(ctx, `SELECT id, entry::text FROM tenants`)
 	if err != nil {
-		return 0, false, fmt.Errorf("read tenant %q: %w", tenant, err)
+		return nil, fmt.Errorf("read the tenants: %w", err)
 	}
-	return id, true, nil
+	defer rows.Close()
+	out := map[string]json.RawMessage{}
+	for rows.Next() {
+		var id, entry string
+		if err := rows.Scan(&id, &entry); err != nil {
+			return nil, fmt.Errorf("read the tenants: %w", err)
+		}
+		out[id] = json.RawMessage(entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the tenants: %w", err)
+	}
+	return out, nil
 }
 
 func (t onboardTx) PutTenant(ctx context.Context, e Entry) error {
@@ -159,9 +192,10 @@ func (t onboardTx) PutTenant(ctx context.Context, e Entry) error {
 	return nil
 }
 
-func (t onboardTx) DeleteTenant(ctx context.Context, tenant string) error {
-	if _, err := t.tx.Exec(ctx, `DELETE FROM tenants WHERE id = $1`, tenant); err != nil {
-		return fmt.Errorf("delete tenant %q: %w", tenant, err)
+func (t onboardTx) DeleteTenant(ctx context.Context, tenant string, installation int64) (bool, error) {
+	tag, err := t.tx.Exec(ctx, `DELETE FROM tenants WHERE id = $1 AND (entry->>'installation_id')::bigint = $2`, tenant, installation)
+	if err != nil {
+		return false, fmt.Errorf("delete tenant %q: %w", tenant, err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
