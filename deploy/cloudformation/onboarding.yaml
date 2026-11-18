@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  firerunner hosted onboarding's webhook ingress (#170): the GitHub App's
+  webhooks go to an API Gateway endpoint, which puts each, as it arrived, on
+  an SQS queue, running no code. The control VMs read the queue
+  (control.yaml's OnboardQueueUrl and OnboardQueueArn) and verify each
+  delivery's signature; the ingress verifies nothing and holds no secret.
+
+Parameters:
+  MaxReceiveCount:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    MaxValue: 1000
+    Description: >-
+      How often a delivery is received before it moves to the dead-letter
+      queue: one that keeps failing (the database, GitHub), or whose
+      signature does not hold (a webhook secret mid-rotation). Replay it from
+      there.
+  RateLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Requests a second the endpoint takes, beyond which it answers 429 (GitHub's webhooks are few; anyone may call the URL).
+  BurstLimit:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: Requests the endpoint takes at once above RateLimit.
+
+Resources:
+  # Fourteen days, SQS's most: a delivery outlives an outage of the control
+  # plane, and a dead letter waits for its replay.
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      # The worker asks for 120 s on each receive; this is the default.
+      VisibilityTimeout: 120
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  # API Gateway may send to this queue, and do nothing else.
+  IngressRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: send
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Queue.Arn
+
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-webhooks"
+      Description: The GitHub App's webhooks, onto an SQS queue (firerunner onboarding).
+      EndpointConfiguration: { Types: [REGIONAL] }
+
+  WebhookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: webhook
+
+  # The envelope the worker reads (onboard.Envelope): GitHub's three headers,
+  # and the body base64, as it arrived, as the signature is over those bytes.
+  # Only application/json is taken, as the App sends (its webhook's content
+  # type); anything else is refused (415), not enqueued. SQS refusing the
+  # message (one larger than its limit, say) answers 500, and GitHub keeps
+  # the delivery failed, to be redelivered from the App's settings.
+  WebhookMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref WebhookResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${Queue.QueueName}"
+        Credentials: !GetAtt IngressRole.Arn
+        PassthroughBehavior: NEVER
+        RequestParameters:
+          integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+        RequestTemplates:
+          application/json: |
+            #set($d = $util.escapeJavaScript($input.params('X-GitHub-Delivery')))
+            #set($e = $util.escapeJavaScript($input.params('X-GitHub-Event')))
+            #set($s = $util.escapeJavaScript($input.params('X-Hub-Signature-256')))
+            #set($b = $util.base64Encode($input.body))
+            #set($msg = '{"delivery":"' + $d + '","event":"' + $e + '","signature":"' + $s + '","body":"' + $b + '"}')
+            Action=SendMessage&MessageBody=$util.urlEncode($msg)
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseTemplates:
+              application/json: '{"queued":true}'
+          - StatusCode: "500"
+            SelectionPattern: "4\\d{2}|5\\d{2}"
+            ResponseTemplates:
+              application/json: '{"queued":false}'
+      MethodResponses:
+        - StatusCode: "200"
+        - StatusCode: "500"
+
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: WebhookMethod
+    Properties:
+      RestApiId: !Ref Api
+
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref Api
+      DeploymentId: !Ref Deployment
+      StageName: v1
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: !Ref RateLimit
+          ThrottlingBurstLimit: !Ref BurstLimit
+
+Outputs:
+  WebhookUrl:
+    Description: The GitHub App's webhook URL. Its content type is application/json, and its secret the one in control.yaml's OnboardWebhookSecretArn.
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${Stage}/webhook"
+  QueueUrl:
+    Description: control.yaml's OnboardQueueUrl.
+    Value: !Ref Queue
+  QueueArn:
+    Description: control.yaml's OnboardQueueArn.
+    Value: !GetAtt Queue.Arn
+  DeadLetterQueueUrl:
+    Description: Deliveries received too often; replay them to the queue (aws sqs start-message-move-task).
+    Value: !Ref DeadLetterQueue

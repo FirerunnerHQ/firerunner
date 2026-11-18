@@ -29,6 +29,9 @@
 #   FR_POOL_KEY_SECRET  the Secrets Manager secret holding the key that signs
 #                 EC2 pool instances (a stack made before it leaves it empty:
 #                 firerunner then rebuilds its warm pool after every restart)
+#   FR_ONBOARD_QUEUE_URL  hosted onboarding's webhook queue (optional), and
+#   FR_ONBOARD_WEBHOOK_SECRET  the Secrets Manager secret holding the App's
+#                 webhook secret: both, as the role covers both, or neither
 #
 # and these SSM parameters under $FR_PREFIX/control/:
 #   env              FR_* lines (non-secret): FR_URL, FR_APP_CLIENT_ID, ...;
@@ -268,6 +271,29 @@ if [ -n "$states" ]; then
 		setenv FR_GUARDDUTY true
 	fi
 	rm -f "$gd_err"
+fi
+# Hosted onboarding: the queue and secret are the stack's, which its role
+# covers; the tiers new tenants get, and the leases, are control/env's.
+if has_env FR_ONBOARD_QUEUE_URL || has_env FR_ONBOARD_WEBHOOK_SECRET_FILE; then
+	log "$FR_PREFIX/control/env sets FR_ONBOARD_QUEUE_URL or FR_ONBOARD_WEBHOOK_SECRET_FILE: set the stack's OnboardQueueUrl, OnboardQueueArn and OnboardWebhookSecretArn instead, which the VM's role covers"
+	false
+fi
+if [ -n "${FR_ONBOARD_QUEUE_URL:-}" ] || [ -n "${FR_ONBOARD_WEBHOOK_SECRET:-}" ]; then
+	if [ -z "${FR_ONBOARD_QUEUE_URL:-}" ] || [ -z "${FR_ONBOARD_WEBHOOK_SECRET:-}" ]; then
+		log "onboarding needs both the queue (OnboardQueueUrl) and the webhook secret (OnboardWebhookSecretArn)"
+		false
+	fi
+	# In a root-only file (umask 077), never the env: firerunner reads it.
+	webhook_secret=$(aws secretsmanager get-secret-value --secret-id "$FR_ONBOARD_WEBHOOK_SECRET" \
+		--query SecretString --output text)
+	if [ -z "$webhook_secret" ]; then
+		log "$FR_ONBOARD_WEBHOOK_SECRET: the webhook secret is empty"
+		false
+	fi
+	printf '%s\n' "$webhook_secret" > "$etc/onboard-webhook-secret"
+	webhook_secret=''
+	setenv FR_ONBOARD_WEBHOOK_SECRET_FILE "$etc/onboard-webhook-secret"
+	setenv FR_ONBOARD_QUEUE_URL "$FR_ONBOARD_QUEUE_URL"
 fi
 if [ -n "${FR_POOL_KEY_SECRET:-}" ]; then
 	# In a root-only file (umask 077), never the env: firerunner reads it.
