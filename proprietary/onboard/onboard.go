@@ -102,6 +102,10 @@ type Outcome struct {
 	// duplicate (a delivery applied before).
 	Result string `json:"result"`
 	Reason string `json:"reason,omitempty"`
+	// KeepGroup is a delivery after which the installation's runner group
+	// is to be kept (Keeper.Keep): it is listed, or its repositories
+	// changed.
+	KeepGroup bool `json:"keep_group,omitempty"`
 }
 
 // Store is where deliveries are applied; a *jobstore.TenantStore.
@@ -156,6 +160,21 @@ func Handle(ctx context.Context, cfg Config, store Store, d Delivery) (Outcome, 
 	}
 	if d.ID == "" {
 		return out, errors.New("the delivery has no X-GitHub-Delivery id")
+	}
+	if d.Event == "installation_repositories" {
+		// Which repositories it may access is GitHub's to say when the
+		// group is kept; the event says only that it changed.
+		var ev struct {
+			Installation struct {
+				ID int64 `json:"id"`
+			} `json:"installation"`
+		}
+		if err := json.Unmarshal(d.Body, &ev); err != nil || ev.Installation.ID <= 0 {
+			return out, fmt.Errorf("installation_repositories event: no installation id (%v)", err)
+		}
+		out.Installation, out.KeepGroup = ev.Installation.ID, true
+		out.Result, out.Reason = "ignored", "changes the runner group's repositories, not the tenant"
+		return out, nil
 	}
 	if d.Event != "installation" {
 		out.Result, out.Reason = "ignored", "onboarding acts on installation events alone"
@@ -303,6 +322,7 @@ func apply(ctx context.Context, cfg Config, tx jobstore.OnboardTx, ev installati
 			return err
 		}
 	}
+	out.KeepGroup = next.State == "active"
 	return tx.PutInstallation(ctx, next)
 }
 
