@@ -34,7 +34,10 @@ func newFake() *fakeStore {
 	return &fakeStore{installations: map[int64]jobstore.Installation{}, tenants: map[string]json.RawMessage{}, delivered: map[string]string{}}
 }
 
-func (f *fakeStore) Onboard(_ context.Context, delivery, _ string, fn func(jobstore.OnboardTx) (string, error)) (string, error) {
+func (f *fakeStore) Onboard(ctx context.Context, delivery, _ string, fn func(jobstore.OnboardTx) (string, error)) (string, error) {
+	if err := ctx.Err(); err != nil { // as the database's driver does
+		return "", err
+	}
 	if out, ok := f.delivered[delivery]; ok {
 		return out, jobstore.ErrDelivered
 	}

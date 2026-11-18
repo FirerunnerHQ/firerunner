@@ -58,6 +58,7 @@ import (
 	"github.com/firerunnerhq/firerunner/internal/tenantstate"
 	"github.com/firerunnerhq/firerunner/proprietary/entitlement"
 	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
+	"github.com/firerunnerhq/firerunner/proprietary/onboard"
 )
 
 // version is overridable at build time via -ldflags; see buildVersion for
@@ -1349,6 +1350,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	s.tenants.Store(tenants)
 	var catalog *tenantCatalog
 	var leaser *tenantLeaser
+	var onboarding *onboard.Worker
 	if cfg.TenantsPath != "" {
 		var db *jobstore.TenantStore
 		src, err := openTenants(cfg.TenantsPath, func() (ssmGetAPI, error) {
@@ -1392,11 +1394,17 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			leaser = &tenantLeaser{store: db, shard: newShard(owner, tenantOwner), set: tenants, log: log.With("component", "tenant-leases")}
 			catalog.leaser = leaser
 		}
+		if onboarding, err = newOnboarding(runCtx, cfg, db, leaser, appJWT, log.With("component", "onboarding")); err != nil {
+			return err
+		}
 		if err := catalog.read(runCtx); err != nil {
 			log.Error("tenants list not read; serving the install alone until it is", "source", src.String(), "err", err)
 		}
 		if leaser != nil {
 			go leaser.run(runCtx)
+		}
+		if onboarding != nil {
+			go onboarding.Run(runCtx)
 		}
 		go catalog.run(runCtx)
 	}
@@ -1430,6 +1438,10 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		}
 		if leaser != nil {
 			f.TenantLeases = leaser.status()
+		}
+		f.Onboarding = nil
+		if onboarding != nil {
+			f.Onboarding = healthOnboarding(onboarding.Status())
 		}
 	}, log)
 

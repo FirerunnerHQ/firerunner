@@ -1,0 +1,4 @@
+### Added
+
+- Hosted onboarding (`--onboard-queue-url`, with `--tenant-leases`): the assigning shard reads the hosted GitHub App's webhooks from an SQS queue and turns them into installations of the tenants list. An organization that installs the App is listed with `--onboard-tiers`, and one that suspends or uninstalls it is removed. A personal account, the install's own organization, or one listed already is refused, with the reason. Each organization gets a runner group of onboarding's own (`--onboard-runner-group`), open only to the installation's repositories that are not public. `firerunner status` and `doctor` show the deliveries applied, dropped and failed.
+- `firerunner tenant import` refuses a list that drops or rewrites an installation that onboarding listed for an organization whose App is still installed.

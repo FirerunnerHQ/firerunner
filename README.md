@@ -375,6 +375,32 @@ once from the database: each shard and its state, which shard serves or
 is assigned each installation and why one is not served, the removals not
 yet cleaned up, and a list of problems.
 
+**Onboarding from the App's webhooks (hosted).** With `--onboard-queue-url`
+(`FR_ONBOARD_QUEUE_URL`), the shard that holds the assigner's lease reads the
+App's webhook deliveries from that SQS queue, one at a time, where an ingress
+puts each with its GitHub headers. An organization that installs the App
+becomes an installation of the list, with `--onboard-tiers` and the default
+limits. A personal account, the install's own organization, or one listed
+already is refused, with the reason kept. One that suspends or uninstalls it
+is removed, as above. Each delivery is applied once, one at a time, and with
+the installation's state as GitHub reports it then.
+
+In each organization the shard also keeps a runner group of its own,
+`--onboard-runner-group`. That group is open to the installation's
+repositories that are not public, never to a public one. A group of that
+name that the organization made itself is left alone, and so is its default
+group.
+
+Give the queue a redrive policy to a dead-letter queue. A delivery that
+fails stays on the queue to be retried, and goes there once it has failed too
+often. So does one whose signature does not hold against
+`--onboard-webhook-secret-file`. While the App's webhook secret is rotated on
+GitHub and here, which cannot happen at once, deliveries go there: replay the
+dead-letter queue once the two agree. A
+malformed delivery is dropped. `firerunner status` counts the deliveries
+applied, rejected, dropped and failed, and `doctor` warns while they are
+rejected or fail, or while the queue cannot be read.
+
 **When one installation fails.** Each installation of the list runs in a loop
 of its own. A failure there (a start GitHub refuses, a scale set deleted, a
 panic in its start, its tiers' listeners or its stop) stops that installation
