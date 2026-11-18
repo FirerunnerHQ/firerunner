@@ -65,9 +65,10 @@ Resources:
         Statement:
           - Effect: Allow
             Principal: { Service: apigateway.amazonaws.com }
+            # No source-account condition: API Gateway gives none when it
+            # assumes an integration's role, and was refused (found on the
+            # first deployment, 2026-11-18).
             Action: sts:AssumeRole
-            Condition:
-              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
       Policies:
         - PolicyName: send
           PolicyDocument:
@@ -83,10 +84,6 @@ Resources:
       Name: !Sub "${AWS::StackName}-webhooks"
       Description: The GitHub App's webhooks, onto an SQS queue (firerunner onboarding).
       EndpointConfiguration: { Types: [REGIONAL] }
-      # A JSON body is taken as bytes, so the template sees it base64, as it
-      # arrived: the signature is over those bytes, and decoding it as text
-      # and encoding it back need not give them again.
-      BinaryMediaTypes: [application/json]
 
   # Refuses (400) a request without GitHub's headers before it reaches the
   # queue: a cheap filter of what is plainly not GitHub's, not a defence;
@@ -130,9 +127,6 @@ Resources:
         Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${Queue.QueueName}"
         Credentials: !GetAtt IngressRole.Arn
         PassthroughBehavior: NEVER
-        # With application/json binary (Api), the template's $input.body is
-        # the body base64.
-        ContentHandling: CONVERT_TO_TEXT
         RequestParameters:
           integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
         RequestTemplates:
@@ -140,7 +134,7 @@ Resources:
             #set($d = $util.escapeJavaScript($input.params('X-GitHub-Delivery')))
             #set($e = $util.escapeJavaScript($input.params('X-GitHub-Event')))
             #set($s = $util.escapeJavaScript($input.params('X-Hub-Signature-256')))
-            #set($b = $input.body)
+            #set($b = $util.base64Encode($input.body))
             #set($msg = '{"delivery":"' + $d + '","event":"' + $e + '","signature":"' + $s + '","body":"' + $b + '"}')
             Action=SendMessage&MessageBody=$util.urlEncode($msg)
         IntegrationResponses:
@@ -159,7 +153,7 @@ Resources:
   # new logical id. So its name ends in a hash of what it deploys (Api to
   # WebhookMethod), which test-policies.py checks: a change there without a
   # new name fails the test, which prints the name to use.
-  Deploymenta6bdbd9fd6:
+  Deploymentd96a9d54b4:
     Type: AWS::ApiGateway::Deployment
     DependsOn: WebhookMethod
     Properties:
@@ -169,7 +163,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref Api
-      DeploymentId: !Ref Deploymenta6bdbd9fd6
+      DeploymentId: !Ref Deploymentd96a9d54b4
       StageName: v1
       MethodSettings:
         - ResourcePath: "/*"
