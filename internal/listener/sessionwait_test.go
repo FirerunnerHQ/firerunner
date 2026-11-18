@@ -102,3 +102,18 @@ func TestRetrySession(t *testing.T) {
 		t.Fatalf("another error: %v after %d tries, want it at once", err, *tries)
 	}
 }
+
+// Only a creation that failed because the name exists is taken for another
+// daemon's creation; any other failure is one.
+func TestIsCreateRace(t *testing.T) {
+	for msg, want := range map[string]bool{
+		"409 Conflict: runner scale set already exists":    true,
+		"A runner scale set with that name already exists": true,
+		"403 Forbidden":                        false,
+		"422 Unprocessable Entity: bad labels": false,
+	} {
+		if got := isCreateRace(errors.New(msg)); got != want {
+			t.Errorf("isCreateRace(%q) = %v, want %v", msg, got, want)
+		}
+	}
+}

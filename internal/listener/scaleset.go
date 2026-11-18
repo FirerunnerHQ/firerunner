@@ -263,11 +263,15 @@ func registerScaleSet(ctx context.Context, client *scaleset.Client, cfg Config, 
 		scaleSet, err = client.CreateRunnerScaleSet(ctx, desired)
 		if err != nil {
 			// Another daemon of the same configuration may have created it
-			// a moment ago: take that one.
+			// a moment ago: take that one. Any other failure is one.
+			if !isCreateRace(err) {
+				return 0, false, fmt.Errorf("create runner scale set: %w", err)
+			}
 			again, gerr := client.GetRunnerScaleSet(ctx, groupID, cfg.Name)
 			if gerr != nil || again == nil {
 				return 0, false, fmt.Errorf("create runner scale set: %w", err)
 			}
+			cfg.Logger.Info("runner scale set created meanwhile by another daemon: taking it", "name", cfg.Name, "createErr", err)
 			reused = true
 			if scaleSet, err = client.UpdateRunnerScaleSet(ctx, again.ID, desired); err != nil {
 				return 0, false, fmt.Errorf("update runner scale set: %w", err)
@@ -330,6 +334,13 @@ func retrySession[S any](ctx context.Context, open func(context.Context) (S, err
 		}
 	}
 	return zero, err
+}
+
+// isCreateRace reports whether a scale set's creation failed because one of
+// that name exists: another daemon created it after this one looked.
+func isCreateRace(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already exists") || strings.Contains(msg, "conflict")
 }
 
 // isSessionConflict reports whether err is GitHub's "scale set already has an
@@ -744,7 +755,9 @@ func (s *ScaleSet) Close(ctx context.Context) error {
 // created it or found it registered: its tenant is gone, and so are the
 // labels its jobs would wait on.
 func (s *ScaleSet) Remove(ctx context.Context) error {
-	_ = s.session.Close(ctx)
+	if s.session != nil {
+		_ = s.session.Close(ctx)
+	}
 	if err := s.client.DeleteRunnerScaleSet(ctx, s.scaleSetID); err != nil {
 		return fmt.Errorf("delete runner scale set: %w", err)
 	}

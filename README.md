@@ -351,7 +351,9 @@ takes any free lease, ignoring the assignments.
   says so. One takes them over within 10 seconds of the shard that held them
   stopping, or about a minute after it crashes, when GitHub lets its
   sessions go. A shard serves the installations of the list whether or not
-  it holds the install's.
+  it holds the install's. A holder whose sessions all lapse at once (a
+  network outage) may find another shard has taken them: it keeps trying
+  to reopen them, and its warm pools keep filling, until it is restarted.
 
 Every shard needs the same `--tenant-owner` (`FR_TENANT_OWNER`): an
 installation's instances are tagged `<tenant-owner>/<id>`, which is how the

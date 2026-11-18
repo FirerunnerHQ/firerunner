@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math/rand/v2"
 	"slices"
 	"strings"
 	"sync"
@@ -628,9 +629,11 @@ type sessionSet interface {
 // tenant served by daemons that share its scale sets (shards of one
 // configuration) is served by whichever opens them all. Holding some while
 // it waits for the rest, two daemons could each hold part and wait on the
-// other for good. It tries them in order, every wait, and on the first one
-// held releases those it opened, until ctx ends. standby, when set, is told
-// whether it stands by.
+// other for good. It tries them in order, about every wait (randomly from
+// half to one and a half of it, so that two starting together fall out of
+// step rather than each releasing what the other needs, round after
+// round), and on the first one held releases those it opened, until ctx
+// ends. standby, when set, is told whether it stands by.
 func openTogether(ctx context.Context, sets []sessionSet, wait time.Duration, standby func(bool), log *slog.Logger) error {
 	if standby == nil {
 		standby = func(bool) {}
@@ -663,7 +666,7 @@ func openTogether(ctx context.Context, sets []sessionSet, wait time.Duration, st
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(wait):
+		case <-time.After(wait/2 + rand.N(wait)):
 		}
 	}
 }

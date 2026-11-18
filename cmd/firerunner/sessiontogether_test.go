@@ -116,3 +116,71 @@ func TestOpenTogetherStops(t *testing.T) {
 		t.Fatalf("c open %v, released %d: want it released", c.open, c.released)
 	}
 }
+
+// serverSet is one scale set's session as GitHub keeps it: one holder at
+// a time.
+type serverSet struct {
+	mu     *sync.Mutex
+	holder *string
+}
+
+// contender is one daemon's view of a serverSet.
+type contender struct {
+	name string
+	set  *serverSet
+}
+
+func (h contender) TryOpenSession(context.Context) (bool, error) {
+	h.set.mu.Lock()
+	defer h.set.mu.Unlock()
+	if *h.set.holder != "" && *h.set.holder != h.name {
+		return false, nil
+	}
+	*h.set.holder = h.name
+	return true, nil
+}
+
+func (h contender) ReleaseSession(context.Context) {
+	h.set.mu.Lock()
+	defer h.set.mu.Unlock()
+	if *h.set.holder == h.name {
+		*h.set.holder = ""
+	}
+}
+
+// Two daemons starting together on the same scale sets end with one holding
+// them all and the other none, standing by: never each part of them.
+func TestOpenTogetherTwoContenders(t *testing.T) {
+	for round := range 20 {
+		var mu sync.Mutex
+		holders := make([]string, 3)
+		server := make([]*serverSet, 3)
+		for i := range server {
+			server[i] = &serverSet{mu: &mu, holder: &holders[i]}
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		won := make(chan string, 2)
+		for _, name := range []string{"x", "y"} {
+			on := []sessionSet{contender{name, server[0]}, contender{name, server[1]}, contender{name, server[2]}}
+			go func() {
+				if openTogether(ctx, on, 2*time.Millisecond, nil, slog.New(slog.DiscardHandler)) == nil {
+					won <- name
+				}
+			}()
+		}
+		var winner string
+		select {
+		case winner = <-won:
+		case <-time.After(10 * time.Second):
+			cancel()
+			t.Fatalf("round %d: neither took the sessions", round)
+		}
+		mu.Lock()
+		got := slices.Clone(holders)
+		mu.Unlock()
+		cancel()
+		if !slices.Equal(got, []string{winner, winner, winner}) {
+			t.Fatalf("round %d: holders %v, want %s on all", round, got, winner)
+		}
+	}
+}
