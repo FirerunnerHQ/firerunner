@@ -36,6 +36,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
 
 	"github.com/firerunnerhq/firerunner/internal/tenantstate"
+	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
 // Account is a tenant's standing with billing.
@@ -75,8 +76,9 @@ type Record struct {
 	// holds its tenant, as someone wrote it.
 	Invalid string `json:"-"`
 	// Written is when the store last saw the record written: the SSM
-	// parameter's last modification, or for a file store the file's, which
-	// any tenant's write changes. Zero when the store does not say.
+	// parameter's last modification, the database row's, or for a file
+	// store the file's, which any tenant's write changes. Zero when the
+	// store does not say.
 	Written time.Time `json:"-"`
 }
 
@@ -208,15 +210,34 @@ type Store interface {
 	Delete(ctx context.Context, id string) error
 }
 
-// CheckSpec reports whether spec names a store: "ssm:" and an absolute SSM
-// path, or an absolute file path.
-func CheckSpec(spec string) error { return tenantstate.CheckSpec(spec) }
+// DBSpec is the spec of the entitlements table of the job store's database
+// (FR_JOB_EVENTS_DSN), one row a tenant.
+const DBSpec = "db:"
+
+// CheckSpec reports whether spec names a store: db:, "ssm:" and an absolute
+// SSM path, or an absolute file path.
+func CheckSpec(spec string) error {
+	if spec == DBSpec {
+		return nil
+	}
+	if strings.HasPrefix(spec, DBSpec) {
+		return fmt.Errorf("%q: the database is the job store's; write db: alone", spec)
+	}
+	return tenantstate.CheckSpec(spec)
+}
 
 // Open returns the store spec names. newSSM is asked for a client only for an
-// SSM path.
-func Open(spec string, newSSM func() (tenantstate.SSMAPI, error)) (Store, error) {
+// SSM path, newDB for the job store only for db:.
+func Open(spec string, newSSM func() (tenantstate.SSMAPI, error), newDB func() (DB, error)) (Store, error) {
 	if err := CheckSpec(spec); err != nil {
 		return nil, err
+	}
+	if spec == DBSpec {
+		db, err := newDB()
+		if err != nil {
+			return nil, err
+		}
+		return &DBStore{DB: db}, nil
 	}
 	if path, ok := strings.CutPrefix(spec, tenantstate.SSMPrefix); ok {
 		api, err := newSSM()
@@ -366,4 +387,46 @@ func (s *SSMStore) Delete(ctx context.Context, id string) error {
 		return nil
 	}
 	return err
+}
+
+// DB is the job store's side of DBStore; a *jobstore.TenantStore.
+type DB interface {
+	Entitlements(ctx context.Context) ([]jobstore.Entitlement, error)
+	PutEntitlement(ctx context.Context, tenant string, record json.RawMessage) error
+	DeleteEntitlement(ctx context.Context, tenant string) error
+}
+
+// DBStore keeps each record as a row of the job store's entitlements table,
+// as billing writes them: writing one tenant never touches another's.
+type DBStore struct{ DB DB }
+
+func (*DBStore) String() string { return DBSpec + " (the job store's entitlements table)" }
+
+// Load reads every row.
+func (d *DBStore) Load(ctx context.Context) (Records, error) {
+	rows, err := d.DB.Entitlements(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rs := Records{}
+	for _, row := range rows {
+		r := decode(row.Record)
+		r.Written = row.UpdatedAt
+		rs[row.Tenant] = r
+	}
+	return rs, nil
+}
+
+// Put writes the tenant's row.
+func (d *DBStore) Put(ctx context.Context, id string, r Record) error {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	return d.DB.PutEntitlement(ctx, id, b)
+}
+
+// Delete removes the tenant's row; one already gone is no error.
+func (d *DBStore) Delete(ctx context.Context, id string) error {
+	return d.DB.DeleteEntitlement(ctx, id)
 }

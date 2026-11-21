@@ -16,7 +16,7 @@ func runEntitlement(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
 	var out, errOut bytes.Buffer
 	code := entitlementCmd(args, &out, &errOut, func(spec string) (entitlement.Store, error) {
-		return entitlement.Open(spec, nil)
+		return entitlement.Open(spec, nil, nil)
 	})
 	return code, out.String(), errOut.String()
 }

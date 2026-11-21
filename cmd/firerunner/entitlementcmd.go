@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,8 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/firerunnerhq/firerunner/internal/tenantstate"
 	"github.com/firerunnerhq/firerunner/proprietary/entitlement"
+	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
 const entitlementUsage = `usage:
@@ -40,9 +44,12 @@ records every 30 seconds:
   - a record past its valid-until: held, unless its account is active and
     its budget not capped (then it goes on launching, and doctor warns).
 
-SPEC is the daemon's --entitlements: ssm:<path> (one SSM parameter per
-tenant; this shell's AWS credentials and region, FR_AWS_REGION or
-AWS_REGION) or an absolute file path. Default FR_ENTITLEMENTS; with no FR_*
+SPEC is the daemon's --entitlements: db: (the job store's entitlements
+table, one row per tenant, at FR_JOB_EVENTS_DSN or FR_JOB_EVENTS_DSN_FILE),
+ssm:<path> (one SSM parameter per tenant; this shell's AWS credentials and
+region, FR_AWS_REGION or AWS_REGION) or an absolute file path. Write with
+billing's or an operator's database role where the daemon's may only read
+the table. Default FR_ENTITLEMENTS; with no FR_*
 variable set, the daemon's settings file is read for it, as status and
 doctor do (--env-file FILE reads another, --env-file none reads none).
 exit status: 0 done, 1 failed, 2 usage error
@@ -204,6 +211,9 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 		if accessDenied(err) {
 			fmt.Fprintln(stderr, "These AWS credentials may not change entitlements; a control VM's role only reads them. Run it where billing's or an operator's credentials are.")
 		}
+		if dbDenied(err) {
+			fmt.Fprintln(stderr, "This database role may not change entitlements; the daemon's may only read them. Set FR_JOB_EVENTS_DSN to billing's or an operator's role, with --env-file none.")
+		}
 		return 1
 	}
 	rep := entitlementReport{Store: store.String()}
@@ -288,7 +298,40 @@ func limitsText(l entitlement.Limits) string {
 }
 
 // openEntitlements opens a store, with an SSM client from this shell's AWS
-// configuration where the spec names SSM.
+// configuration where the spec names SSM, and the job store of
+// FR_JOB_EVENTS_DSN or FR_JOB_EVENTS_DSN_FILE for db:. The process exits
+// soon after, which closes the connections.
 func openEntitlements(spec string) (entitlement.Store, error) {
-	return entitlement.Open(spec, cliSSM)
+	return entitlement.Open(spec, cliSSM, func() (entitlement.DB, error) {
+		dsn, err := envJobStoreDSN()
+		if err != nil {
+			return nil, err
+		}
+		return jobstore.OpenTenants(dsn)
+	})
+}
+
+// dbDenied reports whether err is Postgres refusing the role the statement
+// (insufficient_privilege).
+func dbDenied(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42501"
+}
+
+// envJobStoreDSN is the job store's database URL as this process's
+// environment names it, FR_JOB_EVENTS_DSN or the file FR_JOB_EVENTS_DSN_FILE
+// names. Neither set is an error; the error never holds the URL.
+func envJobStoreDSN() (string, error) {
+	dsn := os.Getenv("FR_JOB_EVENTS_DSN")
+	if file := os.Getenv("FR_JOB_EVENTS_DSN_FILE"); dsn == "" && file != "" {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			return "", fmt.Errorf("cannot read FR_JOB_EVENTS_DSN_FILE: %w", err)
+		}
+		dsn = strings.TrimSpace(string(raw))
+	}
+	if dsn == "" {
+		return "", errors.New("no job store: set FR_JOB_EVENTS_DSN or FR_JOB_EVENTS_DSN_FILE as the daemon's")
+	}
+	return dsn, nil
 }

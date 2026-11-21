@@ -190,6 +190,35 @@ func TestTenantsInDB(t *testing.T) {
 	}
 }
 
+// --entitlements db: is the job store's entitlements table: it needs the
+// store's URL and names nothing more; the other stores check as before.
+func TestEntitlementsInDB(t *testing.T) {
+	c := &Config{Entitlements: "db:"}
+	if err := c.checkEntitlements(); err == nil || !strings.Contains(err.Error(), "FR_JOB_EVENTS_DSN") {
+		t.Fatalf("db: with no job store: %v", err)
+	}
+	c.JobEventsDSN = "postgres://u@h/db"
+	if err := c.checkEntitlements(); err != nil {
+		t.Fatalf("db: with a job store: %v", err)
+	}
+	for _, bad := range []string{"db:entitlements", "relative.json", "ssm:relative"} {
+		c.Entitlements = bad
+		if err := c.checkEntitlements(); err == nil || !strings.Contains(err.Error(), "--entitlements") {
+			t.Errorf("%q: %v, want refused", bad, err)
+		}
+	}
+	for _, good := range []string{"", "/etc/firerunner/entitlements.json", "ssm:/fr/control/entitlements"} {
+		c.Entitlements = good
+		if err := c.checkEntitlements(); err != nil {
+			t.Errorf("%q: %v", good, err)
+		}
+	}
+	t.Setenv("FR_JOB_EVENTS_DSN", "postgres://u@h/db")
+	if _, err := Parse([]string{"--url", "https://github.com/o", "--token", "t", "--entitlements", "db:"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+}
+
 // --tenant-leases keeps its leases beside the tenants table, and hands a
 // tenant's runners on by --owner: it needs both.
 func TestTenantLeasesNeedDBAndOwner(t *testing.T) {

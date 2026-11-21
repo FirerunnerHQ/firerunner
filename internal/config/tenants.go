@@ -9,6 +9,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"github.com/firerunnerhq/firerunner/internal/tenantstate"
 )
 
 // Tenant is an installation a shard serves beside the one the flags name. It
@@ -78,6 +80,26 @@ func ParseTenants(b []byte) ([]Tenant, error) {
 		return nil, errors.New("content after the list")
 	}
 	return tenants, nil
+}
+
+// checkEntitlements reports whether --entitlements names a store: db:, which
+// needs the job store, ssm: and an SSM path, or an absolute file path.
+func (c *Config) checkEntitlements() error {
+	switch e := c.Entitlements; {
+	case e == "":
+		return nil
+	case e == TenantsDB:
+		if c.JobEventsDSN == "" && c.JobEventsDSNFile == "" {
+			return errors.New("--entitlements db: reads the job store's database: set FR_JOB_EVENTS_DSN or FR_JOB_EVENTS_DSN_FILE")
+		}
+		return nil
+	case strings.HasPrefix(e, TenantsDB):
+		return fmt.Errorf("--entitlements %q: the database is the job store's; write db: alone", e)
+	}
+	if err := tenantstate.CheckSpec(c.Entitlements); err != nil {
+		return fmt.Errorf("--entitlements %w", err)
+	}
+	return nil
 }
 
 func (c *Config) checkTenantsSpec() error {

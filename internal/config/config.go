@@ -443,7 +443,7 @@ func newFlagSet(c *Config, v *flagVals, er *envReader) *flag.FlagSet {
 	fs.IntVar(&c.Limits.VCPU, "limit-vcpu", er.int("FR_LIMIT_VCPU", 0), "serve the install only the tiers of at most this many vCPUs, leaving the others out with a warning (0 = no limit). A tenant sets its own in the --tenants catalog")
 	fs.DurationVar(&c.Limits.JobDuration, "limit-job-duration", er.duration("FR_LIMIT_JOB_DURATION", 0), "end the runner of an install's job that has run this long, failing the job (0 = no limit; at least 1m). A tenant sets its own in the --tenants catalog")
 	fs.StringVar(&c.TenantState, "tenant-state", env("FR_TENANT_STATE", ""), "where tenant suspensions are kept (firerunner tenant suspend): an absolute file path, or ssm: and an SSM path holding one parameter per suspended tenant. Read at start and every 15 s; a suspended tenant's launches are held and its runners ended. Off when empty")
-	fs.StringVar(&c.Entitlements, "entitlements", env("FR_ENTITLEMENTS", ""), "where billing keeps what each tenant of the catalog may run: an absolute file path, or ssm: and an SSM path holding one parameter per tenant (account and budget state, valid until). Read at start and every 30 s. A tenant with no record, a suspended account or a capped budget is held: its jobs wait, with the reason; an expired record holds unless it names an active account. The install itself is never held. Off when empty")
+	fs.StringVar(&c.Entitlements, "entitlements", env("FR_ENTITLEMENTS", ""), "where billing keeps what each tenant of the catalog may run: db: (the job store's entitlements table, one row per tenant), an absolute file path, or ssm: and an SSM path holding one parameter per tenant (account and budget state, valid until). Read at start and every 30 s. A tenant with no record, a suspended account or a capped budget is held: its jobs wait, with the reason; an expired record holds unless it names an active account. The install itself is never held. Off when empty")
 	fs.BoolVar(&c.TenantLeases, "tenant-leases", er.boolean("FR_TENANT_LEASES", false), "serve a tenant of --tenants db: only while this process holds the lease on its GitHub account in the job store's database, renewed every 10s, so that several daemons (shards) share one tenants list and each tenant is served by one at a time. A shard that cannot renew stops launching for a tenant within 20s; another takes it over once the lease has expired (30s). Every shard needs the same --tenant-owner, an --owner of its own and, with EC2 tiers, the same --ec2-pool-key-file")
 	fs.StringVar(&c.OnboardQueueURL, "onboard-queue-url", env("FR_ONBOARD_QUEUE_URL", ""), "the SQS queue URL the hosted GitHub App's webhooks arrive on (hosted onboarding): the shard holding the assigner's lease turns installations into tenants of --tenants db: and keeps each organization's --onboard-runner-group. Needs --tenant-leases, --onboard-webhook-secret-file and --onboard-tiers")
 	fs.StringVar(&c.OnboardWebhookSecretFile, "onboard-webhook-secret-file", "", "a file holding the hosted App's webhook secret, which signs every delivery. Default FR_ONBOARD_WEBHOOK_SECRET_FILE")
@@ -724,10 +724,8 @@ func (c *Config) validate() error {
 	}
 	// Without an EC2 tier, --guardduty reads nothing (the daemon says so):
 	// GuardDuty's findings name EC2 instances.
-	if c.Entitlements != "" {
-		if err := tenantstate.CheckSpec(c.Entitlements); err != nil {
-			return fmt.Errorf("--entitlements %w", err)
-		}
+	if err := c.checkEntitlements(); err != nil {
+		return err
 	}
 	if err := c.checkOnboard(); err != nil {
 		return err

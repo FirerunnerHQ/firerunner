@@ -478,8 +478,9 @@ Suppression rules archive findings, which then flag nothing. Without an EC2
 tier, GuardDuty is not read.
 
 **Entitlements: what billing lets each installation run.** With
-`--entitlements` (`FR_ENTITLEMENTS`), a JSON file or `ssm:` and an SSM path
-with one parameter per installation, the daemon reads, at start and every 30
+`--entitlements` (`FR_ENTITLEMENTS`), a JSON file, `ssm:` and an SSM path
+with one parameter per installation, or `db:`, the job store's
+`entitlements` table with one row per installation, the daemon reads, at start and every 30
 seconds, what billing last said each installation in the tenants list may
 run: its account state (`trial`, `active`, `past_due`, `suspended`), its
 budget state (`ok`, `warning`, `capped`) and until when the record holds.
@@ -518,6 +519,24 @@ firerunner entitlement clear acme --store /etc/firerunner/entitlements.json
 
 Entitlements are off unless set: turning them on holds every installation
 that has no record yet, so write the records first.
+
+With `db:`, billing writes the rows itself, in SQL: `tenant`, and `record`,
+the JSON a record holds; the table sets `updated_at` on every write. The
+daemon creates the table with the rest of the job store, so its own database
+role owns it and could write it. For the daemon to read the records only, as
+a control VM's role reads an SSM path, hand the table to billing's role
+(the daemon's must not own the schema or the database either, which could
+drop it):
+
+```sql
+ALTER TABLE entitlements OWNER TO billing;
+GRANT SELECT ON entitlements TO firerunner;
+```
+
+The command writes with whatever role `FR_JOB_EVENTS_DSN` names: run it with
+`--env-file none` and billing's or an operator's URL in that variable. It
+never sets the database up, as whoever did would own the job store's
+tables: start the daemon on it first.
 
 What it does not separate: the daemon itself, which holds every installation's
 App access and signs for them all, and the account's API limits and quotas.

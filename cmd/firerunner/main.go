@@ -730,6 +730,20 @@ func (s *shard) watchEntitlements(ctx context.Context, cfg *config.Config, live 
 			return nil, err
 		}
 		return awsssm.NewFromConfig(awsCfg), nil
+	}, func() (entitlement.DB, error) {
+		dsn, err := jobStoreDSN(cfg)
+		if err != nil {
+			return nil, err
+		}
+		if dsn == "" { // pgx would take its defaults: a local server
+			return nil, errors.New("db: the job store's database URL is empty")
+		}
+		db, err := jobstore.OpenTenants(dsn)
+		if err != nil {
+			return nil, err
+		}
+		context.AfterFunc(ctx, db.Close)
+		return db, nil
 	})
 	if err != nil {
 		return fmt.Errorf("--entitlements: %w", err)
