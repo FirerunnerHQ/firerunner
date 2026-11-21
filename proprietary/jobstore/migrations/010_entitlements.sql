@@ -9,6 +9,8 @@
 -- daemon's role to read it only, hand it to billing's role:
 --   ALTER TABLE entitlements OWNER TO <billing role>;
 --   GRANT SELECT ON entitlements TO <daemon role>;
+-- A later migration must then never alter this table: it runs as the
+-- daemon's role, which would fail, and every migration with it.
 CREATE TABLE entitlements (
     tenant     text PRIMARY KEY CHECK (tenant <> ''),
     record     jsonb NOT NULL,

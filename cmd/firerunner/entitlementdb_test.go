@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/firerunnerhq/firerunner/proprietary/jobstore"
 )
 
 // scratchDB creates a database of its own on FR_TEST_POSTGRES_URL's server,
@@ -48,8 +50,8 @@ func scratchDB(t *testing.T) string {
 }
 
 // The command writes and lists records in the job store's entitlements
-// table with db:, at the database FR_JOB_EVENTS_DSN names, setting it up
-// when nothing has yet; and it says what is missing when no URL is set.
+// table with db:, at the database FR_JOB_EVENTS_DSN names, once a daemon
+// has set it up; and it says what is missing when no URL, or no table, is.
 func TestEntitlementCommandDB(t *testing.T) {
 	db := scratchDB(t) // before clearFREnv unsets FR_TEST_POSTGRES_URL
 	clearFREnv(t)
@@ -66,6 +68,17 @@ func TestEntitlementCommandDB(t *testing.T) {
 	}
 
 	t.Setenv("FR_JOB_EVENTS_DSN", db)
+	if code, _, errOut := run("set", "acme", "--account", "trial", "--budget", "ok", "--store", "db:", "--env-file", "none"); code != 1 || !strings.Contains(errOut, "start the daemon") {
+		t.Fatalf("set before any daemon set the database up: exit %d, %s", code, errOut)
+	}
+	store, err := jobstore.OpenTenants(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Replace(context.Background(), nil); err != nil { // sets it up, as the daemon does
+		t.Fatal(err)
+	}
 	code, out, errOut := run("set", "acme", "--account", "trial", "--budget", "ok", "--valid-for", "720h", "--store", "db:", "--env-file", "none")
 	if code != 0 || !strings.Contains(out, "may launch") || !strings.Contains(out, "entitlements table") {
 		t.Fatalf("set: exit %d\n%s%s", code, out, errOut)

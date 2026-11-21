@@ -13,24 +13,42 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// A database nobody set up has no entitlements table: the reader says so,
-// and clearing a record there is no error.
+// A database nobody set up has no entitlements table: the reader says so;
+// a writer does not set it up, as whoever did would own the job store's
+// tables (billing's role, say, which the daemon's then could not write),
+// and says the daemon does; clearing a record there is no error.
 func TestEntitlementsBeforeSetUp(t *testing.T) {
 	s, _ := openTenantStore(t)
 	ctx := context.Background()
 	if _, err := s.Entitlements(ctx); !errors.Is(err, ErrNoEntitlements) {
 		t.Fatalf("Entitlements = %v, want ErrNoEntitlements", err)
 	}
+	err := s.PutEntitlement(ctx, "acme", json.RawMessage(`{}`))
+	if !errors.Is(err, ErrNoEntitlements) || !strings.Contains(err.Error(), "start the daemon") {
+		t.Fatalf("PutEntitlement before set-up = %v, want ErrNoEntitlements naming the daemon", err)
+	}
+	if _, err := s.Load(ctx); !errors.Is(err, ErrNoTenants) {
+		t.Fatalf("after PutEntitlement, the tenants table: %v; want the database left as it was", err)
+	}
 	if err := s.DeleteEntitlement(ctx, "acme"); err != nil {
 		t.Fatalf("DeleteEntitlement before set-up = %v", err)
 	}
 }
 
-// PutEntitlement sets the database up when it must, writes one tenant's row
+// setUp sets the database up, as the daemon does when it starts.
+func setUp(t *testing.T, s *TenantStore) {
+	t.Helper()
+	if err := prepare(context.Background(), s.pool); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// PutEntitlement writes one tenant's row
 // and leaves the others; the rows come back by tenant, as written, with
 // when each was last written; DeleteEntitlement removes one.
 func TestEntitlementsPutLoadDelete(t *testing.T) {
 	s, _ := openTenantStore(t)
+	setUp(t, s)
 	ctx := context.Background()
 	if err := s.PutEntitlement(ctx, "zeta", json.RawMessage(`{"account_state":"trial"}`)); err != nil {
 		t.Fatal(err)
@@ -71,6 +89,7 @@ func TestEntitlementsPutLoadDelete(t *testing.T) {
 // always sees when a record changed.
 func TestEntitlementsWrittenBySQL(t *testing.T) {
 	s, dsn := openTenantStore(t)
+	setUp(t, s)
 	ctx := context.Background()
 	if err := s.PutEntitlement(ctx, "acme", json.RawMessage(`{"account_state":"active"}`)); err != nil {
 		t.Fatal(err)
@@ -106,6 +125,7 @@ func TestEntitlementsWrittenBySQL(t *testing.T) {
 // insufficient_privilege, which the command explains.
 func TestEntitlementsReadOnlyRole(t *testing.T) {
 	s, dsn := openTenantStore(t)
+	setUp(t, s)
 	ctx := context.Background()
 	if err := s.PutEntitlement(ctx, "acme", json.RawMessage(`{"account_state":"active"}`)); err != nil {
 		t.Fatal(err)
@@ -116,7 +136,7 @@ func TestEntitlementsReadOnlyRole(t *testing.T) {
 	}
 	defer conn.Close(ctx)
 	const role = "fr_test_entitlement_reader"
-	if _, err := conn.Exec(ctx, `DROP ROLE IF EXISTS `+role+`; CREATE ROLE `+role+` LOGIN; GRANT USAGE ON SCHEMA public TO `+role+`; GRANT SELECT ON entitlements TO `+role); err != nil {
+	if _, err := conn.Exec(ctx, `DROP ROLE IF EXISTS `+role+`; CREATE ROLE `+role+` LOGIN PASSWORD 'reader'; GRANT USAGE ON SCHEMA public TO `+role+`; GRANT SELECT ON entitlements TO `+role); err != nil {
 		t.Skipf("cannot create a role here: %v", err)
 	}
 	t.Cleanup(func() {
@@ -131,7 +151,7 @@ func TestEntitlementsReadOnlyRole(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u.User = url.User(role)
+	u.User = url.UserPassword(role, "reader")
 	reader, err := OpenTenants(u.String())
 	if err != nil {
 		t.Fatal(err)

@@ -55,22 +55,16 @@ func entitlementsErr(err error) error {
 }
 
 // PutEntitlement writes the tenant's record, as an operator or billing
-// would. A database without the table yet is set up first, as Replace sets
-// it up; one that has it is not touched otherwise, so a role that may write
-// this table and nothing else, as billing's, can.
+// would. It never sets the database up: whoever did would own every table
+// of the job store, and billing's role owning them would stop the daemon's
+// writing its own. A database without the table is ErrNoEntitlements; the
+// daemon sets it up as it starts.
 func (s *TenantStore) PutEntitlement(ctx context.Context, tenant string, record json.RawMessage) error {
-	put := func() error {
-		_, err := s.pool.Exec(ctx, `INSERT INTO entitlements (tenant, record) VALUES ($1, $2)
-			ON CONFLICT (tenant) DO UPDATE SET record = excluded.record`, tenant, string(record))
-		return err
-	}
-	err := put()
+	_, err := s.pool.Exec(ctx, `INSERT INTO entitlements (tenant, record) VALUES ($1, $2)
+		ON CONFLICT (tenant) DO UPDATE SET record = excluded.record`, tenant, string(record))
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "42P01" { // undefined_table
-		if err := prepare(ctx, s.pool); err != nil {
-			return fmt.Errorf("set up the job store: %w", err)
-		}
-		err = put()
+		return fmt.Errorf("write the entitlement of %q: %w: start the daemon on this database first, which sets it up (or check the role's search_path)", tenant, ErrNoEntitlements)
 	}
 	if err != nil {
 		return fmt.Errorf("write the entitlement of %q: %w", tenant, err)
