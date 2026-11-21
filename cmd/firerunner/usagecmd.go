@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -89,18 +88,10 @@ func usageCmd(args []string, stdout, stderr io.Writer, open func(dsn string) (us
 			}
 		}
 	}
-	dsn := os.Getenv("FR_JOB_EVENTS_DSN")
-	if file := os.Getenv("FR_JOB_EVENTS_DSN_FILE"); dsn == "" && file != "" {
-		raw, err := os.ReadFile(file)
-		if err != nil {
-			fmt.Fprintf(stderr, "firerunner usage: cannot read FR_JOB_EVENTS_DSN_FILE: %v\n", err)
-			return 1
-		}
-		dsn = strings.TrimSpace(string(raw))
-	}
-	if dsn == "" {
+	dsn, err := envJobStoreDSN()
+	if err != nil {
 		// Not a usage error: the arguments were fine, the settings lack it.
-		fmt.Fprintln(stderr, "firerunner usage: no job store: set FR_JOB_EVENTS_DSN or FR_JOB_EVENTS_DSN_FILE as the daemon's")
+		fmt.Fprintf(stderr, "firerunner usage: %v\n", err)
 		return 1
 	}
 	r, err := open(dsn)
