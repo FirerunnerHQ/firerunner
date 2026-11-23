@@ -41,7 +41,12 @@ type tenant struct {
 	Owner       string
 	URL         string
 	RunnerGroup string
-	KeepOnClose bool
+	// RunnerGroupID is the group by id, 0 to find it by RunnerGroup's
+	// name; GroupPending is a group the tenants list says is not ready
+	// (runner_group_id 0): the tenant is not served until it is.
+	RunnerGroupID int
+	GroupPending  bool
+	KeepOnClose   bool
 	// WaitForSession stands its tiers by while another daemon holds their
 	// scale sets' sessions, rather than failing (listener.Config): the
 	// install of a shard under leases, which every shard runs. Its tiers'
@@ -193,18 +198,19 @@ func heldBy(sched func() *scheduler.Scheduler) func() (int, string, string) {
 // assigns.
 func (s *shard) listenerConfig(t tenant, tier config.Tier, hooks tenantHooks, tracker *health.Tracker, jobs *assigned.Jobs, log *slog.Logger, held func() (int, string, string)) listener.Config {
 	return listener.Config{
-		Held:         held,
-		URL:          t.URL,
-		OnJobStarted: hooks.onJobStarted,
-		OnJobOffered: hooks.onJobOffered,
-		OnRunnerID:   hooks.onRunnerID,
-		Events:       s.eventsFor(t),
-		Health:       tracker,
-		Pending:      jobs,
-		Name:         tier.Name,
-		RunnerGroup:  t.RunnerGroup,
-		Labels:       tier.Labels,
-		MaxRunners:   tier.Max,
+		Held:          held,
+		URL:           t.URL,
+		OnJobStarted:  hooks.onJobStarted,
+		OnJobOffered:  hooks.onJobOffered,
+		OnRunnerID:    hooks.onRunnerID,
+		Events:        s.eventsFor(t),
+		Health:        tracker,
+		Pending:       jobs,
+		Name:          tier.Name,
+		RunnerGroup:   t.RunnerGroup,
+		RunnerGroupID: t.RunnerGroupID,
+		Labels:        tier.Labels,
+		MaxRunners:    tier.Max,
 		// A named install outlives its process: keep its scale set across
 		// restarts and control VM replacements.
 		KeepOnClose:    t.KeepOnClose,
@@ -300,8 +306,14 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner string, jwt *ghauth.
 		group = cfg.RunnerGroup
 	}
 	tiers, refused := cfg.TenantTiers(c)
+	var groupID int
+	pending := false
+	if c.RunnerGroupID != nil {
+		groupID, pending = int(*c.RunnerGroupID), *c.RunnerGroupID == 0
+	}
 	return tenant{
 		ID: c.ID, Owner: owner + "/" + c.ID, URL: c.URL, RunnerGroup: group, KeepOnClose: cfg.Owner != "",
+		RunnerGroupID: groupID, GroupPending: pending,
 		Auth:  ghauth.App{InstallationID: c.InstallationID, JWT: jwt},
 		Tiers: tiers, Limits: c.EffectiveLimits(), Refused: refused,
 	}
@@ -314,6 +326,15 @@ func (s *shard) runTenant(ctx context.Context, cur func() config.Tenant, served 
 	et := get()
 	defer live.forget(et.ID)
 	et.warnRefused(s.log)
+	if et.GroupPending {
+		// Registered by the name alone, its scale sets could land in a
+		// group of that name the organization keeps for itself, which
+		// onboarding never opened to the installation's repositories only.
+		s.log.Warn("tenant not served yet: its runner group is not ready", "tenant", et.ID, "group", et.RunnerGroup)
+		live.skip(et, "its runner group is not ready: onboarding sets it up, and says why it cannot")
+		<-ctx.Done()
+		return
+	}
 	if len(et.Tiers) == 0 {
 		s.log.Error("tenant not served: none of its tiers is within its limits", "tenant", et.ID, "limits", et.Limits.String())
 		live.skip(et, "none of its tiers is within its limits")

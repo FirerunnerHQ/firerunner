@@ -70,6 +70,66 @@ func TestInstallationGroups(t *testing.T) {
 	}
 }
 
+// Keeping a group sets the runner group the tenant's scale sets are
+// registered in: its id once ready, 0 while it is not (refused, as when
+// the organization has a group of that name of its own), which serves the
+// tenant nothing. The entry is rewritten only when that changes, as a
+// rewrite restarts the tenant; another tenant's is never touched.
+func TestRecordGroupSetsTheTenantsGroup(t *testing.T) {
+	s, _ := openTenantStore(t)
+	ctx := context.Background()
+	for _, id := range []int64{7, 8} {
+		if _, err := s.Onboard(ctx, fmt.Sprint("d", id), "installation", putTenant(fmt.Sprint("t", id), id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entry := func(id string) (string, time.Time) {
+		t.Helper()
+		var group string
+		var at time.Time
+		if err := s.pool.QueryRow(ctx, `SELECT coalesce(entry->>'runner_group_id', 'absent'), updated_at FROM tenants WHERE id = $1`, id).Scan(&group, &at); err != nil {
+			t.Fatal(err)
+		}
+		return group, at
+	}
+	if g, _ := entry("t7"); g != "absent" {
+		t.Fatalf("before any keep: %s", g)
+	}
+	if err := s.RecordGroup(ctx, 7, 0, []byte(`{"state":"unavailable","reason":"a group of that name exists"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := entry("t7"); g != "0" {
+		t.Fatalf("refused: runner_group_id %s, want 0", g)
+	}
+	if err := s.RecordGroup(ctx, 7, 42, []byte(`{"state":"ready","group_id":42}`)); err != nil {
+		t.Fatal(err)
+	}
+	g, at := entry("t7")
+	if g != "42" {
+		t.Fatalf("ready: runner_group_id %s, want 42", g)
+	}
+	if err := s.RecordGroup(ctx, 7, 42, []byte(`{"state":"ready","group_id":42,"served":3}`)); err != nil {
+		t.Fatal(err)
+	}
+	if g2, at2 := entry("t7"); g2 != "42" || !at2.Equal(at) {
+		t.Fatalf("kept again: %s at %v, want 42 unchanged since %v", g2, at2, at)
+	}
+	if g, _ := entry("t8"); g != "absent" {
+		t.Fatalf("another tenant's entry: %s", g)
+	}
+	// A group refused after it was ready serves the tenant nothing again,
+	// though onboarding still owns it, and the refusal names it.
+	if err := s.RecordGroup(ctx, 7, 42, []byte(`{"state":"unavailable","group_id":42}`)); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := entry("t7"); g != "0" {
+		t.Fatalf("refused after ready: %s, want 0", g)
+	}
+	if g, err := s.OwnedGroup(ctx, 7); err != nil || g != 42 {
+		t.Fatalf("owned after a refusal: %d, %v", g, err)
+	}
+}
+
 // One keeper at a time holds an installation's group; another
 // installation's is free.
 func TestLockInstallation(t *testing.T) {

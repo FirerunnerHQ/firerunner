@@ -29,8 +29,12 @@ type Config struct {
 	URL         string
 	Name        string
 	RunnerGroup string
-	Labels      []string
-	MaxRunners  int
+	// RunnerGroupID, when positive, is the runner group by id, and
+	// RunnerGroup only names it in logs: a group found by name could be
+	// another of the same name.
+	RunnerGroupID int
+	Labels        []string
+	MaxRunners    int
 	// KeepOnClose leaves a scale set this process created registered when
 	// it closes. A long-lived install (a stable --owner, a control VM that
 	// is replaced) keeps one scale set across restarts: deleting it on
@@ -147,7 +151,7 @@ func New(ctx context.Context, cfg Config, owner string) (*ScaleSet, error) {
 		return nil, err
 	}
 
-	groupID, err := runnerGroupID(ctx, client, cfg.RunnerGroup)
+	groupID, err := runnerGroupID(ctx, client, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -777,7 +781,7 @@ func RemoveByName(ctx context.Context, cfg Config) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	groupID, err := runnerGroupID(ctx, client, cfg.RunnerGroup)
+	groupID, err := runnerGroupID(ctx, client, cfg)
 	if err != nil {
 		return false, err
 	}
@@ -1248,7 +1252,11 @@ func newClient(cfg Config) (*scaleset.Client, error) {
 // clientOptions are added to every client; tests point them at a fake GitHub.
 var clientOptions []scaleset.HTTPOption
 
-func runnerGroupID(ctx context.Context, client *scaleset.Client, group string) (int, error) {
+func runnerGroupID(ctx context.Context, client *scaleset.Client, cfg Config) (int, error) {
+	if cfg.RunnerGroupID > 0 {
+		return cfg.RunnerGroupID, nil
+	}
+	group := cfg.RunnerGroup
 	if group == scaleset.DefaultRunnerGroup {
 		return 1, nil
 	}

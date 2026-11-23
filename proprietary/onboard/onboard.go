@@ -415,7 +415,11 @@ func list(ctx context.Context, cfg Config, tx jobstore.OnboardTx, next *jobstore
 		}
 		tenants = append(tenants, t)
 	}
-	t := config.Tenant{ID: next.Tenant, Tiers: cfg.Tiers, RunnerGroup: cfg.RunnerGroup}
+	// Not served until the keeper has made its group ready and set its id
+	// (jobstore.RecordGroup): by name alone, its scale sets could go in a
+	// group the organization made for itself.
+	notReady := int64(0)
+	t := config.Tenant{ID: next.Tenant, Tiers: cfg.Tiers, RunnerGroup: cfg.RunnerGroup, RunnerGroupID: &notReady}
 	if listed {
 		// An entry an operator changed (limits, tiers) keeps the change.
 		t = mine

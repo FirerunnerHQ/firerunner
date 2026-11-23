@@ -275,6 +275,55 @@ func TestExtraTenant(t *testing.T) {
 	}
 }
 
+// A tenant whose entry names its runner group by id registers there, and
+// one whose group is not ready (0) is not served: by name alone its scale
+// sets could go in a group of that name the organization keeps for itself.
+// An entry without one finds the group by name, as before.
+func TestTenantGroupByID(t *testing.T) {
+	cfg := &config.Config{AppClientID: "Iv1", RunnerGroup: "home"}
+	id := func(n int64) *int64 { return &n }
+	if got := extraTenant(cfg, config.Tenant{ID: "t1", RunnerGroup: "firerunner", RunnerGroupID: id(42)}, "base", nil); got.RunnerGroupID != 42 || got.GroupPending {
+		t.Fatalf("ready group: %+v", got)
+	}
+	if got := extraTenant(cfg, config.Tenant{ID: "t1", RunnerGroup: "firerunner", RunnerGroupID: id(0)}, "base", nil); got.RunnerGroupID != 0 || !got.GroupPending {
+		t.Fatalf("group not ready: %+v", got)
+	}
+	if got := extraTenant(cfg, config.Tenant{ID: "t1"}, "base", nil); got.RunnerGroupID != 0 || got.GroupPending || got.RunnerGroup != "home" {
+		t.Fatalf("no id: %+v", got)
+	}
+	s := &shard{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler)}
+	lc := s.listenerConfig(tenant{RunnerGroup: "firerunner", RunnerGroupID: 42}, config.Tier{Name: "t"}, tenantHooks{}, health.NewTracker("t"), assigned.New(nil), s.log, nil)
+	if lc.RunnerGroupID != 42 || lc.RunnerGroup != "firerunner" {
+		t.Fatalf("listener config: group %q id %d", lc.RunnerGroup, lc.RunnerGroupID)
+	}
+
+	// Its run registers nothing, and says why it is not served.
+	live := &liveTenants{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runTenant(ctx, func() config.Tenant {
+			return config.Tenant{ID: "acme", URL: "https://github.com/acme", InstallationID: 7, Tiers: []string{"small"}, RunnerGroup: "firerunner", RunnerGroupID: id(0)}
+		}, nil, live, "base", nil)
+	}()
+	var why string
+	waitFor(t, "the tenant to be skipped", func() bool {
+		live.mu.Lock()
+		defer live.mu.Unlock()
+		if len(live.skipped) == 1 {
+			why = live.skipped[0].NotServed
+		}
+		return why != ""
+	})
+	// Its run ends with ctx, forgetting it.
+	cancel()
+	<-done
+	if !strings.Contains(why, "runner group is not ready") {
+		t.Fatalf("not served because %q", why)
+	}
+}
+
 // A tenant's scale sets authenticate as its own installation, with the shard's
 // one JWT source: the library is given no key.
 func TestListenerConfigIsTheTenantsApp(t *testing.T) {
