@@ -35,6 +35,8 @@ func TestDecide(t *testing.T) {
 		"past due, in grace":        {r: Record{Account: PastDue, Budget: OK, ValidUntil: valid}, ok: true},
 		"capped":                    {r: Record{Account: Active, Budget: Capped, ValidUntil: valid, Reason: "November's cap"}, ok: true, hold: true, why: "spend cap is reached: November's cap"},
 		"suspended":                 {r: Record{Account: Suspended, Budget: OK, ValidUntil: valid}, ok: true, hold: true, why: "account is suspended"},
+		"pending":                   {r: Record{Account: Pending, Budget: OK, ValidUntil: valid, Reason: "add a payment method"}, ok: true, hold: true, why: "account is pending: add a payment method"},
+		"expired pending":           {r: Record{Account: Pending, Budget: OK, ValidUntil: expired}, ok: true, hold: true, why: "account is pending"},
 		"expired active: fail open": {r: Record{Account: Active, Budget: OK, ValidUntil: expired}, ok: true, open: true, why: "launching on its last state"},
 		"expired active warning":    {r: Record{Account: Active, Budget: Warning, ValidUntil: expired}, ok: true, open: true, warn: true},
 		"expired active capped":     {r: Record{Account: Active, Budget: Capped, ValidUntil: expired}, ok: true, hold: true, why: "spend cap"},

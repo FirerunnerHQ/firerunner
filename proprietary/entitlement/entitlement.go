@@ -1,8 +1,8 @@
 // Package entitlement keeps what each tenant may run, as billing last said,
 // and decides from it whether the tenant's launches go ahead.
 //
-// A record per tenant names its account state (trial, active, past due,
-// suspended), its budget state (ok, warning, capped) and how long the record
+// A record per tenant names its account state (pending, trial, active, past
+// due, suspended), its budget state (ok, warning, capped) and how long the record
 // holds (valid until). Billing writes the records; it knows prices, and this
 // package never does. The daemon reads them every Interval and holds a
 // tenant's launches when Decide says so: a held job stays queued at GitHub
@@ -44,6 +44,9 @@ type Account string
 
 // Accounts.
 const (
+	// Pending: the account is waiting for something before it may run,
+	// such as a payment method; billing's reason says what, and where.
+	Pending   Account = "pending"
 	Trial     Account = "trial"
 	Active    Account = "active"
 	PastDue   Account = "past_due"
@@ -115,9 +118,9 @@ func (l Limits) Validate() error {
 // holds until, and limits that can be applied.
 func (r Record) Validate() error {
 	switch r.Account {
-	case Trial, Active, PastDue, Suspended:
+	case Pending, Trial, Active, PastDue, Suspended:
 	default:
-		return fmt.Errorf("account_state %q: want trial, active, past_due or suspended", r.Account)
+		return fmt.Errorf("account_state %q: want pending, trial, active, past_due or suspended", r.Account)
 	}
 	switch r.Budget {
 	case OK, Warning, Capped:
@@ -171,6 +174,8 @@ type Decision struct {
 //
 //   - No record, or one that does not parse: held.
 //   - A suspended account: held, expired or not; only a new record lifts it.
+//   - A pending account: held, expired or not, for billing's reason (a
+//     payment method to add, say), until a new record lifts it.
 //   - A capped budget: held, expired or not; the cap is the customer's own.
 //   - Expired, active: launches (FailOpen).
 //   - Expired, trial or past due: held until billing confirms.
@@ -189,6 +194,8 @@ func Decide(r Record, ok bool, now time.Time) Decision {
 		return Decision{Hold: true, Why: "its entitlement record does not parse: " + r.Invalid}
 	case r.Account == Suspended:
 		return Decision{Hold: true, Why: why("its account is suspended")}
+	case r.Account == Pending:
+		return Decision{Hold: true, Why: why("its account is pending")}
 	case r.Budget == Capped:
 		return Decision{Hold: true, Why: why("its spend cap is reached")}
 	case !now.Before(r.ValidUntil) && r.Account == Active:

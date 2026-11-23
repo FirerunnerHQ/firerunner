@@ -482,10 +482,12 @@ tier, GuardDuty is not read.
 with one parameter per installation, or `db:`, the job store's
 `entitlements` table with one row per installation, the daemon reads, at start and every 30
 seconds, what billing last said each installation in the tenants list may
-run: its account state (`trial`, `active`, `past_due`, `suspended`), its
+run: its account state (`pending`, `trial`, `active`, `past_due`, `suspended`), its
 budget state (`ok`, `warning`, `capped`) and until when the record holds.
 Billing writes the records and knows the prices; firerunner never does. An
-installation with no record, a suspended account or a capped budget is held:
+installation with no record, a pending account (waiting for a payment
+method, say, which billing's reason names), a suspended one or a capped
+budget is held:
 its jobs wait at GitHub, recorded as `held` with the reason, and run once a
 record lets them; running jobs go on (suspend it to end them). A record past
 its valid-until is judged by the account it last named, because billing may
