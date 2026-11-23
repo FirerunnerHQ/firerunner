@@ -31,16 +31,17 @@ const entitlementUsage = `usage:
 
 Billing writes these records; this command is for operators and tests. ID is
 a tenant's id in the --tenants catalog (the install is never held). --account
-is trial, active, past_due or suspended; --budget is ok, warning or capped;
---valid-for defaults to 24h. --max-runners and --tiers are the plan's
+is pending, trial, active, past_due or suspended; --budget is ok, warning or
+capped; --valid-for defaults to 24h. --max-runners and --tiers are the plan's
 limits: at most N runners at once across its tiers (the narrower of this and
 its max_runners in the tenants list holds), and only the tiers named launch;
 jobs on the others wait. Lowering them stops no runner (an idle warm runner
 on a tier left out takes one more job, and is not replaced). A daemon reads the
 records every 30 seconds:
 
-  - no record, a suspended account, or a capped budget: the tenant's launches
-    are held and its jobs wait at GitHub with the reason; running jobs go on;
+  - no record, a pending or suspended account, or a capped budget: the
+    tenant's launches are held and its jobs wait at GitHub with the reason;
+    running jobs go on;
   - a record past its valid-until: held, unless its account is active and
     its budget not capped (then it goes on launching, and doctor warns).
 
