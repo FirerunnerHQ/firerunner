@@ -8,6 +8,14 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-11-23
+
+### Added
+
+- Entitlements have a `pending` account state: the installation is held, expired
+  or not, with billing's reason (a payment method to add, say) until a new
+  record lifts it. `firerunner entitlement set --account pending` writes one.
+
 ## [0.1.31] - 2026-11-23
 
 ### Added
@@ -815,7 +823,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.31...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.32...HEAD
+[0.1.32]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.32
 [0.1.31]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.31
 [0.1.30]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.30
 [0.1.29]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.29
