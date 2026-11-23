@@ -8,6 +8,17 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.31] - 2026-11-23
+
+### Added
+
+- `--entitlements db:` reads what each installation may run from the job
+  store's new `entitlements` table, one row per installation, which billing
+  writes in SQL; the table dates every write itself. `firerunner entitlement`
+  writes and lists it with `--store db:`, and says when the database role
+  may not write it, or the daemon has not set the database up yet. Hand the
+  table to billing's role and the daemon's role reads it only.
+
 ## [0.1.30] - 2026-11-18
 
 ### Fixed
@@ -804,7 +815,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.30...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.31...HEAD
+[0.1.31]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.31
 [0.1.30]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.30
 [0.1.29]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.29
 [0.1.28]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.28
