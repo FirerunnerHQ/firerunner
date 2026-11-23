@@ -38,9 +38,18 @@ func TestValidateTenants(t *testing.T) {
 		"an unknown tier":       func(x *Tenant) { x.Tiers = []string{"nope"} },
 		"a tier twice":          func(x *Tenant) { x.Tiers = []string{"cloud", "cloud"} },
 		"a firecracker tier":    func(x *Tenant) { x.Tiers = []string{"micro"} },
+		"a negative group id":   func(x *Tenant) { g := int64(-1); x.RunnerGroupID = &g },
+		"the default group":     func(x *Tenant) { g := int64(1); x.RunnerGroupID = &g },
 	}
 	if err := tenantConfig(goodTenant()).validateTenants(); err != nil {
 		t.Fatalf("a good tenant: %v", err)
+	}
+	for _, g := range []int64{0, 42} {
+		x := goodTenant()
+		x.RunnerGroupID = &g
+		if err := tenantConfig(x).validateTenants(); err != nil {
+			t.Errorf("runner_group_id %d: %v", g, err)
+		}
 	}
 	for name, change := range bad {
 		x := goodTenant()

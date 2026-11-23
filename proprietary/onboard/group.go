@@ -134,7 +134,8 @@ func SyncGroup(ctx context.Context, gh Groups, installation int64, org, name str
 		return res, nil
 	}
 	if mine.Name != name || mine.Visibility != spec.Visibility || mine.AllowsPublicRepositories {
-		// Renamed back too: the scale sets register in it by name.
+		// Renamed back too: an entry without its id (runner_group_id)
+		// finds the group by name.
 		if err := gh.UpdateRunnerGroup(ctx, installation, org, mine.ID, GroupSpec{Name: name, Visibility: spec.Visibility}); err != nil {
 			return refusedOr(res, "update the runner group", err, http.StatusForbidden)
 		}

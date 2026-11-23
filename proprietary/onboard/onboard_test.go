@@ -175,6 +175,11 @@ func TestInstallThenUninstall(t *testing.T) {
 	if !ok || c.URL != "https://github.com/Momiji-Labs" || c.InstallationID != 41 || len(c.Tiers) != 1 || c.Tiers[0] != "linux-2" || c.RunnerGroup != "firerunner" || c.Limits != nil {
 		t.Fatalf("tenant %+v", c)
 	}
+	// Not served until the keeper has its group ready: by name alone, its
+	// scale sets could go in a group of that name the organization keeps.
+	if c.RunnerGroupID == nil || *c.RunnerGroupID != 0 {
+		t.Fatalf("runner_group_id %v, want 0 until the group is ready", c.RunnerGroupID)
+	}
 	if _, err := config.ParseTenants([]byte("[" + string(s.tenants["momiji-labs"]) + "]")); err != nil {
 		t.Fatalf("the entry onboarding writes does not parse as a tenants list: %v", err)
 	}

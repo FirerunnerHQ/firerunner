@@ -27,6 +27,13 @@ type Tenant struct {
 	Tiers []string `json:"tiers"`
 	// RunnerGroup defaults to the install's --runner-group.
 	RunnerGroup string `json:"runner_group,omitempty"`
+	// RunnerGroupID, when set, is the one runner group its scale sets are
+	// registered in, by id, whatever group RunnerGroup names: onboarding
+	// sets it to the group it created and keeps, so that a group of the
+	// same name the organization made itself is never used. 0 is a group
+	// not ready yet (or refused): the tenant is not served until it is.
+	// Left out, the group is found by RunnerGroup's name.
+	RunnerGroupID *int64 `json:"runner_group_id,omitempty"`
 	// Limits bound what it runs; left out, it gets the defaults
 	// (EffectiveLimits).
 	Limits *TenantLimits `json:"limits,omitempty"`
@@ -181,6 +188,11 @@ func (c *Config) CheckTenants(tenants []Tenant) error {
 		}
 		if len(t.Tiers) == 0 {
 			return fmt.Errorf("tenant %q: tiers is required", t.ID)
+		}
+		if g := t.RunnerGroupID; g != nil && (*g < 0 || *g == 1) {
+			// 1 is every organization's default group, open to every
+			// repository, public ones too.
+			return fmt.Errorf("tenant %q: runner_group_id %d: want a group's id, never the default's (1), or 0 for one not ready", t.ID, *g)
 		}
 		seen := map[string]bool{}
 		for _, name := range t.Tiers {

@@ -47,10 +47,26 @@ func (s *TenantStore) ActiveInstallations(ctx context.Context) ([]Installation, 
 // to, as JSON, and the group onboarding created, if group is not 0. An
 // installation no longer active records nothing: its own delivery
 // settled it while the group was kept.
+//
+// In the same statement, it sets the runner group its tenant's scale sets
+// are registered in (the entry's runner_group_id): the group, by id, when
+// the result is ready, else 0, which serves the tenant nothing until it
+// is. The entry changes only when that does, as a change restarts the
+// tenant.
 func (s *TenantStore) RecordGroup(ctx context.Context, id, group int64, result json.RawMessage) error {
-	_, err := s.pool.Exec(ctx, `UPDATE installations SET group_result = $2, group_synced_at = now(),
-		group_id = CASE WHEN $3::bigint <> 0 THEN $3::bigint ELSE group_id END
-		WHERE installation_id = $1 AND state = 'active'`, id, string(result), group)
+	_, err := s.pool.Exec(ctx, `WITH i AS (
+			UPDATE installations SET group_result = $2, group_synced_at = now(),
+				group_id = CASE WHEN $3::bigint <> 0 THEN $3::bigint ELSE group_id END
+			WHERE installation_id = $1 AND state = 'active'
+			RETURNING tenant
+		), serve AS (
+			SELECT to_jsonb(CASE WHEN $2::jsonb->>'state' = 'ready' THEN $3::bigint ELSE 0 END) AS v
+		)
+		UPDATE tenants t SET entry = jsonb_set(t.entry, '{runner_group_id}', serve.v), updated_at = now()
+		FROM i, serve
+		WHERE i.tenant <> '' AND t.id = i.tenant AND t.entry->>'installation_id' = $1::bigint::text
+			AND t.entry->'runner_group_id' IS DISTINCT FROM serve.v`,
+		id, string(result), group)
 	if err != nil {
 		return fmt.Errorf("record installation %d's runner group: %w", id, err)
 	}
