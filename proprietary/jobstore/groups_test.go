@@ -3,6 +3,7 @@ package jobstore
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -127,6 +128,55 @@ func TestRecordGroupSetsTheTenantsGroup(t *testing.T) {
 	}
 	if g, err := s.OwnedGroup(ctx, 7); err != nil || g != 42 {
 		t.Fatalf("owned after a refusal: %d, %v", g, err)
+	}
+}
+
+// An import never sets an onboarded tenant's runner group: it keeps the
+// one onboarding stored, or 0 when none is, whatever the file says or
+// leaves out. A tenant an operator listed keeps the group its entry names.
+func TestReplaceKeepsTheOnboardedGroup(t *testing.T) {
+	s, _ := openTenantStore(t)
+	ctx := context.Background()
+	for _, id := range []int64{7, 8} {
+		if _, err := s.Onboard(ctx, fmt.Sprint("d", id), "installation", putTenant(fmt.Sprint("t", id), id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.RecordGroup(ctx, 7, 42, []byte(`{"state":"ready","group_id":42}`)); err != nil {
+		t.Fatal(err)
+	}
+	group := func(id string) string {
+		t.Helper()
+		var g string
+		if err := s.pool.QueryRow(ctx, `SELECT coalesce(entry->>'runner_group_id', 'absent') FROM tenants WHERE id = $1`, id).Scan(&g); err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+	with := func(e Entry, group string) Entry {
+		e.Entry = []byte(strings.Replace(string(e.Entry), `"tiers"`, `"runner_group_id":`+group+`,"tiers"`, 1))
+		return e
+	}
+	op := Entry{ID: "op", Entry: []byte(`{"id":"op","url":"https://github.com/op","installation_id":9,"tiers":["small"],"runner_group_id":5}`)}
+	// t7's file names another group; t8's (never kept) names one; neither counts.
+	if err := s.Replace(ctx, []Entry{with(entryOf("t7", 7), "3"), with(entryOf("t8", 8), "9"), op}); err != nil {
+		t.Fatal(err)
+	}
+	if g := group("t7"); g != "42" {
+		t.Errorf("t7 after an import naming 3: %s, want 42", g)
+	}
+	if g := group("t8"); g != "0" {
+		t.Errorf("t8 after an import naming 9: %s, want 0, not ready", g)
+	}
+	if g := group("op"); g != "5" {
+		t.Errorf("an operator's tenant: %s, want its own 5", g)
+	}
+	// An older file, with no group at all.
+	if err := s.Replace(ctx, []Entry{entryOf("t7", 7), entryOf("t8", 8), op}); err != nil {
+		t.Fatal(err)
+	}
+	if g := group("t7"); g != "42" {
+		t.Errorf("t7 after an import with none: %s, want 42", g)
 	}
 }
 

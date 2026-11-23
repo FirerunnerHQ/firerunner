@@ -682,6 +682,28 @@ func TestRemoveLeftovers(t *testing.T) {
 	}
 }
 
+// A removed tenant whose runner group was not ready registered nothing,
+// and its group's name could be one the organization keeps for itself: no
+// scale set is deleted by name. One with a group by id deletes in that
+// group, by id.
+func TestRemoveLeftoversByGroup(t *testing.T) {
+	var asked []listener.Config
+	s := &shard{log: slog.New(slog.DiscardHandler), cfg: &config.Config{RunnerGroup: "firerunner"},
+		removeByName: func(_ context.Context, c listener.Config) (bool, error) {
+			asked = append(asked, c)
+			return true, nil
+		}}
+	id := func(n int64) *int64 { return &n }
+	c := config.Tenant{ID: "acme", URL: "https://github.com/acme", InstallationID: 7, Tiers: []string{"small"}, RunnerGroup: "firerunner", RunnerGroupID: id(0)}
+	if err := s.removeLeftovers(context.Background(), extraTenant(s.cfg, c, "inst", nil), c.Tiers); err != nil || len(asked) != 0 {
+		t.Fatalf("pending group: err %v, asked %d", err, len(asked))
+	}
+	c.RunnerGroupID = id(42)
+	if err := s.removeLeftovers(context.Background(), extraTenant(s.cfg, c, "inst", nil), c.Tiers); err != nil || len(asked) != 1 || asked[0].RunnerGroupID != 42 {
+		t.Fatalf("ready group: err %v, asked %+v", err, asked)
+	}
+}
+
 // A removed tenant whose App installation is gone (uninstalled or
 // suspended) has scale sets nothing can delete: removeLeftovers leaves
 // them, rather than failing for ever. Unknown, it tries.

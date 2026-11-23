@@ -64,7 +64,8 @@ func (s *TenantStore) RecordGroup(ctx context.Context, id, group int64, result j
 		)
 		UPDATE tenants t SET entry = jsonb_set(t.entry, '{runner_group_id}', serve.v), updated_at = now()
 		FROM i, serve
-		WHERE i.tenant <> '' AND t.id = i.tenant AND t.entry->'runner_group_id' IS DISTINCT FROM serve.v`,
+		WHERE i.tenant <> '' AND t.id = i.tenant AND t.entry->>'installation_id' = $1::bigint::text
+			AND t.entry->'runner_group_id' IS DISTINCT FROM serve.v`,
 		id, string(result), group)
 	if err != nil {
 		return fmt.Errorf("record installation %d's runner group: %w", id, err)

@@ -409,6 +409,13 @@ func (s *shard) removeLeftovers(ctx context.Context, t tenant, names []string) e
 	if remove == nil {
 		remove = listener.RemoveByName
 	}
+	if t.GroupPending {
+		// Not served, it registered nothing; and by name, the group could
+		// be one the organization keeps for itself, whose scale sets of
+		// the same names are its own.
+		s.log.Info("a removed tenant's runner group was not ready: it registered no scale set, and none is deleted", "tenant", t.ID)
+		return nil
+	}
 	if s.installationGone != nil {
 		gctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tenantRemoveTimeout)
 		gone, err := s.installationGone(gctx, t.Auth.InstallationID)

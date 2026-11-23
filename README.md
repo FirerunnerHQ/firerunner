@@ -394,7 +394,11 @@ alone, by its id (`runner_group_id` in its entry), and the installation is
 not served until that group is ready: one refused, as when the organization
 has a group of that name of its own, serves nothing, and `firerunner
 status` says why. Rename the organization's group and the next keep, within
-10 minutes, makes onboarding's.
+10 minutes, makes onboarding's. An import (`firerunner tenant import`) never
+changes an onboarded installation's group. Before this, scale sets were
+registered in a group of that name whatever made it: in an organization
+with a group of its own by that name, delete the installation's scale sets
+there by hand, or its jobs may wait on one no daemon serves.
 
 Give the queue a redrive policy to a dead-letter queue. A delivery that
 fails stays on the queue to be retried, and goes there once it has failed too

@@ -103,8 +103,16 @@ func (s *TenantStore) Replace(ctx context.Context, entries []Entry) error {
 		if _, err := tx.Exec(ctx, `DELETE FROM tenants WHERE id <> ALL($1)`, ids); err != nil {
 			return fmt.Errorf("delete the tenants left out: %w", err)
 		}
+		// An onboarded tenant's runner group is onboarding's to say, never
+		// an import's: an older file could name a group since refused, or
+		// none, which finds the group by name. It keeps the one stored, or
+		// 0 (not ready) when none is.
 		for _, e := range entries {
-			if _, err := tx.Exec(ctx, `INSERT INTO tenants (id, entry) VALUES ($1, $2)
+			if _, err := tx.Exec(ctx, `INSERT INTO tenants (id, entry)
+				SELECT $1, CASE WHEN EXISTS (SELECT 1 FROM installations WHERE tenant = $1 AND state = 'active')
+					THEN ($2::jsonb - 'runner_group_id') || jsonb_build_object('runner_group_id',
+						coalesce((SELECT entry->'runner_group_id' FROM tenants WHERE id = $1), '0'::jsonb))
+					ELSE $2::jsonb END
 				ON CONFLICT (id) DO UPDATE SET entry = excluded.entry, updated_at = now()
 				WHERE tenants.entry IS DISTINCT FROM excluded.entry`, e.ID, string(e.Entry)); err != nil {
 				return fmt.Errorf("write tenant %q: %w", e.ID, err)
