@@ -61,6 +61,9 @@ type Pool struct {
 	mu      sync.Mutex
 	ready   []pooled
 	warming map[string]time.Time // instance -> when it was launched
+	// warmSubnet is the subnet of each warming instance this process
+	// launched, by which the next is spread (subnetOrder).
+	warmSubnet map[string]string
 	// unsigned are instances this process launched whose disks it has not
 	// signed yet, with the image each was launched from. Only these are
 	// signed, and only while they run their first boot: a stopped instance's
@@ -92,8 +95,31 @@ var warmMax = 10 * time.Minute
 func newPool(p *Provisioner, target int) *Pool {
 	return &Pool{
 		p: p, target: target, log: p.log.With("component", "pool"), tick: 15 * time.Second, now: time.Now,
-		warming: map[string]time.Time{}, unsigned: map[string]string{}, wake: make(chan struct{}, 1),
+		warming: map[string]time.Time{}, unsigned: map[string]string{}, warmSubnet: map[string]string{},
+		wake: make(chan struct{}, 1),
 	}
+}
+
+// subnetOrder is subnets with those holding fewest of the pool's instances,
+// ready or warming, first, and the configured order among equals: the pool
+// spreads over the tier's zones, so that one zone's spot or capacity is not
+// every pooled job's risk. A subnet with no capacity still falls through to
+// the next, as for any launch.
+func (pl *Pool) subnetOrder(subnets []string) []string {
+	pl.mu.Lock()
+	held := map[string]int{}
+	for _, in := range pl.ready {
+		held[in.subnet]++
+	}
+	for id := range pl.warming {
+		if s := pl.warmSubnet[id]; s != "" {
+			held[s]++
+		}
+	}
+	pl.mu.Unlock()
+	out := slices.Clone(subnets)
+	slices.SortStableFunc(out, func(a, b string) int { return held[a] - held[b] })
+	return out
 }
 
 // Run rediscovers the pool from tags, then keeps it at its target until ctx
@@ -277,6 +303,7 @@ func (pl *Pool) reject(ctx context.Context, i types.Instance, why error) {
 func (pl *Pool) forget(id string) {
 	pl.mu.Lock()
 	delete(pl.warming, id)
+	delete(pl.warmSubnet, id)
 	delete(pl.unsigned, id)
 	pl.mu.Unlock()
 }
@@ -414,6 +441,7 @@ func (pl *Pool) markReady(ctx context.Context, i types.Instance) {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
 	delete(pl.warming, id)
+	delete(pl.warmSubnet, id)
 	delete(pl.unsigned, id)
 	pl.ready = append(pl.ready, pooled{
 		id: id, ip: aws.ToString(i.PrivateIpAddress),
@@ -451,6 +479,9 @@ func (pl *Pool) fill(ctx context.Context) {
 			return
 		}
 		id := aws.ToString(inst.InstanceId)
+		pl.mu.Lock()
+		pl.warmSubnet[id] = aws.ToString(inst.SubnetId)
+		pl.mu.Unlock()
 		// Signed at once, and even as ctx ends: unsigned, no later process
 		// would trust it.
 		if err := pl.sign(context.WithoutCancel(ctx), id); err != nil {

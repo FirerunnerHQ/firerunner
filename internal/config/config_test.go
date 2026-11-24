@@ -685,6 +685,20 @@ func TestFromFlags_EC2OnlyCatalogNeedsNoFirecrackerHost(t *testing.T) {
 	}
 }
 
+// A tier may keep its pool on a market of its own, spot or on-demand.
+func TestEC2Tier_PoolMarket(t *testing.T) {
+	for _, m := range []string{MarketOnDemand, MarketSpot} {
+		body := strings.Replace(ec2TierJSON, `"market":"spot-then-on-demand"`, `"market":"spot-then-on-demand","pool_market":"`+m+`"`, 1)
+		c, err := FromFlags(append([]string{"--url", "https://github.com/org", "--token", "t", "--tiers", writeTiers(t, `[`+body+`]`)}, jitAddr...))
+		if err != nil {
+			t.Fatalf("pool_market %q: %v", m, err)
+		}
+		if got := c.Tiers[0].EC2.PoolMarket; got != m {
+			t.Fatalf("pool_market %q read as %q", m, got)
+		}
+	}
+}
+
 func TestFromFlags_EC2WarmPoolOutsideSlotBudget(t *testing.T) {
 	// EC2 warm runners do not count against the Firecracker slot budget.
 	p := writeTiers(t, `[
@@ -727,6 +741,8 @@ func TestFromFlags_EC2TierErrors(t *testing.T) {
 		"no security groups":      {`["sg-cccc"]`, `[]`},
 		"no market":               {`"market":"spot-then-on-demand",`, ``},
 		"bad market":              {`"market":"spot-then-on-demand"`, `"market":"reserved"`},
+		"bad pool market":         {`"market":"spot-then-on-demand"`, `"market":"spot-then-on-demand","pool_market":"reserved"`},
+		"pool market of two":      {`"market":"spot-then-on-demand"`, `"market":"spot-then-on-demand","pool_market":"spot-then-on-demand"`},
 		"negative root volume":    {`"root_volume_gib":40`, `"root_volume_gib":-1`},
 		"negative pool":           {`"root_volume_gib":40`, `"root_volume_gib":40,"pool":-1`},
 		"bad volume type":         {`"root_volume_gib":40`, `"root_volume_gib":40,"root_volume_type":"st1"`},

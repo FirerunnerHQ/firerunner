@@ -271,6 +271,13 @@ type EC2Tier struct {
 	SecurityGroups []string `json:"security_groups"`
 	// Market is "spot", "spot-then-on-demand" or "on-demand".
 	Market string `json:"market"`
+	// PoolMarket is the market of the stopped pool's instances: "spot",
+	// "on-demand", or empty for Market's. A stopped spot instance can start
+	// again only in its own zone and type, and was seen interrupted soon
+	// after one start in nine where cold spot launches were not (#336); an
+	// on-demand one starts and runs uninterrupted, at the on-demand rate
+	// while it runs a job. Stopped, either costs its volumes alone.
+	PoolMarket string `json:"pool_market,omitempty"`
 	// RootVolumeGiB sizes the root EBS volume; 0 keeps the AMI's size.
 	RootVolumeGiB int `json:"root_volume_gib,omitempty"`
 	// RootVolumeType is the root EBS volume type; empty means gp3.
@@ -1098,6 +1105,9 @@ func validateEC2Tier(t Tier) error {
 		return fmt.Errorf("tier %q: ec2.ami is required (an image ID or an SSM parameter name)", t.Name)
 	case e.Market != MarketSpot && e.Market != MarketSpotThenOnDemand && e.Market != MarketOnDemand:
 		return fmt.Errorf("tier %q: ec2.market %q must be %q, %q or %q", t.Name, e.Market, MarketSpot, MarketSpotThenOnDemand, MarketOnDemand)
+	case e.PoolMarket != "" && e.PoolMarket != MarketSpot && e.PoolMarket != MarketOnDemand:
+		// One market: a pool instance's request is fixed once it launched.
+		return fmt.Errorf("tier %q: ec2.pool_market %q must be %q, %q or empty for ec2.market's", t.Name, e.PoolMarket, MarketSpot, MarketOnDemand)
 	case e.RootVolumeGiB < 0:
 		return fmt.Errorf("tier %q: ec2.root_volume_gib must be >= 0", t.Name)
 	case e.Pool < 0:

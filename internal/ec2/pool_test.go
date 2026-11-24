@@ -677,6 +677,82 @@ func TestPool_FollowsItsTarget(t *testing.T) {
 	eventually(t, "three warming once it rises", func() bool { _, w := h.p.pool.Ready(); return w == 3 })
 }
 
+// A tier on spot may keep its pool on-demand (ec2.pool_market): the pool's
+// instances launch on-demand, to stop and start uninterrupted, while a job
+// that finds the pool empty still cold-launches on the tier's own market.
+func TestPool_OnItsOwnMarket(t *testing.T) {
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Pool = 1
+		o.EC2.Market = config.MarketSpot
+		o.EC2.PoolMarket = config.MarketOnDemand
+	})
+	h.p.pool.tick = 5 * time.Millisecond
+	h.runPool(t)
+	eventually(t, "the pool's instance warming", func() bool { _, w := h.p.pool.Ready(); return w == 1 })
+	for _, i := range h.f.launched() {
+		if i.spotReq != "" || i.shutdown != types.ShutdownBehaviorStop {
+			t.Fatalf("pool instance %s: spot request %q, shutdown %q; want on-demand, stopping", i.id, i.spotReq, i.shutdown)
+		}
+	}
+	// Still warming, so the job cold-launches: on spot, the tier's market.
+	errc := h.launch(context.Background())
+	var cold *fakeInstance
+	eventually(t, "a cold launch", func() bool {
+		for _, i := range h.f.launched() {
+			if i.tags[TagRunner] == "runner-1" {
+				cold = i
+				return true
+			}
+		}
+		return false
+	})
+	if !cold.spot {
+		t.Fatalf("the job's cold launch is not on spot: %+v", cold)
+	}
+	h.f.setState(cold.id, types.InstanceStateNameTerminated)
+	if err := waitErr(t, errc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A pool spreads over the tier's subnets, the emptiest first, so one zone's
+// spot or capacity is not every pooled job's risk; a subnet out of capacity
+// falls through to the next.
+func TestPool_SpreadsOverSubnets(t *testing.T) {
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Pool = 4
+		o.EC2.Subnets = []string{"subnet-a", "subnet-b", "subnet-c"}
+	})
+	h.p.pool.tick = 5 * time.Millisecond
+	h.runPool(t)
+	eventually(t, "four warming", func() bool { _, w := h.p.pool.Ready(); return w == 4 })
+	per := map[string]int{}
+	for _, i := range h.f.launched() {
+		per[i.subnet]++
+	}
+	if per["subnet-a"] != 2 || per["subnet-b"] != 1 || per["subnet-c"] != 1 {
+		t.Fatalf("pool instances by subnet: %v; want 2/1/1, the emptiest first in the configured order", per)
+	}
+
+	// Ready ones count too, and a subnet with no capacity is passed over.
+	h.stopWarming()
+	eventually(t, "four ready", func() bool { r, _ := h.p.pool.Ready(); return r == 4 })
+	h.f.mu.Lock()
+	h.f.runErrs["*/subnet-b/*"] = apiErr("InsufficientInstanceCapacity")
+	h.f.mu.Unlock()
+	h.p.pool.SetTarget(context.Background(), 6)
+	eventually(t, "two more warming", func() bool { _, w := h.p.pool.Ready(); return w == 2 })
+	per = map[string]int{}
+	for _, i := range h.f.launched() {
+		per[i.subnet]++
+	}
+	// The first falls from b, emptiest, to c; b then backs off (breakers),
+	// and a, as empty as c and first in order, takes the second.
+	if per["subnet-a"] != 3 || per["subnet-b"] != 1 || per["subnet-c"] != 2 {
+		t.Fatalf("after b ran out: %v; want a 3, b 1, c 2", per)
+	}
+}
+
 func TestPool_GrowFills(t *testing.T) {
 	h := readyPool(t, 1)
 	h.p.pool.SetTarget(context.Background(), 3)

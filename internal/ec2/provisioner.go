@@ -837,7 +837,15 @@ const (
 // on-demand job costs more for its whole run.
 func (p *Provisioner) run(ctx context.Context, name string, img image, kind launchKind) (types.Instance, error) {
 	var markets []string
-	switch p.o.EC2.Market {
+	market := p.o.EC2.Market
+	if kind == forPool && p.o.EC2.PoolMarket != "" {
+		market = p.o.EC2.PoolMarket
+	}
+	subnets := p.o.EC2.Subnets
+	if kind == forPool && p.pool != nil {
+		subnets = p.pool.subnetOrder(subnets)
+	}
+	switch market {
 	case config.MarketSpot:
 		markets = []string{config.MarketSpot}
 	case config.MarketOnDemand:
@@ -850,7 +858,7 @@ func (p *Provisioner) run(ctx context.Context, name string, img image, kind laun
 	for _, market := range markets {
 		var ready, later []option
 		for _, itype := range p.o.EC2.InstanceTypes {
-			for _, subnet := range p.o.EC2.Subnets {
+			for _, subnet := range subnets {
 				o := option{market, itype, subnet}
 				if p.c.breakers.blocked(o) {
 					later = append(later, o)
@@ -862,7 +870,7 @@ func (p *Provisioner) run(ctx context.Context, name string, img image, kind laun
 		backingOff += len(later)
 		walk = append(append(walk, ready...), later...)
 	}
-	firstChoice := option{markets[0], p.o.EC2.InstanceTypes[0], p.o.EC2.Subnets[0]}
+	firstChoice := option{markets[0], p.o.EC2.InstanceTypes[0], subnets[0]}
 	if backingOff > 0 {
 		p.log.Info("launch options backing off; trying them last in their market", "runner", name, "backingOff", backingOff, "of", len(walk))
 	}
