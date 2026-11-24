@@ -232,9 +232,11 @@ operator raises them per installation, and 0 lifts one:
   pre-warmed instances a tier keeps for the installation, so that a job starts
   one in seconds rather than booting a new instance. Only the tiers named keep
   one, never the catalog's own pool or schedule, and at most the tier's
-  `max`. Its entitlement's pool, when the record names one, takes its place
-  (see *Entitlements*). The pool is empty while the installation is
-  suspended or held, and fills again once it may run. Its instances are tagged
+  `max` and the runners it may have at once. Its entitlement's pool, when the
+  record names one, takes its place (see *Entitlements*). An edit applies at
+  the pool's next pass, within 15 seconds, and restarts nothing. The pool is
+  empty while the installation is suspended or held, or on a tier its plan
+  does not launch, and fills again once it may run. Its instances are tagged
   with the installation's owner, so no other pool takes them. A shard that takes
   the installation over finds them, by the pool key all shards share. A stopped
   instance costs its volumes alone.
@@ -533,9 +535,9 @@ installation runs, and lowering a limit stops no runner: an idle warm runner
 on a tier left out still takes one more job, and is not replaced. `status`
 shows the limit in force. A record's `"pool": {"small": 3}` sizes the tiers'
 stopped pools in place of the tenants list's, which an add-on can sell. A tier
-it leaves out keeps none, and a change applies at the pool's next pass,
-within 15 seconds. A tier that kept no pool when the installation started gets
-one at its next start, when its shard restarts or another takes it over.
+it leaves out keeps none; to keep none at all, name a tier with 0, since an
+empty `{}` reads as no pool named, leaving the list's. A change applies at the
+pool's next pass, within 15 seconds.
 Operators and tests write records as billing would:
 
 ```bash

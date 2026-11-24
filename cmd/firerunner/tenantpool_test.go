@@ -4,21 +4,21 @@ import (
 	"context"
 	"log/slog"
 	"path/filepath"
-	"slices"
 	"testing"
 	"time"
 
+	"github.com/firerunnerhq/firerunner/internal/assigned"
 	"github.com/firerunnerhq/firerunner/internal/config"
+	"github.com/firerunnerhq/firerunner/internal/health"
 	"github.com/firerunnerhq/firerunner/internal/scheduler"
 	"github.com/firerunnerhq/firerunner/proprietary/entitlement"
 )
 
-// A tenant's stopped pool: sized at start at the most its entry or its
-// entitlement grants, so the pool and its reaper's pooled tiers exist; then
-// kept at what applies now, the entitlement's when it names a pool, else
-// the entry's, never above the tier's max, and none while the tenant is
-// held. A tier with no pool from either keeps none, and is not pooled.
-func TestTenantPools(t *testing.T) {
+// A tenant's stopped pool follows, at every pass: its entry as listed now,
+// or its entitlement's pool in its place when the record names one; never
+// more than the runners it may have at once, nor the tier's max; none on a
+// tier its plan does not launch, and none while it is held.
+func TestTenantPoolTarget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	path := filepath.Join(t.TempDir(), "entitlements.json")
@@ -40,73 +40,88 @@ func TestTenantPools(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ec2 := func(name string, max int) config.Tier {
+	tier := func(name string, max int) config.Tier {
 		return config.Tier{Name: name, Max: max, Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{}}
 	}
-	ten := tenant{ID: "acme", Tiers: []config.Tier{ec2("small", 6), ec2("big", 6), ec2("none", 6)},
-		ListPool: map[string]int{"small": 2, "big": 9}}
-	pools := func(ts []config.Tier) []int {
-		var out []int
-		for _, tr := range ts {
-			out = append(out, tr.EC2.Pool)
-		}
-		return out
-	}
+	small, big := tier("small", 6), tier("big", 6)
+	// The entry as listed now: the test edits it between passes.
+	entry := map[string]int{"small": 2, "big": 9}
+	ten := tenant{ID: "acme", Tiers: []config.Tier{small, big}, PoolOf: func(n string) int { return entry[n] }}
+	sm := s.tenantPoolTarget(ten, small, acme.bound)
+	bg := s.tenantPoolTarget(ten, big, acme.bound)
 
-	// No pool in the record: the entry's, within the tier's max.
 	put(entitlement.Active, nil)
-	got := s.withPools(ten)
-	if p := pools(got.Tiers); !slices.Equal(p, []int{2, 6, 0}) {
-		t.Fatalf("pools from the entry: %v, want [2 6 0]", p)
+	if sm() != 2 || bg() != 6 {
+		t.Fatalf("from the entry: %d %d, want 2 and the tier's max 6", sm(), bg())
 	}
-	if ten.Tiers[0].EC2.Pool != 0 {
-		t.Fatal("withPools changed the tiers of the tenant it was given")
+	entry["small"] = 0 // an edit of the pool alone restarts nothing
+	if sm() != 0 {
+		t.Fatalf("after the entry dropped its pool: %d, want 0", sm())
 	}
-	if pt := pooledTiers(got.Tiers); !pt["small"] || !pt["big"] || pt["none"] {
-		t.Fatalf("pooled tiers %v: the reaper would end the pool's instances, or keep a tier's that has none", pt)
-	}
-	small := s.tenantPoolTarget(got, got.Tiers[0], acme.bound)
-	big := s.tenantPoolTarget(got, got.Tiers[1], acme.bound)
-	if small() != 2 || big() != 6 {
-		t.Fatalf("targets from the entry: %d %d, want 2 6", small(), big())
-	}
+	entry["small"] = 3
 
 	// The entitlement names a pool: it takes the entry's place, and a tier
-	// it leaves out keeps none. At start, the larger of the two is made.
+	// it leaves out keeps none.
 	put(entitlement.Active, &entitlement.Limits{Pool: map[string]int{"small": 5}})
-	if small() != 5 || big() != 0 {
-		t.Fatalf("targets from the entitlement: %d %d, want 5 0", small(), big())
+	if sm() != 5 || bg() != 0 {
+		t.Fatalf("from the entitlement: %d %d, want 5 0", sm(), bg())
 	}
-	if p := pools(s.withPools(ten).Tiers); !slices.Equal(p, []int{5, 6, 0}) {
-		t.Fatalf("pools at start with an entitlement: %v, want [5 6 0]", p)
+
+	// Never more than the runners it may have at once.
+	put(entitlement.Active, &entitlement.Limits{Pool: map[string]int{"small": 5}, MaxRunners: 2})
+	if sm() != 2 {
+		t.Fatalf("with 2 runners at most: %d, want 2", sm())
+	}
+
+	// None on a tier the plan does not launch.
+	put(entitlement.Active, &entitlement.Limits{Tiers: []string{"big"}})
+	if sm() != 0 || bg() != 6 {
+		t.Fatalf("plan launching big alone: %d %d, want 0 6", sm(), bg())
 	}
 
 	// Held: none, whatever is granted; then back once it may run again.
 	put(entitlement.Pending, &entitlement.Limits{Pool: map[string]int{"small": 5}})
-	if small() != 0 {
-		t.Fatalf("a held tenant's target: %d, want 0", small())
+	if sm() != 0 {
+		t.Fatalf("a held tenant's target: %d, want 0", sm())
 	}
 	put(entitlement.Active, &entitlement.Limits{Pool: map[string]int{"small": 5}})
-	if small() != 5 {
-		t.Fatalf("resumed: %d, want 5", small())
-	}
-
-	// Only a tenant's pooled tier follows a target: the install's pools
-	// follow their schedules.
-	bound := scheduler.NewTenant("acme", 0)
-	if s.poolTargetFor(got, got.Tiers[0], bound) == nil {
-		t.Fatal("a tenant's pooled tier follows no target")
-	}
-	if s.poolTargetFor(got, got.Tiers[2], bound) != nil {
-		t.Fatal("a tenant's tier with no pool follows a target")
-	}
-	if s.poolTargetFor(tenant{}, got.Tiers[0], bound) != nil {
-		t.Fatal("the install's tier follows a tenant's target")
+	if sm() != 5 {
+		t.Fatalf("resumed: %d, want 5", sm())
 	}
 
 	// No entitlements at all: the entry's.
 	s2 := &shard{log: s.log, cfg: s.cfg}
-	if got := s2.tenantPoolTarget(ten, ten.Tiers[0], scheduler.NewTenant("acme", 0))(); got != 2 {
-		t.Fatalf("without entitlements: %d, want the entry's 2", got)
+	if got := s2.tenantPoolTarget(ten, small, scheduler.NewTenant("acme", 0))(); got != 3 {
+		t.Fatalf("without entitlements: %d, want the entry's 3", got)
+	}
+}
+
+// Every tier of a tenant keeps a pool that follows its target, even one its
+// entry and entitlement size at none when it starts: either may grant one
+// while it runs. Its reaper keeps the proven pool instances of every tier,
+// so a grant read late, or a read that failed at start, never has the
+// adopted pool reaped. The install's tiers keep a pool only by their own
+// config, and follow their schedules.
+func TestTenantTiersAllKeepAPool(t *testing.T) {
+	s := &shard{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler)}
+	tier := config.Tier{Name: "t", Max: 4, Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{InstanceTypes: []string{"c8a.large"}}}
+	bound := scheduler.NewTenant("acme", 0)
+	ten := tenant{ID: "acme", Owner: "fr/acme", Tiers: []config.Tier{tier}}
+	o := s.ec2Options(ten, tier, tenantHooks{}, health.NewTracker("t"), assigned.New(nil))
+	if !o.Pooled || o.EC2.Pool != 0 {
+		t.Fatalf("a tenant's tier with no pool yet: pooled %v, size %d; want a pool, empty", o.Pooled, o.EC2.Pool)
+	}
+	if s.poolTargetFor(ten, tier, bound) == nil {
+		t.Fatal("a tenant's tier follows no target")
+	}
+	if o := s.ec2Options(tenant{Owner: "fr"}, tier, tenantHooks{}, health.NewTracker("t"), assigned.New(nil)); o.Pooled {
+		t.Fatal("an install tier with no pool keeps one")
+	}
+	if s.poolTargetFor(tenant{}, tier, bound) != nil {
+		t.Fatal("an install tier follows a tenant's target")
+	}
+	micro := config.Tier{Name: "micro"}
+	if pt := tenantPooledTiers([]config.Tier{tier, micro}); !pt["t"] || pt["micro"] {
+		t.Fatalf("the tenant's reaper keeps pool instances of %v; want its EC2 tier alone", pt)
 	}
 }

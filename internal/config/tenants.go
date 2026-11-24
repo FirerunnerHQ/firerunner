@@ -219,6 +219,9 @@ func (c *Config) CheckTenants(tenants []Tenant) error {
 				case tier.Max > 0 && n > tier.Max:
 					return fmt.Errorf("tenant %q: limits.pool %q is %d, above the tier's max of %d", t.ID, name, n, tier.Max)
 				}
+				if _, refused := withinVCPU([]Tier{tier}, t.EffectiveLimits().VCPU); n > 0 && len(refused) > 0 {
+					return fmt.Errorf("tenant %q: limits.pool %q: the tier is not served to it (%s)", t.ID, name, refused[0])
+				}
 			}
 		}
 		if err := t.EffectiveLimits().validate(fmt.Sprintf("tenant %q: ", t.ID), catalogLimitNames); err != nil {

@@ -39,9 +39,10 @@ its max_runners in the tenants list holds), and only the tiers named launch;
 jobs on the others wait. Lowering them stops no runner (an idle warm runner
 on a tier left out takes one more job, and is not replaced). --pool is the
 stopped pool each tier keeps (Turbo: a job starts in seconds), in place of the
-tenants list's limits.pool; a tier left out keeps none, and the tier's max
-bounds it. A tier that had no pool when the tenant started gets one at its next
-start. A daemon reads the records every 30 seconds:
+tenants list's limits.pool; a tier left out keeps none (TIER=0 keeps none on
+every tier), and the tier's max and the runner limit bound it. It applies at
+the pool's next pass, within 15 seconds. A daemon reads the records every 30
+seconds:
 
   - no record, a pending or suspended account, or a capped budget: the
     tenant's launches are held and its jobs wait at GitHub with the reason;

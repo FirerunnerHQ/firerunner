@@ -141,6 +141,14 @@ func TestTenantPool(t *testing.T) {
 			t.Errorf("%s: %v, want refused", name, err)
 		}
 	}
+	// A pool on a tier its vCPU limit refuses would never be served.
+	big := goodTenant()
+	big.Limits = &TenantLimits{Pool: map[string]int{"cloud": 1}}
+	cb := tenantConfig(big)
+	cb.Tiers[0].EC2.InstanceTypes = []string{"c8a.2xlarge"}
+	if err := cb.validateTenants(); err == nil || !strings.Contains(err.Error(), "not served") {
+		t.Errorf("a pool on a tier above the vCPU limit: %v, want refused", err)
+	}
 	if _, err := ParseTenants([]byte(`[{"id":"t1","url":"https://github.com/acme","installation_id":7,"tiers":["cloud"],"limits":{"pool":{"cloud":2}}}]`)); err != nil {
 		t.Fatalf("an entry with a pool does not parse: %v", err)
 	}

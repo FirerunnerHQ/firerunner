@@ -641,11 +641,12 @@ func TestPool_FollowsItsTarget(t *testing.T) {
 	var target atomic.Int64
 	target.Store(2)
 	var state atomic.Pointer[[3]int]
+	var passes atomic.Int64
 	h := newHarness(t, func(o *Options) {
 		o.EC2.Pool = 2
 		o.EC2.Market = config.MarketSpot
 		o.PoolTarget = func() int { return int(target.Load()) }
-		o.PoolState = func(tg, r, w int) { state.Store(&[3]int{tg, r, w}) }
+		o.PoolState = func(tg, r, w int) { state.Store(&[3]int{tg, r, w}); passes.Add(1) }
 	})
 	reported := func(want [3]int) func() bool {
 		return func() bool { s := state.Load(); return s != nil && *s == want }
@@ -665,7 +666,9 @@ func TestPool_FollowsItsTarget(t *testing.T) {
 	eventually(t, "the pool reports none", reported([3]int{0, 0, 0}))
 
 	target.Store(-1)
-	time.Sleep(30 * time.Millisecond)
+	// Three whole passes at it, each reported after its fill.
+	from := passes.Load()
+	eventually(t, "three passes at a negative target", func() bool { return passes.Load() >= from+4 })
 	if n, tg := len(h.f.launched()), h.p.pool.Target(); n != 2 || tg != 0 {
 		t.Fatalf("at a negative target: %d launched, target %d; want nothing new, target 0", n, tg)
 	}
