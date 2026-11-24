@@ -38,9 +38,9 @@ func hotTier(name string, max int) config.Tier {
 	return config.Tier{Name: name, Max: max, Provisioner: config.ProvisionerEC2, EC2: &config.EC2Tier{}}
 }
 
-// A tenant's hot runners: on the tiers granted some as it started; its
-// entitlement's in place of its entry's; none while it is held or on a tier
-// its plan does not launch; at most the tier's max; and fewer in all than the
+// A tenant's hot runners: its entitlement's in place of its entry's, as
+// listed now; none while it is held, on a tier its plan does not launch, or
+// on a Firecracker tier; at most the tier's max; and fewer in all than the
 // runners it may have at once, the first tiers served first.
 func TestTenantHotTargets(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -64,102 +64,84 @@ func TestTenantHotTargets(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	entry := map[string]int{"small": 2, "big": 9}
-	tiers := []config.Tier{hotTier("small", 6), hotTier("big", 6), hotTier("none", 6)}
-	ten := s.withHot(tenant{ID: "acme", Tiers: tiers, MinOf: func(n string) int { return entry[n] },
-		Limits: config.Limits{Runners: 20, JobDuration: time.Hour}})
-	if !ten.Hot["small"] || !ten.Hot["big"] || ten.Hot["none"] {
-		t.Fatalf("hot tiers at start %v, want small and big", ten.Hot)
-	}
+	entry := map[string]int{"small": 2, "big": 9, "vm": 2}
+	vm := config.Tier{Name: "vm", Max: 6}
+	tiers := []config.Tier{hotTier("small", 6), hotTier("big", 6), hotTier("none", 6), vm}
+	ten := tenant{ID: "acme", Tiers: tiers, MinOf: func(n string) int { return entry[n] },
+		Limits: config.Limits{Runners: 20, JobDuration: time.Hour}}
 
 	put(entitlement.Active, nil)
-	if got := s.hotTargets(ten, tiers, bound); !slices.Equal(got, []int{2, 6, 0}) {
-		t.Fatalf("from the entry: %v, want [2 6 0]", got)
+	if got := s.hotTargets(ten, tiers, bound); !slices.Equal(got, []int{2, 6, 0, 0}) {
+		t.Fatalf("from the entry: %v, want [2 6 0 0]", got)
 	}
 	entry["small"] = 1 // the entry as listed now
 	if got := s.hotTargets(ten, tiers, bound); got[0] != 1 {
 		t.Fatalf("after an edit: %v", got)
 	}
-	put(entitlement.Active, &entitlement.Limits{Min: map[string]int{"small": 3, "none": 4}})
-	if got := s.hotTargets(ten, tiers, bound); !slices.Equal(got, []int{3, 0, 0}) {
-		t.Fatalf("from the entitlement: %v, want [3 0 0]: big left out, none not granted at start", got)
+	put(entitlement.Active, &entitlement.Limits{Min: map[string]int{"small": 3, "none": 4, "vm": 1}})
+	if got := s.hotTargets(ten, tiers, bound); !slices.Equal(got, []int{3, 0, 4, 0}) {
+		t.Fatalf("from the entitlement: %v, want [3 0 4 0]: big left out, a grant applies at once", got)
 	}
 	// Fewer in all than the runners it may have at once: 4 runners leave 3.
 	put(entitlement.Active, &entitlement.Limits{Min: map[string]int{"small": 2, "big": 5}, MaxRunners: 4})
-	if got := s.hotTargets(ten, tiers, bound); !slices.Equal(got, []int{2, 1, 0}) {
-		t.Fatalf("within 4 runners: %v, want [2 1 0]", got)
+	if got := s.hotTargets(ten, tiers, bound); !slices.Equal(got, []int{2, 1, 0, 0}) {
+		t.Fatalf("within 4 runners: %v, want [2 1 0 0]", got)
 	}
 	put(entitlement.Active, &entitlement.Limits{Min: map[string]int{"small": 2, "big": 2}, Tiers: []string{"big"}})
-	if got := s.hotTargets(ten, tiers, bound); !slices.Equal(got, []int{0, 2, 0}) {
-		t.Fatalf("plan launching big alone: %v, want [0 2 0]", got)
+	if got := s.hotTargets(ten, tiers, bound); !slices.Equal(got, []int{0, 2, 0, 0}) {
+		t.Fatalf("plan launching big alone: %v, want [0 2 0 0]", got)
 	}
 	put(entitlement.Pending, &entitlement.Limits{Min: map[string]int{"small": 2}})
-	if got := s.hotTargets(ten, tiers, bound); !slices.Equal(got, []int{0, 0, 0}) {
+	if got := s.hotTargets(ten, tiers, bound); !slices.Equal(got, []int{0, 0, 0, 0}) {
 		t.Fatalf("held: %v, want none", got)
 	}
 }
 
-// A tier that may keep hot runners lives the job limit plus tenantHotIdle
-// plus slack, within the install's, and recycles a runner past what that
-// leaves; one granted none keeps the job limit plus slack. A lifetime that
-// leaves no room for a wait keeps none.
+// Every machine of a tenant lives the job limit plus tenantHotIdle plus
+// slack, within the install's, hot or not, and a hot runner is recycled past
+// what that leaves; a lifetime that leaves no room for a wait keeps none.
 func TestTenantHotLifetime(t *testing.T) {
-	ten := tenant{ID: "acme", Hot: map[string]bool{"small": true}, Limits: config.Limits{JobDuration: time.Hour}}
-	small, other := hotTier("small", 4), hotTier("other", 4)
-	for _, c := range []struct {
-		install              time.Duration
-		life, idle, coldLife time.Duration
-	}{
-		{6 * time.Hour, 3*time.Hour + 15*time.Minute, 2 * time.Hour, 75 * time.Minute},
-		{2 * time.Hour, 2 * time.Hour, 45 * time.Minute, 75 * time.Minute},
-		{time.Hour, time.Hour, 0, time.Hour},
+	ten := tenant{ID: "acme", Limits: config.Limits{JobDuration: time.Hour}}
+	small := hotTier("small", 4)
+	for _, c := range []struct{ install, life, idle time.Duration }{
+		{6 * time.Hour, time.Hour + 45*time.Minute, 30 * time.Minute},
+		{90 * time.Minute, 90 * time.Minute, 15 * time.Minute},
+		{time.Hour, time.Hour, 0},
 	} {
 		s := &shard{cfg: &config.Config{Firecracker: firecrackerLife(c.install)}}
-		life, cold := s.tenantTierLifetime(ten, small), s.tenantTierLifetime(ten, other)
-		idle := max(s.hotIdleMax(ten, small), 0)
-		if life != c.life || idle != c.idle || cold != c.coldLife {
-			t.Errorf("install %s: hot lifetime %s, idle %s, cold lifetime %s; want %s, %s, %s", c.install, life, idle, cold, c.life, c.idle, c.coldLife)
+		life, idle := s.tenantTierLifetime(ten, small), max(s.hotIdleMax(ten, small), 0)
+		if life != c.life || idle != c.idle {
+			t.Errorf("install %s: lifetime %s, idle %s; want %s, %s", c.install, life, idle, c.life, c.idle)
+		}
+		if r := tenantReaperLifetime(c.install, ten); r < life {
+			t.Errorf("install %s: the reaper's %s is shorter than the launch's %s", c.install, r, life)
 		}
 	}
-	s := &shard{cfg: &config.Config{Firecracker: firecrackerLife(time.Hour)}}
+	// The install's own tiers keep their lifetime.
+	s := &shard{cfg: &config.Config{Firecracker: firecrackerLife(6 * time.Hour)}}
+	own := tenant{Limits: ten.Limits}
+	if got, want := s.tenantTierLifetime(own, small), tierLifetime(6*time.Hour, time.Hour, small); got != want {
+		t.Errorf("the install's tier: %s, want %s", got, want)
+	}
+	short := &shard{cfg: &config.Config{Firecracker: firecrackerLife(time.Hour)}}
 	bound := scheduler.NewTenant("acme", 0)
 	ten.MinOf = func(string) int { return 2 }
-	if got := s.hotTargets(ten, []config.Tier{small}, bound); got[0] != 0 {
+	if got := short.hotTargets(ten, []config.Tier{small}, bound); got[0] != 0 {
 		t.Fatalf("hot runners on a lifetime that leaves no wait: %v", got)
 	}
-	// With no lifetime backstop and no job limit, nothing bounds a wait: only
-	// the tiers granted at start keep hot runners all the same.
-	none := &shard{cfg: &config.Config{Firecracker: firecrackerLife(0)}}
-	free := ten
-	free.Limits = config.Limits{}
-	if got := none.hotTargets(free, []config.Tier{small, other}, bound); !slices.Equal(got, []int{2, 0}) {
-		t.Fatalf("no backstop and no job limit: %v, want [2 0]", got)
+	if got := s.hotTargets(ten, []config.Tier{small}, bound); got[0] != 2 {
+		t.Fatalf("hot runners on a 6h install: %v, want 2", got)
 	}
 }
 
-// The reaper ends no instance of a tenant with hot runners sooner than its
-// launch's own lifetime does.
-func TestTenantReaperLifetime(t *testing.T) {
-	cold := tenant{ID: "acme", Limits: config.Limits{JobDuration: time.Hour}}
-	hot := cold
-	hot.Hot = map[string]bool{"small": true}
-	if got := tenantReaperLifetime(6*time.Hour, cold); got != 75*time.Minute {
-		t.Fatalf("cold: %s, want 1h15m", got)
-	}
-	if got := tenantReaperLifetime(6*time.Hour, hot); got != 3*time.Hour+15*time.Minute {
-		t.Fatalf("hot: %s, want 3h15m", got)
-	}
-	s := &shard{cfg: &config.Config{Firecracker: firecrackerLife(6 * time.Hour)}}
-	if launch := s.tenantTierLifetime(hot, hotTier("small", 4)); tenantReaperLifetime(6*time.Hour, hot) < launch {
-		t.Fatalf("the reaper's %s is shorter than the launch's %s", tenantReaperLifetime(6*time.Hour, hot), launch)
-	}
-}
-
-// followHot sets each tier's floor to its target as it changes, and the
-// floor launches and ends the hot runners.
+// followHot leaves a tier alone until its listener has planned it, so the
+// floor launches under the tier's own context; it then sets the floor to its
+// target as it changes; and the hot runners end with the tier's context.
 func TestFollowHot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	tierCtx, stopTier := context.WithCancel(ctx)
+	defer stopTier()
 	old := hotEvery
 	hotEvery = 5 * time.Millisecond
 	defer func() { hotEvery = old }()
@@ -168,31 +150,37 @@ func TestFollowHot(t *testing.T) {
 	var want atomic.Int64
 	want.Store(2)
 	tier := hotTier("small", 4)
-	ten := tenant{ID: "acme", Tiers: []config.Tier{tier}, Hot: map[string]bool{"small": true},
+	ten := tenant{ID: "acme", Tiers: []config.Tier{tier},
 		MinOf: func(string) int { return int(want.Load()) }, Limits: config.Limits{Runners: 10, JobDuration: time.Hour}}
 	sched := scheduler.New(scheduler.Options{Max: 4, Provisioner: idleUntilDone{}, JIT: &seqJIT{}, Tenant: bound, Logger: s.log})
-	sched.Reconcile(ctx, 0) // the listener's first plan: no jobs
-	go s.followHot(ctx, ten, ten.Tiers, []*scheduler.Scheduler{sched}, bound, s.log)
+	scheds := []*scheduler.Scheduler{sched}
+	s.hotPass(ctx, ten, ten.Tiers, scheds, bound, s.log)
+	if sched.Min() != 0 || sched.Running() != 0 {
+		t.Fatalf("before a plan: floor %d, %d running", sched.Min(), sched.Running())
+	}
+	sched.Reconcile(tierCtx, 0) // the listener's first plan: no jobs
+	go s.followHot(ctx, ten, ten.Tiers, scheds, bound, s.log)
 	waitFor(t, "two hot runners", func() bool { return sched.Running() == 2 && sched.Min() == 2 })
-	want.Store(0)
-	waitFor(t, "none", func() bool { return sched.Running() == 0 && sched.Min() == 0 })
+	want.Store(1)
+	waitFor(t, "one", func() bool { return sched.Running() == 1 && sched.Min() == 1 })
+	stopTier() // the tier stops: its hot runners end, and none relaunch
+	waitFor(t, "none after the tier stopped", func() bool { return sched.Running() == 0 })
+	want.Store(3)
+	s.hotPass(ctx, ten, ten.Tiers, scheds, bound, s.log)
+	if sched.Min() != 1 || sched.Running() != 0 {
+		t.Fatalf("after the tier stopped: floor %d, %d running", sched.Min(), sched.Running())
+	}
 }
 
-// An edit of a tenant's hot runners restarts it: which tiers may keep them,
-// and their machines' lifetime, are set as it starts.
-func TestEditOfHotRunnersRestarts(t *testing.T) {
+// An edit of a tenant's hot runners applies in place: followHot reads the
+// entry as listed now.
+func TestEditOfHotRunnersAppliesInPlace(t *testing.T) {
 	two := 2
 	a := config.Tenant{ID: "acme", Limits: &config.TenantLimits{MaxRunners: &two}}
 	b := a
 	b.Limits = &config.TenantLimits{MaxRunners: &two, Min: map[string]int{"small": 1}}
-	if onlyRunnersDiffer(a, b) {
-		t.Fatal("an edit of limits.min applies in place")
-	}
-	c := a
-	three := 3
-	c.Limits = &config.TenantLimits{MaxRunners: &three}
-	if !onlyRunnersDiffer(a, c) {
-		t.Fatal("an edit of max_runners alone restarts")
+	if !onlyRunnersDiffer(a, b) {
+		t.Fatal("an edit of limits.min restarts the tenant")
 	}
 }
 

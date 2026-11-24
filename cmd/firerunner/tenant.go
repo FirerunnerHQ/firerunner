@@ -64,10 +64,7 @@ type tenant struct {
 	Refused []string
 	// MinOf is a tier's hot runners as its tenants list entry sets them
 	// now (limits.min); its entitlement's take their place, as for PoolOf.
-	// Hot are the tiers that may keep hot runners, as granted when it
-	// started: their machines live long enough for a runner that waited.
 	MinOf func(tier string) int
-	Hot   map[string]bool
 	// PoolOf is a tier's stopped pool as its tenants list entry sets it now
 	// (limits.pool); its entitlement's, when the record names one, takes
 	// its place (tenantPoolTarget). nil keeps none.
@@ -263,46 +260,43 @@ func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracke
 	}
 }
 
-// tenantReaperLifetime is the age past which t's reaper ends one of its
-// instances: the job limit plus slack, within the install's, and with
-// tenantHotIdle more when a tier may keep hot runners, whose machines live
-// that much longer (tenantTierLifetime); the reaper must not end one sooner.
-func tenantReaperLifetime(install time.Duration, t tenant) time.Duration {
-	job := t.Limits.JobDuration
-	if len(t.Hot) > 0 && job > 0 {
-		job += tenantHotIdle
-	}
-	return maxLifetime(install, job)
-}
-
 // tenantHotIdle is how long a tenant's hot runner may wait for a job before
-// it is replaced. Its machine lives the job limit, plus this, plus
-// jobLifetimeSlack: a job a runner takes at any age still runs to its limit.
-const tenantHotIdle = 2 * time.Hour
+// it is replaced. Every machine of a tenant lives the job limit, plus this,
+// plus jobLifetimeSlack, whether its tier keeps hot runners now or not: a
+// job a hot runner takes at any age still runs to its limit, and a run that
+// starts later, or another shard, judges a machine by the same lifetime as
+// the run that launched it. A hot runner idle this long costs a boot to
+// renew; a machine whose job's start is never reported lives this much more.
+const tenantHotIdle = 30 * time.Minute
 
 // hotEvery is how often a tenant's hot runners follow their target.
 var hotEvery = 15 * time.Second
 
-// withHot marks the tiers of t that may keep hot runners: those its entry
-// or its entitlement grants some as it starts. A tier granted none then keeps
-// the shorter lifetime of a machine launched for a job; a grant on it applies
-// at the tenant's next start (an edit of its entry's limits.min restarts it).
-func (s *shard) withHot(t tenant) tenant {
-	ent := s.entitledMin(t.ID)
-	t.Hot = map[string]bool{}
-	for _, tier := range t.Tiers {
-		n := 0
-		if t.MinOf != nil {
-			n = t.MinOf(tier.Name)
-		}
-		if ent != nil {
-			n = max(n, ent[tier.Name])
-		}
-		if n > 0 && tier.IsEC2() {
-			t.Hot[tier.Name] = true
-		}
+// tenantJobLife is the job limit a tenant's machines are given a lifetime
+// for: the job limit plus tenantHotIdle, or none (0) with no job limit.
+func tenantJobLife(t tenant) time.Duration {
+	if t.Limits.JobDuration <= 0 {
+		return 0
 	}
-	return t
+	return t.Limits.JobDuration + tenantHotIdle
+}
+
+// tenantReaperLifetime is the age past which t's reaper ends one of its
+// instances: the lifetime its launch gave it (tenantTierLifetime), so that
+// the reaper of a later run never ends one sooner.
+func tenantReaperLifetime(install time.Duration, t tenant) time.Duration {
+	return maxLifetime(install, tenantJobLife(t))
+}
+
+// tenantTierLifetime is the lifetime backstop of t's machines on tier: for a
+// tenant, the job limit plus tenantHotIdle plus slack, within the install's;
+// for the install's tiers, as before.
+func (s *shard) tenantTierLifetime(t tenant, tier config.Tier) time.Duration {
+	install := s.cfg.Firecracker.MaxVMLifetime
+	if t.ID != "" {
+		return maxLifetime(install, tenantJobLife(t))
+	}
+	return tierLifetime(install, t.Limits.JobDuration, tier)
 }
 
 // entitledMin is the hot runners, by tier, tenant id's entitlement names; nil
@@ -318,20 +312,9 @@ func (s *shard) entitledMin(id string) map[string]int {
 	return r.Limits.Min
 }
 
-// tenantTierLifetime is the lifetime backstop of t's machines on tier: the
-// install's, or the job limit plus slack when that is shorter; on a tier that
-// may keep hot runners, the job limit plus tenantHotIdle plus slack.
-func (s *shard) tenantTierLifetime(t tenant, tier config.Tier) time.Duration {
-	install := s.cfg.Firecracker.MaxVMLifetime
-	if t.ID != "" && t.Hot[tier.Name] && t.Limits.JobDuration > 0 {
-		return maxLifetime(install, t.Limits.JobDuration+tenantHotIdle)
-	}
-	return tierLifetime(install, t.Limits.JobDuration, tier)
-}
-
 // hotIdleMax is how long a hot runner on tier may wait before it is
 // recycled: what its lifetime leaves past the job limit and slack, at most
-// tenantHotIdle. 0 keeps none on it: its lifetime leaves no room.
+// tenantHotIdle. 0 or less keeps none on it: its lifetime leaves no room.
 func (s *shard) hotIdleMax(t tenant, tier config.Tier) time.Duration {
 	life := s.tenantTierLifetime(t, tier)
 	if life <= 0 {
@@ -345,8 +328,8 @@ func (s *shard) hotIdleMax(t tenant, tier config.Tier) time.Duration {
 }
 
 // hotTargets are the hot runners each of t's tiers keeps now: none on a tier
-// that may not keep any (withHot, hotIdleMax), none while the tenant is
-// suspended or held, nor on a tier its plan does not launch; else its
+// whose lifetime leaves no room for a wait (hotIdleMax), none while the tenant
+// is suspended or held, nor on a tier its plan does not launch; else its
 // entitlement's when the record names a min, or its entry's as listed now;
 // at most the tier's max, and fewer in all, taken in tier order, than the
 // runners it may have at once, so that idle runners never hold a job.
@@ -362,7 +345,7 @@ func (s *shard) hotTargets(t tenant, tiers []config.Tier, bound *scheduler.Tenan
 		budget = m - 1
 	}
 	for i, tier := range tiers {
-		if !t.Hot[tier.Name] || s.hotIdleMax(t, tier) <= 0 {
+		if !tier.IsEC2() || s.hotIdleMax(t, tier) <= 0 {
 			continue
 		}
 		if plan.Tiers != nil && !slices.Contains(plan.Tiers, tier.Name) {
@@ -387,28 +370,36 @@ func (s *shard) hotTargets(t tenant, tiers []config.Tier, bound *scheduler.Tenan
 	return out
 }
 
-// followHot keeps t's hot runners at hotTargets, and recycles any that have
-// waited past hotIdleMax, every hotEvery until ctx ends.
+// followHot keeps t's hot runners at hotTargets, and recycles one that has
+// waited past hotIdleMax a pass, every hotEvery until ctx ends. A tier is
+// left alone until its listener has given its scheduler a plan, and once
+// its own context has ended (Planned): the floor then launches under the
+// tier's context, and ends with it.
 func (s *shard) followHot(ctx context.Context, t tenant, tiers []config.Tier, scheds []*scheduler.Scheduler, bound *scheduler.Tenant, log *slog.Logger) {
 	tick := time.NewTicker(hotEvery)
 	defer tick.Stop()
 	for {
-		targets := s.hotTargets(t, tiers, bound)
-		for i, sched := range scheds {
-			if i >= len(tiers) || !t.Hot[tiers[i].Name] {
-				continue
-			}
-			if sched.Min() != targets[i] {
-				log.Info("tenant's hot runners changed", "tier", tiers[i].Name, "from", sched.Min(), "to", targets[i])
-				sched.SetMin(ctx, targets[i])
-			}
-			sched.RecycleIdle(ctx, s.hotIdleMax(t, tiers[i]))
-		}
+		s.hotPass(ctx, t, tiers, scheds, bound, log)
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
 		}
+	}
+}
+
+// hotPass is one pass of followHot.
+func (s *shard) hotPass(ctx context.Context, t tenant, tiers []config.Tier, scheds []*scheduler.Scheduler, bound *scheduler.Tenant, log *slog.Logger) {
+	targets := s.hotTargets(t, tiers, bound)
+	for i, sched := range scheds {
+		if i >= len(tiers) || !sched.Planned() {
+			continue
+		}
+		if sched.Min() != targets[i] {
+			log.Info("tenant's hot runners changed", "tier", tiers[i].Name, "from", sched.Min(), "to", targets[i])
+			sched.SetMin(ctx, targets[i])
+		}
+		sched.RecycleIdle(s.hotIdleMax(t, tiers[i]))
 	}
 }
 
@@ -550,7 +541,7 @@ func (s *shard) runTenant(ctx context.Context, cur func() config.Tenant, served 
 		// nothing, and its pool follows it at the next pass.
 		t.PoolOf = func(tier string) int { return cur().PoolSize(tier) }
 		t.MinOf = func(tier string) int { return cur().MinSize(tier) }
-		return s.withHot(t)
+		return t
 	}
 	et := get()
 	defer live.forget(et.ID)
@@ -874,7 +865,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (_ *serv
 	for _, pool := range pools {
 		go pool.Run(ctx)
 	}
-	if t.ID != "" && len(t.Hot) > 0 {
+	if t.ID != "" {
 		go s.followHot(ctx, t, st.tiers, st.scheds, st.bound, log)
 	}
 

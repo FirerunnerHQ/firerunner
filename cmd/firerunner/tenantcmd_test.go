@@ -246,7 +246,7 @@ func TestTenantStartsInItsState(t *testing.T) {
 		t.Fatalf("started %v %q", susp, why)
 	}
 	ro := s.tenantReaperOptions(acme, nil, s.log)
-	if ro.Suspended == nil || ro.Suspended() != "abuse" || ro.MaxLifetime != 45*time.Minute || ro.Owner != "o/acme" {
+	if ro.Suspended == nil || ro.Suspended() != "abuse" || ro.MaxLifetime != 75*time.Minute || ro.Owner != "o/acme" {
 		t.Fatalf("reaper options = %+v", ro)
 	}
 }

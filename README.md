@@ -252,13 +252,12 @@ operator raises them per installation, and 0 lifts one:
   `max_runners`, since idle runners at the limit would hold every job. Its
   entitlement's min, when the record names one, takes its place. While the
   installation is held or suspended, or on a tier its plan does not launch,
-  it keeps none. A hot runner's machine lives the job limit plus 2 hours plus
-  15 minutes, and a runner idle 2 hours is replaced, so a job it takes still
-  runs to its limit; the reaper allows the same. Only the tiers granted hot
-  runners as the installation starts keep them, as their machines' lifetime
-  is set then: an edit of its entry's `min` restarts it, and an entitlement's
-  grant on another tier applies at its next start. An idle runner's spot
-  interruption fails no job.
+  it keeps none. A change, in the entry or the entitlement, applies within 15
+  seconds. Every machine of an installation of the tenants
+  list lives its job limit plus 30 minutes plus 15 minutes, hot or not, and
+  its reaper allows the same; a hot runner idle 30 minutes is replaced, one a
+  tier at a time, so a job it takes still runs to its limit. An idle runner's
+  spot interruption fails no job.
 
 The install's own tiers are not limited unless `--limit-runners`,
 `--limit-vcpu` and `--limit-job-duration` (`FR_LIMIT_*`) say so.

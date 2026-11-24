@@ -1026,50 +1026,68 @@ func (s *Scheduler) stopCompleted(name string, h *vmHandle) {
 	s.opts.Logger.Warn("stopping a runner still running after its job completed", "runner", name, "grace", s.opts.CompletedGrace)
 }
 
-// RecycleIdle removes the idle runners launched more than olderThan ago, as
-// scale-down removes one: deregistered at GitHub first when a Remover is
-// set, so no job lands on one mid-removal, then ended. The warm-pool floor
-// (Min) launches their replacements as they go. A hot runner that waited
-// long is thereby replaced before it could take a job its machine's
-// lifetime would cut short. It reports how many it chose.
-func (s *Scheduler) RecycleIdle(ctx context.Context, olderThan time.Duration) int {
+// Planned reports whether the scheduler serves now: its listener has given
+// it a plan, under a context still live, and it is not draining. A caller
+// that changes its floor waits for it, so the hot runners the floor launches
+// go under the tier's own context and end with it.
+func (s *Scheduler) Planned() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hasDesired && s.lastCtx.Err() == nil && !s.draining
+}
+
+// RecycleIdle removes the oldest idle runner launched more than olderThan
+// ago, as scale-down removes one: deregistered at GitHub first when a Remover
+// is set, so no job lands on it mid-removal, then ended; a rise in demand
+// never takes it back. The warm-pool floor (Min) launches its replacement.
+// One a call: runners the floor launched together are renewed in turn, never
+// all at once. A hot runner that waited long is thereby replaced before it
+// could take a job its machine's lifetime would cut short. It does nothing
+// before a plan or while draining (Planned), and reports whether it chose one.
+func (s *Scheduler) RecycleIdle(olderThan time.Duration) bool {
 	if olderThan <= 0 {
-		return 0
+		return false
 	}
 	s.mu.Lock()
+	if !s.hasDesired || s.lastCtx.Err() != nil || s.draining {
+		s.mu.Unlock()
+		return false
+	}
+	ctx := s.lastCtx
 	cutoff := time.Now().Add(-olderThan)
-	picked := 0
-	for _, h := range s.active {
+	var name string
+	var oldest *vmHandle
+	for n, h := range s.active {
 		if h.busy || h.cancelled || h.removing || !h.since.Before(cutoff) {
 			continue
 		}
-		picked++
-		if s.opts.Remover == nil {
-			h.cancelled = true
-			h.cancel(nil)
-			continue
-		}
-		h.removing, h.recycling = true, true
-	}
-	if s.opts.Remover != nil {
-		for name, h := range s.active {
-			if h.recycling && h.removing && !slices.Contains(s.removeQ, name) {
-				s.removeQ = append(s.removeQ, name)
-			}
+		if oldest == nil || h.since.Before(oldest.since) {
+			name, oldest = n, h
 		}
 	}
-	start := len(s.removeQ) > 0 && !s.removerActive
+	if oldest == nil {
+		s.mu.Unlock()
+		return false
+	}
+	if s.opts.Remover == nil {
+		oldest.cancelled = true
+		oldest.cancel(nil)
+		s.mu.Unlock()
+		s.opts.Logger.Info("recycling an idle runner past its age", "runner", name, "olderThan", olderThan)
+		return true
+	}
+	oldest.removing, oldest.recycling = true, true
+	s.removeQ = append(s.removeQ, name)
+	start := !s.removerActive
 	if start {
 		s.removerActive = true
 	}
 	s.mu.Unlock()
-	if picked > 0 {
-		s.opts.Logger.Info("recycling idle runners past their age", "runners", picked, "olderThan", olderThan)
-	}
+	s.opts.Logger.Info("recycling an idle runner past its age", "runner", name, "olderThan", olderThan)
 	if start {
 		go s.removeLoop(ctx)
 	}
-	return picked
+	return true
 }
 
 // IdleRunners returns the runners launched more than olderThan ago that have

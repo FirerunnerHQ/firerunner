@@ -43,9 +43,8 @@ tenants list's limits.pool; a tier left out keeps none (TIER=0 keeps none on
 every tier), and the tier's max and the runner limit bound it. It applies at
 the pool's next pass, within 15 seconds. --min is each tier's hot runners
 (Turbo: booted, registered and idle, so a job starts on one at once), in place
-of the tenants list's limits.min: fewer in all than the runner limit, and on the
-tiers that could keep them when the tenant started (on another, at its next
-start). A daemon reads the records every 30 seconds:
+of the tenants list's limits.min, fewer in all than the runner limit, applied
+within 15 seconds. A daemon reads the records every 30 seconds:
 
   - no record, a pending or suspended account, or a capped budget: the
     tenant's launches are held and its jobs wait at GitHub with the reason;

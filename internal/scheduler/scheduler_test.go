@@ -2172,11 +2172,11 @@ func TestHandOffLeavesBusyRunners(t *testing.T) {
 	}
 }
 
-// RecycleIdle removes the idle runners past an age, deregistered first as a
-// scale-down removes one, and the floor launches their replacements: a hot
-// runner that waited long is renewed before its machine's lifetime could cut
-// a job short. A busy runner and a young one are left; a rise in demand never
-// takes back one queued for removal for its age.
+// RecycleIdle removes the oldest idle runner past an age, one a call so a
+// floor launched together is renewed in turn, deregistered first as a
+// scale-down removes one; the floor launches its replacement. A busy runner
+// and a young one are left; a rise in demand never takes back one queued for
+// its age; and before a plan it does nothing (Planned).
 func TestRecycleIdleRenewsOldHotRunners(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2189,7 +2189,13 @@ func TestRecycleIdleRenewsOldHotRunners(t *testing.T) {
 		return nil
 	})
 	s := New(Options{Max: 8, Min: 4, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	if s.Planned() || s.RecycleIdle(time.Nanosecond) {
+		t.Fatal("before any plan: planned, or recycled")
+	}
 	s.Reconcile(ctx, 0) // no jobs: the floor of 4
+	if !s.Planned() {
+		t.Fatal("not planned after a plan")
+	}
 	for range 4 {
 		select {
 		case <-entered:
@@ -2199,17 +2205,19 @@ func TestRecycleIdleRenewsOldHotRunners(t *testing.T) {
 	}
 	waitRunning(t, s, 4)
 
-	// Two are old and idle, one old and busy, one young.
+	// Two are old and idle (the first the older), one old and busy, one young.
 	s.mu.Lock()
 	var old []string
 	var busy, young string
 	i := 0
 	for name, h := range s.active {
 		switch i {
-		case 0, 1:
+		case 0:
+			old, h.since = append(old, name), time.Now().Add(-4*time.Hour)
+		case 1:
 			old, h.since = append(old, name), time.Now().Add(-3*time.Hour)
 		case 2:
-			busy, h.since, h.busy = name, time.Now().Add(-3*time.Hour), true
+			busy, h.since, h.busy = name, time.Now().Add(-5*time.Hour), true
 		default:
 			young = name
 		}
@@ -2217,18 +2225,32 @@ func TestRecycleIdleRenewsOldHotRunners(t *testing.T) {
 	}
 	s.mu.Unlock()
 
-	if n := s.RecycleIdle(ctx, 2*time.Hour); n != 2 {
-		t.Fatalf("recycled %d, want the two old idle runners", n)
+	if !s.RecycleIdle(2 * time.Hour) {
+		t.Fatal("recycled none")
 	}
-	waitCalls(t, &calls, 1) // one removal in flight, one queued
+	waitCalls(t, &calls, 1) // the oldest's removal in flight
+	s.mu.Lock()
+	first := s.active[old[0]]
+	second := s.active[old[1]]
+	inFlight := first != nil && first.recycling && !second.removing
+	s.mu.Unlock()
+	if !inFlight {
+		t.Fatal("the first call did not take the oldest alone")
+	}
+	if !s.RecycleIdle(2 * time.Hour) {
+		t.Fatal("the second call recycled none")
+	}
+	if s.RecycleIdle(2 * time.Hour) {
+		t.Fatal("a third call recycled the busy or the young runner")
+	}
 
-	// Demand rises while one waits in the queue: it is not taken back.
+	// Demand rises while the second waits in the queue: it is not taken back.
 	s.mu.Lock()
 	reclaimed := s.reclaimQueued(8)
 	queued := slices.Clone(s.removeQ)
 	s.mu.Unlock()
-	if reclaimed != 0 || len(queued) != 1 || !slices.Contains(old, queued[0]) {
-		t.Fatalf("reclaimed %d, queue %v; want none reclaimed and an old runner still queued", reclaimed, queued)
+	if reclaimed != 0 || len(queued) != 1 || queued[0] != old[1] {
+		t.Fatalf("reclaimed %d, queue %v; want none reclaimed and %s still queued", reclaimed, queued, old[1])
 	}
 
 	close(release)
@@ -2247,7 +2269,24 @@ func TestRecycleIdleRenewsOldHotRunners(t *testing.T) {
 	if !gone || !kept {
 		t.Fatalf("after recycling: old gone %v, busy and young kept %v", gone, kept)
 	}
-	if n := s.RecycleIdle(ctx, 0); n != 0 {
-		t.Fatalf("an age of 0 recycled %d", n)
+	if s.RecycleIdle(0) {
+		t.Fatal("an age of 0 recycled one")
+	}
+	s.mu.Lock()
+	s.active[young].since = time.Now().Add(-3 * time.Hour)
+	s.draining = true
+	s.mu.Unlock()
+	if s.RecycleIdle(2 * time.Hour) {
+		t.Fatal("recycled while draining")
+	}
+	s.mu.Lock()
+	s.draining = false
+	s.mu.Unlock()
+	if !s.RecycleIdle(2 * time.Hour) {
+		t.Fatal("did not recycle the old runner once serving")
+	}
+	cancel()
+	if s.Planned() {
+		t.Fatal("planned after its context ended")
 	}
 }
