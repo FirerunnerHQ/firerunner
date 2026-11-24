@@ -97,6 +97,13 @@ func TestLimitsPool(t *testing.T) {
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("a pool: %v", err)
 	}
+	for name, min := range map[string]map[string]int{"negative min": {"small": -1}, "min no tier": {"": 1}} {
+		r := ok
+		r.Limits = &Limits{Min: min}
+		if err := r.Validate(); err == nil || !strings.Contains(err.Error(), "limits.min") {
+			t.Errorf("%s: %v, want refused", name, err)
+		}
+	}
 	for name, pool := range map[string]map[string]int{"negative": {"small": -1}, "no tier": {"": 1}} {
 		r := ok
 		r.Limits = &Limits{Pool: pool}

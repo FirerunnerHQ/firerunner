@@ -104,6 +104,14 @@ type Limits struct {
 	// tenant may have at once bound it; a tier the plan does not launch
 	// keeps none. A change applies at the pool's next pass.
 	Pool map[string]int `json:"pool,omitempty"`
+	// Min, when set, is how many hot runners each tier keeps for the tenant
+	// (Turbo, an add-on billing sells), in place of the tenants list's
+	// limits.min; a tier left out keeps none, and naming one with 0 keeps
+	// none at all. A change applies within a pass, on the tiers that could
+	// keep hot runners when the tenant started; on another, at its next
+	// start. Fewer in all than the runners it may have at once, and none
+	// while it is held.
+	Min map[string]int `json:"min,omitempty"`
 }
 
 // Validate reports whether l can be applied.
@@ -125,6 +133,14 @@ func (l Limits) Validate() error {
 		}
 		if n < 0 {
 			return fmt.Errorf("limits.pool %q is %d: want 0 or more", t, n)
+		}
+	}
+	for t, n := range l.Min {
+		if t == "" {
+			return errors.New("limits.min names an empty tier")
+		}
+		if n < 0 {
+			return fmt.Errorf("limits.min %q is %d: want 0 or more", t, n)
 		}
 	}
 	return nil

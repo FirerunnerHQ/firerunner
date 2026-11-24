@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2168,5 +2169,85 @@ func TestHandOffLeavesBusyRunners(t *testing.T) {
 	}
 	if got := s.HandOff(); got != 0 {
 		t.Fatalf("HandOff again = %d, want 0", got)
+	}
+}
+
+// RecycleIdle removes the idle runners past an age, deregistered first as a
+// scale-down removes one, and the floor launches their replacements: a hot
+// runner that waited long is renewed before its machine's lifetime could cut
+// a job short. A busy runner and a young one are left; a rise in demand never
+// takes back one queued for removal for its age.
+func TestRecycleIdleRenewsOldHotRunners(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{}, 16)
+	release := make(chan struct{})
+	var calls atomic.Int64
+	rm := removerFunc(func(_ context.Context, name string) error {
+		calls.Add(1)
+		<-release
+		return nil
+	})
+	s := New(Options{Max: 8, Min: 4, Provisioner: idleProv(entered), JIT: &jitSeq{}, Remover: rm, Logger: testLogger()})
+	s.Reconcile(ctx, 0) // no jobs: the floor of 4
+	for range 4 {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the floor never launched")
+		}
+	}
+	waitRunning(t, s, 4)
+
+	// Two are old and idle, one old and busy, one young.
+	s.mu.Lock()
+	var old []string
+	var busy, young string
+	i := 0
+	for name, h := range s.active {
+		switch i {
+		case 0, 1:
+			old, h.since = append(old, name), time.Now().Add(-3*time.Hour)
+		case 2:
+			busy, h.since, h.busy = name, time.Now().Add(-3*time.Hour), true
+		default:
+			young = name
+		}
+		i++
+	}
+	s.mu.Unlock()
+
+	if n := s.RecycleIdle(ctx, 2*time.Hour); n != 2 {
+		t.Fatalf("recycled %d, want the two old idle runners", n)
+	}
+	waitCalls(t, &calls, 1) // one removal in flight, one queued
+
+	// Demand rises while one waits in the queue: it is not taken back.
+	s.mu.Lock()
+	reclaimed := s.reclaimQueued(8)
+	queued := slices.Clone(s.removeQ)
+	s.mu.Unlock()
+	if reclaimed != 0 || len(queued) != 1 || !slices.Contains(old, queued[0]) {
+		t.Fatalf("reclaimed %d, queue %v; want none reclaimed and an old runner still queued", reclaimed, queued)
+	}
+
+	close(release)
+	for range 2 { // their replacements come from the floor
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("no replacement launched")
+		}
+	}
+	waitRunning(t, s, 4)
+	s.mu.Lock()
+	gone := s.active[old[0]] == nil && s.active[old[1]] == nil
+	kept := s.active[busy] != nil && s.active[young] != nil
+	s.mu.Unlock()
+	if !gone || !kept {
+		t.Fatalf("after recycling: old gone %v, busy and young kept %v", gone, kept)
+	}
+	if n := s.RecycleIdle(ctx, 0); n != 0 {
+		t.Fatalf("an age of 0 recycled %d", n)
 	}
 }

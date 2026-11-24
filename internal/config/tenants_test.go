@@ -154,6 +154,46 @@ func TestTenantPool(t *testing.T) {
 	}
 }
 
+// A tenant's entry may keep hot runners on its own tiers, from 0 to the
+// tier's max, and fewer in all than its runner limit: idle runners at the
+// limit would hold every job.
+func TestTenantHotRunners(t *testing.T) {
+	c := tenantConfig()
+	x := goodTenant()
+	one := 1
+	x.Limits = &TenantLimits{Min: map[string]int{"cloud": 1}}
+	if err := tenantConfig(x).validateTenants(); err != nil {
+		t.Fatalf("one hot runner under the default limit of 2: %v", err)
+	}
+	if x.MinSize("cloud") != 1 || x.MinSize("other") != 0 || goodTenant().MinSize("cloud") != 0 {
+		t.Fatal("MinSize")
+	}
+	if got, _ := c.TenantTiers(x); got[0].Min != 0 {
+		t.Fatalf("a tenant's tier starts with a floor of %d; its hot runners follow their target", got[0].Min)
+	}
+	for name, l := range map[string]*TenantLimits{
+		"a tier it is not given": {Min: map[string]int{"micro": 1}},
+		"negative":               {Min: map[string]int{"cloud": -1}},
+		"above the tier's max":   {Min: map[string]int{"cloud": 11}, MaxRunners: &[]int{50}[0]},
+		"at the runner limit":    {Min: map[string]int{"cloud": 2}},
+		"at a set runner limit":  {Min: map[string]int{"cloud": 1}, MaxRunners: &one},
+	} {
+		y := goodTenant()
+		y.Limits = l
+		cc := tenantConfig(y)
+		cc.Tiers[0].Max = 10
+		if err := cc.validateTenants(); err == nil || !strings.Contains(err.Error(), "limits.min") {
+			t.Errorf("%s: %v, want refused", name, err)
+		}
+	}
+	zero := 0
+	z := goodTenant()
+	z.Limits = &TenantLimits{Min: map[string]int{"cloud": 5}, MaxRunners: &zero}
+	if err := tenantConfig(z).validateTenants(); err != nil {
+		t.Errorf("hot runners with no runner limit: %v", err)
+	}
+}
+
 func TestLoadTenants(t *testing.T) {
 	dir := t.TempDir()
 	write := func(body string) string {

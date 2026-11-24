@@ -62,6 +62,12 @@ type tenant struct {
 	// served to it (above its vCPU limit).
 	Limits  config.Limits
 	Refused []string
+	// MinOf is a tier's hot runners as its tenants list entry sets them
+	// now (limits.min); its entitlement's take their place, as for PoolOf.
+	// Hot are the tiers that may keep hot runners, as granted when it
+	// started: their machines live long enough for a runner that waited.
+	MinOf func(tier string) int
+	Hot   map[string]bool
 	// PoolOf is a tier's stopped pool as its tenants list entry sets it now
 	// (limits.pool); its entitlement's, when the record names one, takes
 	// its place (tenantPoolTarget). nil keeps none.
@@ -242,7 +248,7 @@ func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracke
 		Pooled:      tier.MaxPool() > 0 || t.ID != "",
 		JIT:         s.jit,
 		JITURL:      jitserver.URL(s.cfg.JITEndpoint()),
-		MaxLifetime: tierLifetime(s.cfg.Firecracker.MaxVMLifetime, t.Limits.JobDuration, tier),
+		MaxLifetime: s.tenantTierLifetime(t, tier),
 		UsePool:     jobs.ClaimPool,
 		Cache:       s.ec2Cache,
 		Events:      s.eventsFor(t),
@@ -254,6 +260,155 @@ func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracke
 			tracker.SetPool(health.PoolState{Target: target, Ready: ready, Warming: warming})
 		},
 		Logger: s.log.With("tier", t.tierKey(tier.Name)),
+	}
+}
+
+// tenantReaperLifetime is the age past which t's reaper ends one of its
+// instances: the job limit plus slack, within the install's, and with
+// tenantHotIdle more when a tier may keep hot runners, whose machines live
+// that much longer (tenantTierLifetime); the reaper must not end one sooner.
+func tenantReaperLifetime(install time.Duration, t tenant) time.Duration {
+	job := t.Limits.JobDuration
+	if len(t.Hot) > 0 && job > 0 {
+		job += tenantHotIdle
+	}
+	return maxLifetime(install, job)
+}
+
+// tenantHotIdle is how long a tenant's hot runner may wait for a job before
+// it is replaced. Its machine lives the job limit, plus this, plus
+// jobLifetimeSlack: a job a runner takes at any age still runs to its limit.
+const tenantHotIdle = 2 * time.Hour
+
+// hotEvery is how often a tenant's hot runners follow their target.
+var hotEvery = 15 * time.Second
+
+// withHot marks the tiers of t that may keep hot runners: those its entry
+// or its entitlement grants some as it starts. A tier granted none then keeps
+// the shorter lifetime of a machine launched for a job; a grant on it applies
+// at the tenant's next start (an edit of its entry's limits.min restarts it).
+func (s *shard) withHot(t tenant) tenant {
+	ent := s.entitledMin(t.ID)
+	t.Hot = map[string]bool{}
+	for _, tier := range t.Tiers {
+		n := 0
+		if t.MinOf != nil {
+			n = t.MinOf(tier.Name)
+		}
+		if ent != nil {
+			n = max(n, ent[tier.Name])
+		}
+		if n > 0 && tier.IsEC2() {
+			t.Hot[tier.Name] = true
+		}
+	}
+	return t
+}
+
+// entitledMin is the hot runners, by tier, tenant id's entitlement names; nil
+// when it names none, or there are no entitlements.
+func (s *shard) entitledMin(id string) map[string]int {
+	if s.entitlements == nil || id == "" {
+		return nil
+	}
+	r, ok, _ := s.entitlements.Decide(id)
+	if !ok || r.Limits == nil {
+		return nil
+	}
+	return r.Limits.Min
+}
+
+// tenantTierLifetime is the lifetime backstop of t's machines on tier: the
+// install's, or the job limit plus slack when that is shorter; on a tier that
+// may keep hot runners, the job limit plus tenantHotIdle plus slack.
+func (s *shard) tenantTierLifetime(t tenant, tier config.Tier) time.Duration {
+	install := s.cfg.Firecracker.MaxVMLifetime
+	if t.ID != "" && t.Hot[tier.Name] && t.Limits.JobDuration > 0 {
+		return maxLifetime(install, t.Limits.JobDuration+tenantHotIdle)
+	}
+	return tierLifetime(install, t.Limits.JobDuration, tier)
+}
+
+// hotIdleMax is how long a hot runner on tier may wait before it is
+// recycled: what its lifetime leaves past the job limit and slack, at most
+// tenantHotIdle. 0 keeps none on it: its lifetime leaves no room.
+func (s *shard) hotIdleMax(t tenant, tier config.Tier) time.Duration {
+	life := s.tenantTierLifetime(t, tier)
+	if life <= 0 {
+		return tenantHotIdle // no backstop: only the wait is bounded
+	}
+	job := t.Limits.JobDuration
+	if job <= 0 {
+		job = life // no job limit: a job may take all the lifetime left
+	}
+	return min(tenantHotIdle, life-job-jobLifetimeSlack)
+}
+
+// hotTargets are the hot runners each of t's tiers keeps now: none on a tier
+// that may not keep any (withHot, hotIdleMax), none while the tenant is
+// suspended or held, nor on a tier its plan does not launch; else its
+// entitlement's when the record names a min, or its entry's as listed now;
+// at most the tier's max, and fewer in all, taken in tier order, than the
+// runners it may have at once, so that idle runners never hold a job.
+func (s *shard) hotTargets(t tenant, tiers []config.Tier, bound *scheduler.Tenant) []int {
+	out := make([]int, len(tiers))
+	if _, why := bound.State(); why != "" {
+		return out
+	}
+	plan := bound.Plan()
+	ent := s.entitledMin(t.ID)
+	budget := -1
+	if m := bound.Max(); m > 0 {
+		budget = m - 1
+	}
+	for i, tier := range tiers {
+		if !t.Hot[tier.Name] || s.hotIdleMax(t, tier) <= 0 {
+			continue
+		}
+		if plan.Tiers != nil && !slices.Contains(plan.Tiers, tier.Name) {
+			continue
+		}
+		n := 0
+		if t.MinOf != nil {
+			n = t.MinOf(tier.Name)
+		}
+		if ent != nil {
+			n = ent[tier.Name]
+		}
+		if tier.Max > 0 {
+			n = min(n, tier.Max)
+		}
+		if budget >= 0 {
+			n = min(n, budget)
+			budget -= max(n, 0)
+		}
+		out[i] = max(n, 0)
+	}
+	return out
+}
+
+// followHot keeps t's hot runners at hotTargets, and recycles any that have
+// waited past hotIdleMax, every hotEvery until ctx ends.
+func (s *shard) followHot(ctx context.Context, t tenant, tiers []config.Tier, scheds []*scheduler.Scheduler, bound *scheduler.Tenant, log *slog.Logger) {
+	tick := time.NewTicker(hotEvery)
+	defer tick.Stop()
+	for {
+		targets := s.hotTargets(t, tiers, bound)
+		for i, sched := range scheds {
+			if i >= len(tiers) || !t.Hot[tiers[i].Name] {
+				continue
+			}
+			if sched.Min() != targets[i] {
+				log.Info("tenant's hot runners changed", "tier", tiers[i].Name, "from", sched.Min(), "to", targets[i])
+				sched.SetMin(ctx, targets[i])
+			}
+			sched.RecycleIdle(ctx, s.hotIdleMax(t, tiers[i]))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
 	}
 }
 
@@ -380,7 +535,7 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner string, jwt *ghauth.
 	}
 	return tenant{
 		ID: c.ID, Owner: owner + "/" + c.ID, URL: c.URL, RunnerGroup: group, KeepOnClose: cfg.Owner != "",
-		RunnerGroupID: groupID, GroupPending: pending, PoolOf: c.PoolSize,
+		RunnerGroupID: groupID, GroupPending: pending, PoolOf: c.PoolSize, MinOf: c.MinSize,
 		Auth:  ghauth.App{InstallationID: c.InstallationID, JWT: jwt},
 		Tiers: tiers, Limits: c.EffectiveLimits(), Refused: refused,
 	}
@@ -394,7 +549,8 @@ func (s *shard) runTenant(ctx context.Context, cur func() config.Tenant, served 
 		// The entry as listed now: an edit of its pool alone restarts
 		// nothing, and its pool follows it at the next pass.
 		t.PoolOf = func(tier string) int { return cur().PoolSize(tier) }
-		return t
+		t.MinOf = func(tier string) int { return cur().MinSize(tier) }
+		return s.withHot(t)
 	}
 	et := get()
 	defer live.forget(et.ID)
@@ -718,6 +874,9 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (_ *serv
 	for _, pool := range pools {
 		go pool.Run(ctx)
 	}
+	if t.ID != "" && len(t.Hot) > 0 {
+		go s.followHot(ctx, t, st.tiers, st.scheds, st.bound, log)
+	}
 
 	if s.ec2Client != nil && cfg.EC2Reaper != "off" {
 		reaper := s.ec2Client.NewReaper(s.tenantReaperOptions(t, st.listeners, log))
@@ -825,7 +984,7 @@ func (s *shard) newBound(t tenant, log *slog.Logger) *scheduler.Tenant {
 func (s *shard) tenantReaperOptions(t tenant, listeners []*listener.ScaleSet, log *slog.Logger) ec2.ReaperOptions {
 	ro := reaperOptions(s.cfg, t.Owner, t.Tiers, listeners, log)
 	ro.PooledTiers = tenantPooledTiers(t.Tiers)
-	ro.MaxLifetime = maxLifetime(ro.MaxLifetime, t.Limits.JobDuration)
+	ro.MaxLifetime = tenantReaperLifetime(ro.MaxLifetime, t)
 	ro.Suspended = s.suspension(t.ID)
 	return ro
 }

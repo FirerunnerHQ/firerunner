@@ -34,13 +34,13 @@ func TestEntitlementCommand(t *testing.T) {
 	if err != nil || rs["acme"].Budget != entitlement.Capped || rs["acme"].ValidUntil.IsZero() {
 		t.Fatalf("stored %+v, %v", rs, err)
 	}
-	code, out, errOut = runEntitlement(t, "set", "beta", "--account", "trial", "--budget", "ok", "--valid-for", "1h", "--max-runners", "2", "--tiers", "small,medium", "--pool", "small=3,medium=0", "--store", path, "--env-file", "none")
-	if code != 0 || !strings.Contains(out, "budget ok, at most 2 runner(s), tiers small,medium, pool medium=0,small=3") {
+	code, out, errOut = runEntitlement(t, "set", "beta", "--account", "trial", "--budget", "ok", "--valid-for", "1h", "--max-runners", "2", "--tiers", "small,medium", "--pool", "small=3,medium=0", "--min", "small=1", "--store", path, "--env-file", "none")
+	if code != 0 || !strings.Contains(out, "budget ok, at most 2 runner(s), tiers small,medium, pool medium=0,small=3, hot runners small=1") {
 		t.Fatalf("set beta: exit %d\n%s%s", code, out, errOut)
 	}
 	if rs, _ := (&entitlement.FileStore{Path: path}).Load(context.Background()); rs["beta"].Limits == nil ||
 		rs["beta"].Limits.MaxRunners != 2 || !slices.Equal(rs["beta"].Limits.Tiers, []string{"small", "medium"}) ||
-		rs["beta"].Limits.Pool["small"] != 3 || len(rs["beta"].Limits.Pool) != 2 {
+		rs["beta"].Limits.Pool["small"] != 3 || len(rs["beta"].Limits.Pool) != 2 || rs["beta"].Limits.Min["small"] != 1 {
 		t.Fatalf("stored beta %+v", rs["beta"])
 	}
 	code, out, _ = runEntitlement(t, "list", "--store", path, "--env-file", "none", "--json")
@@ -79,6 +79,8 @@ func TestEntitlementCommandUsage(t *testing.T) {
 		"an empty tier":        {"set", "acme", "--account", "active", "--budget", "ok", "--tiers", "small,"},
 		"tiers for list":       {"list", "--tiers", "small"},
 		"pool for list":        {"list", "--pool", "small=1"},
+		"min for list":         {"list", "--min", "small=1"},
+		"a negative min":       {"set", "acme", "--account", "active", "--budget", "ok", "--min", "small=-1"},
 		"a pool with no size":  {"set", "acme", "--account", "active", "--budget", "ok", "--pool", "small"},
 		"a negative pool":      {"set", "acme", "--account", "active", "--budget", "ok", "--pool", "small=-1"},
 		"a pool tier twice":    {"set", "acme", "--account", "active", "--budget", "ok", "--pool", "small=1,small=2"},

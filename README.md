@@ -241,7 +241,24 @@ operator raises them per installation, and 0 lifts one:
   the installation over finds them, by the pool key all shards share. A stopped
   instance costs its volumes alone.
   `firerunner status` shows each tier's pool: how many are ready of its
-  target, and how many still warm.
+  target, and how many still warm. A stopped pool saves little: starting a
+  stopped instance takes most of a cold start (about 18 s against 21 s,
+  measured on a tenant), and a stopped spot instance can start again only in
+  its own zone and type, where one start in nine was interrupted soon after.
+- **Min** (`"min": {"firerunner-ubuntu-24.04-2": 2}`) is how many hot runners a
+  tier keeps for the installation: booted, registered at GitHub and idle, so a
+  job starts on one at once (1-2 s, against about 21 s cold). It is set per
+  tier, never the catalog's, at most the tier's `max` and fewer in all than
+  `max_runners`, since idle runners at the limit would hold every job. Its
+  entitlement's min, when the record names one, takes its place. While the
+  installation is held or suspended, or on a tier its plan does not launch,
+  it keeps none. A hot runner's machine lives the job limit plus 2 hours plus
+  15 minutes, and a runner idle 2 hours is replaced, so a job it takes still
+  runs to its limit; the reaper allows the same. Only the tiers granted hot
+  runners as the installation starts keep them, as their machines' lifetime
+  is set then: an edit of its entry's `min` restarts it, and an entitlement's
+  grant on another tier applies at its next start. An idle runner's spot
+  interruption fails no job.
 
 The install's own tiers are not limited unless `--limit-runners`,
 `--limit-vcpu` and `--limit-job-duration` (`FR_LIMIT_*`) say so.

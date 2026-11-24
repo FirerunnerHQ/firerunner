@@ -108,6 +108,19 @@ type TenantLimits struct {
 	// left out keeps none. Its entitlement's pool, when the record names
 	// one, takes its place (see Tenant.PoolSize).
 	Pool map[string]int `json:"pool,omitempty"`
+	// Min is how many hot runners each of its tiers keeps: booted,
+	// registered and idle, so that a job starts on one at once. A tier
+	// left out keeps none. Its entitlement's min, when the record names
+	// one, takes its place (see Tenant.MinSize).
+	Min map[string]int `json:"min,omitempty"`
+}
+
+// MinSize is how many hot runners the tenant's entry keeps for tier.
+func (t Tenant) MinSize(tier string) int {
+	if t.Limits == nil {
+		return 0
+	}
+	return t.Limits.Min[tier]
 }
 
 // PoolSize is how many stopped instances the tenant's entry keeps for tier.

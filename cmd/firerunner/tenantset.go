@@ -763,6 +763,18 @@ func onlyRunnersDiffer(a, b config.Tenant) bool {
 	if la.VCPU != lb.VCPU || la.JobDuration != lb.JobDuration {
 		return false
 	}
+	// Which tiers may keep hot runners, and their machines' lifetime, are
+	// set as a tenant starts (withHot): a change of its hot runners does.
+	var ma, mb map[string]int
+	if a.Limits != nil {
+		ma = a.Limits.Min
+	}
+	if b.Limits != nil {
+		mb = b.Limits.Min
+	}
+	if !maps.Equal(ma, mb) {
+		return false
+	}
 	a.Limits, b.Limits = nil, nil
 	return reflect.DeepEqual(a, b)
 }

@@ -168,6 +168,9 @@ type vmHandle struct {
 	// counted it as gone. It returns to the pool (busy or idle) if GitHub
 	// refuses the removal, or if demand rises while it is still queued.
 	removing bool
+	// recycling marks an idle VM RecycleIdle chose: it is removed for its
+	// age, so a rise in demand never takes it back (reclaimQueued).
+	recycling bool
 	// deregistering is set once removeLoop has asked GitHub to remove the
 	// runner, and stays set while the answer is unknown: GitHub may have
 	// deleted the runner, so its runner may exit non-zero because of us. A
@@ -540,7 +543,7 @@ func (s *Scheduler) reclaimQueued(desired int) int {
 		h := s.active[name]
 		switch {
 		case h == nil || !h.removing || h.cancelled:
-		case h.deregistering:
+		case h.deregistering, h.recycling:
 			asked = append(asked, name)
 		default:
 			h.removing = false
@@ -1021,6 +1024,52 @@ func (s *Scheduler) stopCompleted(name string, h *vmHandle) {
 	h.cancelled = true
 	h.cancel(nil)
 	s.opts.Logger.Warn("stopping a runner still running after its job completed", "runner", name, "grace", s.opts.CompletedGrace)
+}
+
+// RecycleIdle removes the idle runners launched more than olderThan ago, as
+// scale-down removes one: deregistered at GitHub first when a Remover is
+// set, so no job lands on one mid-removal, then ended. The warm-pool floor
+// (Min) launches their replacements as they go. A hot runner that waited
+// long is thereby replaced before it could take a job its machine's
+// lifetime would cut short. It reports how many it chose.
+func (s *Scheduler) RecycleIdle(ctx context.Context, olderThan time.Duration) int {
+	if olderThan <= 0 {
+		return 0
+	}
+	s.mu.Lock()
+	cutoff := time.Now().Add(-olderThan)
+	picked := 0
+	for _, h := range s.active {
+		if h.busy || h.cancelled || h.removing || !h.since.Before(cutoff) {
+			continue
+		}
+		picked++
+		if s.opts.Remover == nil {
+			h.cancelled = true
+			h.cancel(nil)
+			continue
+		}
+		h.removing, h.recycling = true, true
+	}
+	if s.opts.Remover != nil {
+		for name, h := range s.active {
+			if h.recycling && h.removing && !slices.Contains(s.removeQ, name) {
+				s.removeQ = append(s.removeQ, name)
+			}
+		}
+	}
+	start := len(s.removeQ) > 0 && !s.removerActive
+	if start {
+		s.removerActive = true
+	}
+	s.mu.Unlock()
+	if picked > 0 {
+		s.opts.Logger.Info("recycling idle runners past their age", "runners", picked, "olderThan", olderThan)
+	}
+	if start {
+		go s.removeLoop(ctx)
+	}
+	return picked
 }
 
 // IdleRunners returns the runners launched more than olderThan ago that have
