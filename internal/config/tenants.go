@@ -223,6 +223,26 @@ func (c *Config) CheckTenants(tenants []Tenant) error {
 					return fmt.Errorf("tenant %q: limits.pool %q: the tier is not served to it (%s)", t.ID, name, refused[0])
 				}
 			}
+			hot := 0
+			for name, n := range t.Limits.Min {
+				tier := catalog[name]
+				switch {
+				case !seen[name]:
+					return fmt.Errorf("tenant %q: limits.min names tier %q, which it is not given", t.ID, name)
+				case n < 0:
+					return fmt.Errorf("tenant %q: limits.min %q is %d: want 0 or more", t.ID, name, n)
+				case tier.Max > 0 && n > tier.Max:
+					return fmt.Errorf("tenant %q: limits.min %q is %d, above the tier's max of %d", t.ID, name, n, tier.Max)
+				}
+				if _, refused := withinVCPU([]Tier{tier}, t.EffectiveLimits().VCPU); n > 0 && len(refused) > 0 {
+					return fmt.Errorf("tenant %q: limits.min %q: the tier is not served to it (%s)", t.ID, name, refused[0])
+				}
+				hot += n
+			}
+			if r := t.EffectiveLimits().Runners; r > 0 && hot >= r {
+				// Idle runners at the limit would hold every job.
+				return fmt.Errorf("tenant %q: limits.min keeps %d hot runner(s) in all: want fewer than its max_runners, %d", t.ID, hot, r)
+			}
 		}
 		if err := t.EffectiveLimits().validate(fmt.Sprintf("tenant %q: ", t.ID), catalogLimitNames); err != nil {
 			return err

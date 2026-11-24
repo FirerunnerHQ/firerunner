@@ -168,6 +168,9 @@ type vmHandle struct {
 	// counted it as gone. It returns to the pool (busy or idle) if GitHub
 	// refuses the removal, or if demand rises while it is still queued.
 	removing bool
+	// recycling marks an idle VM RecycleIdle chose: it is removed for its
+	// age, so a rise in demand never takes it back (reclaimQueued).
+	recycling bool
 	// deregistering is set once removeLoop has asked GitHub to remove the
 	// runner, and stays set while the answer is unknown: GitHub may have
 	// deleted the runner, so its runner may exit non-zero because of us. A
@@ -540,7 +543,7 @@ func (s *Scheduler) reclaimQueued(desired int) int {
 		h := s.active[name]
 		switch {
 		case h == nil || !h.removing || h.cancelled:
-		case h.deregistering:
+		case h.deregistering, h.recycling:
 			asked = append(asked, name)
 		default:
 			h.removing = false
@@ -1021,6 +1024,70 @@ func (s *Scheduler) stopCompleted(name string, h *vmHandle) {
 	h.cancelled = true
 	h.cancel(nil)
 	s.opts.Logger.Warn("stopping a runner still running after its job completed", "runner", name, "grace", s.opts.CompletedGrace)
+}
+
+// Planned reports whether the scheduler serves now: its listener has given
+// it a plan, under a context still live, and it is not draining. A caller
+// that changes its floor waits for it, so the hot runners the floor launches
+// go under the tier's own context and end with it.
+func (s *Scheduler) Planned() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hasDesired && s.lastCtx.Err() == nil && !s.draining
+}
+
+// RecycleIdle removes the oldest idle runner launched more than olderThan
+// ago, as scale-down removes one: deregistered at GitHub first when a Remover
+// is set, so no job lands on it mid-removal, then ended; a rise in demand
+// never takes it back. The warm-pool floor (Min) launches its replacement.
+// One a call: runners the floor launched together are renewed in turn, never
+// all at once. A hot runner that waited long is thereby replaced before it
+// could take a job its machine's lifetime would cut short. It does nothing
+// before a plan or while draining (Planned), and reports whether it chose one.
+func (s *Scheduler) RecycleIdle(olderThan time.Duration) bool {
+	if olderThan <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	if !s.hasDesired || s.lastCtx.Err() != nil || s.draining {
+		s.mu.Unlock()
+		return false
+	}
+	ctx := s.lastCtx
+	cutoff := time.Now().Add(-olderThan)
+	var name string
+	var oldest *vmHandle
+	for n, h := range s.active {
+		if h.busy || h.cancelled || h.removing || !h.since.Before(cutoff) {
+			continue
+		}
+		if oldest == nil || h.since.Before(oldest.since) {
+			name, oldest = n, h
+		}
+	}
+	if oldest == nil {
+		s.mu.Unlock()
+		return false
+	}
+	if s.opts.Remover == nil {
+		oldest.cancelled = true
+		oldest.cancel(nil)
+		s.mu.Unlock()
+		s.opts.Logger.Info("recycling an idle runner past its age", "runner", name, "olderThan", olderThan)
+		return true
+	}
+	oldest.removing, oldest.recycling = true, true
+	s.removeQ = append(s.removeQ, name)
+	start := !s.removerActive
+	if start {
+		s.removerActive = true
+	}
+	s.mu.Unlock()
+	s.opts.Logger.Info("recycling an idle runner past its age", "runner", name, "olderThan", olderThan)
+	if start {
+		go s.removeLoop(ctx)
+	}
+	return true
 }
 
 // IdleRunners returns the runners launched more than olderThan ago that have
