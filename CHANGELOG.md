@@ -8,6 +8,20 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.34] - 2026-11-24
+
+### Added
+
+- An installation of the tenants list can keep a stopped, pre-warmed pool per
+  tier, so its jobs start in seconds. The pool is set by its entry's
+  `limits.pool` (`{"tier": N}`) or by its entitlement's, which takes its place
+  when the record names one. It is bounded by the tier's `max` and the runner
+  limit, empty while the installation is held or suspended, and a change applies
+  within 15 seconds with no restart. Before, a tenant's tiers never kept a pool.
+- `firerunner entitlement set --pool TIER=N,...` writes an entitlement's pool.
+- `firerunner status` shows each tier's stopped pool: ready of its target, and
+  warming.
+
 ## [0.1.33] - 2026-11-23
 
 ### Fixed
@@ -835,7 +849,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.33...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.34...HEAD
+[0.1.34]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.34
 [0.1.33]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.33
 [0.1.32]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.32
 [0.1.31]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.31
