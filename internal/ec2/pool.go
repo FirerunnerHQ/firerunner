@@ -105,12 +105,21 @@ func (pl *Pool) Run(ctx context.Context) {
 	t := time.NewTicker(pl.tick)
 	defer t.Stop()
 	for pass := 0; ; pass++ {
+		if f := pl.p.o.PoolTarget; f != nil {
+			if n := max(f(), 0); n != pl.Target() {
+				pl.SetTarget(ctx, n)
+			}
+		}
 		if pass%readyCheckEvery == 0 {
 			pl.checkReady(ctx)
 		}
 		pl.refresh(ctx)
 		pl.trim(ctx)
 		pl.fill(ctx)
+		if f := pl.p.o.PoolState; f != nil {
+			ready, warming := pl.Ready()
+			f(pl.Target(), ready, warming)
+		}
 		select {
 		case <-ctx.Done():
 			return

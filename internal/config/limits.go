@@ -103,6 +103,19 @@ type TenantLimits struct {
 	MaxRunners     *int      `json:"max_runners,omitempty"`
 	MaxVCPU        *int      `json:"max_vcpu,omitempty"`
 	MaxJobDuration *Duration `json:"max_job_duration,omitempty"`
+	// Pool is how many stopped, pre-warmed instances each of its tiers
+	// keeps, by tier name: a job takes one and starts in seconds. A tier
+	// left out keeps none. Its entitlement's pool, when the record names
+	// one, takes its place (see Tenant.PoolSize).
+	Pool map[string]int `json:"pool,omitempty"`
+}
+
+// PoolSize is how many stopped instances the tenant's entry keeps for tier.
+func (t Tenant) PoolSize(tier string) int {
+	if t.Limits == nil {
+		return 0
+	}
+	return t.Limits.Pool[tier]
 }
 
 // Duration is a time.Duration written as a string, e.g. "30m"; "0" is none.

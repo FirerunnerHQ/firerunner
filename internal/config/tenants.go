@@ -208,6 +208,22 @@ func (c *Config) CheckTenants(tenants []Tenant) error {
 			}
 			seen[name] = true
 		}
+		if t.Limits != nil {
+			for name, n := range t.Limits.Pool {
+				tier := catalog[name]
+				switch {
+				case !seen[name]:
+					return fmt.Errorf("tenant %q: limits.pool names tier %q, which it is not given", t.ID, name)
+				case n < 0:
+					return fmt.Errorf("tenant %q: limits.pool %q is %d: want 0 or more", t.ID, name, n)
+				case tier.Max > 0 && n > tier.Max:
+					return fmt.Errorf("tenant %q: limits.pool %q is %d, above the tier's max of %d", t.ID, name, n, tier.Max)
+				}
+				if _, refused := withinVCPU([]Tier{tier}, t.EffectiveLimits().VCPU); n > 0 && len(refused) > 0 {
+					return fmt.Errorf("tenant %q: limits.pool %q: the tier is not served to it (%s)", t.ID, name, refused[0])
+				}
+			}
+		}
 		if err := t.EffectiveLimits().validate(fmt.Sprintf("tenant %q: ", t.ID), catalogLimitNames); err != nil {
 			return err
 		}
@@ -237,8 +253,9 @@ func accountOf(raw string) string {
 // TenantTiers returns the catalog tiers t gets, and why it leaves out any it
 // lists: a tier above the tenant's vCPU limit is not served to it. Their caches
 // are off, as the cache has no boundary between tenants yet (#168), and they
-// keep no hot runners or pool, which would multiply by the tenants however idle
-// they are.
+// keep no hot runners, nor the catalog's pool or schedule, which would multiply
+// by the tenants however idle they are: a tier's pool is the one its entry
+// sets (limits.pool), and none by default.
 func (c *Config) TenantTiers(t Tenant) ([]Tier, []string) {
 	var tiers []Tier
 	for _, name := range t.Tiers {
@@ -248,7 +265,7 @@ func (c *Config) TenantTiers(t Tenant) ([]Tier, []string) {
 			}
 			e := *tier.EC2
 			e.Cache, e.GitCache = false, false
-			e.Pool, e.PoolFor = 0, nil
+			e.Pool, e.PoolFor = t.PoolSize(name), nil
 			tier.EC2, tier.Min, tier.Schedule = &e, 0, nil
 			tiers = append(tiers, tier)
 		}

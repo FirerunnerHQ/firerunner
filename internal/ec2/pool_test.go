@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -630,6 +631,50 @@ func TestPool_ShrinkTerminatesReadyBeforeReturning(t *testing.T) {
 	if n := len(h.f.launched()); n != 3 {
 		t.Fatalf("launched %d after the shrink, want the original 3", n)
 	}
+}
+
+// A pool given a target to follow asks it every pass: it ends its ready
+// instances when the target drops to 0, as for a tenant that is held, and
+// fills again when it rises, as when the tenant resumes or its entitlement
+// grants more. A negative target counts as 0.
+func TestPool_FollowsItsTarget(t *testing.T) {
+	var target atomic.Int64
+	target.Store(2)
+	var state atomic.Pointer[[3]int]
+	var passes atomic.Int64
+	h := newHarness(t, func(o *Options) {
+		o.EC2.Pool = 2
+		o.EC2.Market = config.MarketSpot
+		o.PoolTarget = func() int { return int(target.Load()) }
+		o.PoolState = func(tg, r, w int) { state.Store(&[3]int{tg, r, w}); passes.Add(1) }
+	})
+	reported := func(want [3]int) func() bool {
+		return func() bool { s := state.Load(); return s != nil && *s == want }
+	}
+	h.p.pool.tick = 5 * time.Millisecond
+	h.runPool(t)
+	eventually(t, "two warming", func() bool { _, w := h.p.pool.Ready(); return w == 2 })
+	h.stopWarming()
+	eventually(t, "two ready", func() bool { r, _ := h.p.pool.Ready(); return r == 2 })
+	eventually(t, "the pool reports 2 of 2 ready", reported([3]int{2, 2, 0}))
+
+	target.Store(0)
+	eventually(t, "both ended at a target of 0", func() bool {
+		r, w := h.p.pool.Ready()
+		return r == 0 && w == 0 && len(h.f.terminatedIDs()) == 2 && h.p.pool.Target() == 0
+	})
+	eventually(t, "the pool reports none", reported([3]int{0, 0, 0}))
+
+	target.Store(-1)
+	// Three whole passes at it, each reported after its fill.
+	from := passes.Load()
+	eventually(t, "three passes at a negative target", func() bool { return passes.Load() >= from+4 })
+	if n, tg := len(h.f.launched()), h.p.pool.Target(); n != 2 || tg != 0 {
+		t.Fatalf("at a negative target: %d launched, target %d; want nothing new, target 0", n, tg)
+	}
+
+	target.Store(3)
+	eventually(t, "three warming once it rises", func() bool { _, w := h.p.pool.Ready(); return w == 3 })
 }
 
 func TestPool_GrowFills(t *testing.T) {

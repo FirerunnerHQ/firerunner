@@ -436,6 +436,9 @@ func renderStatusText(r StatusReport, w io.Writer) {
 				fmt.Fprintf(w, "  %s schedule: %s: %d hot runner(s), pool %d, since %s\n",
 					t.Name, window, sz.Min, sz.Pool, sz.Since.UTC().Format(time.RFC3339))
 			}
+			if p := t.Pool; p != nil {
+				fmt.Fprintf(w, "  %s pool: %d of %d ready, %d warming\n", t.Name, p.Ready, p.Target, p.Warming)
+			}
 			if pj := t.Pending; pj != nil {
 				fmt.Fprintf(w, "  %s assigned, not started: %d job(s) (%s)", t.Name, pj.Jobs, countList(pj.ByEvent))
 				if pj.Kept > 0 {
