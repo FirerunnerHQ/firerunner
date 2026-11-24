@@ -62,6 +62,10 @@ type tenant struct {
 	// served to it (above its vCPU limit).
 	Limits  config.Limits
 	Refused []string
+	// ListPool is each tier's stopped pool as its tenants list entry sets
+	// it (limits.pool); its entitlement's, when the record names one,
+	// takes its place (tenantPoolTarget).
+	ListPool map[string]int
 }
 
 // shard holds what a process's tenants share. Its EC2 client carries the
@@ -243,7 +247,80 @@ func (s *shard) ec2Options(t tenant, tier config.Tier, hooks tenantHooks, tracke
 		Launched:    tracker.Launched,
 		FellBack:    tracker.FellBack,
 		Interrupted: tracker.Interrupted,
-		Logger:      s.log.With("tier", t.tierKey(tier.Name)),
+		PoolState: func(target, ready, warming int) {
+			tracker.SetPool(health.PoolState{Target: target, Ready: ready, Warming: warming})
+		},
+		Logger: s.log.With("tier", t.tierKey(tier.Name)),
+	}
+}
+
+// withPools sizes each of t's tiers' stopped pool at the most it may keep
+// while served: its entry's (limits.pool) or its entitlement's, whichever is
+// more, within the tier's max. A tier with none keeps no pool, and its
+// reaper ends any pool instance of it; one with some starts a pool, and
+// tenantPoolTarget then keeps it at what applies now.
+func (s *shard) withPools(t tenant) tenant {
+	ent := s.entitledPool(t.ID)
+	t.Tiers = slices.Clone(t.Tiers) // its own: the caller's stay as they were
+	for i, tier := range t.Tiers {
+		if tier.EC2 == nil {
+			continue
+		}
+		n := t.ListPool[tier.Name]
+		if ent != nil {
+			n = max(n, ent[tier.Name])
+		}
+		if tier.Max > 0 {
+			n = min(n, tier.Max)
+		}
+		e := *tier.EC2
+		e.Pool = n
+		t.Tiers[i].EC2 = &e
+	}
+	return t
+}
+
+// entitledPool is the stopped pool, by tier, tenant id's entitlement names;
+// nil when it names none, or there are no entitlements.
+func (s *shard) entitledPool(id string) map[string]int {
+	if s.entitlements == nil || id == "" {
+		return nil
+	}
+	r, ok, _ := s.entitlements.Decide(id)
+	if !ok || r.Limits == nil {
+		return nil
+	}
+	return r.Limits.Pool
+}
+
+// poolTargetFor is what a tier's stopped pool follows: for a tenant's tier
+// that keeps one, tenantPoolTarget; nil for the install's tiers, whose pools
+// follow their schedules, and for a tier with no pool.
+func (s *shard) poolTargetFor(t tenant, tier config.Tier, bound *scheduler.Tenant) func() int {
+	if t.ID == "" || tier.MaxPool() == 0 {
+		return nil
+	}
+	return s.tenantPoolTarget(t, tier, bound)
+}
+
+// tenantPoolTarget is the size tier's stopped pool keeps for t, asked on
+// every pass of the pool: none while the tenant is suspended or held (by its
+// entitlement, or for want of its state), so no machine waits for an account
+// that may run nothing; else its entitlement's when the record names a pool,
+// or else its entry's; never above the tier's max.
+func (s *shard) tenantPoolTarget(t tenant, tier config.Tier, bound *scheduler.Tenant) func() int {
+	return func() int {
+		if _, why := bound.State(); why != "" {
+			return 0
+		}
+		n := t.ListPool[tier.Name]
+		if ent := s.entitledPool(t.ID); ent != nil {
+			n = ent[tier.Name]
+		}
+		if tier.Max > 0 {
+			n = min(n, tier.Max)
+		}
+		return n
 	}
 }
 
@@ -311,9 +388,13 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner string, jwt *ghauth.
 	if c.RunnerGroupID != nil {
 		groupID, pending = int(*c.RunnerGroupID), *c.RunnerGroupID == 0
 	}
+	var listPool map[string]int
+	if c.Limits != nil {
+		listPool = c.Limits.Pool
+	}
 	return tenant{
 		ID: c.ID, Owner: owner + "/" + c.ID, URL: c.URL, RunnerGroup: group, KeepOnClose: cfg.Owner != "",
-		RunnerGroupID: groupID, GroupPending: pending,
+		RunnerGroupID: groupID, GroupPending: pending, ListPool: listPool,
 		Auth:  ghauth.App{InstallationID: c.InstallationID, JWT: jwt},
 		Tiers: tiers, Limits: c.EffectiveLimits(), Refused: refused,
 	}
@@ -322,7 +403,7 @@ func extraTenant(cfg *config.Config, c config.Tenant, owner string, jwt *ghauth.
 // runTenant serves a tenant of the list until ctx ends, as cur returns its
 // entry each time it starts.
 func (s *shard) runTenant(ctx context.Context, cur func() config.Tenant, served func(*servedTenant), live *liveTenants, owner string, jwt *ghauth.JWT) {
-	get := func() tenant { return extraTenant(s.cfg, cur(), owner, jwt) }
+	get := func() tenant { return s.withPools(extraTenant(s.cfg, cur(), owner, jwt)) }
 	et := get()
 	defer live.forget(et.ID)
 	et.warnRefused(s.log)
@@ -592,6 +673,7 @@ func (s *shard) start(ctx context.Context, t tenant, hooks tenantHooks) (_ *serv
 	if s.ec2Client != nil {
 		newEC2 = func(tier config.Tier) provisioner.Provisioner {
 			o := s.ec2Options(t, tier, hooks, tierHealth[tier.Name], tierJobs[tier.Name])
+			o.PoolTarget = s.poolTargetFor(t, tier, st.bound)
 			sched := tierScheds[tier.Name]
 			o.OnRunnerJob = alsoMarkBusy(o.OnRunnerJob, sched.Load)
 			p := s.ec2Client.Tier(o)

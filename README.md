@@ -228,6 +228,18 @@ operator raises them per installation, and 0 lifts one:
   ended, and fails; the job events record the runner as `stopped`. On a tier
   that keeps no warm runners, as a tenant's never do, its machines also live
   at most the limit plus 15 minutes from launch.
+- **Pool** (`"pool": {"firerunner-ubuntu-24.04-2": 3}`) is how many stopped,
+  pre-warmed instances a tier keeps for the installation, so that a job starts
+  one in seconds rather than booting a new instance. Only the tiers named keep
+  one, never the catalog's own pool or schedule, and at most the tier's
+  `max`. Its entitlement's pool, when the record names one, takes its place
+  (see *Entitlements*). The pool is empty while the installation is
+  suspended or held, and fills again once it may run. Its instances are tagged
+  with the installation's owner, so no other pool takes them. A shard that takes
+  the installation over finds them, by the pool key all shards share. A stopped
+  instance costs its volumes alone.
+  `firerunner status` shows each tier's pool: how many are ready of its
+  target, and how many still warm.
 
 The install's own tiers are not limited unless `--limit-runners`,
 `--limit-vcpu` and `--limit-job-duration` (`FR_LIMIT_*`) say so.
@@ -519,7 +531,12 @@ tenants list holding, and only the tiers named launching; a job on another
 waits at GitHub with the reason. A change applies at the next read, while the
 installation runs, and lowering a limit stops no runner: an idle warm runner
 on a tier left out still takes one more job, and is not replaced. `status`
-shows the limit in force. Operators and tests write records as billing would:
+shows the limit in force. A record's `"pool": {"small": 3}` sizes the tiers'
+stopped pools in place of the tenants list's, which an add-on can sell. A tier
+it leaves out keeps none, and a change applies at the pool's next pass,
+within 15 seconds. A tier that kept no pool when the installation started gets
+one at its next start, when its shard restarts or another takes it over.
+Operators and tests write records as billing would:
 
 ```bash
 firerunner entitlement set acme --account active --budget capped --reason "November's cap" --store /etc/firerunner/entitlements.json

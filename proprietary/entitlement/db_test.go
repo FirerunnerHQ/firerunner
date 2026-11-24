@@ -90,6 +90,26 @@ func TestDBStore(t *testing.T) {
 	}
 }
 
+// A record's pool names tiers and sizes from 0; it reads back as written.
+func TestLimitsPool(t *testing.T) {
+	until := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	ok := Record{Account: Active, Budget: OK, ValidUntil: until, Limits: &Limits{Pool: map[string]int{"small": 3, "big": 0}}}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("a pool: %v", err)
+	}
+	for name, pool := range map[string]map[string]int{"negative": {"small": -1}, "no tier": {"": 1}} {
+		r := ok
+		r.Limits = &Limits{Pool: pool}
+		if err := r.Validate(); err == nil || !strings.Contains(err.Error(), "limits.pool") {
+			t.Errorf("%s: %v, want refused", name, err)
+		}
+	}
+	r := decode([]byte(`{"account_state":"active","budget_state":"ok","valid_until":"2026-12-01T00:00:00Z","limits":{"pool":{"small":3}}}`))
+	if r.Invalid != "" || r.PlanLimits().Pool["small"] != 3 {
+		t.Fatalf("decoded %+v", r)
+	}
+}
+
 // db: names the job store alone; anything after it is a mistake, and an
 // unknown spec is refused as before. The job store is asked for only for
 // db:.

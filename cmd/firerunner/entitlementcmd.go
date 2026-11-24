@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"strconv"
@@ -21,7 +22,7 @@ import (
 const entitlementUsage = `usage:
   firerunner entitlement set ID --account STATE --budget STATE
       [--plan NAME] [--reason TEXT] [--valid-for DURATION]
-      [--max-runners N] [--tiers NAME,...]
+      [--max-runners N] [--tiers NAME,...] [--pool TIER=N,...]
       [--store SPEC] [--env-file FILE|none] [--json]
       write what tenant ID may run, as billing would
   firerunner entitlement clear ID [--store SPEC] [--env-file FILE|none] [--json]
@@ -36,8 +37,11 @@ capped; --valid-for defaults to 24h. --max-runners and --tiers are the plan's
 limits: at most N runners at once across its tiers (the narrower of this and
 its max_runners in the tenants list holds), and only the tiers named launch;
 jobs on the others wait. Lowering them stops no runner (an idle warm runner
-on a tier left out takes one more job, and is not replaced). A daemon reads the
-records every 30 seconds:
+on a tier left out takes one more job, and is not replaced). --pool is the
+stopped pool each tier keeps (Turbo: a job starts in seconds), in place of the
+tenants list's limits.pool; a tier left out keeps none, and the tier's max
+bounds it. A tier that had no pool when the tenant started gets one at its next
+start. A daemon reads the records every 30 seconds:
 
   - no record, a pending or suspended account, or a capped budget: the
     tenant's launches are held and its jobs wait at GitHub with the reason;
@@ -130,7 +134,7 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 			}
 			asJSON = true
 			continue
-		case "--store", "--account", "--budget", "--plan", "--reason", "--valid-for", "--max-runners", "--tiers":
+		case "--store", "--account", "--budget", "--plan", "--reason", "--valid-for", "--max-runners", "--tiers", "--pool":
 			if !hasVal {
 				if i+1 >= len(rest) {
 					return usageErr("%s needs a value", name)
@@ -166,6 +170,12 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 					return usageErr("--tiers %q: name the tiers, separated by commas", val)
 				}
 				limits(&r).Tiers = tiers
+			case "--pool":
+				pool, err := parsePool(val)
+				if err != nil {
+					return usageErr("--pool %q: %v", val, err)
+				}
+				limits(&r).Pool = pool
 			}
 			continue
 		}
@@ -174,7 +184,7 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 		}
 		ids = append(ids, arg)
 	}
-	for _, f := range []string{"--account", "--budget", "--plan", "--reason", "--valid-for", "--max-runners", "--tiers"} {
+	for _, f := range []string{"--account", "--budget", "--plan", "--reason", "--valid-for", "--max-runners", "--tiers", "--pool"} {
 		if set[f] && action != "set" {
 			return usageErr("%s is for set", f)
 		}
@@ -278,6 +288,23 @@ func entitlementCmd(args []string, stdout, stderr io.Writer, open func(spec stri
 	return 0
 }
 
+// parsePool reads --pool: TIER=N pairs, separated by commas, N from 0.
+func parsePool(val string) (map[string]int, error) {
+	pool := map[string]int{}
+	for _, part := range strings.Split(val, ",") {
+		name, n, ok := strings.Cut(part, "=")
+		size, err := strconv.Atoi(n)
+		if !ok || name == "" || err != nil || size < 0 {
+			return nil, fmt.Errorf("want TIER=N pairs, separated by commas, N from 0: %q", part)
+		}
+		if _, dup := pool[name]; dup {
+			return nil, fmt.Errorf("tier %q named twice", name)
+		}
+		pool[name] = size
+	}
+	return pool, nil
+}
+
 // limits returns r's limits, set to none first if it has none.
 func limits(r *entitlement.Record) *entitlement.Limits {
 	if r.Limits == nil {
@@ -294,6 +321,14 @@ func limitsText(l entitlement.Limits) string {
 	}
 	if l.Tiers != nil {
 		s += ", tiers " + strings.Join(l.Tiers, ",")
+	}
+	if l.Pool != nil {
+		names := slices.Sorted(maps.Keys(l.Pool))
+		parts := make([]string, len(names))
+		for i, n := range names {
+			parts[i] = fmt.Sprintf("%s=%d", n, l.Pool[n])
+		}
+		s += ", pool " + strings.Join(parts, ",")
 	}
 	return s
 }

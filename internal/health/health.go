@@ -61,6 +61,9 @@ type Tier struct {
 	// Sizes are the hot runners and pool size the tier's schedule set last;
 	// nil for a tier without a schedule.
 	Sizes *Sizes `json:"sizes,omitempty"`
+	// Pool is the tier's stopped pool as its last pass left it; nil for a
+	// tier that keeps none.
+	Pool *PoolState `json:"pool,omitempty"`
 	// Pending is the jobs GitHub assigned that have not started, when any.
 	Pending *Pending `json:"pending,omitempty"`
 	// Launches counts EC2 launches by path: "pool", "cold", or "kept" (a
@@ -289,6 +292,14 @@ type Sizes struct {
 	Since  time.Time `json:"since"`
 }
 
+// PoolState is a stopped pool: the size it keeps, and how many of its
+// instances are ready to start and how many still warm.
+type PoolState struct {
+	Target  int `json:"target"`
+	Ready   int `json:"ready"`
+	Warming int `json:"warming"`
+}
+
 // GitHubStats is a scale set's statistics as GitHub reported them.
 type GitHubStats struct {
 	Available  int       `json:"available"`
@@ -380,6 +391,13 @@ func (tr *Tracker) SetSizes(sz Sizes) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	tr.t.Sizes = &sz
+}
+
+// SetPool records the tier's stopped pool.
+func (tr *Tracker) SetPool(p PoolState) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.t.Pool = &p
 }
 
 // SetPending records the pending jobs; nil or empty clears them.

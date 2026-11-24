@@ -96,6 +96,12 @@ type Limits struct {
 	// another waits at GitHub with the reason. Omitted, every tier it is
 	// served launches.
 	Tiers []string `json:"tiers,omitempty"`
+	// Pool, when set, is how many stopped, pre-warmed instances each tier
+	// keeps for the tenant (an add-on billing sells), in place of the
+	// tenants list's limits.pool; a tier left out keeps none. The tier's
+	// max bounds it. A tier whose pool the daemon did not start, as it had
+	// none when the tenant started, gets one at the tenant's next start.
+	Pool map[string]int `json:"pool,omitempty"`
 }
 
 // Validate reports whether l can be applied.
@@ -109,6 +115,14 @@ func (l Limits) Validate() error {
 	for _, t := range l.Tiers {
 		if t == "" {
 			return errors.New("limits.tiers names an empty tier")
+		}
+	}
+	for t, n := range l.Pool {
+		if t == "" {
+			return errors.New("limits.pool names an empty tier")
+		}
+		if n < 0 {
+			return fmt.Errorf("limits.pool %q is %d: want 0 or more", t, n)
 		}
 	}
 	return nil

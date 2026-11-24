@@ -106,6 +106,46 @@ func TestTenantTiersHaveNoCacheOrIdleMachines(t *testing.T) {
 	}
 }
 
+// A tenant's tier keeps the stopped pool its entry sets, never the
+// catalog's; the entry may set one only on its own tiers, from 0 to the
+// tier's max.
+func TestTenantPool(t *testing.T) {
+	c := tenantConfig()
+	c.Tiers[0].Max = 10
+	x := goodTenant()
+	x.Limits = &TenantLimits{Pool: map[string]int{"cloud": 4}}
+	got, _ := c.TenantTiers(x)
+	if len(got) != 1 || got[0].EC2.Pool != 4 || got[0].EC2.PoolFor != nil || got[0].Min != 0 || got[0].Schedule != nil {
+		t.Fatalf("a tenant's pooled tier: %+v, %+v", got[0], got[0].EC2)
+	}
+	if x.PoolSize("cloud") != 4 || x.PoolSize("other") != 0 || goodTenant().PoolSize("cloud") != 0 {
+		t.Fatal("PoolSize")
+	}
+	if c.Tiers[0].EC2.Pool != 3 {
+		t.Fatalf("the catalog's own pool changed: %d", c.Tiers[0].EC2.Pool)
+	}
+	if err := tenantConfig(x).validateTenants(); err != nil {
+		t.Fatalf("a pool within the tier: %v", err)
+	}
+	for name, pool := range map[string]map[string]int{
+		"a tier it is not given": {"micro": 1},
+		"an unknown tier":        {"nope": 1},
+		"negative":               {"cloud": -1},
+		"above the tier's max":   {"cloud": 11},
+	} {
+		y := goodTenant()
+		y.Limits = &TenantLimits{Pool: pool}
+		cc := tenantConfig(y)
+		cc.Tiers[0].Max = 10
+		if err := cc.validateTenants(); err == nil || !strings.Contains(err.Error(), "limits.pool") {
+			t.Errorf("%s: %v, want refused", name, err)
+		}
+	}
+	if _, err := ParseTenants([]byte(`[{"id":"t1","url":"https://github.com/acme","installation_id":7,"tiers":["cloud"],"limits":{"pool":{"cloud":2}}}]`)); err != nil {
+		t.Fatalf("an entry with a pool does not parse: %v", err)
+	}
+}
+
 func TestLoadTenants(t *testing.T) {
 	dir := t.TempDir()
 	write := func(body string) string {

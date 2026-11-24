@@ -153,6 +153,14 @@ type Options struct {
 	// Pooled keeps a pool even while EC2.Pool is 0, for a tier whose
 	// schedule sizes one later (see Pool.SetTarget).
 	Pooled bool
+	// PoolTarget, when set, is the size the pool keeps, asked on every
+	// pass: a tenant's pool follows its entitlement, and is 0 while the
+	// tenant is held or suspended. EC2.Pool is only its size until the
+	// first pass. It must be quick, and must not call into the pool.
+	PoolTarget func() int
+	// PoolState, when set, hears the pool's target, and its ready and
+	// warming instances, after each pass.
+	PoolState func(target, ready, warming int)
 	// UsePool, when set, decides per launch whether it may take a pool
 	// instance; false cold-launches and leaves the pool for the jobs
 	// ec2.pool_for names. release is called when the launch did not start
