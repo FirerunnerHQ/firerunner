@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,7 +87,7 @@ func (b *priceBook) order(itype string, subnets []string) []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.want(itype, subnets)
-	b.kick()
+	b.kick(false)
 	if b.now().Sub(b.fetched) > priceStale {
 		return out
 	}
@@ -151,23 +152,24 @@ func (b *priceBook) register(itypes, subnets []string) {
 	for _, it := range itypes {
 		b.want(it, subnets)
 	}
-	b.kick()
+	b.kick(false)
 	b.mu.Unlock()
 	b.ticking.Do(func() {
 		go func() {
 			for range time.Tick(b.every) {
 				b.mu.Lock()
-				b.kick()
+				b.kick(true)
 				b.mu.Unlock()
 			}
 		}()
 	})
 }
 
-// kick starts a background refresh when one is due and none is running.
-// Called with b.mu held.
-func (b *priceBook) kick() {
-	if !b.running && b.now().Sub(b.tried) >= b.every {
+// kick starts a background refresh when none is running and one is due, or
+// at once on the ticker's beat: a launch's refresh between two beats must
+// not push the next beat's to the one after. Called with b.mu held.
+func (b *priceBook) kick(beat bool) {
+	if !b.running && (beat || b.now().Sub(b.tried) >= b.every) {
 		b.running, b.tried = true, b.now()
 		go b.refresh()
 	}
@@ -207,8 +209,6 @@ func (b *priceBook) Price(itype, subnet string) string {
 }
 
 func (b *priceBook) refresh() {
-	ctx, cancel := context.WithTimeout(context.Background(), priceTimeout)
-	defer cancel()
 	b.mu.Lock()
 	itypes := sortedKeys(b.types)
 	var unzoned []string
@@ -220,8 +220,14 @@ func (b *priceBook) refresh() {
 	slices.Sort(unzoned)
 	b.mu.Unlock()
 
-	zones, zerr := b.zones(ctx, unzoned)
-	prices, perr := b.prices(ctx, itypes)
+	// Each lookup has its own deadline, so slow subnet lookups cannot use up
+	// the price fetch's.
+	zctx, zcancel := context.WithTimeout(context.Background(), priceTimeout)
+	zones, zerr := b.zones(zctx, unzoned)
+	zcancel()
+	pctx, pcancel := context.WithTimeout(context.Background(), priceTimeout)
+	prices, perr := b.prices(pctx, itypes)
+	pcancel()
 
 	b.mu.Lock()
 	for s, z := range zones {
@@ -238,9 +244,17 @@ func (b *priceBook) refresh() {
 		b.failing = false
 		b.log.Info("spot prices available again; launching in the cheapest zone first")
 	}
-	bad := ""
-	if zerr != nil {
-		bad = zerr.Error()
+	// Warned once per set of subnets: an error's text carries a request ID
+	// that differs on every call.
+	var missing []string
+	for _, s := range unzoned {
+		if _, ok := zones[s]; !ok {
+			missing = append(missing, s)
+		}
+	}
+	bad := strings.Join(missing, ",")
+	if zerr == nil {
+		bad = ""
 	}
 	if bad != b.badZones {
 		b.badZones = bad

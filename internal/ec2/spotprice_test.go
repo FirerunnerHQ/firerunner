@@ -2,6 +2,7 @@ package ec2
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 
 	"github.com/firerunnerhq/firerunner/internal/config"
 	"github.com/firerunnerhq/firerunner/internal/jitserver"
@@ -22,23 +24,26 @@ import (
 // newest last, filtered by type, pageSize entries a page.
 type pricedEC2 struct {
 	*fakeEC2
-	pmu        sync.Mutex
-	zones      map[string]string
-	hist       []types.SpotPrice
-	priceErr   error
-	priceCalls int
-	pageSize   int
-	block      chan struct{} // when set, price calls wait for it to close
+	pmu         sync.Mutex
+	zones       map[string]string
+	hist        []types.SpotPrice
+	priceErr    error
+	priceCalls  int
+	subnetCalls int
+	pageSize    int
+	block       chan struct{} // when set, price calls wait for it to close
 }
 
 func (f *pricedEC2) DescribeSubnets(_ context.Context, in *ec2.DescribeSubnetsInput, _ ...func(*ec2.Options)) (*ec2.DescribeSubnetsOutput, error) {
 	f.pmu.Lock()
 	defer f.pmu.Unlock()
+	f.subnetCalls++
 	out := &ec2.DescribeSubnetsOutput{}
 	for _, id := range in.SubnetIds {
 		z, ok := f.zones[id]
 		if !ok {
-			return nil, apiErr("InvalidSubnetID.NotFound")
+			// As from AWS, the text differs per call: it carries a request ID.
+			return nil, &smithy.GenericAPIError{Code: "InvalidSubnetID.NotFound", Message: fmt.Sprintf("The subnet ID '%s' does not exist, RequestID: req-%d", id, f.subnetCalls)}
 		}
 		out.Subnets = append(out.Subnets, types.Subnet{SubnetId: aws.String(id), AvailabilityZone: aws.String(z)})
 	}
@@ -391,9 +396,10 @@ func TestSpotPrice_UnknownSubnetHidesNoOtherZone(t *testing.T) {
 	f.setPrice("c8a.xlarge", "us-east-1b", "0.05", t0)
 	subnets := []string{"subnet-gone", "subnet-a", "subnet-b"}
 	o := config.EC2Tier{InstanceTypes: []string{"c8a.xlarge"}, Subnets: subnets}
-	prime(t, b, o)
-	clk.add(priceEvery)
-	prime(t, b, o)
+	for range 3 {
+		prime(t, b, o)
+		clk.add(priceEvery)
+	}
 	if got, want := b.order("c8a.xlarge", subnets), []string{"subnet-b", "subnet-a", "subnet-gone"}; !slices.Equal(got, want) {
 		t.Fatalf("order = %v, want %v", got, want)
 	}
@@ -404,6 +410,23 @@ func TestSpotPrice_UnknownSubnetHidesNoOtherZone(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "spot prices unavailable") {
 		t.Fatalf("an unknown subnet was reported as prices unavailable:\n%s", logs.String())
+	}
+}
+
+func TestSpotPrice_TickerBeatRefreshesAfterALaunchsRefresh(t *testing.T) {
+	_, f, _ := newPricedHarness(t, nil)
+	b := newPriceBook(f, quietLog())
+	b.now = (&testClock{t: t0}).now
+	o := config.EC2Tier{InstanceTypes: []string{"c8a.xlarge"}, Subnets: []string{"subnet-a"}}
+	prime(t, b, o) // as a launch's refresh just before the beat
+	calls := f.calls()
+	done := refreshed(b)
+	b.mu.Lock()
+	b.kick(true)
+	b.mu.Unlock()
+	waitRefresh(t, done)
+	if f.calls() == calls {
+		t.Fatal("the ticker's beat skipped its refresh because a launch's refresh came first")
 	}
 }
 
