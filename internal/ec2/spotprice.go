@@ -2,7 +2,10 @@ package ec2
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strconv"
 	"sync"
@@ -20,9 +23,11 @@ type PriceAPI interface {
 	DescribeSpotPriceHistory(context.Context, *ec2.DescribeSpotPriceHistoryInput, ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error)
 }
 
-// Spot price book timings. Prices are fetched in the background, at most
-// every priceEvery, so a launch never waits on them; prices older than
-// priceStale (every refresh since failed) are not used at all.
+// Spot price book timings. Prices are fetched in the background every
+// priceEvery, from the first tier's start and whether or not anything
+// launches, so a launch never waits on them and a burst after a quiet night
+// finds them fresh; prices older than priceStale (every refresh since
+// failed) are not used at all.
 const (
 	priceEvery    = 5 * time.Minute
 	priceStale    = 30 * time.Minute
@@ -45,6 +50,9 @@ type priceBook struct {
 	api PriceAPI
 	log *slog.Logger
 	now func() time.Time
+	// every is how often the book refreshes: priceEvery, shorter in tests.
+	every   time.Duration
+	ticking sync.Once
 
 	mu       sync.Mutex
 	zone     map[string]string // subnet -> availability zone
@@ -54,14 +62,15 @@ type priceBook struct {
 	fetched  time.Time // when price was last filled
 	tried    time.Time // when a refresh last started
 	running  bool
-	failing  bool
+	failing  bool              // the last price fetch failed
+	badZones string            // the subnets whose zones the last lookup could not find
 	turn     map[string]uint64 // per instance type, for taking turns
 	refreshc chan struct{}     // tests: closed after each refresh, then renewed
 }
 
 func newPriceBook(api PriceAPI, log *slog.Logger) *priceBook {
 	return &priceBook{
-		api: api, log: log, now: time.Now,
+		api: api, log: log, now: time.Now, every: priceEvery,
 		zone: map[string]string{}, types: map[string]bool{}, subnets: map[string]bool{},
 		price: map[[2]string]float64{}, turn: map[string]uint64{}, refreshc: make(chan struct{}),
 	}
@@ -77,10 +86,7 @@ func (b *priceBook) order(itype string, subnets []string) []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.want(itype, subnets)
-	if !b.running && b.now().Sub(b.tried) >= priceEvery {
-		b.running, b.tried = true, b.now()
-		go b.refresh()
-	}
+	b.kick()
 	if b.now().Sub(b.fetched) > priceStale {
 		return out
 	}
@@ -134,15 +140,36 @@ func (b *priceBook) order(itype string, subnets []string) []string {
 }
 
 // register adds a spot tier's types and subnets to what the book fetches,
-// so that the first launch's fetch covers every type its walk may reach.
+// fetches them at once, so that the tier's first launch finds them, and
+// starts the book's refreshes on the first call. The refreshes last as long
+// as the process, as the client does.
 func (b *priceBook) register(itypes, subnets []string) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	for _, it := range itypes {
 		b.want(it, subnets)
+	}
+	b.kick()
+	b.mu.Unlock()
+	b.ticking.Do(func() {
+		go func() {
+			for range time.Tick(b.every) {
+				b.mu.Lock()
+				b.kick()
+				b.mu.Unlock()
+			}
+		}()
+	})
+}
+
+// kick starts a background refresh when one is due and none is running.
+// Called with b.mu held.
+func (b *priceBook) kick() {
+	if !b.running && b.now().Sub(b.tried) >= b.every {
+		b.running, b.tried = true, b.now()
+		go b.refresh()
 	}
 }
 
@@ -200,20 +227,26 @@ func (b *priceBook) refresh() {
 	for s, z := range zones {
 		b.zone[s] = z
 	}
-	err := zerr
-	if err == nil {
-		err = perr
-	}
 	if perr == nil {
 		b.price, b.fetched = prices, b.now()
 	}
 	switch {
-	case err != nil && !b.failing:
+	case perr != nil && !b.failing:
 		b.failing = true
-		b.log.Warn("spot prices unavailable; launching in the configured subnet order until they are", "err", err)
-	case err == nil && b.failing:
+		b.log.Warn("spot prices unavailable; launching in the configured subnet order until they are", "err", perr)
+	case perr == nil && b.failing:
 		b.failing = false
 		b.log.Info("spot prices available again; launching in the cheapest zone first")
+	}
+	bad := ""
+	if zerr != nil {
+		bad = zerr.Error()
+	}
+	if bad != b.badZones {
+		b.badZones = bad
+		if bad != "" {
+			b.log.Warn("cannot find the zone of a subnet; spot launches try it after the priced ones", "err", zerr)
+		}
 	}
 	b.running = false
 	close(b.refreshc)
@@ -227,13 +260,26 @@ func (b *priceBook) zones(ctx context.Context, subnets []string) (map[string]str
 		return out, nil
 	}
 	res, err := b.api.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{SubnetIds: subnets})
-	if err != nil {
-		return out, err
+	if err == nil {
+		for _, s := range res.Subnets {
+			out[aws.ToString(s.SubnetId)] = aws.ToString(s.AvailabilityZone)
+		}
+		return out, nil
 	}
-	for _, s := range res.Subnets {
-		out[aws.ToString(s.SubnetId)] = aws.ToString(s.AvailabilityZone)
+	if len(subnets) == 1 {
+		return out, fmt.Errorf("subnet %s: %w", subnets[0], err)
 	}
-	return out, nil
+	// One unknown subnet fails the whole call: look the rest up one by one,
+	// so that it does not hide every other subnet's zone.
+	var errs []error
+	for _, s := range subnets {
+		got, err := b.zones(ctx, []string{s})
+		maps.Copy(out, got)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return out, errors.Join(errs...)
 }
 
 // prices fetches the current spot price of each type in each zone: with

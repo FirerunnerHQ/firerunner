@@ -127,10 +127,28 @@ func newPricedHarness(t *testing.T, mut func(*Options)) (*harness, *pricedEC2, *
 	}
 	clk := &testClock{t: t0}
 	c.prices.now = clk.now
+	started := refreshed(c.prices)
 	p := c.Tier(o)
+	waitRefresh(t, started) // the tier's start fetches its prices
 	p.tick = 5 * time.Millisecond
 	p.termWait, p.termRetry = 300*time.Millisecond, 20*time.Millisecond
 	return &harness{f: f.fakeEC2, jit: o.JIT, p: p}, f, clk
+}
+
+// refreshed returns a channel closed when b's next refresh ends.
+func refreshed(b *priceBook) <-chan struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.refreshc
+}
+
+func waitRefresh(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the background refresh did not finish")
+	}
 }
 
 // prime fetches the tier's prices now, as the first launch would in the
@@ -279,6 +297,7 @@ func TestSpotPrice_NewestPriceWinsAcrossPages(t *testing.T) {
 	f.setPrice("c8a.xlarge", "us-east-1a", "0.04", t0.Add(-2*time.Hour))
 	f.setPrice("c8a.xlarge", "us-east-1b", "0.07", t0.Add(-time.Hour))
 	subnets := []string{"subnet-a", "subnet-b"}
+	before := f.calls()
 	prime(t, b, config.EC2Tier{InstanceTypes: []string{"c8a.xlarge"}, Subnets: subnets})
 	if got := b.Price("c8a.xlarge", "subnet-a"); got != "0.09" {
 		t.Fatalf("price in 1a = %q, want the newest, 0.09", got)
@@ -286,7 +305,7 @@ func TestSpotPrice_NewestPriceWinsAcrossPages(t *testing.T) {
 	if got, want := b.order("c8a.xlarge", subnets), []string{"subnet-b", "subnet-a"}; !slices.Equal(got, want) {
 		t.Fatalf("order = %v, want %v", got, want)
 	}
-	if n := f.calls(); n != 4 {
+	if n := f.calls() - before; n != 4 {
 		t.Fatalf("%d price calls, want 4 (one per page)", n)
 	}
 }
@@ -295,13 +314,15 @@ func TestSpotPrice_LaunchNeverWaitsForPrices(t *testing.T) {
 	h, f, clk := newPricedHarness(t, nil)
 	f.setPrice("c8a.xlarge", "us-east-1c", "0.05", t0)
 	f.setPrice("c8a.xlarge", "us-east-1a", "0.09", t0)
+	f.pmu.Lock()
 	f.block = make(chan struct{})
-	b := h.p.c.prices
-	b.mu.Lock()
-	done := b.refreshc
-	b.mu.Unlock()
+	f.pmu.Unlock()
+	done := refreshed(h.p.c.prices)
 
-	// The first launch starts the fetch and goes on in the configured order.
+	// The tier's start fetched no prices (there were none yet). A launch
+	// once they are due starts the fetch and goes on in the configured
+	// order.
+	clk.add(priceEvery)
 	if inst := launchPriced(t, h); inst.subnet != "subnet-a" {
 		t.Fatalf("first launch in %s, want subnet-a while prices are being fetched", inst.subnet)
 	}
@@ -309,20 +330,80 @@ func TestSpotPrice_LaunchNeverWaitsForPrices(t *testing.T) {
 	close(f.block)
 	f.block = nil
 	f.pmu.Unlock()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("the background refresh did not finish")
-	}
+	waitRefresh(t, done)
 	if inst := launchPriced(t, h); inst.subnet != "subnet-c" {
 		t.Fatalf("launch after the fetch in %s, want subnet-c", inst.subnet)
 	}
-	// Within priceEvery, no launch fetches again.
+	// Within priceEvery, no launch fetches again; after it, one does.
 	calls := f.calls()
 	clk.add(priceEvery - time.Second)
 	launchPriced(t, h)
 	if f.calls() != calls {
 		t.Fatalf("prices fetched again %v after the last fetch", priceEvery-time.Second)
+	}
+	clk.add(time.Second)
+	done = refreshed(h.p.c.prices)
+	launchPriced(t, h)
+	waitRefresh(t, done)
+	if f.calls() == calls {
+		t.Fatalf("no fetch %v after the last", priceEvery)
+	}
+}
+
+func TestSpotPrice_TierStartFetchesPricesBeforeAnyLaunch(t *testing.T) {
+	f := &pricedEC2{fakeEC2: newFakeEC2(t), zones: map[string]string{"subnet-a": "us-east-1a", "subnet-b": "us-east-1b"}}
+	f.setPrice("c8a.xlarge", "us-east-1a", "0.09", t0)
+	f.setPrice("c8a.xlarge", "us-east-1b", "0.05", t0)
+	c := NewClient(f, nil, time.Second, quietLog())
+	c.prices.now = (&testClock{t: t0}).now
+	done := refreshed(c.prices)
+	c.Tier(Options{Tier: "t", Owner: "o", EC2: config.EC2Tier{InstanceTypes: []string{"c8a.xlarge"}, Subnets: []string{"subnet-a", "subnet-b"}, Market: config.MarketSpotThenOnDemand}})
+	waitRefresh(t, done)
+	if got := c.prices.Price("c8a.xlarge", "subnet-b"); got != "0.05" {
+		t.Fatalf("price after the tier's start = %q, want 0.05 fetched before any launch", got)
+	}
+	// An on-demand tier fetches nothing.
+	calls := f.calls()
+	c.Tier(Options{Tier: "od", Owner: "o", EC2: config.EC2Tier{InstanceTypes: []string{"m8a.xlarge"}, Subnets: []string{"subnet-a"}, Market: config.MarketOnDemand}})
+	c.prices.mu.Lock()
+	asked := c.prices.types["m8a.xlarge"]
+	c.prices.mu.Unlock()
+	if asked || f.calls() != calls {
+		t.Fatalf("an on-demand tier registered its types for spot prices")
+	}
+}
+
+func TestSpotPrice_IdleBookKeepsRefreshing(t *testing.T) {
+	_, f, _ := newPricedHarness(t, nil)
+	b := newPriceBook(f, quietLog())
+	b.every = 5 * time.Millisecond // and the real clock
+	b.register([]string{"c8a.xlarge"}, []string{"subnet-a"})
+	eventually(t, "three refreshes with no launch", func() bool { return f.calls() >= 3 })
+}
+
+func TestSpotPrice_UnknownSubnetHidesNoOtherZone(t *testing.T) {
+	var logs strings.Builder
+	var mu sync.Mutex
+	_, f, clk := newPricedHarness(t, nil)
+	b := newPriceBook(f, slog.New(slog.NewTextHandler(lockedWriter{&mu, &logs}, nil)))
+	b.now = clk.now
+	f.setPrice("c8a.xlarge", "us-east-1a", "0.09", t0)
+	f.setPrice("c8a.xlarge", "us-east-1b", "0.05", t0)
+	subnets := []string{"subnet-gone", "subnet-a", "subnet-b"}
+	o := config.EC2Tier{InstanceTypes: []string{"c8a.xlarge"}, Subnets: subnets}
+	prime(t, b, o)
+	clk.add(priceEvery)
+	prime(t, b, o)
+	if got, want := b.order("c8a.xlarge", subnets), []string{"subnet-b", "subnet-a", "subnet-gone"}; !slices.Equal(got, want) {
+		t.Fatalf("order = %v, want %v", got, want)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if n := strings.Count(logs.String(), "cannot find the zone of a subnet"); n != 1 || !strings.Contains(logs.String(), "subnet-gone") {
+		t.Fatalf("want one warning naming subnet-gone:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "spot prices unavailable") {
+		t.Fatalf("an unknown subnet was reported as prices unavailable:\n%s", logs.String())
 	}
 }
 

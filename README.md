@@ -1087,15 +1087,18 @@ No instance is terminated while its spot request may still be open.
 **Which zone.** Spot prices for one type differ between zones, often by 10-30%,
 and change by the hour. A spot launch tries each type's subnets cheapest zone
 first: firerunner reads the current prices with `ec2:DescribeSpotPriceHistory`
-every 5 minutes, in the background, so a launch never waits for them. Zones
-within 3% of the cheapest take turns, so near-equal zones share the instances
-and one zone's interruptions are not every runner's. A subnet whose zone has no
-price for the type goes last. Without prices (the permission is missing, or the
-last 30 minutes of reads failed) launches use the configured order, and the
-daemon logs that once. `instance launched` names the `spotPrice` it paid, and
-`doctor` checks the permission (`spot-prices`). Instance types keep their
-configured order: list them by preference, as a cheaper but slower type can
-cost more per job. Landing on the cheapest zone is not a fallback.
+when a spot tier starts and every 5 minutes after, in the background, so a
+launch never waits for them. Zones within 3% of the cheapest take turns, so
+near-equal zones share the instances and one zone's interruptions are not
+every runner's. A subnet whose zone has no price for the type, or whose zone
+cannot be looked up, goes last. Without prices (the permission is missing, or
+the last 30 minutes of reads failed) launches use the configured order, and
+the daemon logs that once. `instance launched` names `spotPrice`, the zone's
+price as last read (it may have changed since), and `doctor` checks the
+permission (`spot-prices`). Instance types keep their configured order: list
+them by preference, as a cheaper but slower type can cost more per job.
+Landing on the cheapest zone is not a fallback. A pool instance stays in the
+zone it was launched in: claiming it does not pick a zone again.
 
 When a type has no capacity in a subnet, firerunner tries the next subnet, then
 the next type: `InsufficientInstanceCapacity`, `Unsupported` and
