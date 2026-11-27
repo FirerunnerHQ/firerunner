@@ -866,7 +866,7 @@ See [`examples/tiers-ec2.json`](examples/tiers-ec2.json):
 |---|---|
 | `instance_types` | tried in order; the first with capacity wins |
 | `ami` | an image ID (`ami-…`) or an SSM parameter holding one, re-read every 5 minutes so a rebuilt image needs no config change |
-| `subnets` | tried in order for each type; one per AZ spreads launches across zones |
+| `subnets` | one per AZ. For spot, each type tries its subnets cheapest zone first, by the current spot price; on-demand, and spot while prices are unknown, tries them in order |
 | `security_groups` | for the instances; they need **no inbound rules** |
 | `market` | `spot`, `on-demand`, or `spot-then-on-demand` (every spot option before any on-demand one) |
 | `root_volume_gib`, `root_volume_type` | optional root EBS override (default: the AMI's size, type `gp3`) |
@@ -1084,6 +1084,19 @@ Use `--ec2-reaper dry-run` to only log what it would do. With `off`, nothing
 cleans up after a crash: not even pool instances left mid-claim.
 No instance is terminated while its spot request may still be open.
 
+**Which zone.** Spot prices for one type differ between zones, often by 10-30%,
+and change by the hour. A spot launch tries each type's subnets cheapest zone
+first: firerunner reads the current prices with `ec2:DescribeSpotPriceHistory`
+every 5 minutes, in the background, so a launch never waits for them. Zones
+within 3% of the cheapest take turns, so near-equal zones share the instances
+and one zone's interruptions are not every runner's. A subnet whose zone has no
+price for the type goes last. Without prices (the permission is missing, or the
+last 30 minutes of reads failed) launches use the configured order, and the
+daemon logs that once. `instance launched` names the `spotPrice` it paid, and
+`doctor` checks the permission (`spot-prices`). Instance types keep their
+configured order: list them by preference, as a cheaper but slower type can
+cost more per job. Landing on the cheapest zone is not a fallback.
+
 When a type has no capacity in a subnet, firerunner tries the next subnet, then
 the next type: `InsufficientInstanceCapacity`, `Unsupported` and
 `InsufficientFreeAddressesInSubnet` all move on. A used-up vCPU quota
@@ -1159,8 +1172,8 @@ the runners get no role:
     { "Effect": "Allow",
       "Action": ["ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeSpotInstanceRequests",
                  "ec2:DescribeSubnets", "ec2:DescribeRouteTables", "ec2:DescribeSecurityGroups",
-                 "ec2:DescribeInstanceTypes", "servicequotas:GetServiceQuota",
-                 "servicequotas:GetAWSDefaultServiceQuota"],
+                 "ec2:DescribeInstanceTypes", "ec2:DescribeSpotPriceHistory",
+                 "servicequotas:GetServiceQuota", "servicequotas:GetAWSDefaultServiceQuota"],
       "Resource": "*" },
     { "Effect": "Allow",
       "Action": ["ec2:TerminateInstances", "ec2:StartInstances", "ec2:ModifyInstanceAttribute"],
@@ -1287,6 +1300,8 @@ so GitHub Enterprise Server works too). Then:
   - `security-groups[tier]`: in the subnets' VPC, outbound allowed, no
     inbound rule;
   - `instance-metadata`: launches require IMDSv2 with hop limit 1;
+  - `spot-prices`: spot tiers can read the zones' spot prices; without them
+    launches keep the configured subnet order, so this warns;
   - `vcpu-quota[group/market]`: the vCPUs every tier at its `max` would use,
     per quota group (Standard, G and VT, …) and market, against Service
     Quotas. It warns rather than fails: other instances share the quota.

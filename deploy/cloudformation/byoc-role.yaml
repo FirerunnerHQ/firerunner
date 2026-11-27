@@ -123,6 +123,9 @@ Resources:
                   - ec2:DescribeRouteTables
                   - ec2:DescribeSecurityGroups
                   - ec2:DescribeInstanceTypes
+                  # Spot prices per zone, by which spot launches take each
+                  # type's cheapest zone first.
+                  - ec2:DescribeSpotPriceHistory
                   - servicequotas:GetServiceQuota
                   - servicequotas:GetAWSDefaultServiceQuota
                 Resource: "*"

@@ -89,6 +89,17 @@ func (a *fakeAccount) DescribeInstanceTypes(_ context.Context, in *ec2.DescribeI
 	return out, nil
 }
 
+func (a *fakeAccount) DescribeSpotPriceHistory(_ context.Context, in *ec2.DescribeSpotPriceHistoryInput, _ ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error) {
+	if a.denied["DescribeSpotPriceHistory"] {
+		return nil, apiErr("UnauthorizedOperation")
+	}
+	out := &ec2.DescribeSpotPriceHistoryOutput{}
+	for _, it := range in.InstanceTypes {
+		out.SpotPriceHistory = append(out.SpotPriceHistory, types.SpotPrice{InstanceType: it, AvailabilityZone: aws.String("az-1"), SpotPrice: aws.String("0.05")})
+	}
+	return out, nil
+}
+
 func (a *fakeAccount) GetServiceQuota(_ context.Context, in *servicequotas.GetServiceQuotaInput, _ ...func(*servicequotas.Options)) (*servicequotas.GetServiceQuotaOutput, error) {
 	if a.denied["GetServiceQuota"] {
 		return nil, apiErr("AccessDeniedException")
@@ -154,7 +165,7 @@ func ec2Tier(mut func(*config.EC2Tier)) config.Tier {
 
 func TestPreflight_AGoodDeploymentPasses(t *testing.T) {
 	got := preflight(t, goodAccount(), ec2Tier(nil))
-	for _, name := range []string{"aws-identity", "ami[cloud]", "subnets[cloud]", "security-groups[cloud]", "instance-metadata", "vcpu-quota[Standard/on-demand]", "vcpu-quota[Standard/spot]"} {
+	for _, name := range []string{"aws-identity", "ami[cloud]", "subnets[cloud]", "security-groups[cloud]", "instance-metadata", "spot-prices", "vcpu-quota[Standard/on-demand]", "vcpu-quota[Standard/spot]"} {
 		if f, ok := got[name]; !ok || f.Level != "PASS" {
 			t.Errorf("%s = %+v, want PASS", name, f)
 		}
@@ -164,6 +175,15 @@ func TestPreflight_AGoodDeploymentPasses(t *testing.T) {
 	}
 	if d := got["vcpu-quota[Standard/spot]"].Detail; !strings.Contains(d, "needs 40 vCPUs of 640") {
 		t.Errorf("quota detail = %q, want 10 x 4 vCPUs against 640", d)
+	}
+}
+
+func TestPreflight_OnDemandTiersReadNoSpotPrices(t *testing.T) {
+	a := goodAccount()
+	a.denied["DescribeSpotPriceHistory"] = true
+	got := preflight(t, a, ec2Tier(func(e *config.EC2Tier) { e.Market = config.MarketOnDemand }))
+	if f, ok := got["spot-prices"]; ok {
+		t.Fatalf("spot-prices checked for on-demand tiers only: %+v", f)
 	}
 }
 
@@ -259,6 +279,7 @@ func TestPreflight_Failures(t *testing.T) {
 			a.groups["sg-1"] = g
 		}, nil},
 		{"unknown family", "vcpu-quota", "WARN", "mac2.metal", nil, func(e *config.EC2Tier) { e.InstanceTypes = []string{"mac2.metal"} }},
+		{"spot prices not allowed", "spot-prices", "WARN", "ec2:DescribeSpotPriceHistory", func(a *fakeAccount) { a.denied["DescribeSpotPriceHistory"] = true }, nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			a := goodAccount()

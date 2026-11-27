@@ -60,7 +60,10 @@ type Client struct {
 	amis     *amiResolver
 	watch    *watcher
 	breakers *breakers
-	log      *slog.Logger
+	// prices orders a spot launch's subnets by zone price; nil when the
+	// API cannot fetch prices.
+	prices *priceBook
+	log    *slog.Logger
 
 	// live holds the instances some Launch in this process is responsible
 	// for; the reaper leaves them alone.
@@ -129,10 +132,14 @@ func NewClient(api API, params ParamAPI, pollInterval time.Duration, log *slog.L
 	if pollInterval <= 0 {
 		pollInterval = DefaultPollInterval
 	}
-	return &Client{
+	c := &Client{
 		api: api, amis: newAMIResolver(api, params), watch: newWatcher(api, pollInterval, log), breakers: newBreakers(), log: log, live: map[string]bool{},
 		poolKey: randomPoolKey(), poolKeyEphemeral: true, signBackoff: 500 * time.Millisecond,
 	}
+	if pa, ok := api.(PriceAPI); ok {
+		c.prices = newPriceBook(pa, log)
+	}
+	return c
 }
 
 // Options configures one EC2 tier's provisioner.
@@ -320,6 +327,9 @@ func (c *Client) Tier(o Options) *Provisioner {
 	if o.EC2.Pool > 0 || o.Pooled {
 		p.pool = newPool(p, o.EC2.Pool)
 	}
+	if o.EC2.Market != config.MarketOnDemand {
+		c.prices.register(o.EC2.InstanceTypes, o.EC2.Subnets)
+	}
 	return p
 }
 
@@ -387,9 +397,15 @@ func (p *Provisioner) Launch(ctx context.Context, name, jit string, _ core.Runne
 	// instance meanwhile, so the launch need not wait for it.
 	go p.signRunner(context.WithoutCancel(ctx), id, name)
 	log := p.log.With("runner", name, "instance", id, "type", inst.InstanceType, "subnet", aws.ToString(inst.SubnetId))
-	log.Info("instance launched",
+	var priced []any
+	if inst.InstanceLifecycle == types.InstanceLifecycleTypeSpot {
+		if sp := p.c.prices.Price(string(inst.InstanceType), aws.ToString(inst.SubnetId)); sp != "" {
+			priced = []any{"spotPrice", sp}
+		}
+	}
+	log.Info("instance launched", append([]any{
 		"ami", resolved.Sub(entered).Round(time.Millisecond),
-		"runInstances", time.Since(resolved).Round(time.Millisecond))
+		"runInstances", time.Since(resolved).Round(time.Millisecond)}, priced...)...)
 
 	states, stopWatch := p.c.watch.watch(id)
 	defer stopWatch()
@@ -828,8 +844,10 @@ const (
 	forPool
 )
 
-// run walks markets × instance types × subnets in the configured order and
-// returns the first instance EC2 accepts. A capacity error moves on to the
+// run walks markets × instance types × subnets and returns the first
+// instance EC2 accepts: types in the configured order, and within a spot
+// type its subnets cheapest zone first (see priceBook), else in the
+// configured order. A capacity error moves on to the
 // next subnet, a quota error to the next type or market (the quota is
 // regional); any other error ends the walk. Options EC2 refused lately (see
 // breakers) go to the end of their market rather than out of the walk: spot
@@ -847,10 +865,18 @@ func (p *Provisioner) run(ctx context.Context, name string, img image, kind laun
 	}
 	var walk []option
 	backingOff := 0
-	for _, market := range markets {
+	var firstChoice option
+	for mi, market := range markets {
 		var ready, later []option
-		for _, itype := range p.o.EC2.InstanceTypes {
-			for _, subnet := range p.o.EC2.Subnets {
+		for ti, itype := range p.o.EC2.InstanceTypes {
+			subnets := p.o.EC2.Subnets
+			if market == config.MarketSpot {
+				subnets = p.c.prices.order(itype, subnets)
+			}
+			if mi == 0 && ti == 0 {
+				firstChoice = option{market, itype, subnets[0]}
+			}
+			for _, subnet := range subnets {
 				o := option{market, itype, subnet}
 				if p.c.breakers.blocked(o) {
 					later = append(later, o)
@@ -862,7 +888,6 @@ func (p *Provisioner) run(ctx context.Context, name string, img image, kind laun
 		backingOff += len(later)
 		walk = append(append(walk, ready...), later...)
 	}
-	firstChoice := option{markets[0], p.o.EC2.InstanceTypes[0], p.o.EC2.Subnets[0]}
 	if backingOff > 0 {
 		p.log.Info("launch options backing off; trying them last in their market", "runner", name, "backingOff", backingOff, "of", len(walk))
 	}
