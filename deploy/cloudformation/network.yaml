@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  firerunner runner network: a VPC with public subnets in two or three
+  firerunner runner network: a VPC with public subnets in two to four
   Availability Zones, and the runners' security group (no inbound). Its
   outputs are control.yaml's VpcId, SubnetIds and RunnerSecurityGroupId.
   See deploy/cloudformation/README.md.
@@ -13,12 +13,16 @@ Parameters:
     Description: The VPC's /16. Each subnet gets a /18 quarter of it.
   SubnetCount:
     Type: Number
-    AllowedValues: [2, 3]
+    AllowedValues: [2, 3, 4]
     Default: 3
-    Description: Availability Zones to spread runners over; more zones, more spot capacity.
+    Description: >-
+      Availability Zones to spread runners over, the region's first ones;
+      more zones, more spot capacity and more spot prices to pick the
+      cheapest from. 4 needs a region with four zones.
 
 Conditions:
-  ThreeSubnets: !Equals [!Ref SubnetCount, 3]
+  ThreeSubnets: !Not [!Equals [!Ref SubnetCount, 2]]
+  FourSubnets: !Equals [!Ref SubnetCount, 4]
 
 Resources:
   Vpc:
@@ -76,6 +80,15 @@ Resources:
       CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 14]]
       MapPublicIpOnLaunch: true
       Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-c" }]
+  SubnetD:
+    Type: AWS::EC2::Subnet
+    Condition: FourSubnets
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [3, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 14]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-d" }]
   RouteA:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties: { SubnetId: !Ref SubnetA, RouteTableId: !Ref RouteTable }
@@ -86,6 +99,10 @@ Resources:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Condition: ThreeSubnets
     Properties: { SubnetId: !Ref SubnetC, RouteTableId: !Ref RouteTable }
+  RouteD:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: FourSubnets
+    Properties: { SubnetId: !Ref SubnetD, RouteTableId: !Ref RouteTable }
 
   # Job code runs as root on these subnets' instances: mail must not leave
   # them, or an account could send spam from the provider's ranges. A security
@@ -123,6 +140,10 @@ Resources:
     Type: AWS::EC2::SubnetNetworkAclAssociation
     Condition: ThreeSubnets
     Properties: { SubnetId: !Ref SubnetC, NetworkAclId: !Ref RunnerAcl }
+  AclD:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Condition: FourSubnets
+    Properties: { SubnetId: !Ref SubnetD, NetworkAclId: !Ref RunnerAcl }
 
   RunnerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -139,9 +160,12 @@ Outputs:
   SubnetIds:
     Description: Comma-separated, for control.yaml's SubnetIds and the tiers' ec2.subnets.
     Value: !If
-      - ThreeSubnets
-      - !Join [",", [!Ref SubnetA, !Ref SubnetB, !Ref SubnetC]]
-      - !Join [",", [!Ref SubnetA, !Ref SubnetB]]
+      - FourSubnets
+      - !Join [",", [!Ref SubnetA, !Ref SubnetB, !Ref SubnetC, !Ref SubnetD]]
+      - !If
+        - ThreeSubnets
+        - !Join [",", [!Ref SubnetA, !Ref SubnetB, !Ref SubnetC]]
+        - !Join [",", [!Ref SubnetA, !Ref SubnetB]]
   RunnerSecurityGroupId:
     Description: For control.yaml's RunnerSecurityGroupId and the tiers' ec2.security_groups.
     Value: !Ref RunnerSecurityGroup
