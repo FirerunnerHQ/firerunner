@@ -6,7 +6,7 @@ or deploy them from other tooling:
 
 | template | creates | needs |
 |---|---|---|
-| [`network.yaml`](network.yaml) | a VPC with public subnets in 2–3 zones, and the runners' security group (no inbound) | — (or bring your own VPC) |
+| [`network.yaml`](network.yaml) | a VPC with public subnets in 2–4 zones, and the runners' security group (no inbound) | — (or bring your own VPC) |
 | [`control.yaml`](control.yaml) | the control plane: an Auto Scaling group of one VM, its role, its security group, a private DNS zone | a VPC, subnets, the runners' group |
 | [`reaper.yaml`](reaper.yaml) (optional) | a scheduled Lambda that ends the install's instances running past a limit | the install's `Owner` (and `TenantOwner`, for shards) |
 | [`byoc-role.yaml`](byoc-role.yaml) (bring your own cloud) | a role a control plane in another account assumes, with an external ID, to run runners here | that account's ID, an external ID, `Owner` |
