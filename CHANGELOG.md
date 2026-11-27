@@ -8,6 +8,27 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.36] - 2026-11-27
+
+### Added
+
+- `network.yaml` takes `SubnetCount=4`, for a fourth subnet in the region's
+  fourth Availability Zone: more spot capacity, and one more zone's price for
+  spot launches to pick the cheapest from. The VPC's address plan already
+  held a fourth /18, so an existing stack only gains the subnet.
+
+### Changed
+
+- Spot launches try each instance type's subnets cheapest zone first, by the
+  current spot price, instead of always starting at the first subnet; zones
+  within 3% of the cheapest take turns. Prices are read when a spot tier
+  starts and every 5 minutes after, in the background. Without them, launches
+  keep the configured order. The control
+  VM's role needs `ec2:DescribeSpotPriceHistory`; the CloudFormation templates
+  grant it, and `firerunner doctor` checks it (`spot-prices`).
+- `instance launched` log lines for spot instances name `spotPrice`, the
+  zone's spot price as last read.
+
 ## [0.1.35] - 2026-11-24
 
 ### Added
@@ -867,7 +888,8 @@ separately.
 - `firerunner migrate`, which opens a pull request moving a repository's jobs
   onto firerunner.
 
-[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.35...HEAD
+[Unreleased]: https://github.com/FirerunnerHQ/firerunner/compare/v0.1.36...HEAD
+[0.1.36]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.36
 [0.1.35]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.35
 [0.1.34]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.34
 [0.1.33]: https://github.com/FirerunnerHQ/firerunner/releases/tag/v0.1.33
