@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -23,6 +24,7 @@ type PreflightAPI interface {
 	DescribeRouteTables(context.Context, *ec2.DescribeRouteTablesInput, ...func(*ec2.Options)) (*ec2.DescribeRouteTablesOutput, error)
 	DescribeSecurityGroups(context.Context, *ec2.DescribeSecurityGroupsInput, ...func(*ec2.Options)) (*ec2.DescribeSecurityGroupsOutput, error)
 	DescribeInstanceTypes(context.Context, *ec2.DescribeInstanceTypesInput, ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error)
+	DescribeSpotPriceHistory(context.Context, *ec2.DescribeSpotPriceHistoryInput, ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error)
 }
 
 // QuotaAPI reads a vCPU quota from Service Quotas.
@@ -72,7 +74,42 @@ func (c *Client) Preflight(ctx context.Context, region string, pre PreflightAPI,
 		out = append(out, c.amiCheck(ctx, t), subnetCheck(ctx, pre, t), securityGroupCheck(ctx, pre, t))
 	}
 	out = append(out, metadataCheck())
+	out = append(out, spotPriceCheck(ctx, pre, valid)...)
 	return append(out, quotaChecks(ctx, pre, quotas, valid)...)
+}
+
+// spotPriceCheck: the spot price book can read prices, by which spot
+// launches take each type's cheapest zone first. Without them launches still
+// work, in the configured subnet order, so this warns rather than fails.
+func spotPriceCheck(ctx context.Context, pre PreflightAPI, tiers []config.Tier) []Finding {
+	const name = "spot-prices"
+	seen := map[string]bool{}
+	var itypes []types.InstanceType
+	for _, t := range tiers {
+		if t.EC2.Market == config.MarketOnDemand {
+			continue
+		}
+		for _, it := range t.EC2.InstanceTypes {
+			if !seen[it] {
+				seen[it] = true
+				itypes = append(itypes, types.InstanceType(it))
+			}
+		}
+	}
+	if len(itypes) == 0 {
+		return nil
+	}
+	now := time.Now()
+	res, err := pre.DescribeSpotPriceHistory(ctx, &ec2.DescribeSpotPriceHistoryInput{
+		InstanceTypes: itypes, ProductDescriptions: []string{priceProduct}, StartTime: aws.Time(now), EndTime: aws.Time(now),
+	})
+	if err != nil {
+		return []Finding{warnf(name, "cannot read spot prices (%v): spot launches use the configured subnet order, not the cheapest zone; allow ec2:DescribeSpotPriceHistory (deploy/cloudformation/control.yaml grants it)", err)}
+	}
+	if len(res.SpotPriceHistory) == 0 {
+		return []Finding{warnf(name, "EC2 lists no spot price for %v: spot launches use the configured subnet order", itypes)}
+	}
+	return []Finding{passf(name, "%d prices for %d types: spot launches take each type's cheapest zone first", len(res.SpotPriceHistory), len(itypes))}
 }
 
 // identityFailure tells credentials AWS rejected from an STS it could not
