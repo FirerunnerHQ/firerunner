@@ -784,9 +784,15 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 	// cancels the VM. Its error is then ours, not a failed boot. A runner
 	// with a job is never deleted, so a busy one's error still counts.
 	deregistered := false
+	// A VM that ended on its own before its runner took a job (a spot
+	// interruption, a crash, a boot that failed after registering) leaves
+	// its runner registered at GitHub, which may still hand it a job until
+	// it notices the runner is gone; see deregisterEnded.
+	endedIdle := false
 	if h := s.active[name]; h != nil {
 		jobDone = h.completed && s.reconciles > h.completedAt
 		deregistered = h.deregistering && !h.busy
+		endedIdle = !h.busy && !h.deregistering // MarkCompleted sets busy too
 	}
 	delete(s.active, name)
 	failed := launchErr != nil && vmCtx.Err() == nil && !deregistered
@@ -795,6 +801,12 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 	}
 	s.mu.Unlock()
 	startReplanned()
+	// We cancel a VM ourselves only after deregistering it (scale-down), or
+	// at shutdown, which leaves idle runners as they are.
+	if endedIdle && vmCtx.Err() == nil && s.opts.Remover != nil {
+		s.wg.Add(1) // before this launch's wg.Done, as in startReplanned
+		go s.deregisterEnded(context.WithoutCancel(ctx), name)
+	}
 	switch {
 	case vmCtx.Err() != nil:
 		// We cancelled this VM ourselves (scale-down or shutdown); any error it
@@ -808,6 +820,26 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 		s.backoff(ctx)
 	default:
 		s.resetBackoff()
+	}
+}
+
+// deregisterEnded removes at GitHub the runner of a VM that ended before it
+// took a job. Until GitHub sees the runner is gone, it can still assign that
+// runner a job, which then waits several minutes before GitHub gives it to
+// another runner. Hot runners make this common: AWS takes a spot instance
+// back mostly while its runner waits. It runs beside the replacement launch,
+// not before it, and Drain waits for it. A runner GitHub already dropped
+// (an ephemeral runner removes itself after its job) is success.
+func (s *Scheduler) deregisterEnded(ctx context.Context, name string) {
+	defer s.wg.Done()
+	err := s.opts.Remover.RemoveRunner(ctx, name)
+	switch {
+	case err == nil:
+		s.opts.Logger.Info("deregistered the runner of a machine that ended before taking a job", "runner", name)
+	case errors.Is(err, core.ErrRunnerBusy):
+		s.opts.Logger.Warn("GitHub had assigned a job to a runner whose machine ended; GitHub gives the job to another runner or fails it", "runner", name)
+	default:
+		s.opts.Logger.Warn("could not deregister the runner of a machine that ended; the offline-runner sweep removes it later", "runner", name, "err", err)
 	}
 }
 
