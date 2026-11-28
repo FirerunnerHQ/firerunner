@@ -22,8 +22,11 @@ type JITSource interface {
 	Generate(ctx context.Context, spec core.RunnerSpec) (name, jitConfig string, err error)
 }
 
-// RunnerRemover deregisters an idle runner from GitHub before scale-down kills
-// its microVM. GitHub may already have assigned the runner a job in the few
+// RunnerRemover deregisters an idle runner from GitHub: before scale-down
+// kills its microVM, and after a VM ends on its own before its runner took
+// a job (see deregisterEnded).
+//
+// For scale-down: GitHub may already have assigned the runner a job in the few
 // seconds before its guest logs "Running job:"; killing the VM then strands
 // that job on a dead runner until GitHub reaps the session (~5 min) and
 // re-queues it. Deregistering first closes the race: GitHub refuses with
@@ -47,8 +50,9 @@ type Options struct {
 	Provisioner provisioner.Provisioner
 	JIT         JITSource
 	// Remover, when set, deregisters each idle VM with GitHub before
-	// scale-down cancels it. nil cancels at once, with the race described on
-	// RunnerRemover.
+	// scale-down cancels it, and the runner of a VM that ended before taking
+	// a job. nil cancels at once, with the race described on RunnerRemover,
+	// and leaves ended runners to the offline-runner sweep.
 	Remover RunnerRemover
 	Logger  *slog.Logger
 	// Pending, when set, is shared by every Scheduler on the host so that each
@@ -133,6 +137,12 @@ type Scheduler struct {
 	// mu.
 	removeQ       []string
 	removerActive bool
+	// endedQ holds the runners of VMs that ended before they took a job,
+	// for endedLoop to deregister; endedActive is true while one runs;
+	// endedAsked counts every runner ever queued. Guarded by mu.
+	endedQ      []string
+	endedActive bool
+	endedAsked  int
 	// lastJobs and lastCtx are the job count and context of the latest
 	// Reconcile, kept so a runner that finishes its job, or a change of Min,
 	// can re-run the plan (see replan, SetMin). hasDesired is false until the
@@ -784,17 +794,39 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 	// cancels the VM. Its error is then ours, not a failed boot. A runner
 	// with a job is never deleted, so a busy one's error still counts.
 	deregistered := false
+	// A VM that ended on its own before its runner took a job (a spot
+	// interruption, a crash, a boot that failed after registering) leaves
+	// its runner registered at GitHub, which may still hand it a job until
+	// it notices the runner is gone; see deregisterEnded.
+	endedIdle := false
 	if h := s.active[name]; h != nil {
 		jobDone = h.completed && s.reconciles > h.completedAt
 		deregistered = h.deregistering && !h.busy
+		// Not busy is not enough: a job cancelled before it started is
+		// reported completed, which marks the runner busy though it never
+		// began a job. jobStarted, set by MarkBusy alone, tells them apart,
+		// as in HandOff.
+		endedIdle = h.jobStarted.IsZero() && !h.deregistering
 	}
 	delete(s.active, name)
 	failed := launchErr != nil && vmCtx.Err() == nil && !deregistered
 	if !failed {
 		finish()
 	}
+	// Only a VM that ended on its own: every VM the scheduler cancels
+	// (scale-down, which deregisters first; a suspended or fenced tenant;
+	// shutdown; a hand-off) has its own reason, and those that leave a
+	// runner registered leave it to the offline-runner sweep, as before.
+	// At shutdown endedLoop drops what is queued.
+	startEnded := false
+	if endedIdle && vmCtx.Err() == nil && s.opts.Remover != nil {
+		startEnded = s.queueEnded(name)
+	}
 	s.mu.Unlock()
 	startReplanned()
+	if startEnded {
+		go s.endedLoop(ctx)
+	}
 	switch {
 	case vmCtx.Err() != nil:
 		// We cancelled this VM ourselves (scale-down or shutdown); any error it
@@ -808,6 +840,69 @@ func (s *Scheduler) launchOne(ctx context.Context, queuedAt time.Time) {
 		s.backoff(ctx)
 	default:
 		s.resetBackoff()
+	}
+}
+
+// queueEnded queues the runner of a VM that ended before it took a job for
+// endedLoop, and reports whether the caller must start one. Callers hold
+// s.mu.
+func (s *Scheduler) queueEnded(name string) bool {
+	s.endedQ = append(s.endedQ, name)
+	s.endedAsked++
+	if s.endedActive {
+		return false
+	}
+	s.endedActive = true
+	return true
+}
+
+// endedLoop deregisters, one at a time, the runners of VMs that ended
+// before they took a job (see deregisterEnded). Like removeLoop it is not
+// in the WaitGroup and stops at shutdown, so Drain never waits on GitHub
+// (whose client's token refresh does not honour a context), and a burst of
+// spot interruptions does not send a burst of removals. What it leaves
+// queued, the offline-runner sweep removes.
+func (s *Scheduler) endedLoop(ctx context.Context) {
+	for {
+		s.mu.Lock()
+		if ctx.Err() != nil || len(s.endedQ) == 0 {
+			s.endedQ = nil
+			s.endedActive = false
+			s.mu.Unlock()
+			return
+		}
+		name := s.endedQ[0]
+		s.endedQ = s.endedQ[1:]
+		s.mu.Unlock()
+		s.deregisterEnded(ctx, name)
+	}
+}
+
+// deregisterEnded removes at GitHub the runner of a VM that ended before it
+// took a job. Until GitHub sees that a runner which had connected is gone,
+// it can still assign it a job, which then waits minutes before GitHub
+// gives it to another runner. Hot runners make this common: AWS takes a
+// spot instance back mostly while its runner waits. A runner that never
+// connected (a boot that failed after registering) is only tidied away. A
+// runner GitHub no longer knows, such as an ephemeral one that removed
+// itself after a job, is success. An answer GitHub could not confirm is
+// asked once more.
+func (s *Scheduler) deregisterEnded(ctx context.Context, name string) {
+	err := s.opts.Remover.RemoveRunner(context.WithoutCancel(ctx), name)
+	if errors.Is(err, core.ErrRemovalUnknown) {
+		select {
+		case <-ctx.Done():
+		case <-time.After(s.removeRetryDelay):
+			err = s.opts.Remover.RemoveRunner(context.WithoutCancel(ctx), name)
+		}
+	}
+	switch {
+	case err == nil:
+		s.opts.Logger.Info("made sure GitHub holds no runner for a machine that ended before taking a job", "runner", name)
+	case errors.Is(err, core.ErrRunnerBusy):
+		s.opts.Logger.Warn("GitHub holds a job for the runner of a machine that ended; a job that had not started goes to another runner or fails at GitHub", "runner", name)
+	default:
+		s.opts.Logger.Warn("could not deregister the runner of a machine that ended; GitHub marks it offline, and the offline-runner sweep, when on, removes it", "runner", name, "err", err)
 	}
 }
 
